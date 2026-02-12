@@ -1,0 +1,18 @@
+out/
+node_modules/
+*.vsix
+.vscode-test/
+
+# Claude Code
+.claude/
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Test artifacts
+out/test-output.agent-plan.json
+
+# Environment
+.env
+.env.local

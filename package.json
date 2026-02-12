@@ -1,0 +1,338 @@
+{
+  "name": "agent-task-player",
+  "displayName": "Agent Task Player",
+  "description": "Define playlists of tasks and play them sequentially using coding agent CLIs (Codex, Claude Code, Gemini CLI, Ollama).",
+  "version": "0.1.0",
+  "publisher": "moag",
+  "license": "MIT",
+  "icon": "media/icon.png",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/moag/agent-task-player"
+  },
+  "homepage": "https://github.com/moag/agent-task-player#readme",
+  "bugs": {
+    "url": "https://github.com/moag/agent-task-player/issues"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other",
+    "Machine Learning"
+  ],
+  "keywords": [
+    "ai",
+    "agent",
+    "codex",
+    "claude",
+    "gemini",
+    "ollama",
+    "task-runner",
+    "automation",
+    "llm"
+  ],
+  "activationEvents": [
+    "onView:agentTaskPlayer.planView",
+    "workspaceContains:**/*.agent-plan.json"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentTaskPlayer.play",
+        "title": "Play",
+        "category": "Agent Task Player",
+        "icon": "$(play)"
+      },
+      {
+        "command": "agentTaskPlayer.pause",
+        "title": "Pause",
+        "category": "Agent Task Player",
+        "icon": "$(debug-pause)"
+      },
+      {
+        "command": "agentTaskPlayer.stop",
+        "title": "Stop",
+        "category": "Agent Task Player",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "agentTaskPlayer.openPlan",
+        "title": "Open Plan File",
+        "category": "Agent Task Player",
+        "icon": "$(folder-opened)"
+      },
+      {
+        "command": "agentTaskPlayer.newPlan",
+        "title": "New Plan",
+        "category": "Agent Task Player",
+        "icon": "$(new-file)"
+      },
+      {
+        "command": "agentTaskPlayer.addPlaylist",
+        "title": "Add Playlist",
+        "category": "Agent Task Player",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentTaskPlayer.addTask",
+        "title": "Add Task",
+        "category": "Agent Task Player",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentTaskPlayer.editTask",
+        "title": "Edit Task",
+        "category": "Agent Task Player",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "agentTaskPlayer.deleteItem",
+        "title": "Delete",
+        "category": "Agent Task Player",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentTaskPlayer.moveUp",
+        "title": "Move Up",
+        "category": "Agent Task Player",
+        "icon": "$(arrow-up)"
+      },
+      {
+        "command": "agentTaskPlayer.moveDown",
+        "title": "Move Down",
+        "category": "Agent Task Player",
+        "icon": "$(arrow-down)"
+      },
+      {
+        "command": "agentTaskPlayer.showHistory",
+        "title": "Show History",
+        "category": "Agent Task Player",
+        "icon": "$(history)"
+      },
+      {
+        "command": "agentTaskPlayer.showDashboard",
+        "title": "Show Dashboard",
+        "category": "Agent Task Player",
+        "icon": "$(dashboard)"
+      },
+      {
+        "command": "agentTaskPlayer.clearHistory",
+        "title": "Clear History",
+        "category": "Agent Task Player",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "agentTaskPlayer.playPlaylist",
+        "title": "Play Playlist",
+        "category": "Agent Task Player",
+        "icon": "$(play)"
+      },
+      {
+        "command": "agentTaskPlayer.playTask",
+        "title": "Run Task",
+        "category": "Agent Task Player",
+        "icon": "$(play)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "agentTaskPlayer",
+          "title": "Agent Task Player",
+          "icon": "$(rocket)"
+        }
+      ]
+    },
+    "views": {
+      "agentTaskPlayer": [
+        {
+          "id": "agentTaskPlayer.planView",
+          "name": "Plan",
+          "type": "tree"
+        },
+        {
+          "id": "agentTaskPlayer.historyView",
+          "name": "History",
+          "type": "tree"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "agentTaskPlayer.openPlan",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agentTaskPlayer.newPlan",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "agentTaskPlayer.addPlaylist",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "agentTaskPlayer.play",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@4"
+        },
+        {
+          "command": "agentTaskPlayer.pause",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@5"
+        },
+        {
+          "command": "agentTaskPlayer.stop",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@6"
+        },
+        {
+          "command": "agentTaskPlayer.clearHistory",
+          "when": "view == agentTaskPlayer.historyView",
+          "group": "navigation@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "agentTaskPlayer.playPlaylist",
+          "when": "view == agentTaskPlayer.planView && viewItem == playlist",
+          "group": "inline@1"
+        },
+        {
+          "command": "agentTaskPlayer.addTask",
+          "when": "view == agentTaskPlayer.planView && viewItem == playlist",
+          "group": "inline@2"
+        },
+        {
+          "command": "agentTaskPlayer.deleteItem",
+          "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/",
+          "group": "inline@3"
+        },
+        {
+          "command": "agentTaskPlayer.playTask",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "inline@1"
+        },
+        {
+          "command": "agentTaskPlayer.editTask",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "inline@2"
+        },
+        {
+          "command": "agentTaskPlayer.moveUp",
+          "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/",
+          "group": "1_move@1"
+        },
+        {
+          "command": "agentTaskPlayer.moveDown",
+          "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/",
+          "group": "1_move@2"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Agent Task Player",
+      "properties": {
+        "agentTaskPlayer.defaultEngine": {
+          "type": "string",
+          "default": "claude",
+          "enum": [
+            "codex",
+            "claude",
+            "gemini",
+            "ollama",
+            "custom"
+          ],
+          "description": "Default agent engine to use for tasks."
+        },
+        "agentTaskPlayer.engines.codex.command": {
+          "type": "string",
+          "default": "codex",
+          "description": "Path or command name for the Codex CLI."
+        },
+        "agentTaskPlayer.engines.codex.args": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "description": "Extra arguments for Codex CLI."
+        },
+        "agentTaskPlayer.engines.claude.command": {
+          "type": "string",
+          "default": "claude",
+          "description": "Path or command name for Claude Code CLI."
+        },
+        "agentTaskPlayer.engines.claude.args": {
+          "type": "array",
+          "default": ["-p"],
+          "items": { "type": "string" },
+          "description": "Extra arguments for Claude Code CLI."
+        },
+        "agentTaskPlayer.engines.gemini.command": {
+          "type": "string",
+          "default": "gemini",
+          "description": "Path or command name for Gemini CLI."
+        },
+        "agentTaskPlayer.engines.gemini.args": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "description": "Extra arguments for Gemini CLI."
+        },
+        "agentTaskPlayer.engines.ollama.command": {
+          "type": "string",
+          "default": "ollama",
+          "description": "Path or command name for Ollama CLI."
+        },
+        "agentTaskPlayer.engines.ollama.model": {
+          "type": "string",
+          "default": "codellama",
+          "description": "Model name for Ollama."
+        },
+        "agentTaskPlayer.engines.custom.command": {
+          "type": "string",
+          "default": "",
+          "description": "Custom engine command."
+        },
+        "agentTaskPlayer.engines.custom.args": {
+          "type": "array",
+          "default": [],
+          "items": { "type": "string" },
+          "description": "Custom engine arguments. Use {prompt} as placeholder."
+        },
+        "agentTaskPlayer.autoplayDelay": {
+          "type": "number",
+          "default": 2000,
+          "minimum": 0,
+          "description": "Delay (ms) between tasks during autoplay."
+        },
+        "agentTaskPlayer.maxHistoryEntries": {
+          "type": "number",
+          "default": 200,
+          "minimum": 10,
+          "description": "Maximum number of history entries to keep."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.56.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
