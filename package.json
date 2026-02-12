@@ -8,11 +8,11 @@
   "icon": "media/icon.png",
   "repository": {
     "type": "git",
-    "url": "https://github.com/moag/agent-task-player"
+    "url": "https://github.com/sujan-poudel-03/moag"
   },
-  "homepage": "https://github.com/moag/agent-task-player#readme",
+  "homepage": "https://github.com/sujan-poudel-03/moag#readme",
   "bugs": {
-    "url": "https://github.com/moag/agent-task-player/issues"
+    "url": "https://github.com/sujan-poudel-03/moag/issues"
   },
   "engines": {
     "vscode": "^1.85.0"
