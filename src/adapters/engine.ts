@@ -1,6 +1,7 @@
 // ─── Engine adapter interface and registry ───
 
 import { EngineId, EngineResult } from '../models/types';
+import { OutputCallback } from './base-cli';
 
 /** Options passed to every engine adapter */
 export interface EngineRunOptions {
@@ -12,6 +13,8 @@ export interface EngineRunOptions {
   files?: string[];
   /** AbortSignal to cancel the running process */
   signal?: AbortSignal;
+  /** Callback for streaming output chunks */
+  onOutput?: OutputCallback;
 }
 
 /** Every engine adapter implements this interface */

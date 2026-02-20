@@ -1,5 +1,5 @@
 // ─── Codex CLI adapter ───
-// Invokes the OpenAI Codex CLI tool to run a task.
+// Invokes the OpenAI Codex CLI in non-interactive mode via `codex exec`.
 
 import * as vscode from 'vscode';
 import { EngineAdapter, EngineRunOptions } from './engine';
@@ -19,13 +19,13 @@ export class CodexAdapter implements EngineAdapter {
       {
         command,
         buildArgs: (opts) => {
-          const args = [...extraArgs];
-          // Pass the prompt as a positional argument
-          args.push(opts.prompt);
+          // Use `codex exec` for non-interactive execution
+          const args = ['exec', ...extraArgs, opts.prompt];
           return args;
         },
       },
       options,
+      options.onOutput,
     );
   }
 }

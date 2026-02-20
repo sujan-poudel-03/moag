@@ -13,7 +13,7 @@ export function generateId(): string {
 }
 
 /** Convert a persisted plan file into the runtime Plan model (adds status fields) */
-function hydratePlan(file: PlanFile): Plan {
+export function hydratePlan(file: PlanFile): Plan {
   return {
     version: file.version,
     name: file.name,
@@ -30,6 +30,7 @@ function hydratePlaylist(p: PlanFilePlaylist): Playlist {
     engine: p.engine,
     autoplay: p.autoplay ?? true,
     autoplayDelay: p.autoplayDelay,
+    parallel: p.parallel,
     tasks: p.tasks.map(hydrateTask),
   };
 }
@@ -43,12 +44,14 @@ function hydrateTask(t: PlanFileTask): Task {
     cwd: t.cwd,
     files: t.files,
     verifyCommand: t.verifyCommand,
+    retryCount: t.retryCount,
+    dependsOn: t.dependsOn,
     status: TaskStatus.Pending,
   };
 }
 
 /** Strip runtime status from Plan to get a serializable PlanFile */
-function dehydratePlan(plan: Plan): PlanFile {
+export function dehydratePlan(plan: Plan): PlanFile {
   return {
     version: plan.version,
     name: plan.name,
@@ -65,6 +68,7 @@ function dehydratePlaylist(p: Playlist): PlanFilePlaylist {
     engine: p.engine,
     autoplay: p.autoplay,
     autoplayDelay: p.autoplayDelay,
+    parallel: p.parallel,
     tasks: p.tasks.map(dehydrateTask),
   };
 }
@@ -78,6 +82,8 @@ function dehydrateTask(t: Task): PlanFileTask {
     cwd: t.cwd,
     files: t.files,
     verifyCommand: t.verifyCommand,
+    retryCount: t.retryCount,
+    dependsOn: t.dependsOn,
   };
 }
 

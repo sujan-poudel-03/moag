@@ -1,6 +1,8 @@
 // ─── Task Runner — state machine that plays through tasks sequentially ───
 
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import { EventEmitter } from 'events';
 import { spawn } from 'child_process';
 import { Plan, Playlist, Task, TaskStatus, RunnerState, EngineId, EngineResult, HistoryEntry } from '../models/types';
@@ -105,7 +107,7 @@ export class TaskRunner {
     const task = playlist.tasks[taskIndex];
 
     try {
-      await this.executeTask(task, playlist, plan);
+      await this.executeTaskWithRetry(task, playlist, plan);
     } catch (err) {
       this.emit('error', err instanceof Error ? err : new Error(String(err)));
     } finally {
@@ -147,47 +149,115 @@ export class TaskRunner {
   // ─── Internal loop ───
 
   private async runLoop(): Promise<void> {
+    // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
     const plan = this._plan!;
 
     for (let pi = this._currentPlaylistIndex; pi < plan.playlists.length; pi++) {
       const playlist = plan.playlists[pi];
-      const startTask = pi === this._currentPlaylistIndex ? this._currentTaskIndex : 0;
+      this._currentPlaylistIndex = pi;
 
-      for (let ti = startTask; ti < playlist.tasks.length; ti++) {
-        // Check for stop
-        if (this._state === RunnerState.Stopping) {
-          return;
-        }
+      if (this._state === RunnerState.Stopping) { return; }
 
-        // Check for pause — wait until resumed or stopped
-        if (this._state === RunnerState.Paused) {
-          await new Promise<void>((resolve) => {
-            this._pauseResolve = resolve;
-          });
-          // After resume, state may have been set to Stopping via stop()
-          if ((this._state as RunnerState) === RunnerState.Stopping) {
-            return;
-          }
-        }
-
-        const task = playlist.tasks[ti];
-        this._currentPlaylistIndex = pi;
-        this._currentTaskIndex = ti;
-
-        await this.executeTask(task, playlist, plan);
-
-        // Autoplay delay between tasks
-        if (playlist.autoplay && ti < playlist.tasks.length - 1) {
-          const delay = playlist.autoplayDelay ??
-            vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('autoplayDelay', 2000);
-          await this.sleep(delay);
-        }
+      if (playlist.parallel) {
+        // ─── Parallel execution: run all tasks concurrently ───
+        await this.runPlaylistParallel(playlist, plan);
+      } else {
+        // ─── Sequential execution ───
+        const startTask = pi === this._currentPlaylistIndex ? this._currentTaskIndex : 0;
+        await this.runPlaylistSequential(playlist, plan, startTask);
       }
 
       this.emit('playlist-completed', playlist);
     }
 
     this.emit('all-completed');
+  }
+
+  /** Run tasks in a playlist sequentially */
+  private async runPlaylistSequential(playlist: Playlist, plan: Plan, startTask: number): Promise<void> {
+    for (let ti = startTask; ti < playlist.tasks.length; ti++) {
+      if (this._state === RunnerState.Stopping) { return; }
+
+      // Check for pause — wait until resumed or stopped
+      if (this._state === RunnerState.Paused) {
+        await new Promise<void>((resolve) => {
+          this._pauseResolve = resolve;
+        });
+        if ((this._state as RunnerState) === RunnerState.Stopping) { return; }
+      }
+
+      const task = playlist.tasks[ti];
+      this._currentTaskIndex = ti;
+
+      // Check dependencies — skip if any dependency failed or is not completed
+      if (task.dependsOn && task.dependsOn.length > 0) {
+        const depStatus = this.checkDependencies(task, plan);
+        if (depStatus === 'skip') {
+          task.status = TaskStatus.Skipped;
+          this.emit('task-output', task, `[Skipped] "${task.name}" — dependency not met\n`, 'stderr');
+          this.emit('task-completed', task, { stdout: '', stderr: 'Skipped: dependency not met', exitCode: 0, durationMs: 0 });
+          continue;
+        }
+      }
+
+      await this.executeTaskWithRetry(task, playlist, plan);
+
+      // Autoplay delay between tasks
+      if (playlist.autoplay && ti < playlist.tasks.length - 1) {
+        const delay = playlist.autoplayDelay ??
+          vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('autoplayDelay', 2000);
+        await this.sleep(delay);
+      }
+    }
+  }
+
+  /** Run all tasks in a playlist concurrently */
+  private async runPlaylistParallel(playlist: Playlist, plan: Plan): Promise<void> {
+    const promises = playlist.tasks.map(task => {
+      if (task.dependsOn && task.dependsOn.length > 0) {
+        const depStatus = this.checkDependencies(task, plan);
+        if (depStatus === 'skip') {
+          task.status = TaskStatus.Skipped;
+          this.emit('task-output', task, `[Skipped] "${task.name}" — dependency not met\n`, 'stderr');
+          return Promise.resolve();
+        }
+      }
+      return this.executeTaskWithRetry(task, playlist, plan);
+    });
+
+    await Promise.allSettled(promises);
+  }
+
+  /** Check if all dependency tasks have completed successfully */
+  private checkDependencies(task: Task, plan: Plan): 'ok' | 'skip' {
+    const allTasks = plan.playlists.flatMap(pl => pl.tasks);
+    for (const depId of task.dependsOn ?? []) {
+      const dep = allTasks.find(t => t.id === depId);
+      if (!dep || dep.status === TaskStatus.Failed || dep.status === TaskStatus.Skipped) {
+        return 'skip';
+      }
+      if (dep.status !== TaskStatus.Completed) {
+        return 'skip';
+      }
+    }
+    return 'ok';
+  }
+
+  /** Execute a task with optional retries on failure */
+  private async executeTaskWithRetry(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
+    const maxAttempts = (task.retryCount ?? 0) + 1;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      await this.executeTask(task, playlist, plan);
+      if (task.status === TaskStatus.Completed || this._state === RunnerState.Stopping) {
+        return;
+      }
+      // Task failed — retry if attempts remain
+      if (attempt < maxAttempts) {
+        this.emit('task-output', task, `\n[Retry ${attempt}/${task.retryCount}] Retrying "${task.name}"...\n`, 'stderr');
+        task.status = TaskStatus.Pending;
+        await this.sleep(2000);
+      }
+    }
   }
 
   private async executeTask(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
@@ -197,7 +267,7 @@ export class TaskRunner {
     const cwd = this.resolveCwd(task.cwd);
 
     // Build context-enriched prompt
-    const fullPrompt = this.buildPrompt(task);
+    const fullPrompt = this.buildPrompt(task, cwd);
 
     task.status = TaskStatus.Running;
     const startedAt = new Date().toISOString();
@@ -209,6 +279,9 @@ export class TaskRunner {
         cwd,
         files: task.files,
         signal: this._abortController?.signal,
+        onOutput: (chunk, stream) => {
+          this.emit('task-output', task, chunk, stream);
+        },
       });
 
       // Run optional verify command
@@ -248,9 +321,11 @@ export class TaskRunner {
     } catch (err) {
       task.status = TaskStatus.Failed;
       const finishedAt = new Date().toISOString();
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const guidance = this.getErrorGuidance(errMsg, engineId);
       const errorResult: EngineResult = {
         stdout: '',
-        stderr: err instanceof Error ? err.message : String(err),
+        stderr: guidance ? `${errMsg}\n\n${guidance}` : errMsg,
         exitCode: 1,
         durationMs: 0,
       };
@@ -272,13 +347,22 @@ export class TaskRunner {
     }
   }
 
-  /** Build a context-enriched prompt for the engine */
-  private buildPrompt(task: Task): string {
+  /** Build a context-enriched prompt with file contents injected */
+  private buildPrompt(task: Task, cwd: string): string {
     let prompt = task.prompt;
 
-    // Add file references if specified
     if (task.files && task.files.length > 0) {
-      prompt += `\n\nRelevant files:\n${task.files.map(f => `- ${f}`).join('\n')}`;
+      const fileContents: string[] = [];
+      for (const filePath of task.files) {
+        const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
+        try {
+          const content = fs.readFileSync(resolved, 'utf-8');
+          fileContents.push(`--- ${filePath} ---\n${content}`);
+        } catch {
+          fileContents.push(`--- ${filePath} --- (file not found)`);
+        }
+      }
+      prompt += `\n\nContext files:\n\n${fileContents.join('\n\n')}`;
     }
 
     return prompt;
@@ -291,7 +375,7 @@ export class TaskRunner {
     if (!taskCwd) {
       return root;
     }
-    const path = require('path');
+    const path = require('path'); // eslint-disable-line @typescript-eslint/no-var-requires
     return path.isAbsolute(taskCwd) ? taskCwd : path.join(root, taskCwd);
   }
 
@@ -302,6 +386,29 @@ export class TaskRunner {
       proc.on('error', () => resolve(1));
       proc.on('close', (code) => resolve(code ?? 1));
     });
+  }
+
+  /** Provide actionable guidance based on common error patterns */
+  private getErrorGuidance(errorMsg: string, engineId: EngineId): string | null {
+    const lower = errorMsg.toLowerCase();
+
+    if (lower.includes('enoent') || lower.includes('not found') || lower.includes('not recognized')) {
+      return `Hint: The "${engineId}" CLI does not appear to be installed or is not in your PATH. ` +
+        `Check the command in Settings > agentTaskPlayer.engines.${engineId}.command`;
+    }
+    if (lower.includes('eacces') || lower.includes('permission denied')) {
+      return `Hint: Permission denied. Ensure the "${engineId}" CLI binary is executable.`;
+    }
+    if (lower.includes('timeout') || lower.includes('etimedout')) {
+      return `Hint: The task timed out. The AI engine may be overloaded — try again or use a different engine.`;
+    }
+    if (lower.includes('api key') || lower.includes('unauthorized') || lower.includes('authentication')) {
+      return `Hint: Authentication failed. Ensure your API key or credentials for "${engineId}" are configured correctly.`;
+    }
+    if (lower.includes('rate limit') || lower.includes('429')) {
+      return `Hint: Rate limited by the "${engineId}" API. Wait a moment and try again.`;
+    }
+    return null;
   }
 
   private sleep(ms: number): Promise<void> {

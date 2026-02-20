@@ -25,6 +25,7 @@ export class GeminiAdapter implements EngineAdapter {
         },
       },
       options,
+      options.onOutput,
     );
   }
 }

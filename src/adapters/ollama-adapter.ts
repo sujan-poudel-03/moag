@@ -24,6 +24,7 @@ export class OllamaAdapter implements EngineAdapter {
         },
       },
       options,
+      options.onOutput,
     );
   }
 }

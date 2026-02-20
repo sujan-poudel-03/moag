@@ -3,7 +3,7 @@
 // live output streaming, and history viewing.
 
 import * as vscode from 'vscode';
-import { Plan, Playlist, Task, TaskStatus, RunnerState, HistoryEntry, EngineId } from '../models/types';
+import { Plan } from '../models/types';
 import { HistoryStore } from '../history/store';
 import { TaskRunner } from '../runner/runner';
 

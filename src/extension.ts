@@ -3,11 +3,13 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { Plan, Playlist, Task, TaskStatus, RunnerState, EngineId } from './models/types';
-import { loadPlan, savePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
+import { Plan, RunnerState, EngineId } from './models/types';
+import { loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
 import { registerAllEngines } from './adapters/index';
 import { TaskRunner } from './runner/runner';
 import { HistoryStore } from './history/store';
+import { TemplateStore } from './templates/store';
+import { generateId } from './models/plan';
 import { PlanTreeProvider, PlanTreeItem } from './ui/plan-tree';
 import { HistoryTreeProvider } from './ui/history-tree';
 import { DashboardPanel } from './ui/dashboard-panel';
@@ -20,6 +22,7 @@ let runner: TaskRunner;
 let historyStore: HistoryStore;
 let planTree: PlanTreeProvider;
 let historyTree: HistoryTreeProvider;
+let templateStore: TemplateStore;
 
 export function activate(context: vscode.ExtensionContext): void {
   // Register all engine adapters
@@ -27,6 +30,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Initialize history store from workspace state
   historyStore = new HistoryStore(context.workspaceState);
+
+  // Initialize template store
+  templateStore = new TemplateStore(context.globalState);
 
   // Initialize task runner
   runner = new TaskRunner(historyStore);
@@ -39,11 +45,15 @@ export function activate(context: vscode.ExtensionContext): void {
   const planView = vscode.window.createTreeView('agentTaskPlayer.planView', {
     treeDataProvider: planTree,
     showCollapseAll: true,
+    dragAndDropController: planTree,
   });
   const histView = vscode.window.createTreeView('agentTaskPlayer.historyView', {
     treeDataProvider: historyTree,
   });
   context.subscriptions.push(planView, histView);
+
+  // Save plan when tree items are reordered via drag-and-drop
+  planTree.onDidReorder(() => saveAndRefresh());
 
   // ─── Wire runner events to UI ───
 
@@ -53,13 +63,17 @@ export function activate(context: vscode.ExtensionContext): void {
     updateStatusBar(state);
   });
 
-  runner.on('task-started', (task, playlist) => {
+  runner.on('task-started', (task, _playlist) => {
     planTree.refresh();
     DashboardPanel.currentPanel?.update();
     vscode.window.setStatusBarMessage(`Running: ${task.name}`, 3000);
   });
 
-  runner.on('task-completed', (task, result) => {
+  runner.on('task-output', (task, chunk, stream) => {
+    DashboardPanel.currentPanel?.appendOutput(chunk, stream);
+  });
+
+  runner.on('task-completed', (_task, _result) => {
     planTree.refresh();
     DashboardPanel.currentPanel?.update();
   });
@@ -67,7 +81,16 @@ export function activate(context: vscode.ExtensionContext): void {
   runner.on('task-failed', (task, result) => {
     planTree.refresh();
     DashboardPanel.currentPanel?.update();
-    vscode.window.showWarningMessage(`Task "${task.name}" failed (exit ${result.exitCode})`);
+    const stderrPreview = result.stderr.split('\n').filter(l => l.trim()).slice(0, 2).join(' | ');
+    const detail = stderrPreview ? `: ${stderrPreview.substring(0, 120)}` : '';
+    vscode.window.showWarningMessage(
+      `Task "${task.name}" failed (exit ${result.exitCode})${detail}`,
+      'Show Output',
+    ).then(action => {
+      if (action === 'Show Output') {
+        vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+      }
+    });
   });
 
   runner.on('playlist-completed', (playlist) => {
@@ -79,7 +102,14 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   runner.on('error', (err) => {
-    vscode.window.showErrorMessage(`Runner error: ${err.message}`);
+    vscode.window.showErrorMessage(
+      `Runner error: ${err.message}`,
+      'Show Dashboard',
+    ).then(action => {
+      if (action === 'Show Dashboard') {
+        vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+      }
+    });
   });
 
   // ─── Status bar ───
@@ -121,6 +151,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.clearHistory', cmdClearHistory),
     vscode.commands.registerCommand('agentTaskPlayer.playPlaylist', cmdPlayPlaylist),
     vscode.commands.registerCommand('agentTaskPlayer.playTask', cmdPlayTask),
+    vscode.commands.registerCommand('agentTaskPlayer.addTaskFromTemplate', cmdAddTaskFromTemplate),
+    vscode.commands.registerCommand('agentTaskPlayer.saveTaskAsTemplate', cmdSaveTaskAsTemplate),
+    vscode.commands.registerCommand('agentTaskPlayer.exportPlan', cmdExportPlan),
+    vscode.commands.registerCommand('agentTaskPlayer.importPlan', cmdImportPlan),
+    vscode.commands.registerCommand('agentTaskPlayer.showCostSummary', cmdShowCostSummary),
   );
 
   // Auto-load plan if one exists in workspace
@@ -449,4 +484,263 @@ async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
 async function cmdPlayTask(item?: PlanTreeItem): Promise<void> {
   if (!currentPlan || !item || item.kind !== 'task' || item.taskIndex === undefined) { return; }
   runner.playTask(currentPlan, item.playlistIndex, item.taskIndex);
+}
+
+async function cmdAddTaskFromTemplate(playlistIndexOrItem?: unknown): Promise<void> {
+  if (!currentPlan) {
+    vscode.window.showWarningMessage('No plan loaded.');
+    return;
+  }
+
+  // Resolve playlist index
+  let playlistIndex: number;
+  if (playlistIndexOrItem instanceof PlanTreeItem) {
+    playlistIndex = playlistIndexOrItem.playlistIndex;
+  } else if (typeof playlistIndexOrItem === 'number') {
+    playlistIndex = playlistIndexOrItem;
+  } else {
+    const items = currentPlan.playlists.map((pl, i) => ({ label: pl.name, index: i }));
+    if (items.length === 0) {
+      vscode.window.showWarningMessage('Add a playlist first.');
+      return;
+    }
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select playlist' });
+    if (!picked) { return; }
+    playlistIndex = picked.index;
+  }
+
+  // Show templates grouped by category
+  const templates = templateStore.getAll();
+  const items = templates.map(t => ({
+    label: t.name,
+    description: t.category,
+    detail: t.prompt.substring(0, 100),
+    template: t,
+  }));
+
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: 'Select a template',
+    matchOnDescription: true,
+    matchOnDetail: true,
+  });
+  if (!picked) { return; }
+
+  const t = picked.template;
+  const task = createTask(t.name, t.prompt, t.engine as EngineId | undefined);
+  task.files = t.files;
+  task.verifyCommand = t.verifyCommand;
+  task.retryCount = t.retryCount;
+  currentPlan.playlists[playlistIndex].tasks.push(task);
+  saveAndRefresh();
+}
+
+async function cmdSaveTaskAsTemplate(item?: PlanTreeItem): Promise<void> {
+  if (!currentPlan || !item || item.kind !== 'task' || item.taskIndex === undefined) { return; }
+
+  const task = currentPlan.playlists[item.playlistIndex]?.tasks[item.taskIndex];
+  if (!task) { return; }
+
+  const category = await vscode.window.showInputBox({
+    prompt: 'Template category',
+    placeHolder: 'e.g., Setup, Feature, Testing, Bugfix',
+    value: 'Custom',
+  });
+  if (!category) { return; }
+
+  await templateStore.add({
+    id: generateId(),
+    name: task.name,
+    prompt: task.prompt,
+    engine: task.engine,
+    files: task.files,
+    verifyCommand: task.verifyCommand,
+    retryCount: task.retryCount,
+    category,
+  });
+  vscode.window.showInformationMessage(`Template "${task.name}" saved.`);
+}
+
+// ─── Plan Import / Export ───
+
+async function cmdExportPlan(): Promise<void> {
+  if (!currentPlan) {
+    vscode.window.showWarningMessage('No plan loaded.');
+    return;
+  }
+
+  const choice = await vscode.window.showQuickPick(
+    [
+      { label: 'Export to file', description: 'Save as a new .agent-plan.json file' },
+      { label: 'Copy to clipboard', description: 'Copy plan JSON to clipboard for sharing' },
+    ],
+    { placeHolder: 'How do you want to export the plan?' },
+  );
+  if (!choice) { return; }
+
+  const planFile = dehydratePlan(currentPlan);
+  const json = JSON.stringify(planFile, null, 2);
+
+  if (choice.label === 'Copy to clipboard') {
+    await vscode.env.clipboard.writeText(json);
+    vscode.window.showInformationMessage('Plan copied to clipboard.');
+    return;
+  }
+
+  const uri = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(`${currentPlan.name.toLowerCase().replace(/\s+/g, '-')}.agent-plan.json`),
+    filters: { 'Agent Plan': ['agent-plan.json', 'json'] },
+    title: 'Export Plan',
+  });
+  if (!uri) { return; }
+
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(json, 'utf-8'));
+  vscode.window.showInformationMessage(`Plan exported to ${uri.fsPath}`);
+}
+
+async function cmdImportPlan(): Promise<void> {
+  const choice = await vscode.window.showQuickPick(
+    [
+      { label: 'Import from file', description: 'Load a .agent-plan.json file' },
+      { label: 'Import from clipboard', description: 'Paste plan JSON from clipboard' },
+    ],
+    { placeHolder: 'Where do you want to import from?' },
+  );
+  if (!choice) { return; }
+
+  let plan: Plan;
+
+  if (choice.label === 'Import from clipboard') {
+    const text = await vscode.env.clipboard.readText();
+    if (!text.trim()) {
+      vscode.window.showWarningMessage('Clipboard is empty.');
+      return;
+    }
+    try {
+      plan = loadPlanFromJson(text);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Invalid plan JSON: ${err}`);
+      return;
+    }
+  } else {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectFiles: true,
+      canSelectMany: false,
+      filters: { 'Agent Plan': ['agent-plan.json', 'json'] },
+      title: 'Import Plan',
+    });
+    if (!uris || uris.length === 0) { return; }
+
+    try {
+      plan = loadPlan(uris[0].fsPath);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Failed to load plan: ${err}`);
+      return;
+    }
+  }
+
+  // Ask where to save the imported plan
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    vscode.window.showErrorMessage('Open a workspace folder first.');
+    return;
+  }
+
+  currentPlan = plan;
+  currentPlanPath = path.join(
+    workspaceFolder.uri.fsPath,
+    `${plan.name.toLowerCase().replace(/\s+/g, '-')}.agent-plan.json`,
+  );
+  saveAndRefresh();
+  vscode.window.showInformationMessage(`Imported plan: ${plan.name}`);
+}
+
+/** Parse a JSON string into a Plan (hydrates status fields) */
+function loadPlanFromJson(json: string): Plan {
+  const file = JSON.parse(json);
+  if (!file.version || !file.playlists) {
+    throw new Error('Missing required fields (version, playlists)');
+  }
+  return hydratePlan(file);
+}
+
+// ─── Cost / Token Summary ───
+
+function cmdShowCostSummary(): void {
+  const entries = historyStore.getAll();
+  if (entries.length === 0) {
+    vscode.window.showInformationMessage('No execution history yet.');
+    return;
+  }
+
+  // Aggregate stats by engine
+  const stats = new Map<string, { runs: number; totalMs: number; inputTokens: number; outputTokens: number; totalTokens: number; cost: number }>();
+
+  for (const entry of entries) {
+    let s = stats.get(entry.engine);
+    if (!s) {
+      s = { runs: 0, totalMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 };
+      stats.set(entry.engine, s);
+    }
+    s.runs++;
+    s.totalMs += entry.result.durationMs;
+    const usage = entry.result.tokenUsage;
+    if (usage) {
+      s.inputTokens += usage.inputTokens ?? 0;
+      s.outputTokens += usage.outputTokens ?? 0;
+      s.totalTokens += usage.totalTokens ?? 0;
+      s.cost += usage.estimatedCost ?? 0;
+    }
+  }
+
+  // Build summary document
+  let doc = `# Cost & Usage Summary\n\n`;
+  doc += `**Total Runs:** ${entries.length}\n\n`;
+
+  let grandTotalMs = 0;
+  let grandTotalTokens = 0;
+  let grandTotalCost = 0;
+
+  doc += `| Engine | Runs | Total Time | Tokens (In/Out/Total) | Est. Cost |\n`;
+  doc += `|--------|------|------------|----------------------|----------|\n`;
+
+  for (const [engine, s] of stats) {
+    grandTotalMs += s.totalMs;
+    grandTotalTokens += s.totalTokens;
+    grandTotalCost += s.cost;
+    const time = formatDuration(s.totalMs);
+    const tokens = s.totalTokens > 0 ? `${s.inputTokens} / ${s.outputTokens} / ${s.totalTokens}` : 'N/A';
+    const cost = s.cost > 0 ? `$${s.cost.toFixed(4)}` : 'N/A';
+    doc += `| ${engine} | ${s.runs} | ${time} | ${tokens} | ${cost} |\n`;
+  }
+
+  doc += `\n**Grand Total:** ${formatDuration(grandTotalMs)}`;
+  if (grandTotalTokens > 0) { doc += ` | ${grandTotalTokens} tokens`; }
+  if (grandTotalCost > 0) { doc += ` | $${grandTotalCost.toFixed(4)}`; }
+  doc += `\n\n---\n\n`;
+
+  // Recent entries detail
+  doc += `## Recent Executions (last 20)\n\n`;
+  doc += `| Task | Engine | Duration | Tokens | Cost | Status |\n`;
+  doc += `|------|--------|----------|--------|------|--------|\n`;
+
+  for (const e of entries.slice(0, 20)) {
+    const time = formatDuration(e.result.durationMs);
+    const usage = e.result.tokenUsage;
+    const tokens = usage?.totalTokens ? String(usage.totalTokens) : '-';
+    const cost = usage?.estimatedCost ? `$${usage.estimatedCost.toFixed(4)}` : '-';
+    const status = e.status === 'completed' ? 'Pass' : 'Fail';
+    doc += `| ${e.taskName} | ${e.engine} | ${time} | ${tokens} | ${cost} | ${status} |\n`;
+  }
+
+  vscode.workspace.openTextDocument({ content: doc, language: 'markdown' })
+    .then(d => vscode.window.showTextDocument(d, { preview: true }));
+}
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) { return `${ms}ms`; }
+  const secs = Math.floor(ms / 1000);
+  if (secs < 60) { return `${secs}s`; }
+  const mins = Math.floor(secs / 60);
+  const remSecs = secs % 60;
+  return `${mins}m ${remSecs}s`;
 }

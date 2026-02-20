@@ -33,6 +33,7 @@ export class CustomAdapter implements EngineAdapter {
         },
       },
       options,
+      options.onOutput,
     );
   }
 }

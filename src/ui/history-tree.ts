@@ -42,7 +42,7 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryTreeI
         if (!groups.has(date)) {
           groups.set(date, []);
         }
-        groups.get(date)!.push(entry);
+        groups.get(date)!.push(entry); // eslint-disable-line @typescript-eslint/no-non-null-assertion
       }
 
       return Array.from(groups.entries()).map(([date, items]) => {
@@ -62,12 +62,14 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryTreeI
     const dayEntries = entries.filter(e => e.startedAt.startsWith(date));
 
     return dayEntries.map(entry => {
-      const icon = entry.status === TaskStatus.Completed ? '$(check)' : '$(error)';
       const time = entry.startedAt.split('T')[1]?.substring(0, 8) ?? '';
       const item = new HistoryTreeItem(
         entry,
-        `${icon} ${entry.taskName}`,
+        entry.taskName,
         vscode.TreeItemCollapsibleState.None,
+      );
+      item.iconPath = new vscode.ThemeIcon(
+        entry.status === TaskStatus.Completed ? 'check' : 'error',
       );
       item.description = `${time} | ${entry.engine} | ${entry.result.durationMs}ms`;
       item.tooltip = new vscode.MarkdownString(

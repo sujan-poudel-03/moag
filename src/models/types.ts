@@ -34,6 +34,10 @@ export interface Task {
   files?: string[];
   /** Optional shell command to verify the task result */
   verifyCommand?: string;
+  /** Number of times to retry on failure (default 0 = no retry) */
+  retryCount?: number;
+  /** Task IDs that must complete before this task runs */
+  dependsOn?: string[];
   /** Runtime status (not persisted in the plan file) */
   status: TaskStatus;
 }
@@ -48,6 +52,8 @@ export interface Playlist {
   autoplay: boolean;
   /** Delay between tasks in ms (overrides global setting) */
   autoplayDelay?: number;
+  /** Run all tasks in this playlist concurrently */
+  parallel?: boolean;
   tasks: Task[];
 }
 
@@ -69,6 +75,20 @@ export interface EngineResult {
   exitCode: number;
   /** Duration in milliseconds */
   durationMs: number;
+  /** Token usage stats (when available from the engine) */
+  tokenUsage?: TokenUsage;
+}
+
+/** Token/cost tracking for a single task execution */
+export interface TokenUsage {
+  /** Number of tokens in the prompt */
+  inputTokens?: number;
+  /** Number of tokens in the response */
+  outputTokens?: number;
+  /** Total tokens (input + output) */
+  totalTokens?: number;
+  /** Estimated cost in USD (if computable) */
+  estimatedCost?: number;
 }
 
 /** A single entry in the execution history log */
@@ -103,6 +123,7 @@ export interface PlanFilePlaylist {
   engine?: EngineId;
   autoplay: boolean;
   autoplayDelay?: number;
+  parallel?: boolean;
   tasks: PlanFileTask[];
 }
 
@@ -114,4 +135,6 @@ export interface PlanFileTask {
   cwd?: string;
   files?: string[];
   verifyCommand?: string;
+  retryCount?: number;
+  dependsOn?: string[];
 }

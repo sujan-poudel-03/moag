@@ -13,18 +13,20 @@ export interface CliConfig {
   env?: Record<string, string>;
 }
 
+/** Callback for streaming output chunks as they arrive */
+export type OutputCallback = (chunk: string, stream: 'stdout' | 'stderr') => void;
+
 /**
  * Spawns a CLI process and captures its output.
  * Resolves when the process exits; rejects only on spawn errors.
  */
-export function runCli(config: CliConfig, options: EngineRunOptions): Promise<EngineResult> {
+export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: OutputCallback): Promise<EngineResult> {
   return new Promise((resolve, reject) => {
     const startTime = Date.now();
     const args = config.buildArgs(options);
 
     const proc = spawn(config.command, args, {
       cwd: options.cwd,
-      shell: true,
       env: { ...process.env, ...config.env },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -33,11 +35,15 @@ export function runCli(config: CliConfig, options: EngineRunOptions): Promise<En
     let stderr = '';
 
     proc.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString();
+      const text = chunk.toString();
+      stdout += text;
+      onOutput?.(text, 'stdout');
     });
 
     proc.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString();
+      const text = chunk.toString();
+      stderr += text;
+      onOutput?.(text, 'stderr');
     });
 
     // Handle abort signal — kill the child process

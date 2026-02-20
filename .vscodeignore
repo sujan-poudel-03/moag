@@ -5,7 +5,15 @@ src/**
 node_modules/**
 .gitignore
 tsconfig.json
+tsconfig.test.json
+.vscode-test.mjs
+.eslintrc.json
+examples/**
+.github/**
 **/*.map
 **/*.ts
-!out/**
+**/*.d.ts.map
 media/icon.svg
+*.test.*
+*.vsix
+out/test/**

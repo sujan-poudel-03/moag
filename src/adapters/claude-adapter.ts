@@ -3,7 +3,7 @@
 
 import * as vscode from 'vscode';
 import { EngineAdapter, EngineRunOptions } from './engine';
-import { EngineResult, EngineId } from '../models/types';
+import { EngineResult, EngineId, TokenUsage } from '../models/types';
 import { runCli } from './base-cli';
 
 export class ClaudeAdapter implements EngineAdapter {
@@ -15,7 +15,7 @@ export class ClaudeAdapter implements EngineAdapter {
     const command = config.get<string>('command', 'claude');
     const extraArgs = config.get<string[]>('args', ['-p']);
 
-    return runCli(
+    const result = await runCli(
       {
         command,
         buildArgs: (opts) => {
@@ -27,6 +27,59 @@ export class ClaudeAdapter implements EngineAdapter {
         },
       },
       options,
+      options.onOutput,
     );
+
+    // Parse token usage from Claude Code stderr output
+    result.tokenUsage = parseClaudeTokenUsage(result.stderr);
+    return result;
   }
+}
+
+/**
+ * Parse token usage from Claude Code CLI output.
+ * Claude Code may output usage stats in stderr like:
+ *   "Total input tokens: 1234"
+ *   "Total output tokens: 567"
+ *   "Total tokens: 1801"
+ *   or JSON-formatted usage blocks.
+ */
+function parseClaudeTokenUsage(stderr: string): TokenUsage | undefined {
+  if (!stderr) { return undefined; }
+
+  const usage: TokenUsage = {};
+  let found = false;
+
+  // Match patterns like "input tokens: 1234" or "input_tokens: 1234"
+  const inputMatch = stderr.match(/input[_ ]tokens[:\s]+(\d+)/i);
+  if (inputMatch) {
+    usage.inputTokens = parseInt(inputMatch[1], 10);
+    found = true;
+  }
+
+  const outputMatch = stderr.match(/output[_ ]tokens[:\s]+(\d+)/i);
+  if (outputMatch) {
+    usage.outputTokens = parseInt(outputMatch[1], 10);
+    found = true;
+  }
+
+  const totalMatch = stderr.match(/total[_ ]tokens[:\s]+(\d+)/i);
+  if (totalMatch) {
+    usage.totalTokens = parseInt(totalMatch[1], 10);
+    found = true;
+  }
+
+  // Compute total if we have input+output but no explicit total
+  if (usage.inputTokens && usage.outputTokens && !usage.totalTokens) {
+    usage.totalTokens = usage.inputTokens + usage.outputTokens;
+  }
+
+  // Match cost like "$0.0123" or "cost: $0.0123"
+  const costMatch = stderr.match(/\$(\d+\.?\d*)/);
+  if (costMatch) {
+    usage.estimatedCost = parseFloat(costMatch[1]);
+    found = true;
+  }
+
+  return found ? usage : undefined;
 }
