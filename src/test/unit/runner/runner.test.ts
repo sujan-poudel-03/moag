@@ -321,4 +321,65 @@ describe('TaskRunner', () => {
     assert.deepEqual(taskNames, ['Task 2']);
     assert.equal(runner.state, RunnerState.Idle);
   });
+
+  it('should retry a failed task when retryCount is set', async function () {
+    this.timeout(10000);
+    const { runner } = buildRunner();
+    // Stub the sleep method to avoid the 2s retry delay
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    sinon.stub(Object.getPrototypeOf(runner), 'sleep').resolves();
+    let callCount = 0;
+    engineRunStub.callsFake(async () => {
+      callCount++;
+      // Fail on first attempt, succeed on second
+      if (callCount === 1) {
+        return { ...mockEngineResult, exitCode: 1 };
+      }
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    // Only one task with retryCount
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].retryCount = 1;
+    plan.playlists[0].autoplayDelay = 0;
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.equal(callCount, 2);
+  });
+
+  it('should skip task when dependency is not met', async () => {
+    const { runner } = buildRunner();
+    engineRunStub.resolves({ ...mockEngineResult, exitCode: 1 });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].id = 'dep-task';
+    plan.playlists[0].tasks[1].dependsOn = ['dep-task'];
+    plan.playlists[0].autoplayDelay = 0;
+
+    await runner.play(plan);
+
+    // First task fails
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    // Second task should be skipped because dependency failed
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Skipped);
+  });
+
+  it('should run tasks in parallel when playlist.parallel is true', async () => {
+    const { runner } = buildRunner();
+    const startedTasks: string[] = [];
+    runner.on('task-started', (task: { name: string }) => startedTasks.push(task.name));
+
+    const plan = makePlan();
+    plan.playlists[0].parallel = true;
+
+    await runner.play(plan);
+
+    // Both tasks should have started
+    assert.ok(startedTasks.includes('Task 1'));
+    assert.ok(startedTasks.includes('Task 2'));
+    assert.equal(runner.state, RunnerState.Idle);
+  });
 });

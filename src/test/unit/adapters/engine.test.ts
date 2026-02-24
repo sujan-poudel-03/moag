@@ -7,6 +7,7 @@ function makeAdapter(id: EngineId, displayName: string): EngineAdapter {
   return {
     id,
     displayName,
+    getCommand(): string { return id; },
     async runTask(_options: EngineRunOptions): Promise<EngineResult> {
       return { stdout: '', stderr: '', exitCode: 0, durationMs: 0 };
     },

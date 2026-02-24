@@ -2,6 +2,7 @@
 
 import { EngineId, EngineResult } from '../models/types';
 import { OutputCallback } from './base-cli';
+import { commandExists } from '../utils/command-exists';
 
 /** Options passed to every engine adapter */
 export interface EngineRunOptions {
@@ -21,6 +22,8 @@ export interface EngineRunOptions {
 export interface EngineAdapter {
   readonly id: EngineId;
   readonly displayName: string;
+  /** Returns the CLI command this adapter will invoke */
+  getCommand(): string;
   runTask(options: EngineRunOptions): Promise<EngineResult>;
 }
 
@@ -41,4 +44,37 @@ export function getEngine(id: EngineId): EngineAdapter {
 
 export function getAllEngines(): EngineAdapter[] {
   return Array.from(registry.values());
+}
+
+/** Result of an engine availability check */
+export interface EngineAvailability {
+  available: boolean;
+  command: string;
+  displayName: string;
+}
+
+/**
+ * Check availability of multiple engines in parallel.
+ * Returns a Map from EngineId to availability info.
+ */
+export async function checkEngineAvailability(
+  engineIds: EngineId[]
+): Promise<Map<EngineId, EngineAvailability>> {
+  const unique = [...new Set(engineIds)];
+  const results = new Map<EngineId, EngineAvailability>();
+
+  await Promise.all(
+    unique.map(async (id) => {
+      const adapter = registry.get(id);
+      if (!adapter) {
+        results.set(id, { available: false, command: '', displayName: id });
+        return;
+      }
+      const command = adapter.getCommand();
+      const available = await commandExists(command);
+      results.set(id, { available, command, displayName: adapter.displayName });
+    })
+  );
+
+  return results;
 }

@@ -10,9 +10,14 @@ export class OllamaAdapter implements EngineAdapter {
   readonly id: EngineId = 'ollama';
   readonly displayName = 'Ollama (Local)';
 
+  getCommand(): string {
+    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.ollama')
+      .get<string>('command', 'ollama');
+  }
+
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
     const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.ollama');
-    const command = config.get<string>('command', 'ollama');
+    const command = this.getCommand();
     const model = config.get<string>('model', 'codellama');
 
     return runCli(

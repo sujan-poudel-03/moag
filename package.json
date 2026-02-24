@@ -175,6 +175,18 @@
         "title": "Show Cost & Usage Summary",
         "category": "Agent Task Player",
         "icon": "$(graph)"
+      },
+      {
+        "command": "agentTaskPlayer.gettingStarted",
+        "title": "Getting Started",
+        "category": "Agent Task Player",
+        "icon": "$(book)"
+      },
+      {
+        "command": "agentTaskPlayer.detectEngines",
+        "title": "Detect Installed Engines",
+        "category": "Agent Task Player",
+        "icon": "$(search)"
       }
     ],
     "viewsContainers": {
@@ -383,7 +395,75 @@
           "description": "Maximum number of history entries to keep."
         }
       }
-    }
+    },
+    "walkthroughs": [
+      {
+        "id": "agentTaskPlayer.getStarted",
+        "title": "Get Started with Agent Task Player",
+        "description": "Learn how to automate your AI coding workflow — define task playlists and run them with any coding agent CLI.",
+        "steps": [
+          {
+            "id": "installCli",
+            "title": "Install a Coding Agent CLI",
+            "description": "Agent Task Player **automatically detects** installed CLIs and sets your default engine on first launch.\n\nYou need at least one AI coding agent CLI installed on your system. Pick one and install it globally:\n\n**Claude Code** (recommended):\n```\nnpm install -g @anthropic-ai/claude-code\n```\n\nOr: [Codex](https://www.npmjs.com/package/@openai/codex) · [Gemini CLI](https://www.npmjs.com/package/@google/gemini-cli) · [Ollama](https://ollama.com)\n\nVerify it works by running ``claude -p \"say hello\"`` in your terminal.\n\n[Re-run Engine Detection](command:agentTaskPlayer.detectEngines)",
+            "media": {
+              "altText": "Terminal showing CLI install command",
+              "markdown": "media/walkthrough-install.md"
+            },
+            "completionEvents": ["onCommand:agentTaskPlayer.detectEngines"]
+          },
+          {
+            "id": "openPanel",
+            "title": "Open the Agent Task Player Panel",
+            "description": "Click the **rocket icon** $(rocket) in the Activity Bar on the left side of VS Code. This opens the Agent Task Player panel with two sections:\n\n- **Plan** — your playlists and tasks\n- **History** — past execution logs\n\n[Open Agent Task Player Panel](command:workbench.view.extension.agentTaskPlayer)",
+            "media": {
+              "altText": "Agent Task Player panel in the activity bar",
+              "markdown": "media/walkthrough-panel.md"
+            },
+            "completionEvents": ["onView:agentTaskPlayer.planView"]
+          },
+          {
+            "id": "createPlan",
+            "title": "Create Your First Plan",
+            "description": "A **plan** is a JSON file that holds your task playlists. Click the button below to create one:\n\n[Create New Plan](command:agentTaskPlayer.newPlan)\n\nOr open the example plan from the ``examples/`` folder with **Open Plan File**.",
+            "media": {
+              "altText": "Creating a new plan file",
+              "markdown": "media/walkthrough-plan.md"
+            },
+            "completionEvents": ["onCommand:agentTaskPlayer.newPlan"]
+          },
+          {
+            "id": "addPlaylistAndTask",
+            "title": "Add a Playlist and Tasks",
+            "description": "A **playlist** is a phase/group (e.g., \"Setup\", \"Features\", \"Testing\"). Each playlist contains **tasks** — the prompts you want the AI agent to execute.\n\n1. Click **+** in the Plan panel toolbar to add a playlist\n2. Click **+** on the playlist to add a task\n3. Enter a **name** and a **prompt** — the instruction for the AI\n\n[Add Playlist](command:agentTaskPlayer.addPlaylist)\n\nOr edit the ``.agent-plan.json`` file directly — changes are picked up automatically.",
+            "media": {
+              "altText": "Adding playlists and tasks to a plan",
+              "markdown": "media/walkthrough-tasks.md"
+            },
+            "completionEvents": ["onCommand:agentTaskPlayer.addPlaylist"]
+          },
+          {
+            "id": "hitPlay",
+            "title": "Hit Play!",
+            "description": "Click the **Play** $(play) button in the Plan panel toolbar. Here's what happens:\n\n1. Extension checks if your CLI is installed (warns if not)\n2. Sends the first task's prompt to the agent CLI\n3. The agent works on your project files\n4. Output streams live in the Dashboard\n5. Moves to the next task automatically\n\n[Play](command:agentTaskPlayer.play) · [Open Dashboard](command:agentTaskPlayer.showDashboard)\n\nUse **Pause** $(debug-pause) to hold between tasks, or **Stop** $(debug-stop) to abort.",
+            "media": {
+              "altText": "Playing tasks and viewing output",
+              "markdown": "media/walkthrough-play.md"
+            },
+            "completionEvents": ["onCommand:agentTaskPlayer.play"]
+          },
+          {
+            "id": "advancedFeatures",
+            "title": "Level Up: Dependencies, Retries & Templates",
+            "description": "Once you're comfortable, explore these power features:\n\n- **Dependencies** — ``\"dependsOn\": [\"task-id\"]`` ensures order\n- **Retries** — ``\"retryCount\": 1`` retries failed tasks\n- **Parallel** — ``\"parallel\": true`` on a playlist runs tasks concurrently\n- **Verify** — ``\"verifyCommand\": \"npm test\"`` validates results\n- **Templates** — right-click a task → **Save as Template** for reuse\n- **Import/Export** — share plans with your team\n\n[Open Settings](command:workbench.action.openSettings?%22agentTaskPlayer%22)",
+            "media": {
+              "altText": "Advanced features overview",
+              "markdown": "media/walkthrough-advanced.md"
+            }
+          }
+        ]
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

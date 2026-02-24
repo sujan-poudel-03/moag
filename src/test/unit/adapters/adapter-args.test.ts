@@ -42,6 +42,18 @@ describe('adapter argument building', () => {
       assert.equal(adapter.id, 'codex');
     });
 
+    it('should return default command from getCommand()', () => {
+      clearMockConfig();
+      const adapter = new CodexAdapter();
+      assert.equal(adapter.getCommand(), 'codex');
+    });
+
+    it('should return configured command from getCommand()', () => {
+      setMockConfig('agentTaskPlayer.engines.codex', { command: '/usr/local/bin/codex' });
+      const adapter = new CodexAdapter();
+      assert.equal(adapter.getCommand(), '/usr/local/bin/codex');
+    });
+
     it('should pass prompt as positional argument', async () => {
       let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[] } | undefined;
       const { CodexAdapter: CA } = proxyquire('../../../adapters/codex-adapter', {
@@ -64,6 +76,12 @@ describe('adapter argument building', () => {
     it('should have id "claude"', () => {
       const adapter = new ClaudeAdapter();
       assert.equal(adapter.id, 'claude');
+    });
+
+    it('should return default command from getCommand()', () => {
+      clearMockConfig();
+      const adapter = new ClaudeAdapter();
+      assert.equal(adapter.getCommand(), 'claude');
     });
 
     it('should include default -p flag and prompt', async () => {
@@ -91,12 +109,24 @@ describe('adapter argument building', () => {
       const adapter = new GeminiAdapter();
       assert.equal(adapter.id, 'gemini');
     });
+
+    it('should return default command from getCommand()', () => {
+      clearMockConfig();
+      const adapter = new GeminiAdapter();
+      assert.equal(adapter.getCommand(), 'gemini');
+    });
   });
 
   describe('OllamaAdapter', () => {
     it('should have id "ollama"', () => {
       const adapter = new OllamaAdapter();
       assert.equal(adapter.id, 'ollama');
+    });
+
+    it('should return default command from getCommand()', () => {
+      clearMockConfig();
+      const adapter = new OllamaAdapter();
+      assert.equal(adapter.getCommand(), 'ollama');
     });
 
     it('should build args with "run", model, and prompt', async () => {
@@ -122,6 +152,12 @@ describe('adapter argument building', () => {
     it('should have id "custom"', () => {
       const adapter = new CustomAdapter();
       assert.equal(adapter.id, 'custom');
+    });
+
+    it('should return empty string from getCommand() when not configured', () => {
+      clearMockConfig();
+      const adapter = new CustomAdapter();
+      assert.equal(adapter.getCommand(), '');
     });
 
     it('should return error result when command is empty', async () => {

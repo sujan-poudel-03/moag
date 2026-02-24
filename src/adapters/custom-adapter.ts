@@ -10,9 +10,14 @@ export class CustomAdapter implements EngineAdapter {
   readonly id: EngineId = 'custom';
   readonly displayName = 'Custom Engine';
 
+  getCommand(): string {
+    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.custom')
+      .get<string>('command', '');
+  }
+
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
     const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.custom');
-    const command = config.get<string>('command', '');
+    const command = this.getCommand();
     const argTemplates = config.get<string[]>('args', []);
 
     if (!command) {

@@ -85,10 +85,13 @@ describe('loadPlan / savePlan round-trip', () => {
     plan.description = 'A test plan';
     const pl = createPlaylist('Phase 1', 'codex');
     pl.autoplayDelay = 500;
+    pl.parallel = true;
     const task = createTask('Task 1', 'Do something', 'claude');
     task.cwd = './src';
     task.files = ['a.ts', 'b.ts'];
     task.verifyCommand = 'npm test';
+    task.retryCount = 2;
+    task.dependsOn = ['other-task'];
     pl.tasks.push(task);
     plan.playlists.push(pl);
 
@@ -102,6 +105,7 @@ describe('loadPlan / savePlan round-trip', () => {
     assert.equal(loaded.playlists[0].name, 'Phase 1');
     assert.equal(loaded.playlists[0].engine, 'codex');
     assert.equal(loaded.playlists[0].autoplayDelay, 500);
+    assert.equal(loaded.playlists[0].parallel, true);
     assert.equal(loaded.playlists[0].tasks.length, 1);
 
     const t = loaded.playlists[0].tasks[0];
@@ -111,6 +115,8 @@ describe('loadPlan / savePlan round-trip', () => {
     assert.equal(t.cwd, './src');
     assert.deepEqual(t.files, ['a.ts', 'b.ts']);
     assert.equal(t.verifyCommand, 'npm test');
+    assert.equal(t.retryCount, 2);
+    assert.deepEqual(t.dependsOn, ['other-task']);
     // Status should be hydrated back to Pending
     assert.equal(t.status, TaskStatus.Pending);
   });

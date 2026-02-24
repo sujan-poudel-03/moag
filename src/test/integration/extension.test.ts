@@ -17,7 +17,7 @@ suite('Extension Integration Tests', () => {
     assert.ok(ext?.isActive, 'Extension failed to activate');
   });
 
-  test('All 21 commands should be registered', async () => {
+  test('All 23 commands should be registered', async () => {
     const allCommands = await vscode.commands.getCommands(true);
     const expectedCommands = [
       'agentTaskPlayer.play',
@@ -41,6 +41,8 @@ suite('Extension Integration Tests', () => {
       'agentTaskPlayer.exportPlan',
       'agentTaskPlayer.importPlan',
       'agentTaskPlayer.showCostSummary',
+      'agentTaskPlayer.gettingStarted',
+      'agentTaskPlayer.detectEngines',
     ];
 
     for (const cmd of expectedCommands) {

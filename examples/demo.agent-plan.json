@@ -1,7 +1,78 @@
 {
   "version": "1.0",
-  "name": "Demo Project Plan",
-  "description": "Example plan demonstrating Agent Task Player features",
+  "name": "Build a REST API",
+  "description": "Step-by-step plan to scaffold and build a Node.js REST API using AI agents",
   "defaultEngine": "claude",
-  "playlists": []
+  "playlists": [
+    {
+      "id": "pl-scaffold",
+      "name": "1. Project Setup",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "task-init",
+          "name": "Initialize Node.js project",
+          "prompt": "Create a new Node.js project with TypeScript. Initialize package.json, tsconfig.json, install express, @types/express, and typescript as dependencies. Create a src/ directory with an empty index.ts."
+        },
+        {
+          "id": "task-structure",
+          "name": "Create folder structure",
+          "prompt": "Set up a clean project structure: src/routes/, src/controllers/, src/models/, src/middleware/. Add a basic Express server in src/index.ts that listens on port 3000 with a health check GET /health endpoint.",
+          "dependsOn": [
+            "task-init"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pl-features",
+      "name": "2. Build Features",
+      "autoplay": true,
+      "autoplayDelay": 3000,
+      "tasks": [
+        {
+          "id": "task-users",
+          "name": "Add user CRUD endpoints",
+          "prompt": "Create a users module with in-memory storage. Add REST endpoints: GET /users, GET /users/:id, POST /users, PUT /users/:id, DELETE /users/:id. Use proper HTTP status codes and JSON responses. Add input validation.",
+          "verifyCommand": "npx tsc --noEmit"
+        },
+        {
+          "id": "task-auth",
+          "name": "Add authentication middleware",
+          "prompt": "Add a simple JWT authentication middleware. Create POST /auth/login that accepts {email, password} and returns a JWT token. Protect the PUT and DELETE /users endpoints with the auth middleware. Use jsonwebtoken package.",
+          "verifyCommand": "npx tsc --noEmit",
+          "dependsOn": [
+            "task-users"
+          ]
+        },
+        {
+          "id": "task-error",
+          "name": "Add error handling",
+          "prompt": "Add a global error handling middleware to Express. Create custom error classes (NotFoundError, ValidationError, UnauthorizedError). Update all routes to use proper try-catch and pass errors to the error handler. Return consistent JSON error responses.",
+          "dependsOn": [
+            "task-users"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pl-quality",
+      "name": "3. Testing & Docs",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "task-tests",
+          "name": "Write API tests",
+          "prompt": "Install jest and supertest. Write integration tests for all user endpoints and auth endpoints. Test success cases, validation errors, 404s, and unauthorized access. Aim for good coverage of the happy paths and edge cases.",
+          "verifyCommand": "npx jest --passWithNoTests",
+          "retryCount": 1
+        },
+        {
+          "id": "task-readme",
+          "name": "Generate README",
+          "prompt": "Create a README.md for this project. Include: project description, how to install dependencies, how to run the server, API endpoint documentation with request/response examples, and how to run tests."
+        }
+      ]
+    }
+  ]
 }

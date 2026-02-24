@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import { Plan, RunnerState, EngineId } from './models/types';
 import { loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
-import { registerAllEngines } from './adapters/index';
+import { registerAllEngines, checkEngineAvailability } from './adapters/index';
 import { TaskRunner } from './runner/runner';
 import { HistoryStore } from './history/store';
 import { TemplateStore } from './templates/store';
@@ -13,6 +13,7 @@ import { generateId } from './models/plan';
 import { PlanTreeProvider, PlanTreeItem } from './ui/plan-tree';
 import { HistoryTreeProvider } from './ui/history-tree';
 import { DashboardPanel } from './ui/dashboard-panel';
+import { detectAndConfigureEngines, redetectEngines } from './engine-detection';
 
 // ─── Shared state ───
 
@@ -156,7 +157,34 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.exportPlan', cmdExportPlan),
     vscode.commands.registerCommand('agentTaskPlayer.importPlan', cmdImportPlan),
     vscode.commands.registerCommand('agentTaskPlayer.showCostSummary', cmdShowCostSummary),
+    vscode.commands.registerCommand('agentTaskPlayer.gettingStarted', () => {
+      vscode.commands.executeCommand(
+        'workbench.action.openWalkthrough',
+        'moag.agent-task-player#agentTaskPlayer.getStarted',
+        false,
+      );
+    }),
+    vscode.commands.registerCommand('agentTaskPlayer.detectEngines', () => redetectEngines(context)),
   );
+
+  // Show walkthrough on first activation (no plan loaded yet)
+  const hasSeenWalkthrough = context.globalState.get<boolean>('agentTaskPlayer.hasSeenWalkthrough', false);
+  if (!hasSeenWalkthrough) {
+    // Check if there's no plan in workspace — likely a first-time user
+    vscode.workspace.findFiles('**/*.agent-plan.json', '**/node_modules/**', 1).then(files => {
+      if (files.length === 0) {
+        vscode.commands.executeCommand(
+          'workbench.action.openWalkthrough',
+          'moag.agent-task-player#agentTaskPlayer.getStarted',
+          false,
+        );
+      }
+      context.globalState.update('agentTaskPlayer.hasSeenWalkthrough', true);
+    });
+  }
+
+  // Auto-detect installed engines on first launch (non-blocking)
+  detectAndConfigureEngines(context);
 
   // Auto-load plan if one exists in workspace
   autoLoadPlan();
@@ -191,6 +219,82 @@ async function autoLoadPlan(): Promise<void> {
   }
 }
 
+// ─── Pre-flight engine validation ───
+
+/** Collect unique engine IDs needed to execute a given scope of the plan. */
+function collectEngineIds(plan: Plan, playlistIndex?: number, taskIndex?: number): EngineId[] {
+  const engines = new Set<EngineId>();
+
+  if (playlistIndex !== undefined && taskIndex !== undefined) {
+    const playlist = plan.playlists[playlistIndex];
+    const task = playlist.tasks[taskIndex];
+    engines.add(task.engine ?? playlist.engine ?? plan.defaultEngine);
+  } else if (playlistIndex !== undefined) {
+    const playlist = plan.playlists[playlistIndex];
+    for (const task of playlist.tasks) {
+      engines.add(task.engine ?? playlist.engine ?? plan.defaultEngine);
+    }
+  } else {
+    for (const playlist of plan.playlists) {
+      for (const task of playlist.tasks) {
+        engines.add(task.engine ?? playlist.engine ?? plan.defaultEngine);
+      }
+    }
+  }
+
+  return [...engines];
+}
+
+/**
+ * Pre-flight check: validate that all required engines are available.
+ * Returns true if execution should proceed, false if the user cancelled.
+ */
+async function preflightEngineCheck(
+  plan: Plan,
+  playlistIndex?: number,
+  taskIndex?: number,
+): Promise<boolean> {
+  const engineIds = collectEngineIds(plan, playlistIndex, taskIndex);
+  const availability = await checkEngineAvailability(engineIds);
+
+  const missing: Array<{ id: EngineId; command: string; displayName: string }> = [];
+  for (const [id, info] of availability) {
+    if (!info.available) {
+      missing.push({ id, command: info.command, displayName: info.displayName });
+    }
+  }
+
+  if (missing.length === 0) {
+    return true;
+  }
+
+  const engineList = missing
+    .map(m => m.command
+      ? `"${m.displayName}" (command: ${m.command})`
+      : `"${m.displayName}" (not configured)`)
+    .join(', ');
+
+  const msg = missing.length === 1
+    ? `Engine ${engineList} was not found on your system.`
+    : `Engines ${engineList} were not found on your system.`;
+
+  const action = await vscode.window.showWarningMessage(
+    msg,
+    'Run Anyway',
+    'Open Settings',
+  );
+
+  if (action === 'Run Anyway') {
+    return true;
+  }
+  if (action === 'Open Settings') {
+    vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer.engines');
+    return false;
+  }
+
+  return false;
+}
+
 // ─── Command handlers ───
 
 async function cmdPlay(): Promise<void> {
@@ -206,6 +310,11 @@ async function cmdPlay(): Promise<void> {
   if (runner.state === RunnerState.Playing) {
     return;
   }
+  // Pre-flight engine check
+  if (!await preflightEngineCheck(currentPlan)) {
+    return;
+  }
+
   // Reset all tasks and start from the beginning
   runner.resetPlan(currentPlan);
   saveAndRefresh();
@@ -476,6 +585,11 @@ function cmdClearHistory(): void {
 
 async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
   if (!currentPlan || !item || item.kind !== 'playlist') { return; }
+
+  if (!await preflightEngineCheck(currentPlan, item.playlistIndex)) {
+    return;
+  }
+
   runner.resetPlan(currentPlan);
   saveAndRefresh();
   runner.playPlaylist(currentPlan, item.playlistIndex);
@@ -483,6 +597,11 @@ async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
 
 async function cmdPlayTask(item?: PlanTreeItem): Promise<void> {
   if (!currentPlan || !item || item.kind !== 'task' || item.taskIndex === undefined) { return; }
+
+  if (!await preflightEngineCheck(currentPlan, item.playlistIndex, item.taskIndex)) {
+    return;
+  }
+
   runner.playTask(currentPlan, item.playlistIndex, item.taskIndex);
 }
 

@@ -15,5 +15,5 @@ export function registerAllEngines(): void {
   registerEngine(new CustomAdapter());
 }
 
-export { getEngine, getAllEngines } from './engine';
-export type { EngineAdapter, EngineRunOptions } from './engine';
+export { getEngine, getAllEngines, checkEngineAvailability } from './engine';
+export type { EngineAdapter, EngineRunOptions, EngineAvailability } from './engine';

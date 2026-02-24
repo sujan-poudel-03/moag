@@ -10,9 +10,14 @@ export class ClaudeAdapter implements EngineAdapter {
   readonly id: EngineId = 'claude';
   readonly displayName = 'Claude Code';
 
+  getCommand(): string {
+    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.claude')
+      .get<string>('command', 'claude');
+  }
+
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
     const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.claude');
-    const command = config.get<string>('command', 'claude');
+    const command = this.getCommand();
     const extraArgs = config.get<string[]>('args', ['-p']);
 
     const result = await runCli(
