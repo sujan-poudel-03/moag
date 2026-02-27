@@ -3,9 +3,9 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { Plan, RunnerState, EngineId } from './models/types';
+import { Plan, RunnerState, EngineId, HistoryEntry } from './models/types';
 import { loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
-import { registerAllEngines, checkEngineAvailability } from './adapters/index';
+import { registerAllEngines, checkEngineAvailability, getEngine } from './adapters/index';
 import { TaskRunner } from './runner/runner';
 import { HistoryStore } from './history/store';
 import { TemplateStore } from './templates/store';
@@ -13,6 +13,7 @@ import { generateId } from './models/plan';
 import { PlanTreeProvider, PlanTreeItem } from './ui/plan-tree';
 import { HistoryTreeProvider } from './ui/history-tree';
 import { DashboardPanel } from './ui/dashboard-panel';
+import { ExecutionDetailPanel } from './ui/execution-detail-panel';
 import { detectAndConfigureEngines, redetectEngines } from './engine-detection';
 
 // ─── Shared state ───
@@ -22,6 +23,7 @@ let currentPlanPath: string | null = null;
 let runner: TaskRunner;
 let historyStore: HistoryStore;
 let planTree: PlanTreeProvider;
+let planView: vscode.TreeView<PlanTreeItem>;
 let historyTree: HistoryTreeProvider;
 let templateStore: TemplateStore;
 
@@ -43,7 +45,7 @@ export function activate(context: vscode.ExtensionContext): void {
   historyTree = new HistoryTreeProvider(historyStore);
 
   // Register tree views
-  const planView = vscode.window.createTreeView('agentTaskPlayer.planView', {
+  planView = vscode.window.createTreeView('agentTaskPlayer.planView', {
     treeDataProvider: planTree,
     showCollapseAll: true,
     dragAndDropController: planTree,
@@ -64,23 +66,34 @@ export function activate(context: vscode.ExtensionContext): void {
     updateStatusBar(state);
   });
 
-  runner.on('task-started', (task, _playlist) => {
+  runner.on('task-started', (task, playlist, fullPrompt) => {
     planTree.refresh();
     DashboardPanel.currentPanel?.update();
+    DashboardPanel.currentPanel?.startTaskCard(task, playlist, fullPrompt);
     vscode.window.setStatusBarMessage(`Running: ${task.name}`, 3000);
   });
 
   runner.on('task-output', (task, chunk, stream) => {
-    DashboardPanel.currentPanel?.appendOutput(chunk, stream);
+    DashboardPanel.currentPanel?.appendOutput(chunk, stream, task.id);
   });
 
-  runner.on('task-completed', (_task, _result) => {
+  runner.on('task-completed', (task, _result) => {
     planTree.refresh();
+    const entries = historyStore.getForTask(task.id);
+    const entry = entries[0]; // newest first
+    DashboardPanel.currentPanel?.completeTaskCard(
+      task, entry?.result ?? _result, entry?.changedFiles, entry?.codeChanges,
+    );
     DashboardPanel.currentPanel?.update();
   });
 
   runner.on('task-failed', (task, result) => {
     planTree.refresh();
+    const entries = historyStore.getForTask(task.id);
+    const entry = entries[0];
+    DashboardPanel.currentPanel?.completeTaskCard(
+      task, entry?.result ?? result, entry?.changedFiles, entry?.codeChanges,
+    );
     DashboardPanel.currentPanel?.update();
     const stderrPreview = result.stderr.split('\n').filter(l => l.trim()).slice(0, 2).join(' | ');
     const detail = stderrPreview ? `: ${stderrPreview.substring(0, 120)}` : '';
@@ -165,6 +178,8 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
     vscode.commands.registerCommand('agentTaskPlayer.detectEngines', () => redetectEngines(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.loadExamplePlan', cmdLoadExamplePlan),
+    vscode.commands.registerCommand('agentTaskPlayer.showThreadList', cmdShowThreadList),
   );
 
   // Show walkthrough on first activation (no plan loaded yet)
@@ -201,6 +216,7 @@ function saveAndRefresh(): void {
     savePlan(currentPlan, currentPlanPath);
   }
   planTree.setPlan(currentPlan);
+  planView.message = currentPlan?.description || undefined;
   DashboardPanel.currentPanel?.update();
 }
 
@@ -213,6 +229,7 @@ async function autoLoadPlan(): Promise<void> {
       currentPlanPath = files[0].fsPath;
       currentPlan = loadPlan(currentPlanPath);
       planTree.setPlan(currentPlan);
+      planView.message = currentPlan.description || undefined;
     } catch {
       // Silently ignore corrupt plan files on startup
     }
@@ -318,6 +335,7 @@ async function cmdPlay(): Promise<void> {
   // Reset all tasks and start from the beginning
   runner.resetPlan(currentPlan);
   saveAndRefresh();
+  DashboardPanel.currentPanel?.clearTimeline();
   runner.play(currentPlan);
 }
 
@@ -342,6 +360,7 @@ async function cmdOpenPlan(): Promise<void> {
     currentPlanPath = uris[0].fsPath;
     currentPlan = loadPlan(currentPlanPath);
     planTree.setPlan(currentPlan);
+    planView.message = currentPlan.description || undefined;
     DashboardPanel.currentPanel?.update();
     vscode.window.showInformationMessage(`Loaded plan: ${currentPlan.name}`);
   } catch (err) {
@@ -350,12 +369,11 @@ async function cmdOpenPlan(): Promise<void> {
 }
 
 async function cmdNewPlan(): Promise<void> {
-  const name = await vscode.window.showInputBox({
-    prompt: 'Plan name',
-    placeHolder: 'My Agent Plan',
-    value: 'New Plan',
+  const rawIdea = await vscode.window.showInputBox({
+    prompt: 'Describe your project or what you want built',
+    placeHolder: 'e.g., Build a REST API with auth, user CRUD, and tests',
   });
-  if (!name) { return; }
+  if (!rawIdea) { return; }
 
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
@@ -363,10 +381,140 @@ async function cmdNewPlan(): Promise<void> {
     return;
   }
 
-  currentPlan = createEmptyPlan(name);
-  currentPlanPath = path.join(workspaceFolder.uri.fsPath, `${name.toLowerCase().replace(/\s+/g, '-')}.agent-plan.json`);
+  // Use the AI engine to convert the raw idea into a structured playlist
+  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
+
+  let planName = rawIdea.substring(0, 60).trim();
+  let tasks: Array<{ name: string; prompt: string }> = [];
+
+  try {
+    const engine = getEngine(defaultEngine);
+    const cwd = workspaceFolder.uri.fsPath;
+
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Notification, title: 'Generating plan from your idea...', cancellable: true },
+      async (progress, token) => {
+        const abortController = new AbortController();
+        token.onCancellationRequested(() => abortController.abort());
+
+        const result = await engine.runTask({
+          prompt: PLAN_GENERATION_PROMPT + '\n\nUser idea:\n' + rawIdea,
+          cwd,
+          signal: abortController.signal,
+        });
+
+        if (result.exitCode === 0 && result.stdout.trim()) {
+          const parsed = parsePlanResponse(result.stdout);
+          if (parsed) {
+            planName = parsed.name;
+            tasks = parsed.tasks;
+          }
+        }
+      },
+    );
+  } catch {
+    // Engine not available or failed — fall back to manual
+  }
+
+  // Fallback: if AI didn't produce tasks, create a single task from the raw idea
+  if (tasks.length === 0) {
+    tasks = [{ name: planName, prompt: rawIdea }];
+  }
+
+  currentPlan = createEmptyPlan(planName);
+  currentPlan.description = rawIdea;
+  currentPlan.playlists[0].name = 'Tasks';
+  for (const t of tasks) {
+    currentPlan.playlists[0].tasks.push(createTask(t.name, t.prompt));
+  }
+
+  currentPlanPath = path.join(workspaceFolder.uri.fsPath, `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`);
   saveAndRefresh();
-  vscode.window.showInformationMessage(`Created plan: ${name}`);
+  vscode.window.showInformationMessage(`Plan "${planName}" created with ${tasks.length} task${tasks.length > 1 ? 's' : ''}.`);
+}
+
+async function cmdLoadExamplePlan(): Promise<void> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    vscode.window.showErrorMessage('Open a workspace folder first.');
+    return;
+  }
+
+  currentPlan = createEmptyPlan('Example: Todo CLI App');
+  currentPlan.description = 'Build a simple command-line todo app with add, list, complete, and delete operations. This is an example plan to show how Agent Task Player works.';
+
+  const pl = currentPlan.playlists[0];
+  pl.name = 'Build Todo App';
+  pl.tasks = [
+    createTask(
+      'Set up project structure',
+      'Create a new Node.js project with a package.json. Set up a src/ directory with an index.ts entry point. Add TypeScript as a dev dependency and create a tsconfig.json with strict mode enabled.',
+    ),
+    createTask(
+      'Implement todo data model',
+      'Create src/todo.ts with a Todo interface (id, title, completed, createdAt) and a TodoStore class that stores todos in a JSON file. Implement methods: add(title), list(), complete(id), delete(id), and save/load from ~/.todos.json.',
+    ),
+    createTask(
+      'Build CLI interface',
+      'Update src/index.ts to parse command-line arguments using process.argv. Support these commands: add <title>, list, done <id>, delete <id>. Print a helpful usage message if no arguments are given. Use the TodoStore to persist data.',
+    ),
+    createTask(
+      'Add tests',
+      'Create src/todo.test.ts with unit tests for the TodoStore class. Test add, list, complete, and delete operations. Use a temp directory for the test JSON file. Make sure tests clean up after themselves.',
+    ),
+  ];
+
+  currentPlanPath = path.join(workspaceFolder.uri.fsPath, 'example-todo-app.agent-plan.json');
+  saveAndRefresh();
+  vscode.window.showInformationMessage(
+    'Example plan loaded! Click Play to start building, or explore the tasks first.',
+    'Play Now',
+  ).then(action => {
+    if (action === 'Play Now') {
+      vscode.commands.executeCommand('agentTaskPlayer.play');
+    }
+  });
+}
+
+const PLAN_GENERATION_PROMPT = `You are a project planner. Given a raw idea or description, break it down into a concrete plan.
+
+Respond with ONLY valid JSON (no markdown fences, no commentary) in this exact format:
+{
+  "name": "Short project name (max 60 chars)",
+  "tasks": [
+    { "name": "Short task name", "prompt": "Detailed instruction for a coding agent to execute this task" }
+  ]
+}
+
+Rules:
+- Each task should be a single, focused coding step that a CLI agent can execute independently
+- Tasks should be ordered so they can be run sequentially (earlier tasks set up what later tasks need)
+- Task prompts should be detailed and actionable — the agent needs enough context to do the work
+- Keep it to 3-10 tasks. Don't over-split simple work, don't under-split complex work
+- The project name should be concise and descriptive`;
+
+/** Try to extract structured plan from AI response */
+function parsePlanResponse(raw: string): { name: string; tasks: Array<{ name: string; prompt: string }> } | null {
+  try {
+    // Strip markdown code fences if present
+    let json = raw.trim();
+    const fenceMatch = json.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenceMatch) {
+      json = fenceMatch[1].trim();
+    }
+    const parsed = JSON.parse(json);
+    if (parsed.name && Array.isArray(parsed.tasks) && parsed.tasks.length > 0) {
+      const tasks = parsed.tasks
+        .filter((t: { name?: string; prompt?: string }) => t.name && t.prompt)
+        .map((t: { name: string; prompt: string }) => ({ name: t.name, prompt: t.prompt }));
+      if (tasks.length > 0) {
+        return { name: String(parsed.name).substring(0, 60), tasks };
+      }
+    }
+  } catch {
+    // Parse failed — return null
+  }
+  return null;
 }
 
 async function cmdAddPlaylist(): Promise<void> {
@@ -403,13 +551,15 @@ async function cmdAddTask(playlistIndexOrItem?: unknown): Promise<void> {
     playlistIndex = playlistIndexOrItem.playlistIndex;
   } else if (typeof playlistIndexOrItem === 'number') {
     playlistIndex = playlistIndexOrItem;
+  } else if (currentPlan.playlists.length === 1) {
+    // Only one playlist — use it directly, no need to ask
+    playlistIndex = 0;
+  } else if (currentPlan.playlists.length === 0) {
+    vscode.window.showWarningMessage('Add a playlist first.');
+    return;
   } else {
-    // Ask user to pick a playlist
+    // Multiple playlists — ask user to pick
     const items = currentPlan.playlists.map((pl, i) => ({ label: pl.name, index: i }));
-    if (items.length === 0) {
-      vscode.window.showWarningMessage('Add a playlist first.');
-      return;
-    }
     const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select playlist' });
     if (!picked) { return; }
     playlistIndex = picked.index;
@@ -529,40 +679,15 @@ function cmdMoveDown(item?: PlanTreeItem): void {
 }
 
 function cmdShowHistory(entry?: unknown): void {
-  // If called with a history entry, show details
   if (entry && typeof entry === 'object' && 'result' in entry) {
-    const e = entry as import('./models/types').HistoryEntry;
-    const doc = `# ${e.taskName}
-
-**Engine:** ${e.engine}
-**Status:** ${e.status}
-**Started:** ${e.startedAt}
-**Finished:** ${e.finishedAt}
-**Duration:** ${e.result.durationMs}ms
-**Exit Code:** ${e.result.exitCode}
-
-## Prompt
-\`\`\`
-${e.prompt}
-\`\`\`
-
-## Stdout
-\`\`\`
-${e.result.stdout}
-\`\`\`
-
-## Stderr
-\`\`\`
-${e.result.stderr}
-\`\`\`
-`;
-    vscode.workspace.openTextDocument({ content: doc, language: 'markdown' })
-      .then(d => vscode.window.showTextDocument(d, { preview: true }));
+    ExecutionDetailPanel.show(entry as HistoryEntry, historyStore);
     return;
   }
+  ExecutionDetailPanel.showEmpty(historyStore);
+}
 
-  // Otherwise, show the dashboard with history tab
-  cmdShowDashboard();
+function cmdShowThreadList(): void {
+  ExecutionDetailPanel.showEmpty(historyStore);
 }
 
 function cmdShowDashboard(): void {
@@ -592,6 +717,7 @@ async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
 
   runner.resetPlan(currentPlan);
   saveAndRefresh();
+  DashboardPanel.currentPanel?.clearTimeline();
   runner.playPlaylist(currentPlan, item.playlistIndex);
 }
 
@@ -617,12 +743,13 @@ async function cmdAddTaskFromTemplate(playlistIndexOrItem?: unknown): Promise<vo
     playlistIndex = playlistIndexOrItem.playlistIndex;
   } else if (typeof playlistIndexOrItem === 'number') {
     playlistIndex = playlistIndexOrItem;
+  } else if (currentPlan.playlists.length === 1) {
+    playlistIndex = 0;
+  } else if (currentPlan.playlists.length === 0) {
+    vscode.window.showWarningMessage('Add a playlist first.');
+    return;
   } else {
     const items = currentPlan.playlists.map((pl, i) => ({ label: pl.name, index: i }));
-    if (items.length === 0) {
-      vscode.window.showWarningMessage('Add a playlist first.');
-      return;
-    }
     const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select playlist' });
     if (!picked) { return; }
     playlistIndex = picked.index;

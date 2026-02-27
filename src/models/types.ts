@@ -77,6 +77,8 @@ export interface EngineResult {
   durationMs: number;
   /** Token usage stats (when available from the engine) */
   tokenUsage?: TokenUsage;
+  /** The CLI command that was executed (without the prompt body) */
+  command?: string;
 }
 
 /** Token/cost tracking for a single task execution */
@@ -106,6 +108,14 @@ export interface HistoryEntry {
   startedAt: string;
   /** ISO timestamp of when execution ended */
   finishedAt: string;
+  /** List of files changed during task execution (from git diff) */
+  changedFiles?: string[];
+  /** Unified diff of code changes made during task execution */
+  codeChanges?: string;
+  /** Groups related turns; first entry uses threadId = id */
+  threadId?: string;
+  /** 0 = original, 1 = first reply, etc. */
+  turnIndex?: number;
 }
 
 /** Serializable plan file format (status fields stripped) */

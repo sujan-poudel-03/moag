@@ -81,6 +81,12 @@
         "icon": "$(new-file)"
       },
       {
+        "command": "agentTaskPlayer.loadExamplePlan",
+        "title": "Try Example Plan",
+        "category": "Agent Task Player",
+        "icon": "$(beaker)"
+      },
+      {
         "command": "agentTaskPlayer.addPlaylist",
         "title": "Add Playlist",
         "category": "Agent Task Player",
@@ -187,6 +193,12 @@
         "title": "Detect Installed Engines",
         "category": "Agent Task Player",
         "icon": "$(search)"
+      },
+      {
+        "command": "agentTaskPlayer.showThreadList",
+        "title": "Show Threads",
+        "category": "Agent Task Player",
+        "icon": "$(comment-discussion)"
       }
     ],
     "viewsContainers": {
@@ -212,37 +224,63 @@
         }
       ]
     },
+    "viewsWelcome": [
+      {
+        "view": "agentTaskPlayer.planView",
+        "contents": "No plan loaded.\n\nDescribe what you want built and the AI agent will create a structured plan for you.\n[New Plan](command:agentTaskPlayer.newPlan)\n\nOr try a ready-made example to see how it works:\n[Try Example Plan](command:agentTaskPlayer.loadExamplePlan)\n\nAlready have a plan file?\n[Open Plan File](command:agentTaskPlayer.openPlan)"
+      }
+    ],
     "menus": {
       "view/title": [
         {
-          "command": "agentTaskPlayer.openPlan",
+          "command": "agentTaskPlayer.addTask",
           "when": "view == agentTaskPlayer.planView",
           "group": "navigation@1"
         },
         {
-          "command": "agentTaskPlayer.newPlan",
+          "command": "agentTaskPlayer.play",
           "when": "view == agentTaskPlayer.planView",
           "group": "navigation@2"
         },
         {
-          "command": "agentTaskPlayer.addPlaylist",
+          "command": "agentTaskPlayer.stop",
           "when": "view == agentTaskPlayer.planView",
           "group": "navigation@3"
         },
         {
-          "command": "agentTaskPlayer.play",
+          "command": "agentTaskPlayer.newPlan",
           "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@4"
+          "group": "1_plan@1"
+        },
+        {
+          "command": "agentTaskPlayer.openPlan",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "1_plan@2"
         },
         {
           "command": "agentTaskPlayer.pause",
           "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@5"
+          "group": "2_playback@1"
         },
         {
-          "command": "agentTaskPlayer.stop",
+          "command": "agentTaskPlayer.showDashboard",
           "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@6"
+          "group": "2_playback@2"
+        },
+        {
+          "command": "agentTaskPlayer.addPlaylist",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "3_advanced@1"
+        },
+        {
+          "command": "agentTaskPlayer.exportPlan",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "3_advanced@2"
+        },
+        {
+          "command": "agentTaskPlayer.importPlan",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "3_advanced@3"
         },
         {
           "command": "agentTaskPlayer.clearHistory",
@@ -255,14 +293,9 @@
           "group": "navigation@2"
         },
         {
-          "command": "agentTaskPlayer.exportPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_importexport@1"
-        },
-        {
-          "command": "agentTaskPlayer.importPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_importexport@2"
+          "command": "agentTaskPlayer.showThreadList",
+          "when": "view == agentTaskPlayer.historyView",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -339,6 +372,11 @@
           "items": { "type": "string" },
           "description": "Extra arguments for Codex CLI."
         },
+        "agentTaskPlayer.engines.codex.autoApprove": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-approve file operations (passes --full-auto to Codex CLI)."
+        },
         "agentTaskPlayer.engines.claude.command": {
           "type": "string",
           "default": "claude",
@@ -349,6 +387,11 @@
           "default": ["-p"],
           "items": { "type": "string" },
           "description": "Extra arguments for Claude Code CLI."
+        },
+        "agentTaskPlayer.engines.claude.autoApprove": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-approve file operations (passes --dangerously-skip-permissions to Claude CLI). Required for non-interactive execution."
         },
         "agentTaskPlayer.engines.gemini.command": {
           "type": "string",
@@ -393,6 +436,60 @@
           "default": 200,
           "minimum": 10,
           "description": "Maximum number of history entries to keep."
+        },
+        "agentTaskPlayer.context.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Master switch for auto-context injection into task prompts."
+        },
+        "agentTaskPlayer.context.planOverview": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include plan roadmap showing task statuses and current position."
+        },
+        "agentTaskPlayer.context.priorTaskOutputs": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include stdout from dependency task executions."
+        },
+        "agentTaskPlayer.context.allPriorOutputs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include ALL prior playlist task outputs (not just dependencies)."
+        },
+        "agentTaskPlayer.context.projectState": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-scan and include README, package.json, and file tree."
+        },
+        "agentTaskPlayer.context.changedFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "List files changed by prior tasks with attribution."
+        },
+        "agentTaskPlayer.context.cumulativeProgress": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include summary of completed tasks with file change counts."
+        },
+        "agentTaskPlayer.context.maxContextChars": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "description": "Maximum characters for the context section. Low-priority sections are dropped first."
+        },
+        "agentTaskPlayer.context.maxOutputPerTask": {
+          "type": "number",
+          "default": 3000,
+          "minimum": 500,
+          "description": "Maximum characters per prior task stdout output."
+        },
+        "agentTaskPlayer.context.fileTreeDepth": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 6,
+          "description": "File tree scan depth for project state context."
         }
       }
     },

@@ -42,17 +42,42 @@ function createMockHistoryStore() {
 function buildRunner() {
   const historyStore = createMockHistoryStore();
   const mockEngine = createMockEngine();
-  spawnStub = sinon.stub().returns({
-    on: sinon.stub(),
-    stdout: { on: sinon.stub() },
-    stderr: { on: sinon.stub() },
-    kill: sinon.stub(),
+  spawnStub = sinon.stub().callsFake(() => {
+    const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+    const stdoutHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+    const proc = {
+      on: (event: string, handler: (...args: unknown[]) => void) => {
+        if (!handlers[event]) { handlers[event] = []; }
+        handlers[event].push(handler);
+        return proc;
+      },
+      stdout: {
+        on: (event: string, handler: (...args: unknown[]) => void) => {
+          if (!stdoutHandlers[event]) { stdoutHandlers[event] = []; }
+          stdoutHandlers[event].push(handler);
+          return proc.stdout;
+        },
+      },
+      stderr: { on: sinon.stub() },
+      kill: sinon.stub(),
+    };
+    // Auto-fire close with code 0 on next tick (handles git commands)
+    setTimeout(() => {
+      if (handlers['close']) {
+        handlers['close'].forEach(h => h(0));
+      }
+    }, 5);
+    return proc;
   });
 
   const { TaskRunner } = proxyquire('../../../runner/runner', {
     'vscode': vscodeMock,
     '../adapters/index': {
       getEngine: () => mockEngine,
+    },
+    '../context/context-builder': {
+      buildContext: () => '',
+      getContextSettings: () => ({ enabled: false }),
     },
     'child_process': { spawn: spawnStub },
   });
@@ -63,14 +88,15 @@ function buildRunner() {
 
 function makePlan(): Plan {
   const plan = createEmptyPlan('Test Plan');
-  const pl = createPlaylist('Phase 1');
+  // Use the default playlist that createEmptyPlan provides
+  const pl = plan.playlists[0];
+  pl.name = 'Phase 1';
   pl.autoplay = true;
   pl.autoplayDelay = 0; // no delay in tests
   pl.tasks.push(
     createTask('Task 1', 'Do first thing'),
     createTask('Task 2', 'Do second thing'),
   );
-  plan.playlists.push(pl);
   return plan;
 }
 

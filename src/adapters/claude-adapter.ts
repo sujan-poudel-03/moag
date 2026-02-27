@@ -20,11 +20,16 @@ export class ClaudeAdapter implements EngineAdapter {
     const command = this.getCommand();
     const extraArgs = config.get<string[]>('args', ['-p']);
 
+    const autoApprove = config.get<boolean>('autoApprove', true);
+
     const result = await runCli(
       {
         command,
         buildArgs: (opts) => {
           const args = [...extraArgs];
+          if (autoApprove && !args.includes('--dangerously-skip-permissions')) {
+            args.push('--dangerously-skip-permissions');
+          }
           // Claude Code uses -p for non-interactive print mode
           // The prompt is passed as the final positional argument
           args.push(opts.prompt);

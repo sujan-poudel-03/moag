@@ -37,6 +37,33 @@ export class HistoryStore {
     this._onDidChange.fire();
   }
 
+  /** Get all entries in a thread, sorted by startedAt ascending */
+  getThread(threadId: string): HistoryEntry[] {
+    return this._entries
+      .filter(e => (e.threadId ?? e.id) === threadId)
+      .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
+  }
+
+  /** Get the most recent entry per unique thread, sorted newest first */
+  getThreadHeads(): HistoryEntry[] {
+    const headMap = new Map<string, HistoryEntry>();
+    for (const entry of this._entries) {
+      const tid = entry.threadId ?? entry.id;
+      const existing = headMap.get(tid);
+      if (!existing || entry.startedAt > existing.startedAt) {
+        headMap.set(tid, entry);
+      }
+    }
+    return [...headMap.values()].sort((a, b) => b.startedAt.localeCompare(a.startedAt));
+  }
+
+  /** Delete all entries belonging to a thread */
+  deleteThread(threadId: string): void {
+    this._entries = this._entries.filter(e => (e.threadId ?? e.id) !== threadId);
+    this.persist();
+    this._onDidChange.fire();
+  }
+
   /** Clear all history */
   clear(): void {
     this._entries = [];

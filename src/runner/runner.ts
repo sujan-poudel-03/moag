@@ -9,11 +9,12 @@ import { Plan, Playlist, Task, TaskStatus, RunnerState, EngineId, EngineResult, 
 import { generateId } from '../models/plan';
 import { getEngine } from '../adapters/index';
 import { HistoryStore } from '../history/store';
+import { buildContext, getContextSettings } from '../context/context-builder';
 
 /** Events emitted by the TaskRunner */
 export interface RunnerEvents {
   'state-changed': (state: RunnerState) => void;
-  'task-started': (task: Task, playlist: Playlist) => void;
+  'task-started': (task: Task, playlist: Playlist, fullPrompt: string) => void;
   'task-output': (task: Task, chunk: string, stream: 'stdout' | 'stderr') => void;
   'task-completed': (task: Task, result: EngineResult) => void;
   'task-failed': (task: Task, result: EngineResult) => void;
@@ -267,11 +268,14 @@ export class TaskRunner {
     const cwd = this.resolveCwd(task.cwd);
 
     // Build context-enriched prompt
-    const fullPrompt = this.buildPrompt(task, cwd);
+    const fullPrompt = this.buildPrompt(task, cwd, plan, playlist);
 
     task.status = TaskStatus.Running;
     const startedAt = new Date().toISOString();
-    this.emit('task-started', task, playlist);
+    this.emit('task-started', task, playlist, fullPrompt);
+
+    // Capture git state before task execution (non-destructive)
+    const gitRef = await this.captureGitRef(cwd);
 
     try {
       const result = await engine.runTask({
@@ -293,17 +297,19 @@ export class TaskRunner {
         }
       }
 
+      // Capture git diff after task execution
+      const { changedFiles, codeChanges } = await this.captureGitDiff(gitRef, cwd);
+
       const finishedAt = new Date().toISOString();
 
+      // Determine status
       if (result.exitCode === 0) {
         task.status = TaskStatus.Completed;
-        this.emit('task-completed', task, result);
       } else {
         task.status = TaskStatus.Failed;
-        this.emit('task-failed', task, result);
       }
 
-      // Record in history
+      // Record in history FIRST (so event handlers can query it)
       const entry: HistoryEntry = {
         id: generateId(),
         taskId: task.id,
@@ -316,8 +322,17 @@ export class TaskRunner {
         status: task.status,
         startedAt,
         finishedAt,
+        changedFiles: changedFiles.length > 0 ? changedFiles : undefined,
+        codeChanges: codeChanges || undefined,
       };
       this.historyStore.add(entry);
+
+      // THEN emit events
+      if (result.exitCode === 0) {
+        this.emit('task-completed', task, result);
+      } else {
+        this.emit('task-failed', task, result);
+      }
     } catch (err) {
       task.status = TaskStatus.Failed;
       const finishedAt = new Date().toISOString();
@@ -329,8 +344,7 @@ export class TaskRunner {
         exitCode: 1,
         durationMs: 0,
       };
-      this.emit('task-failed', task, errorResult);
-
+      // Record in history FIRST (so event handlers can query it)
       this.historyStore.add({
         id: generateId(),
         taskId: task.id,
@@ -344,12 +358,20 @@ export class TaskRunner {
         startedAt,
         finishedAt,
       });
+
+      this.emit('task-failed', task, errorResult);
     }
   }
 
   /** Build a context-enriched prompt with file contents injected */
-  private buildPrompt(task: Task, cwd: string): string {
-    let prompt = task.prompt;
+  private buildPrompt(task: Task, cwd: string, plan: Plan, playlist: Playlist): string {
+    const settings = getContextSettings();
+    let prompt = '';
+    if (settings.enabled) {
+      const ctx = buildContext({ plan, playlist, task, cwd, historyStore: this.historyStore, settings });
+      if (ctx) { prompt += ctx + '\n\n'; }
+    }
+    prompt += task.prompt;
 
     if (task.files && task.files.length > 0) {
       const fileContents: string[] = [];
@@ -409,6 +431,39 @@ export class TaskRunner {
       return `Hint: Rate limited by the "${engineId}" API. Wait a moment and try again.`;
     }
     return null;
+  }
+
+  /** Run a git command and return stdout, or null on any failure */
+  private runGitCommand(args: string[], cwd: string): Promise<string | null> {
+    return new Promise((resolve) => {
+      const proc = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      proc.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
+      proc.on('error', () => resolve(null));
+      proc.on('close', (code) => resolve(code === 0 ? stdout.trim() : null));
+    });
+  }
+
+  /** Capture a git ref of the current working tree state (non-destructive) */
+  private async captureGitRef(cwd: string): Promise<string | null> {
+    // git stash create produces a ref without modifying the working tree
+    const stashRef = await this.runGitCommand(['stash', 'create'], cwd);
+    if (stashRef) {
+      return stashRef;
+    }
+    // Working tree is clean — fall back to HEAD
+    return await this.runGitCommand(['rev-parse', 'HEAD'], cwd);
+  }
+
+  /** Capture git diff between a ref and the current working tree */
+  private async captureGitDiff(ref: string | null, cwd: string): Promise<{ changedFiles: string[]; codeChanges: string }> {
+    if (!ref) {
+      return { changedFiles: [], codeChanges: '' };
+    }
+    const nameOnly = await this.runGitCommand(['diff', '--name-only', ref], cwd);
+    const diff = await this.runGitCommand(['diff', '--no-color', ref], cwd);
+    const changedFiles = nameOnly ? nameOnly.split('\n').filter(f => f.length > 0) : [];
+    return { changedFiles, codeChanges: diff || '' };
   }
 
   private sleep(ms: number): Promise<void> {

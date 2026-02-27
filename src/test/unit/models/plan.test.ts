@@ -28,7 +28,9 @@ describe('createEmptyPlan', () => {
     assert.equal(plan.name, 'Test Plan');
     assert.equal(plan.version, '1.0');
     assert.equal(plan.defaultEngine, 'claude');
-    assert.deepEqual(plan.playlists, []);
+    assert.equal(plan.playlists.length, 1);
+    assert.equal(plan.playlists[0].name, 'Tasks');
+    assert.deepEqual(plan.playlists[0].tasks, []);
   });
 });
 
@@ -83,7 +85,10 @@ describe('loadPlan / savePlan round-trip', () => {
   it('should save and reload a plan preserving all fields', () => {
     const plan = createEmptyPlan('Round Trip');
     plan.description = 'A test plan';
-    const pl = createPlaylist('Phase 1', 'codex');
+    // Use the default playlist that createEmptyPlan provides
+    const pl = plan.playlists[0];
+    pl.name = 'Phase 1';
+    pl.engine = 'codex';
     pl.autoplayDelay = 500;
     pl.parallel = true;
     const task = createTask('Task 1', 'Do something', 'claude');
@@ -93,7 +98,6 @@ describe('loadPlan / savePlan round-trip', () => {
     task.retryCount = 2;
     task.dependsOn = ['other-task'];
     pl.tasks.push(task);
-    plan.playlists.push(pl);
 
     savePlan(plan, tmpFile);
     const loaded = loadPlan(tmpFile);
@@ -123,11 +127,9 @@ describe('loadPlan / savePlan round-trip', () => {
 
   it('should strip status fields from the saved file', () => {
     const plan = createEmptyPlan('Strip Test');
-    const pl = createPlaylist('PL');
     const task = createTask('T', 'prompt');
     task.status = TaskStatus.Completed; // should not persist
-    pl.tasks.push(task);
-    plan.playlists.push(pl);
+    plan.playlists[0].tasks.push(task);
 
     savePlan(plan, tmpFile);
     const raw: PlanFile = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));

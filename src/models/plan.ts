@@ -105,13 +105,13 @@ export function savePlan(plan: Plan, filePath: string): void {
   fs.writeFileSync(filePath, json, 'utf-8');
 }
 
-/** Create a blank new plan */
+/** Create a new plan with a default playlist ready for tasks */
 export function createEmptyPlan(name: string): Plan {
   return {
     version: '1.0',
     name,
     defaultEngine: 'claude' as EngineId,
-    playlists: [],
+    playlists: [createPlaylist('Tasks')],
   };
 }
 

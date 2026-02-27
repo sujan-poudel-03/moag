@@ -25,6 +25,15 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
     const startTime = Date.now();
     const args = config.buildArgs(options);
 
+    // Build a display-friendly command string (omit the last arg which is the prompt body)
+    const displayArgs = args.length > 1 ? args.slice(0, -1) : args;
+    const commandStr = [config.command, ...displayArgs].join(' ');
+
+    // Emit command and response headers before spawning
+    if (onOutput) {
+      onOutput(`\u2500\u2500 Command \u2500\u2500\n${commandStr}\n\n\u2500\u2500 Response \u2500\u2500\n`, 'stdout');
+    }
+
     const proc = spawn(config.command, args, {
       cwd: options.cwd,
       env: { ...process.env, ...config.env },
@@ -63,6 +72,7 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
         stderr,
         exitCode: code ?? 1,
         durationMs: Date.now() - startTime,
+        command: commandStr,
       });
     });
   });

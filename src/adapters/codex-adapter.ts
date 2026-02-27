@@ -20,12 +20,18 @@ export class CodexAdapter implements EngineAdapter {
     const command = this.getCommand();
     const extraArgs = config.get<string[]>('args', []);
 
+    const autoApprove = config.get<boolean>('autoApprove', true);
+
     return runCli(
       {
         command,
         buildArgs: (opts) => {
           // Use `codex exec` for non-interactive execution
-          const args = ['exec', ...extraArgs, opts.prompt];
+          const args = ['exec', ...extraArgs];
+          if (autoApprove && !args.includes('--full-auto')) {
+            args.push('--full-auto');
+          }
+          args.push(opts.prompt);
           return args;
         },
       },
