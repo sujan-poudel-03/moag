@@ -14,6 +14,7 @@ import { PlanTreeProvider, PlanTreeItem } from './ui/plan-tree';
 import { HistoryTreeProvider } from './ui/history-tree';
 import { DashboardPanel } from './ui/dashboard-panel';
 import { ExecutionDetailPanel } from './ui/execution-detail-panel';
+import { PromptInputViewProvider } from './ui/prompt-input-view';
 import { detectAndConfigureEngines, redetectEngines } from './engine-detection';
 
 // ─── Shared state ───
@@ -54,6 +55,55 @@ export function activate(context: vscode.ExtensionContext): void {
     treeDataProvider: historyTree,
   });
   context.subscriptions.push(planView, histView);
+
+  // Register prompt input webview in sidebar
+  const promptProvider = new PromptInputViewProvider(
+    context.extensionUri,
+    async (prompt: string) => {
+      const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+      if (!workspaceFolder) {
+        vscode.window.showErrorMessage('Open a workspace folder first.');
+        return;
+      }
+
+      // Auto-create a plan if none loaded
+      if (!currentPlan) {
+        const planName = prompt.substring(0, 60).trim();
+        currentPlan = createEmptyPlan(planName);
+        currentPlan.description = prompt;
+        currentPlanPath = path.join(
+          workspaceFolder.uri.fsPath,
+          `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`,
+        );
+      }
+
+      // Ensure at least one playlist exists
+      if (currentPlan.playlists.length === 0) {
+        currentPlan.playlists.push(createPlaylist('Tasks'));
+      }
+
+      // Create and add the task
+      const taskName = prompt.length > 60 ? prompt.substring(0, 57) + '...' : prompt;
+      const task = createTask(taskName, prompt);
+      currentPlan.playlists[0].tasks.push(task);
+      saveAndRefresh();
+
+      // Find the indices for the new task
+      const playlistIndex = 0;
+      const taskIndex = currentPlan.playlists[0].tasks.length - 1;
+
+      // Pre-flight engine check
+      if (!await preflightEngineCheck(currentPlan, playlistIndex, taskIndex)) {
+        return;
+      }
+
+      // Run the task immediately
+      await runner.playTask(currentPlan, playlistIndex, taskIndex);
+    },
+  );
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider(PromptInputViewProvider.viewType, promptProvider),
+  );
 
   // Save plan when tree items are reordered via drag-and-drop
   planTree.onDidReorder(() => saveAndRefresh());

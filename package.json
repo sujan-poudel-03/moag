@@ -213,6 +213,11 @@
     "views": {
       "agentTaskPlayer": [
         {
+          "id": "agentTaskPlayer.promptView",
+          "name": "Prompt",
+          "type": "webview"
+        },
+        {
           "id": "agentTaskPlayer.planView",
           "name": "Plan",
           "type": "tree"
