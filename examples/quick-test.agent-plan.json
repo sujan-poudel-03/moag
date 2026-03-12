@@ -1,0 +1,40 @@
+{
+  "version": "1.0",
+  "name": "Quick Smoke Test",
+  "description": "A minimal plan to verify Agent Task Player works. Hit Play and watch it run.",
+  "defaultEngine": "codex",
+  "playlists": [
+    {
+      "id": "pl-setup",
+      "name": "Setup",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t1-hello",
+          "name": "Create hello.ts",
+          "prompt": "Create a file called hello.ts that exports a function greet(name: string): string which returns `Hello, ${name}!`. Keep it simple, just the function and export."
+        },
+        {
+          "id": "t2-test",
+          "name": "Add a test",
+          "prompt": "Create hello.test.ts that imports greet from ./hello and tests it with a few assertions using Node's built-in assert module. Test with 'World' and an empty string.",
+          "dependsOn": ["t1-hello"]
+        }
+      ]
+    },
+    {
+      "id": "pl-verify",
+      "name": "Verify",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t3-run-test",
+          "name": "Run the test",
+          "prompt": "Run the test file hello.test.ts using ts-node or tsx. If it passes, print 'All tests passed'. If there are any issues with the test, fix them.",
+          "dependsOn": ["t2-test"],
+          "verifyCommand": "node -e \"require('assert').ok(true)\""
+        }
+      ]
+    }
+  ]
+}

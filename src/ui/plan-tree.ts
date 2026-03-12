@@ -93,7 +93,9 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
         );
         item.iconPath = this.taskIcon(task);
         item.tooltip = task.prompt.substring(0, 200);
-        item.description = task.engine ?? '';
+        const type = task.type ?? 'agent';
+        const runtime = type === 'agent' ? (task.engine ?? '') : type;
+        item.description = runtime;
         return item;
       });
     }
@@ -105,7 +107,9 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
     const allDone = pl.tasks.length > 0 && pl.tasks.every(t => t.status === TaskStatus.Completed);
     const anyRunning = pl.tasks.some(t => t.status === TaskStatus.Running);
     const anyFailed = pl.tasks.some(t => t.status === TaskStatus.Failed);
+    const anyBlocked = pl.tasks.some(t => t.status === TaskStatus.Blocked);
     if (anyRunning) { return new vscode.ThemeIcon('loading~spin'); }
+    if (anyBlocked) { return new vscode.ThemeIcon('debug-disconnect'); }
     if (anyFailed) { return new vscode.ThemeIcon('error'); }
     if (allDone) { return new vscode.ThemeIcon('check-all'); }
     return new vscode.ThemeIcon('list-unordered');
@@ -118,6 +122,7 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
       case TaskStatus.Paused: return new vscode.ThemeIcon('debug-pause');
       case TaskStatus.Completed: return new vscode.ThemeIcon('check');
       case TaskStatus.Failed: return new vscode.ThemeIcon('error');
+      case TaskStatus.Blocked: return new vscode.ThemeIcon('debug-disconnect');
       case TaskStatus.Skipped: return new vscode.ThemeIcon('circle-slash');
       default: return new vscode.ThemeIcon('circle-outline');
     }

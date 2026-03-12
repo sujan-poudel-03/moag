@@ -69,7 +69,11 @@ export class HistoryTreeProvider implements vscode.TreeDataProvider<HistoryTreeI
         vscode.TreeItemCollapsibleState.None,
       );
       item.iconPath = new vscode.ThemeIcon(
-        entry.status === TaskStatus.Completed ? 'check' : 'error',
+        entry.status === TaskStatus.Completed
+          ? 'check'
+          : entry.status === TaskStatus.Blocked
+            ? 'debug-disconnect'
+            : 'error',
       );
       item.description = `${time} | ${entry.engine} | ${entry.result.durationMs}ms`;
       item.tooltip = new vscode.MarkdownString(

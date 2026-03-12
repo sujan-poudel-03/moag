@@ -473,6 +473,8 @@ npm run package    # produces a .vsix file
 - Multi-workspace plan management
 - Conditional task execution (run only if previous output matches pattern)
 
+For the product direction beyond the current feature list, see [docs/local-first-roadmap.md](docs/local-first-roadmap.md). It lays out the local-first execution strategy for `v0.6.0` through `v1.0.0`, including implementation order and release/deployment steps.
+
 ---
 
 ## License

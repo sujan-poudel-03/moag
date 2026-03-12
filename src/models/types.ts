@@ -3,6 +3,12 @@
 /** Supported agent engine identifiers */
 export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom';
 
+/** Supported task execution modes */
+export type TaskType = 'agent' | 'command' | 'service' | 'check';
+
+/** How the runner should react when a task fails */
+export type FailurePolicy = 'stop' | 'continue' | 'mark-blocked';
+
 /** Status of a task in the execution lifecycle */
 export enum TaskStatus {
   Pending = 'pending',
@@ -11,6 +17,7 @@ export enum TaskStatus {
   Completed = 'completed',
   Failed = 'failed',
   Skipped = 'skipped',
+  Blocked = 'blocked',
 }
 
 /** Status of the overall runner state machine */
@@ -26,14 +33,36 @@ export interface Task {
   id: string;
   name: string;
   prompt: string;
+  /** Execution mode for this task */
+  type?: TaskType;
   /** Optional engine override — falls back to playlist/global default */
   engine?: EngineId;
+  /** Command to run for command/check/service tasks */
+  command?: string;
   /** Working directory override relative to workspace root */
   cwd?: string;
+  /** Environment variable overrides for local execution */
+  env?: Record<string, string>;
   /** File references to include as context */
   files?: string[];
+  /** Success criteria shown in the dashboard and checked by the operator */
+  acceptanceCriteria?: string[];
   /** Optional shell command to verify the task result */
   verifyCommand?: string;
+  /** Files or outputs expected after the task completes */
+  expectedArtifacts?: string[];
+  /** Owner guidance or review notes */
+  ownerNote?: string;
+  /** How to handle failures for this task */
+  failurePolicy?: FailurePolicy;
+  /** Port that should be opened by a service/check task */
+  port?: number;
+  /** Regex/text that indicates a background service is ready */
+  readyPattern?: string;
+  /** HTTP endpoint to probe for service readiness */
+  healthCheckUrl?: string;
+  /** Startup timeout override for service tasks */
+  startupTimeoutMs?: number;
   /** Number of times to retry on failure (default 0 = no retry) */
   retryCount?: number;
   /** Task IDs that must complete before this task runs */
@@ -75,6 +104,8 @@ export interface EngineResult {
   exitCode: number;
   /** Duration in milliseconds */
   durationMs: number;
+  /** Human-readable execution summary */
+  summary?: string;
   /** Token usage stats (when available from the engine) */
   tokenUsage?: TokenUsage;
   /** The CLI command that was executed (without the prompt body) */
@@ -93,6 +124,22 @@ export interface TokenUsage {
   estimatedCost?: number;
 }
 
+/** Result of a verification command */
+export interface VerificationResult {
+  command: string;
+  exitCode: number;
+  output: string;
+  durationMs: number;
+  passed: boolean;
+}
+
+/** Artifact evidence recorded for a task run */
+export interface TaskArtifact {
+  target: string;
+  exists: boolean;
+  resolvedPath?: string;
+}
+
 /** A single entry in the execution history log */
 export interface HistoryEntry {
   id: string;
@@ -101,6 +148,7 @@ export interface HistoryEntry {
   playlistId: string;
   playlistName: string;
   engine: EngineId;
+  taskType?: TaskType;
   prompt: string;
   result: EngineResult;
   status: TaskStatus;
@@ -112,10 +160,20 @@ export interface HistoryEntry {
   changedFiles?: string[];
   /** Unified diff of code changes made during task execution */
   codeChanges?: string;
+  verification?: VerificationResult;
+  artifacts?: TaskArtifact[];
+  failurePolicy?: FailurePolicy;
+  ownerNote?: string;
   /** Groups related turns; first entry uses threadId = id */
   threadId?: string;
   /** 0 = original, 1 = first reply, etc. */
   turnIndex?: number;
+  /** Groups entries from the same runner.play() invocation */
+  runId?: string;
+  /** Which model was used (e.g., "claude-sonnet-4") */
+  modelId?: string;
+  /** Why this model was selected by auto-selection */
+  modelReason?: string;
 }
 
 /** Serializable plan file format (status fields stripped) */
@@ -141,10 +199,23 @@ export interface PlanFileTask {
   id: string;
   name: string;
   prompt: string;
+  type?: TaskType;
   engine?: EngineId;
+  command?: string;
   cwd?: string;
+  env?: Record<string, string>;
   files?: string[];
+  acceptanceCriteria?: string[];
   verifyCommand?: string;
+  expectedArtifacts?: string[];
+  ownerNote?: string;
+  failurePolicy?: FailurePolicy;
+  port?: number;
+  readyPattern?: string;
+  healthCheckUrl?: string;
+  startupTimeoutMs?: number;
   retryCount?: number;
   dependsOn?: string[];
+  /** Persisted execution status (omitted or 'pending' means not yet run) */
+  status?: string;
 }

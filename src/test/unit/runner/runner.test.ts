@@ -19,6 +19,82 @@ const mockEngineResult: EngineResult = {
 let engineRunStub: sinon.SinonStub;
 let spawnStub: sinon.SinonStub;
 
+function createSpawnProc(options?: {
+  stdoutChunks?: string[];
+  stderrChunks?: string[];
+  closeCode?: number;
+  keepOpen?: boolean;
+}) {
+  const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+  const stdoutHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+  const stderrHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
+  const proc = {
+    pid: 1234,
+    killed: false,
+    on: (event: string, handler: (...args: unknown[]) => void) => {
+      if (!handlers[event]) { handlers[event] = []; }
+      handlers[event].push(handler);
+      return proc;
+    },
+    once: (event: string, handler: (...args: unknown[]) => void) => {
+      if (!handlers[event]) { handlers[event] = []; }
+      const onceHandler = (...args: unknown[]) => {
+        handler(...args);
+        handlers[event] = (handlers[event] || []).filter(h => h !== onceHandler);
+      };
+      handlers[event].push(onceHandler);
+      return proc;
+    },
+    stdout: {
+      on: (event: string, handler: (...args: unknown[]) => void) => {
+        if (!stdoutHandlers[event]) { stdoutHandlers[event] = []; }
+        stdoutHandlers[event].push(handler);
+        return proc.stdout;
+      },
+      removeListener: (event: string, handler: (...args: unknown[]) => void) => {
+        stdoutHandlers[event] = (stdoutHandlers[event] || []).filter(h => h !== handler);
+        return proc.stdout;
+      },
+    },
+    stderr: {
+      on: (event: string, handler: (...args: unknown[]) => void) => {
+        if (!stderrHandlers[event]) { stderrHandlers[event] = []; }
+        stderrHandlers[event].push(handler);
+        return proc.stderr;
+      },
+      removeListener: (event: string, handler: (...args: unknown[]) => void) => {
+        stderrHandlers[event] = (stderrHandlers[event] || []).filter(h => h !== handler);
+        return proc.stderr;
+      },
+    },
+    removeListener: (event: string, handler: (...args: unknown[]) => void) => {
+      handlers[event] = (handlers[event] || []).filter(h => h !== handler);
+      return proc;
+    },
+    kill: sinon.stub().callsFake(() => {
+      proc.killed = true;
+      return true;
+    }),
+  };
+  // Expose handler maps for tests that need to emit service output after spawn.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (proc as any).__stdoutHandlers = stdoutHandlers;
+
+  if (!options?.keepOpen) {
+    setTimeout(() => {
+      (options?.stdoutChunks ?? []).forEach(chunk => {
+        (stdoutHandlers['data'] || []).forEach(h => h(Buffer.from(chunk)));
+      });
+      (options?.stderrChunks ?? []).forEach(chunk => {
+        (stderrHandlers['data'] || []).forEach(h => h(Buffer.from(chunk)));
+      });
+      (handlers['close'] || []).forEach(h => h(options?.closeCode ?? 0));
+    }, 5);
+  }
+
+  return proc;
+}
+
 function createMockEngine() {
   engineRunStub = sinon.stub().resolves(mockEngineResult);
   return {
@@ -42,33 +118,7 @@ function createMockHistoryStore() {
 function buildRunner() {
   const historyStore = createMockHistoryStore();
   const mockEngine = createMockEngine();
-  spawnStub = sinon.stub().callsFake(() => {
-    const handlers: Record<string, ((...args: unknown[]) => void)[]> = {};
-    const stdoutHandlers: Record<string, ((...args: unknown[]) => void)[]> = {};
-    const proc = {
-      on: (event: string, handler: (...args: unknown[]) => void) => {
-        if (!handlers[event]) { handlers[event] = []; }
-        handlers[event].push(handler);
-        return proc;
-      },
-      stdout: {
-        on: (event: string, handler: (...args: unknown[]) => void) => {
-          if (!stdoutHandlers[event]) { stdoutHandlers[event] = []; }
-          stdoutHandlers[event].push(handler);
-          return proc.stdout;
-        },
-      },
-      stderr: { on: sinon.stub() },
-      kill: sinon.stub(),
-    };
-    // Auto-fire close with code 0 on next tick (handles git commands)
-    setTimeout(() => {
-      if (handlers['close']) {
-        handlers['close'].forEach(h => h(0));
-      }
-    }, 5);
-    return proc;
-  });
+  spawnStub = sinon.stub().callsFake(() => createSpawnProc());
 
   const { TaskRunner } = proxyquire('../../../runner/runner', {
     'vscode': vscodeMock,
@@ -79,7 +129,7 @@ function buildRunner() {
       buildContext: () => '',
       getContextSettings: () => ({ enabled: false }),
     },
-    'child_process': { spawn: spawnStub },
+    'child_process': { spawn: spawnStub, execSync: sinon.stub() },
   });
 
   const runner = new TaskRunner(historyStore);
@@ -336,6 +386,104 @@ describe('TaskRunner', () => {
     assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
   });
 
+  it('should execute command tasks without using an agent engine', async () => {
+    const { runner, historyStore } = buildRunner();
+    spawnStub.callsFake((command: string) => {
+      if (command === 'git') {
+        return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
+      }
+      return createSpawnProc({ stdoutChunks: ['command ok'], closeCode: 0 });
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'command';
+    plan.playlists[0].tasks[0].command = 'npm test';
+
+    await runner.play(plan);
+
+    assert.equal(engineRunStub.callCount, 0);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    const entry = historyStore.add.firstCall.args[0];
+    assert.equal(entry.taskType, 'command');
+    assert.equal(entry.result.command, 'npm test');
+  });
+
+  it('should mark blocked when failurePolicy is mark-blocked', async () => {
+    const { runner, historyStore } = buildRunner();
+    spawnStub.callsFake((command: string) => {
+      if (command === 'git') {
+        return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
+      }
+      return createSpawnProc({ stderrChunks: ['boom'], closeCode: 1 });
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'command';
+    plan.playlists[0].tasks[0].command = 'npm test';
+    plan.playlists[0].tasks[0].failurePolicy = 'mark-blocked';
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Blocked);
+    const entry = historyStore.add.firstCall.args[0];
+    assert.equal(entry.status, TaskStatus.Blocked);
+  });
+
+  it('should fail when expected artifacts are missing', async () => {
+    const { runner, historyStore } = buildRunner();
+    spawnStub.callsFake((command: string) => {
+      if (command === 'git') {
+        return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
+      }
+      return createSpawnProc({ stdoutChunks: ['done'], closeCode: 0 });
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'command';
+    plan.playlists[0].tasks[0].command = 'npm run build';
+    plan.playlists[0].tasks[0].expectedArtifacts = ['dist/output.js'];
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    const entry = historyStore.add.firstCall.args[0];
+    assert.equal(entry.artifacts[0].target, 'dist/output.js');
+    assert.equal(entry.artifacts[0].exists, false);
+  });
+
+  it('should keep a service task running after it becomes ready', async () => {
+    const { runner } = buildRunner();
+    const serviceProc = createSpawnProc({ keepOpen: true });
+    spawnStub.callsFake((command: string) => {
+      if (command === 'git') {
+        return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
+      }
+      setTimeout(() => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const handlers = (serviceProc as any).__stdoutHandlers;
+        if (handlers?.data) {
+          handlers.data.forEach((handler: (...args: unknown[]) => void) => handler(Buffer.from('server ready')));
+        }
+      }, 10);
+      return serviceProc;
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'service';
+    plan.playlists[0].tasks[0].command = 'npm run dev';
+    plan.playlists[0].tasks[0].readyPattern = 'server ready';
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.equal(runner.getRunningServices().length, 1);
+    runner.stopAllServices();
+  });
+
   it('should play a single task', async () => {
     const { runner } = buildRunner();
     const taskNames: string[] = [];
@@ -406,6 +554,88 @@ describe('TaskRunner', () => {
     // Both tasks should have started
     assert.ok(startedTasks.includes('Task 1'));
     assert.ok(startedTasks.includes('Task 2'));
+    assert.equal(runner.state, RunnerState.Idle);
+  });
+
+  it('should skip completed tasks on resume', async () => {
+    const { runner } = buildRunner();
+    const taskNames: string[] = [];
+    runner.on('task-started', (task: { name: string }) => taskNames.push(task.name));
+
+    const plan = makePlan();
+    // Mark first task as already completed
+    plan.playlists[0].tasks[0].status = TaskStatus.Completed;
+
+    await runner.play(plan);
+
+    // Only second task should have been executed
+    assert.deepEqual(taskNames, ['Task 2']);
+  });
+
+  it('should prevent concurrent play() via mutex', async () => {
+    const { runner } = buildRunner();
+    let startCount = 0;
+    runner.on('task-started', () => { startCount++; });
+
+    engineRunStub.callsFake(async () => {
+      await new Promise(r => setTimeout(r, 50));
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    const p1 = runner.play(plan);
+    // Immediate second call should be blocked by mutex
+    const p2 = runner.play(plan);
+    await Promise.all([p1, p2]);
+
+    // Should only have run tasks from the first play invocation
+    assert.ok(startCount <= 2, `Expected at most 2 task starts, got ${startCount}`);
+  });
+
+  it('should clean up abort controller after play finishes', async () => {
+    const { runner } = buildRunner();
+    const plan = makePlan();
+    await runner.play(plan);
+
+    // After play finishes, abort controller should be null
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    assert.equal((runner as any)._abortController, null);
+  });
+
+  it('should return to Idle after stop from pause', async () => {
+    const { runner } = buildRunner();
+    engineRunStub.callsFake(async () => {
+      await new Promise(r => setTimeout(r, 200));
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    const playPromise = runner.play(plan);
+
+    await new Promise(r => setTimeout(r, 50));
+    runner.pause();
+    await new Promise(r => setTimeout(r, 50));
+    runner.stop();
+    await playPromise;
+
+    assert.equal(runner.state, RunnerState.Idle);
+  });
+
+  it('should not allow playTask when runner is busy', async () => {
+    const { runner } = buildRunner();
+    engineRunStub.callsFake(async () => {
+      await new Promise(r => setTimeout(r, 100));
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    const p1 = runner.play(plan);
+    await new Promise(r => setTimeout(r, 10));
+
+    // playTask while playing should be rejected
+    await runner.playTask(plan, 0, 0);
+    await p1;
+
     assert.equal(runner.state, RunnerState.Idle);
   });
 });

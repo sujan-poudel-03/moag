@@ -1,10 +1,14 @@
 // ─── Execution detail panel ───
-// Interactive chat-style webview that shows thread conversations with reply
-// capability, streaming responses, thread list navigation, and empty state.
+// Interactive chat-style webview with session list (Mode 1) and thread detail
+// (Mode 2).  Inspired by Copilot Chat sessions / Codex tasks / Claude Code
+// conversations panels — shows execution history with model info, cost, tokens,
+// retries, diffs, and a reply-capable thread view.
 
 import * as vscode from 'vscode';
 import { HistoryEntry, EngineId, TaskStatus } from '../models/types';
 import { HistoryStore } from '../history/store';
+import { RunSession, RunSessionStore } from '../models/run-session';
+import { getModelSpec, ModelSpec, getAllModelSpecs } from '../models/model-specs';
 import { getEngine } from '../adapters/index';
 import { generateId } from '../models/plan';
 
@@ -14,6 +18,7 @@ const openPanels = new Map<string, ExecutionDetailPanel>();
 export class ExecutionDetailPanel {
   private readonly _panel: vscode.WebviewPanel;
   private readonly _historyStore: HistoryStore;
+  private readonly _runSessionStore: RunSessionStore | null;
   private _threadId: string | null = null;
   private _abortController: AbortController | null = null;
   private _isStreaming = false;
@@ -22,9 +27,11 @@ export class ExecutionDetailPanel {
   private constructor(
     panel: vscode.WebviewPanel,
     historyStore: HistoryStore,
+    runSessionStore?: RunSessionStore,
   ) {
     this._panel = panel;
     this._historyStore = historyStore;
+    this._runSessionStore = runSessionStore ?? null;
 
     panel.onDidDispose(() => {
       this._disposed = true;
@@ -42,7 +49,7 @@ export class ExecutionDetailPanel {
   /**
    * Show (or re-reveal) a conversation panel for a history entry's thread.
    */
-  static show(entry: HistoryEntry, historyStore: HistoryStore): void {
+  static show(entry: HistoryEntry, historyStore: HistoryStore, runSessionStore?: RunSessionStore): void {
     const threadId = entry.threadId ?? entry.id;
 
     const existing = openPanels.get(threadId);
@@ -70,16 +77,16 @@ export class ExecutionDetailPanel {
       { enableScripts: true, retainContextWhenHidden: true },
     );
 
-    const instance = new ExecutionDetailPanel(panel, historyStore);
+    const instance = new ExecutionDetailPanel(panel, historyStore, runSessionStore);
     instance._threadId = threadId;
     openPanels.set(threadId, instance);
     instance._renderThread(threadId);
   }
 
   /**
-   * Show thread list / empty state when no specific entry is selected.
+   * Show thread list / session list when no specific entry is selected.
    */
-  static showEmpty(historyStore: HistoryStore): void {
+  static showEmpty(historyStore: HistoryStore, runSessionStore?: RunSessionStore): void {
     const existing = openPanels.get('__empty__');
     if (existing) {
       existing._panel.reveal(vscode.ViewColumn.Active);
@@ -89,19 +96,19 @@ export class ExecutionDetailPanel {
 
     const panel = vscode.window.createWebviewPanel(
       'agentTaskPlayerDetail',
-      'Conversations',
+      'Sessions',
       vscode.ViewColumn.Active,
       { enableScripts: true, retainContextWhenHidden: true },
     );
 
-    const instance = new ExecutionDetailPanel(panel, historyStore);
+    const instance = new ExecutionDetailPanel(panel, historyStore, runSessionStore);
     openPanels.set('__empty__', instance);
     instance._renderEmpty();
   }
 
   // ─── Message handling ───
 
-  private async _handleMessage(msg: { type: string; text?: string; threadId?: string }): Promise<void> {
+  private async _handleMessage(msg: { type: string; text?: string; threadId?: string; runId?: string; engine?: string }): Promise<void> {
     switch (msg.type) {
       case 'send-reply':
         if (msg.text && this._threadId) {
@@ -116,9 +123,24 @@ export class ExecutionDetailPanel {
           this._navigateToThread(msg.threadId);
         }
         break;
+      case 'open-run':
+        if (msg.runId) {
+          this._navigateToRun(msg.runId);
+        }
+        break;
       case 'delete-thread':
         if (msg.threadId) {
           this._deleteThread(msg.threadId);
+        }
+        break;
+      case 'delete-run':
+        if (msg.runId) {
+          this._deleteRun(msg.runId);
+        }
+        break;
+      case 'new-conversation':
+        if (msg.text) {
+          await this._startNewConversation(msg.text, (msg.engine || 'claude') as EngineId);
         }
         break;
     }
@@ -130,19 +152,17 @@ export class ExecutionDetailPanel {
     }
     this._threadId = null;
     openPanels.set('__empty__', this);
-    this._panel.title = 'Conversations';
+    this._panel.title = 'Sessions';
     this._renderEmpty();
   }
 
   private _navigateToThread(threadId: string): void {
-    // Clean up old key
     if (this._threadId) {
       openPanels.delete(this._threadId);
     } else {
       openPanels.delete('__empty__');
     }
 
-    // If there's already a panel for this thread, just reveal it
     const existing = openPanels.get(threadId);
     if (existing && existing !== this) {
       existing._panel.reveal(vscode.ViewColumn.Active);
@@ -157,7 +177,24 @@ export class ExecutionDetailPanel {
     this._renderThread(threadId);
   }
 
-  // ─── Delete thread ───
+  private _navigateToRun(runId: string): void {
+    // For run view, we set threadId to `run:<runId>` to distinguish from threads
+    const key = `run:${runId}`;
+    if (this._threadId) {
+      openPanels.delete(this._threadId);
+    } else {
+      openPanels.delete('__empty__');
+    }
+
+    this._threadId = key;
+    openPanels.set(key, this);
+
+    const session = this._runSessionStore?.get(runId);
+    this._panel.title = session?.planName ?? 'Run Details';
+    this._renderRun(runId);
+  }
+
+  // ─── Delete ───
 
   private async _deleteThread(threadId: string): Promise<void> {
     const confirm = await vscode.window.showWarningMessage(
@@ -169,12 +206,89 @@ export class ExecutionDetailPanel {
 
     this._historyStore.deleteThread(threadId);
 
-    // If we're viewing the thread we just deleted, go back to thread list
     if (this._threadId === threadId) {
       this._navigateToEmpty();
     } else {
-      // Refresh the thread list to remove the deleted card
       this._renderEmpty();
+    }
+  }
+
+  private async _deleteRun(runId: string): Promise<void> {
+    const confirm = await vscode.window.showWarningMessage(
+      'Delete this run session? This cannot be undone.',
+      { modal: true },
+      'Delete',
+    );
+    if (confirm !== 'Delete') { return; }
+
+    this._runSessionStore?.delete(runId);
+    this._navigateToEmpty();
+  }
+
+  // ─── New conversation from session list ───
+
+  private async _startNewConversation(text: string, engineId: EngineId): Promise<void> {
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const id = generateId();
+    const taskName = text.length > 60 ? text.substring(0, 57) + '...' : text;
+    const startedAt = new Date().toISOString();
+
+    // Navigate to the thread immediately (will show empty, then stream)
+    this._threadId = id;
+    if (this._threadId) { openPanels.delete('__empty__'); }
+    openPanels.set(id, this);
+    this._panel.title = taskName;
+
+    // Build a minimal thread view with streaming
+    this._panel.webview.html = buildThreadHtml([]);
+    this._postMessage({ type: 'user-message', text });
+    this._postMessage({ type: 'stream-start', engine: engineId });
+
+    this._isStreaming = true;
+    this._abortController = new AbortController();
+
+    try {
+      const engine = getEngine(engineId);
+      const result = await engine.runTask({
+        prompt: text,
+        cwd,
+        signal: this._abortController.signal,
+        onOutput: (chunk, stream) => {
+          if (!this._disposed && stream === 'stdout') {
+            this._postMessage({ type: 'stream-chunk', text: chunk });
+          }
+        },
+      });
+
+      const entry: HistoryEntry = {
+        id,
+        taskId: id,
+        taskName,
+        playlistId: 'conversation',
+        playlistName: 'Conversations',
+        engine: engineId,
+        prompt: text,
+        result,
+        status: result.exitCode === 0 ? TaskStatus.Completed : TaskStatus.Failed,
+        startedAt,
+        finishedAt: new Date().toISOString(),
+        threadId: id,
+        turnIndex: 0,
+      };
+
+      this._historyStore.add(entry);
+
+      if (!this._disposed) {
+        this._postMessage({ type: 'stream-end', entry });
+      }
+    } catch (err) {
+      if (!this._disposed) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        this._postMessage({ type: 'stream-error', error: errMsg });
+      }
+    } finally {
+      this._isStreaming = false;
+      this._abortController = null;
     }
   }
 
@@ -192,7 +306,6 @@ export class ExecutionDetailPanel {
     const engineId: EngineId = firstEntry.engine;
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
 
-    // Show the user message and streaming indicator immediately
     this._postMessage({ type: 'user-message', text });
     this._postMessage({ type: 'stream-start', engine: engineId });
 
@@ -201,7 +314,6 @@ export class ExecutionDetailPanel {
     try {
       const engine = getEngine(engineId);
 
-      // Build context from prior turns
       let contextPrompt = '';
       for (const entry of threadEntries) {
         contextPrompt += `User: ${entry.prompt}\n\nAssistant: ${entry.result.stdout}\n\n`;
@@ -268,8 +380,15 @@ export class ExecutionDetailPanel {
   }
 
   private _renderEmpty(): void {
-    const heads = this._historyStore.getThreadHeads().slice(0, 10);
-    this._panel.webview.html = buildEmptyHtml(heads);
+    const heads = this._historyStore.getThreadHeads().slice(0, 20);
+    const sessions = this._runSessionStore?.getAll().slice(0, 20) ?? [];
+    this._panel.webview.html = buildSessionListHtml(heads, sessions);
+  }
+
+  private _renderRun(runId: string): void {
+    const session = this._runSessionStore?.get(runId);
+    const entries = this._historyStore.getForRun(runId);
+    this._panel.webview.html = buildRunDetailHtml(session ?? null, entries);
   }
 }
 
@@ -285,8 +404,16 @@ function escHtml(text: string): string {
 
 function formatDuration(ms: number): string {
   if (ms < 1000) { return `${ms}ms`; }
-  const secs = (ms / 1000).toFixed(1);
-  return `${secs}s`;
+  if (ms < 60_000) { return `${(ms / 1000).toFixed(1)}s`; }
+  const mins = Math.floor(ms / 60_000);
+  const secs = Math.floor((ms % 60_000) / 1000);
+  return `${mins}m ${secs}s`;
+}
+
+function formatDurationFromIso(startedAt: string, finishedAt?: string): string {
+  if (!finishedAt) { return 'running...'; }
+  const ms = new Date(finishedAt).getTime() - new Date(startedAt).getTime();
+  return formatDuration(ms);
 }
 
 function timeAgo(isoDate: string): string {
@@ -298,6 +425,39 @@ function timeAgo(isoDate: string): string {
   if (hours < 24) { return `${hours}h ago`; }
   const days = Math.floor(hours / 24);
   return `${days}d ago`;
+}
+
+function formatCost(cost: number): string {
+  if (cost === 0) { return 'Free'; }
+  if (cost < 0.01) { return `$${cost.toFixed(4)}`; }
+  return `$${cost.toFixed(2)}`;
+}
+
+function formatTokens(count: number): string {
+  if (count >= 1_000_000) { return `${(count / 1_000_000).toFixed(1)}M`; }
+  if (count >= 1_000) { return `${(count / 1_000).toFixed(1)}K`; }
+  return `${count}`;
+}
+
+function engineBadgeClass(engine: EngineId): string {
+  const map: Record<string, string> = {
+    claude: 'engine-claude',
+    codex: 'engine-codex',
+    gemini: 'engine-gemini',
+    ollama: 'engine-ollama',
+    custom: 'engine-custom',
+  };
+  return map[engine] || 'engine-custom';
+}
+
+function reasoningBadge(level: string): string {
+  const icons: Record<string, string> = {
+    low: '&#9679;',
+    medium: '&#9679;&#9679;',
+    high: '&#9679;&#9679;&#9679;',
+    'extra-high': '&#9679;&#9679;&#9679;&#9679;',
+  };
+  return icons[level] || '';
 }
 
 function colorDiff(diff: string): string {
@@ -322,94 +482,197 @@ function colorDiff(diff: string): string {
     .join('\n');
 }
 
-function buildEntrySections(entry: HistoryEntry): string {
-  let sectionsHtml = '';
+// ─── Mode 1: Session List HTML ───
 
-  if (entry.changedFiles && entry.changedFiles.length > 0) {
-    const fileItems = entry.changedFiles.map(f => `<li>${escHtml(f)}</li>`).join('');
-    sectionsHtml += `
-    <details class="section">
-      <summary>Changed Files (${entry.changedFiles.length})</summary>
-      <ul class="file-list">${fileItems}</ul>
-    </details>`;
+function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[]): string {
+  // Active session (if any)
+  const activeSession = sessions.find(s => s.status === 'running');
+  const pastSessions = sessions.filter(s => s.status !== 'running');
+
+  let html = '';
+
+  // Active run card
+  if (activeSession) {
+    const progress = activeSession.taskCount > 0
+      ? Math.round((activeSession.tasksCompleted / activeSession.taskCount) * 100)
+      : 0;
+    html += `
+    <div class="active-run-card">
+      <div class="active-run-indicator">
+        <span class="pulse-dot"></span>
+        <span class="active-run-label">Running</span>
+      </div>
+      <div class="active-run-title">${escHtml(activeSession.planName)}</div>
+      <div class="progress-bar-container">
+        <div class="progress-bar" style="width: ${progress}%"></div>
+      </div>
+      <div class="active-run-stats">
+        <span>${activeSession.tasksCompleted}/${activeSession.taskCount} tasks</span>
+        <span>${activeSession.engines.map(e => `<span class="engine-pill ${engineBadgeClass(e)}">${escHtml(e)}</span>`).join(' ')}</span>
+        <span>${formatCost(activeSession.totalCost)}</span>
+      </div>
+      <button class="active-run-open" data-run-id="${escHtml(activeSession.id)}">View Details</button>
+    </div>`;
   }
 
-  if (entry.codeChanges) {
-    sectionsHtml += `
-    <details class="section">
-      <summary>Code Changes (Diff)</summary>
-      <pre class="diff">${colorDiff(entry.codeChanges)}</pre>
-    </details>`;
-  }
+  // Section: Past Sessions
+  if (pastSessions.length > 0) {
+    html += `<div class="section-header">Recent Sessions</div>`;
+    html += `<div class="session-list">`;
+    for (const session of pastSessions) {
+      const statusClass = session.status === 'completed' ? 'status-ok'
+        : session.status === 'failed' ? 'status-fail'
+        : 'status-stopped';
+      const statusLabel = session.status === 'completed' ? 'Completed'
+        : session.status === 'failed' ? 'Failed'
+        : 'Stopped';
+      const duration = formatDurationFromIso(session.startedAt, session.finishedAt);
+      const enginePills = session.engines.map(e =>
+        `<span class="engine-pill ${engineBadgeClass(e)}">${escHtml(e)}</span>`
+      ).join(' ');
 
-  if (entry.result.tokenUsage) {
-    const u = entry.result.tokenUsage;
-    const parts: string[] = [];
-    if (u.inputTokens !== undefined) { parts.push(`Input: ${u.inputTokens}`); }
-    if (u.outputTokens !== undefined) { parts.push(`Output: ${u.outputTokens}`); }
-    if (u.totalTokens !== undefined) { parts.push(`Total: ${u.totalTokens}`); }
-    if (u.estimatedCost !== undefined) { parts.push(`Cost: $${u.estimatedCost.toFixed(4)}`); }
-    if (parts.length > 0) {
-      sectionsHtml += `
-      <details class="section">
-        <summary>Token Usage</summary>
-        <pre class="tokens">${escHtml(parts.join('  |  '))}</pre>
-      </details>`;
+      html += `
+      <div class="session-card" data-run-id="${escHtml(session.id)}">
+        <div class="session-card-row">
+          <div class="session-card-title">${escHtml(session.planName)}</div>
+          <button class="card-delete" data-run-id="${escHtml(session.id)}" title="Delete session">&#x2715;</button>
+        </div>
+        <div class="session-card-meta">
+          <span class="badge-sm ${statusClass}">${statusLabel}</span>
+          ${enginePills}
+          <span class="meta-sep">&middot;</span>
+          <span>${session.tasksCompleted}/${session.taskCount} tasks</span>
+          <span class="meta-sep">&middot;</span>
+          <span>${duration}</span>
+        </div>
+        <div class="session-card-bottom">
+          <span class="token-info">
+            ${formatTokens(session.totalTokensIn)} in / ${formatTokens(session.totalTokensOut)} out
+          </span>
+          <span class="cost-info">${formatCost(session.totalCost)}</span>
+          <span class="time-ago">${timeAgo(session.startedAt)}</span>
+        </div>
+      </div>`;
     }
+    html += `</div>`;
   }
 
-  if (entry.result.stderr && entry.result.stderr.trim()) {
-    sectionsHtml += `
-    <details class="section">
-      <summary>Stderr</summary>
-      <pre class="stderr">${escHtml(entry.result.stderr)}</pre>
-    </details>`;
+  // Section: Threads (conversations)
+  if (threadHeads.length > 0) {
+    html += `<div class="section-header">Conversations</div>`;
+    html += `<div class="thread-list">`;
+    for (const head of threadHeads) {
+      const tid = head.threadId ?? head.id;
+      const ago = timeAgo(head.startedAt);
+      const modelSpec = head.modelId ? getModelSpec(head.modelId) : null;
+      const engineClass = engineBadgeClass(head.engine);
+
+      html += `
+      <div class="thread-card" data-thread-id="${escHtml(tid)}">
+        <div class="thread-card-row">
+          <div class="thread-card-title">${escHtml(head.taskName)}</div>
+          <button class="card-delete" data-thread-id="${escHtml(tid)}" title="Delete conversation">&#x2715;</button>
+        </div>
+        <div class="thread-card-meta">
+          <span class="engine-pill ${engineClass}">${escHtml(head.engine)}</span>
+          ${modelSpec ? `<span class="model-label">${escHtml(modelSpec.displayName)}</span>` : ''}
+          <span class="meta-sep">&middot;</span>
+          <span>${ago}</span>
+        </div>
+      </div>`;
+    }
+    html += `</div>`;
   }
 
-  return sectionsHtml;
-}
+  // Empty state if nothing at all
+  if (!activeSession && pastSessions.length === 0 && threadHeads.length === 0) {
+    html += `
+    <div class="empty-hint-container">
+      <div class="empty-icon">&#9654;</div>
+      <p class="empty-hint-title">No sessions yet</p>
+      <p class="empty-hint-text">Run a task from the Plan view to start a new session.</p>
+    </div>`;
+  }
 
-function buildBubblePair(entry: HistoryEntry): string {
-  const statusLabel = entry.status === 'completed' ? 'Completed' : 'Failed';
-  const statusClass = entry.status === 'completed' ? 'status-ok' : 'status-fail';
-  const duration = formatDuration(entry.result.durationMs);
-  const sections = buildEntrySections(entry);
-
-  return `
-    <!-- User prompt -->
-    <div class="bubble-row user">
-      <div>
-        <div class="bubble-label">You</div>
-        <div class="bubble">${escHtml(entry.prompt)}</div>
+  return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sessions</title>
+  <style>${sharedStyles()}</style>
+</head>
+<body>
+  <div class="session-list-container">
+    <div class="panel-header">
+      <div class="panel-header-row">
+        <h2>Sessions</h2>
+      </div>
+      <div class="search-bar">
+        <input type="text" id="searchInput" placeholder="Search sessions and conversations..." />
       </div>
     </div>
+    <div id="filterable-content">
+      ${html}
+    </div>
+  </div>
 
-    <!-- Assistant response -->
-    <div class="bubble-row assistant">
-      <div>
-        <div class="bubble-label">
-          ${escHtml(entry.engine)}
-          <span class="badge ${statusClass}">${statusLabel}</span>
-          <span class="detail">${duration}</span>
-        </div>
-        <div class="bubble">${escHtml(entry.result.stdout || '(no output)')}</div>
-        ${sections ? `<div class="bubble-sections">${sections}</div>` : ''}
-      </div>
-    </div>`;
+  <!-- Footer input bar -->
+  <div class="footer-input-bar">
+    <select id="enginePicker" class="engine-select">
+      <option value="claude">Claude</option>
+      <option value="codex">Codex</option>
+      <option value="gemini">Gemini</option>
+      <option value="ollama">Ollama</option>
+    </select>
+    <input type="text" id="newPromptInput" class="footer-prompt-input" placeholder="Start a new conversation..." />
+    <button id="btnNewConversation" class="footer-send-btn" title="Start conversation">&#9654;</button>
+  </div>
+
+  <script>${sessionListScript()}</script>
+</body>
+</html>`;
 }
 
-// ─── Thread conversation HTML ───
+// ─── Mode 2: Thread Detail HTML ───
 
 function buildThreadHtml(entries: HistoryEntry[]): string {
   const title = entries.length > 0 ? escHtml(entries[0].taskName) : 'Conversation';
-  const engine = entries.length > 0 ? escHtml(entries[0].engine) : '';
+  const engine = entries.length > 0 ? entries[0].engine : '';
   const turnCount = entries.length;
   const threadId = entries.length > 0 ? escHtml(entries[0].threadId ?? entries[0].id) : '';
 
-  let bubblesHtml = '';
+  // Compute thread-level summary
+  let totalTokensIn = 0, totalTokensOut = 0, totalCost = 0, totalDuration = 0;
+  const enginesUsed = new Set<string>();
+  const modelsUsed = new Set<string>();
+
   for (const entry of entries) {
-    bubblesHtml += buildBubblePair(entry);
+    enginesUsed.add(entry.engine);
+    if (entry.modelId) { modelsUsed.add(entry.modelId); }
+    if (entry.result.tokenUsage) {
+      totalTokensIn += entry.result.tokenUsage.inputTokens ?? 0;
+      totalTokensOut += entry.result.tokenUsage.outputTokens ?? 0;
+      totalCost += entry.result.tokenUsage.estimatedCost ?? 0;
+    }
+    totalDuration += entry.result.durationMs;
   }
+
+  // Build turn cards
+  let turnsHtml = '';
+  for (const entry of entries) {
+    turnsHtml += buildTurnCard(entry);
+  }
+
+  // Thread summary bar
+  const summaryHtml = entries.length > 0 ? `
+  <div class="thread-summary">
+    <span class="engine-pill ${engineBadgeClass(engine as EngineId)}">${escHtml(engine)}</span>
+    <span class="summary-stat">${turnCount} turn${turnCount !== 1 ? 's' : ''}</span>
+    <span class="summary-stat">${formatTokens(totalTokensIn)} in / ${formatTokens(totalTokensOut)} out</span>
+    <span class="summary-stat">${formatCost(totalCost)}</span>
+    <span class="summary-stat">${formatDuration(totalDuration)}</span>
+  </div>` : '';
 
   return /* html */ `<!DOCTYPE html>
 <html lang="en">
@@ -423,17 +686,18 @@ function buildThreadHtml(entries: HistoryEntry[]): string {
 
   <!-- Nav bar -->
   <div class="nav-bar">
-    <button class="nav-back" id="btnBack" title="Back to thread list">&#8592; Threads</button>
+    <button class="nav-back" id="btnBack" title="Back to sessions">&#8592; Sessions</button>
     <div class="nav-title">
       <strong>${title}</strong>
-      <span class="nav-meta">${engine} &middot; ${turnCount} turn${turnCount !== 1 ? 's' : ''}</span>
     </div>
-    <button class="nav-delete" id="btnDelete" data-thread-id="${threadId}" title="Delete this conversation">Delete</button>
+    <button class="nav-delete" id="btnDelete" data-thread-id="${threadId}" title="Delete conversation">Delete</button>
   </div>
+
+  ${summaryHtml}
 
   <!-- Chat area -->
   <div class="chat" id="chatArea">
-    ${bubblesHtml}
+    ${turnsHtml}
     <!-- Streaming bubble (hidden by default) -->
     <div class="bubble-row assistant streaming-row" id="streamingRow" style="display:none;">
       <div>
@@ -454,29 +718,189 @@ function buildThreadHtml(entries: HistoryEntry[]): string {
 </html>`;
 }
 
-// ─── Empty / thread list HTML ───
+/** Build a rich turn card for a single history entry */
+function buildTurnCard(entry: HistoryEntry): string {
+  const statusLabel = entry.status === 'completed' ? 'Completed'
+    : entry.status === 'blocked' ? 'Blocked'
+    : entry.status === 'failed' ? 'Failed'
+    : entry.status;
+  const statusClass = entry.status === 'completed' ? 'status-ok'
+    : entry.status === 'blocked' ? 'status-warn'
+    : 'status-fail';
+  const duration = formatDuration(entry.result.durationMs);
 
-function buildEmptyHtml(threadHeads: HistoryEntry[]): string {
-  let cardsHtml = '';
-  if (threadHeads.length > 0) {
-    cardsHtml = '<div class="thread-list">';
-    for (const head of threadHeads) {
-      const tid = head.threadId ?? head.id;
-      const ago = timeAgo(head.startedAt);
-      cardsHtml += `
-      <div class="thread-card" data-thread-id="${escHtml(tid)}">
-        <div class="thread-card-header">
-          <div class="thread-card-title">${escHtml(head.taskName)}</div>
-          <button class="thread-card-delete" data-thread-id="${escHtml(tid)}" title="Delete conversation">&#x2715;</button>
+  const modelSpec = entry.modelId ? getModelSpec(entry.modelId) : null;
+  const engineClass = engineBadgeClass(entry.engine);
+
+  // Model info line
+  let modelLine = `<span class="engine-pill ${engineClass}">${escHtml(entry.engine)}</span>`;
+  if (modelSpec) {
+    modelLine += ` <span class="model-label">${escHtml(modelSpec.displayName)}</span>`;
+    modelLine += ` <span class="reasoning-dots" title="${escHtml(modelSpec.reasoning)} reasoning">${reasoningBadge(modelSpec.reasoning)}</span>`;
+  } else if (entry.modelId) {
+    modelLine += ` <span class="model-label">${escHtml(entry.modelId)}</span>`;
+  }
+
+  // Token info
+  let tokenLine = '';
+  if (entry.result.tokenUsage) {
+    const u = entry.result.tokenUsage;
+    const parts: string[] = [];
+    if (u.inputTokens !== undefined) { parts.push(`${formatTokens(u.inputTokens)} in`); }
+    if (u.outputTokens !== undefined) { parts.push(`${formatTokens(u.outputTokens)} out`); }
+    if (u.estimatedCost !== undefined) { parts.push(formatCost(u.estimatedCost)); }
+    tokenLine = parts.join(' &middot; ');
+  }
+
+  // Auto-selection reason
+  let reasonLine = '';
+  if (entry.modelReason) {
+    reasonLine = `<div class="auto-select-reason" title="${escHtml(entry.modelReason)}">Auto: ${escHtml(entry.modelReason)}</div>`;
+  }
+
+  // Changed files
+  let filesHtml = '';
+  if (entry.changedFiles && entry.changedFiles.length > 0) {
+    const fileItems = entry.changedFiles.map(f => `<li>${escHtml(f)}</li>`).join('');
+    filesHtml = `
+    <details class="section">
+      <summary>Files Changed (${entry.changedFiles.length})</summary>
+      <ul class="file-list">${fileItems}</ul>
+    </details>`;
+  }
+
+  // Diff
+  let diffHtml = '';
+  if (entry.codeChanges) {
+    diffHtml = `
+    <details class="section">
+      <summary>Diff</summary>
+      <pre class="diff">${colorDiff(entry.codeChanges)}</pre>
+    </details>`;
+  }
+
+  // Verification
+  let verifyHtml = '';
+  if (entry.verification) {
+    const vClass = entry.verification.passed ? 'verify-pass' : 'verify-fail';
+    verifyHtml = `
+    <details class="section">
+      <summary class="${vClass}">Verification ${entry.verification.passed ? 'Passed' : 'Failed'}</summary>
+      <pre>${escHtml(`$ ${entry.verification.command}\nexit ${entry.verification.exitCode}\n${entry.verification.output}`)}</pre>
+    </details>`;
+  }
+
+  // Stderr
+  let stderrHtml = '';
+  if (entry.result.stderr && entry.result.stderr.trim()) {
+    stderrHtml = `
+    <details class="section">
+      <summary>Stderr</summary>
+      <pre class="stderr">${escHtml(entry.result.stderr)}</pre>
+    </details>`;
+  }
+
+  return `
+    <!-- User prompt -->
+    <div class="bubble-row user">
+      <div>
+        <div class="bubble-label">You</div>
+        <div class="bubble user-bubble">${escHtml(entry.prompt)}</div>
+      </div>
+    </div>
+
+    <!-- Assistant response -->
+    <div class="turn-card">
+      <div class="turn-header">
+        <div class="turn-model-row">
+          ${modelLine}
+          <span class="badge-sm ${statusClass}">${statusLabel}</span>
+          <span class="turn-duration">${duration}</span>
         </div>
-        <div class="thread-card-meta">
-          <span>${escHtml(head.engine)}</span>
-          <span>&middot;</span>
-          <span>${ago}</span>
-        </div>
-      </div>`;
+        ${tokenLine ? `<div class="turn-token-row">${tokenLine}</div>` : ''}
+        ${reasonLine}
+      </div>
+      <div class="turn-body">
+        <pre class="turn-output">${escHtml(entry.result.stdout || '(no output)')}</pre>
+      </div>
+      <div class="turn-sections">
+        ${filesHtml}${diffHtml}${verifyHtml}${stderrHtml}
+      </div>
+    </div>`;
+}
+
+// ─── Run Detail HTML (session view with all tasks) ───
+
+function buildRunDetailHtml(session: RunSession | null, entries: HistoryEntry[]): string {
+  if (!session) {
+    return buildErrorHtml('Run session not found');
+  }
+
+  const statusClass = session.status === 'completed' ? 'status-ok'
+    : session.status === 'failed' ? 'status-fail'
+    : session.status === 'running' ? 'status-running'
+    : 'status-stopped';
+  const statusLabel = session.status.charAt(0).toUpperCase() + session.status.slice(1);
+  const duration = formatDurationFromIso(session.startedAt, session.finishedAt);
+  const progress = session.taskCount > 0
+    ? Math.round((session.tasksCompleted / session.taskCount) * 100)
+    : 0;
+
+  const enginePills = session.engines.map(e =>
+    `<span class="engine-pill ${engineBadgeClass(e)}">${escHtml(e)}</span>`
+  ).join(' ');
+
+  // Group entries by playlist
+  const playlistGroups = new Map<string, HistoryEntry[]>();
+  for (const entry of entries) {
+    const key = entry.playlistName || 'Default';
+    if (!playlistGroups.has(key)) { playlistGroups.set(key, []); }
+    playlistGroups.get(key)!.push(entry);
+  }
+
+  let tasksHtml = '';
+  for (const [playlistName, groupEntries] of playlistGroups) {
+    tasksHtml += `<div class="playlist-group">
+      <div class="playlist-group-header">${escHtml(playlistName)}</div>`;
+    for (const entry of groupEntries) {
+      tasksHtml += buildTurnCard(entry);
     }
-    cardsHtml += '</div>';
+    tasksHtml += `</div>`;
+  }
+
+  // Model breakdown
+  const modelCounts = new Map<string, { count: number; tokensIn: number; tokensOut: number; cost: number }>();
+  for (const entry of entries) {
+    const mid = entry.modelId || 'unknown';
+    const existing = modelCounts.get(mid) ?? { count: 0, tokensIn: 0, tokensOut: 0, cost: 0 };
+    existing.count++;
+    existing.tokensIn += entry.result.tokenUsage?.inputTokens ?? 0;
+    existing.tokensOut += entry.result.tokenUsage?.outputTokens ?? 0;
+    existing.cost += entry.result.tokenUsage?.estimatedCost ?? 0;
+    modelCounts.set(mid, existing);
+  }
+
+  let modelBreakdownHtml = '';
+  if (modelCounts.size > 0) {
+    const rows = [...modelCounts.entries()].map(([mid, stats]) => {
+      const spec = getModelSpec(mid);
+      const name = spec?.displayName ?? mid;
+      return `<tr>
+        <td>${escHtml(name)}</td>
+        <td>${stats.count}</td>
+        <td>${formatTokens(stats.tokensIn)} / ${formatTokens(stats.tokensOut)}</td>
+        <td>${formatCost(stats.cost)}</td>
+      </tr>`;
+    }).join('');
+
+    modelBreakdownHtml = `
+    <details class="section" open>
+      <summary>Model Breakdown</summary>
+      <table class="breakdown-table">
+        <thead><tr><th>Model</th><th>Tasks</th><th>Tokens (in/out)</th><th>Cost</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </details>`;
   }
 
   return /* html */ `<!DOCTYPE html>
@@ -484,19 +908,77 @@ function buildEmptyHtml(threadHeads: HistoryEntry[]): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Conversations</title>
+  <title>${escHtml(session.planName)}</title>
   <style>${sharedStyles()}</style>
 </head>
 <body>
 
-  <div class="empty-state">
-    <h2>Conversations</h2>
-    <p class="empty-subtitle">Select a thread to continue a conversation, or run a task to start a new one.</p>
-
-    ${cardsHtml || '<p class="empty-hint">No conversations yet. Run a task from the Plan view to get started.</p>'}
+  <!-- Nav bar -->
+  <div class="nav-bar">
+    <button class="nav-back" id="btnBack" title="Back to sessions">&#8592; Sessions</button>
+    <div class="nav-title">
+      <strong>${escHtml(session.planName)}</strong>
+      <span class="badge-sm ${statusClass}">${statusLabel}</span>
+    </div>
+    <button class="nav-delete" id="btnDeleteRun" data-run-id="${escHtml(session.id)}" title="Delete run">Delete</button>
   </div>
 
-  <script>${emptyScript()}</script>
+  <!-- Run summary header -->
+  <div class="run-summary-header">
+    <div class="run-summary-row">
+      ${enginePills}
+      <span class="summary-stat">${session.tasksCompleted}/${session.taskCount} tasks</span>
+      <span class="summary-stat">${session.tasksFailed} failed</span>
+      <span class="summary-stat">${duration}</span>
+    </div>
+    <div class="progress-bar-container">
+      <div class="progress-bar ${statusClass}" style="width: ${progress}%"></div>
+    </div>
+    <div class="run-summary-row">
+      <span class="summary-stat">${formatTokens(session.totalTokensIn)} in / ${formatTokens(session.totalTokensOut)} out</span>
+      <span class="summary-stat cost-highlight">${formatCost(session.totalCost)}</span>
+      <span class="summary-stat time-ago">${timeAgo(session.startedAt)}</span>
+    </div>
+  </div>
+
+  <!-- Model breakdown -->
+  <div class="run-breakdown">
+    ${modelBreakdownHtml}
+  </div>
+
+  <!-- Task cards -->
+  <div class="chat" id="chatArea">
+    ${tasksHtml || '<p class="empty-hint-text">No task entries recorded for this run.</p>'}
+  </div>
+
+  <script>${runDetailScript()}</script>
+</body>
+</html>`;
+}
+
+function buildErrorHtml(message: string): string {
+  return /* html */ `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <style>${sharedStyles()}</style>
+</head>
+<body>
+  <div class="nav-bar">
+    <button class="nav-back" id="btnBack">&#8592; Sessions</button>
+    <div class="nav-title"><strong>Error</strong></div>
+  </div>
+  <div class="empty-hint-container">
+    <p class="empty-hint-title">${escHtml(message)}</p>
+  </div>
+  <script>
+    (function() {
+      const vscode = acquireVsCodeApi();
+      document.getElementById('btnBack').addEventListener('click', () => {
+        vscode.postMessage({ type: 'navigate-back' });
+      });
+    })();
+  </script>
 </body>
 </html>`;
 }
@@ -541,8 +1023,8 @@ function sharedStyles(): string {
     .nav-back:hover {
       background: var(--vscode-button-secondaryHoverBackground, var(--vscode-list-hoverBackground));
     }
-    .nav-title { flex: 1; }
-    .nav-title strong { margin-right: 8px; }
+    .nav-title { flex: 1; display: flex; align-items: center; gap: 8px; }
+    .nav-title strong { margin-right: 4px; }
     .nav-meta { opacity: 0.6; font-size: 0.85em; }
     .nav-delete {
       background: none;
@@ -552,37 +1034,253 @@ function sharedStyles(): string {
       border-radius: 4px;
       cursor: pointer;
       font-size: 0.85em;
-      margin-left: auto;
     }
     .nav-delete:hover {
       background: var(--vscode-testing-iconFailed, #f44336);
       color: #fff;
     }
 
+    /* ── Panel header ── */
+    .panel-header {
+      padding: 16px 20px 8px;
+    }
+    .panel-header h2 {
+      font-size: 1.2em;
+      font-weight: 600;
+    }
+
+    /* ── Session list container ── */
+    .session-list-container {
+      flex: 1;
+      overflow-y: auto;
+      padding-bottom: 24px;
+    }
+
+    .section-header {
+      padding: 16px 20px 8px;
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      opacity: 0.5;
+      font-weight: 600;
+    }
+
+    /* ── Active run card ── */
+    .active-run-card {
+      margin: 12px 20px;
+      padding: 16px;
+      border-radius: 10px;
+      border: 1px solid var(--vscode-focusBorder);
+      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+      animation: active-glow 2s ease-in-out infinite;
+    }
+    @keyframes active-glow {
+      0%, 100% { border-color: var(--vscode-focusBorder); }
+      50% { border-color: var(--vscode-button-background); }
+    }
+    .active-run-indicator {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+    .pulse-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--vscode-testing-iconPassed, #4caf50);
+      animation: pulse 1.5s ease-in-out infinite;
+    }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.8); }
+    }
+    .active-run-label {
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--vscode-testing-iconPassed, #4caf50);
+      font-weight: 600;
+    }
+    .active-run-title {
+      font-weight: 600;
+      font-size: 1.05em;
+      margin-bottom: 10px;
+    }
+    .active-run-stats {
+      display: flex;
+      gap: 12px;
+      font-size: 0.85em;
+      opacity: 0.8;
+      margin-top: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+    .active-run-open {
+      margin-top: 12px;
+      padding: 6px 16px;
+      border: none;
+      border-radius: 4px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      cursor: pointer;
+      font-size: 0.85em;
+      font-weight: 600;
+    }
+    .active-run-open:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    /* ── Progress bar ── */
+    .progress-bar-container {
+      width: 100%;
+      height: 4px;
+      border-radius: 2px;
+      background: var(--vscode-editorWidget-background, rgba(255,255,255,0.1));
+      overflow: hidden;
+    }
+    .progress-bar {
+      height: 100%;
+      border-radius: 2px;
+      background: var(--vscode-button-background);
+      transition: width 0.3s ease;
+    }
+    .progress-bar.status-ok { background: var(--vscode-testing-iconPassed, #4caf50); }
+    .progress-bar.status-fail { background: var(--vscode-testing-iconFailed, #f44336); }
+    .progress-bar.status-running { background: var(--vscode-button-background); }
+
+    /* ── Session card ── */
+    .session-list, .thread-list {
+      padding: 0 20px;
+    }
+    .session-card, .thread-card {
+      padding: 12px 16px;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 8px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: background 0.15s, border-color 0.15s;
+    }
+    .session-card:hover, .thread-card:hover {
+      background: var(--vscode-list-hoverBackground);
+      border-color: var(--vscode-focusBorder);
+    }
+    .session-card-row, .thread-card-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 4px;
+    }
+    .session-card-title, .thread-card-title {
+      font-weight: 600;
+      font-size: 0.95em;
+    }
+    .session-card-meta, .thread-card-meta {
+      display: flex;
+      gap: 6px;
+      font-size: 0.8em;
+      opacity: 0.75;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .session-card-bottom {
+      display: flex;
+      gap: 12px;
+      font-size: 0.75em;
+      opacity: 0.55;
+      margin-top: 4px;
+    }
+    .meta-sep { opacity: 0.4; }
+
+    /* ── Card delete button ── */
+    .card-delete {
+      background: none;
+      border: none;
+      color: var(--vscode-editor-foreground);
+      opacity: 0;
+      cursor: pointer;
+      font-size: 1em;
+      padding: 2px 6px;
+      border-radius: 4px;
+      transition: opacity 0.15s;
+    }
+    .session-card:hover .card-delete,
+    .thread-card:hover .card-delete {
+      opacity: 0.5;
+    }
+    .card-delete:hover {
+      opacity: 1 !important;
+      color: var(--vscode-testing-iconFailed, #f44336);
+      background: var(--vscode-list-hoverBackground);
+    }
+
+    /* ── Engine pills ── */
+    .engine-pill {
+      display: inline-block;
+      padding: 1px 8px;
+      border-radius: 10px;
+      font-size: 0.75em;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .engine-claude { background: #d4a574; color: #1a1a1a; }
+    .engine-codex  { background: #74b9ff; color: #1a1a1a; }
+    .engine-gemini { background: #81ecec; color: #1a1a1a; }
+    .engine-ollama { background: #a29bfe; color: #1a1a1a; }
+    .engine-custom { background: #636e72; color: #fff; }
+
+    /* ── Badges ── */
+    .badge-sm {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 8px;
+      font-size: 0.75em;
+      font-weight: 600;
+    }
+    .status-ok { background: var(--vscode-testing-iconPassed, #4caf50); color: #fff; }
+    .status-warn { background: var(--vscode-editorWarning-foreground, #cca700); color: #000; }
+    .status-fail { background: var(--vscode-testing-iconFailed, #f44336); color: #fff; }
+    .status-stopped { background: var(--vscode-descriptionForeground, #888); color: #fff; }
+    .status-running { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
+
+    .model-label {
+      font-size: 0.85em;
+      opacity: 0.8;
+    }
+
+    .reasoning-dots {
+      font-size: 0.6em;
+      color: var(--vscode-button-background);
+      letter-spacing: -1px;
+    }
+
     /* ── Chat area ── */
     .chat {
       flex: 1;
       overflow-y: auto;
-      padding: 24px 20px;
-      max-width: 800px;
+      padding: 16px 20px;
+      max-width: 900px;
       width: 100%;
       margin: 0 auto;
     }
 
+    /* ── Bubble rows ── */
     .bubble-row {
       display: flex;
-      margin-bottom: 16px;
+      margin-bottom: 12px;
     }
     .bubble-row.user { justify-content: flex-end; }
     .bubble-row.assistant { justify-content: flex-start; }
 
     .bubble {
-      max-width: 75%;
-      padding: 12px 16px;
+      max-width: 80%;
+      padding: 10px 14px;
       border-radius: 12px;
       line-height: 1.5;
       white-space: pre-wrap;
       word-break: break-word;
+      font-size: 0.9em;
     }
     .bubble-row.user .bubble {
       background: var(--vscode-button-background);
@@ -595,46 +1293,83 @@ function sharedStyles(): string {
     }
 
     .bubble-label {
-      font-size: 0.75em;
-      opacity: 0.6;
-      margin-bottom: 4px;
+      font-size: 0.7em;
+      opacity: 0.5;
+      margin-bottom: 3px;
     }
     .bubble-row.user .bubble-label { text-align: right; }
 
-    .badge {
-      display: inline-block;
-      padding: 1px 6px;
-      border-radius: 8px;
-      font-size: 0.8em;
-      font-weight: 600;
-      margin-left: 6px;
+    /* ── Turn card (rich assistant response) ── */
+    .turn-card {
+      margin-bottom: 16px;
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 10px;
+      overflow: hidden;
     }
-    .status-ok { background: var(--vscode-testing-iconPassed, #4caf50); color: #fff; }
-    .status-fail { background: var(--vscode-testing-iconFailed, #f44336); color: #fff; }
-    .detail { opacity: 0.7; margin-left: 6px; font-size: 0.85em; }
-
-    .bubble-sections {
-      margin-top: 8px;
-      max-width: 75%;
+    .turn-header {
+      padding: 10px 14px;
+      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .turn-model-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .turn-duration {
+      font-size: 0.8em;
+      opacity: 0.6;
+      margin-left: auto;
+    }
+    .turn-token-row {
+      font-size: 0.75em;
+      opacity: 0.55;
+      margin-top: 4px;
+    }
+    .auto-select-reason {
+      font-size: 0.7em;
+      opacity: 0.45;
+      font-style: italic;
+      margin-top: 2px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .turn-body {
+      padding: 12px 14px;
+    }
+    .turn-output {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 0;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .turn-sections {
+      padding: 0 14px 8px;
     }
 
     /* ── Collapsible sections ── */
     .section {
       border: 1px solid var(--vscode-panel-border);
       border-radius: 6px;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .section summary {
       cursor: pointer;
-      padding: 8px 12px;
+      padding: 6px 10px;
       font-weight: 600;
+      font-size: 0.85em;
       user-select: none;
     }
     .section summary:hover {
       background: var(--vscode-list-hoverBackground);
     }
-    .section pre, .section ul {
-      padding: 8px 12px;
+    .section pre, .section ul, .section table {
+      padding: 8px 10px;
       margin: 0;
     }
     .section pre {
@@ -658,17 +1393,84 @@ function sharedStyles(): string {
     .diff-hunk { color: var(--vscode-gitDecoration-modifiedResourceForeground, #2196f3); }
     .diff-meta { opacity: 0.7; font-weight: bold; }
     .stderr { color: var(--vscode-testing-iconFailed, #f44336); }
-    .tokens { opacity: 0.85; }
+    .verify-pass summary { color: var(--vscode-testing-iconPassed, #4caf50); }
+    .verify-fail summary { color: var(--vscode-testing-iconFailed, #f44336); }
+
+    /* ── Breakdown table ── */
+    .breakdown-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85em;
+    }
+    .breakdown-table th {
+      text-align: left;
+      font-weight: 600;
+      opacity: 0.6;
+      padding: 4px 8px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .breakdown-table td {
+      padding: 4px 8px;
+    }
+
+    /* ── Thread summary bar ── */
+    .thread-summary {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 8px 16px;
+      font-size: 0.8em;
+      opacity: 0.7;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+    .summary-stat { white-space: nowrap; }
+    .cost-highlight { font-weight: 600; }
+
+    /* ── Run summary header ── */
+    .run-summary-header {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      flex-shrink: 0;
+    }
+    .run-summary-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      font-size: 0.85em;
+      margin-bottom: 6px;
+      flex-wrap: wrap;
+    }
+    .run-breakdown {
+      padding: 8px 20px;
+      flex-shrink: 0;
+    }
+
+    /* ── Playlist group ── */
+    .playlist-group {
+      margin-bottom: 16px;
+    }
+    .playlist-group-header {
+      font-size: 0.75em;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      opacity: 0.5;
+      font-weight: 600;
+      padding: 8px 0 4px;
+      border-bottom: 1px solid var(--vscode-panel-border);
+      margin-bottom: 12px;
+    }
 
     /* ── Input area ── */
     .input-area {
       display: flex;
       gap: 8px;
-      padding: 12px 20px;
+      padding: 10px 20px;
       border-top: 1px solid var(--vscode-panel-border);
       background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
       flex-shrink: 0;
-      max-width: 800px;
+      max-width: 900px;
       width: 100%;
       margin: 0 auto;
     }
@@ -709,80 +1511,201 @@ function sharedStyles(): string {
     .typing-indicator { opacity: 0.6; font-style: italic; }
 
     /* ── Empty state ── */
-    .empty-state {
+    .empty-hint-container {
       display: flex;
       flex-direction: column;
       align-items: center;
       padding: 48px 24px;
       text-align: center;
     }
-    .empty-state h2 {
-      margin-bottom: 8px;
+    .empty-icon {
+      font-size: 2.5em;
+      opacity: 0.15;
+      margin-bottom: 12px;
     }
-    .empty-subtitle {
-      opacity: 0.7;
-      margin-bottom: 24px;
+    .empty-hint-title {
+      font-weight: 600;
+      margin-bottom: 6px;
     }
-    .empty-hint {
+    .empty-hint-text {
       opacity: 0.5;
-      font-style: italic;
-      margin-top: 16px;
+      font-size: 0.9em;
     }
 
-    /* ── Thread list ── */
-    .thread-list {
+    .time-ago { opacity: 0.6; }
+    .token-info { font-family: var(--vscode-editor-font-family, monospace); }
+    .cost-info { font-weight: 600; }
+
+    /* ── Search bar ── */
+    .search-bar {
+      padding: 0 20px 8px;
+    }
+    .search-bar input {
       width: 100%;
-      max-width: 600px;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
     }
-    .thread-card {
-      padding: 12px 16px;
-      border: 1px solid var(--vscode-panel-border);
-      border-radius: 8px;
-      margin-bottom: 8px;
-      cursor: pointer;
-      transition: background 0.15s;
+    .search-bar input:focus {
+      outline: 1px solid var(--vscode-focusBorder);
     }
-    .thread-card:hover {
-      background: var(--vscode-list-hoverBackground);
-    }
-    .thread-card-header {
+    .panel-header-row {
       display: flex;
       align-items: center;
       justify-content: space-between;
-      margin-bottom: 4px;
     }
-    .thread-card-title {
-      font-weight: 600;
-    }
-    .thread-card-delete {
-      background: none;
-      border: none;
-      color: var(--vscode-editor-foreground);
-      opacity: 0;
-      cursor: pointer;
-      font-size: 1em;
-      padding: 2px 6px;
-      border-radius: 4px;
-      transition: opacity 0.15s;
-    }
-    .thread-card:hover .thread-card-delete {
-      opacity: 0.5;
-    }
-    .thread-card-delete:hover {
-      opacity: 1 !important;
-      color: var(--vscode-testing-iconFailed, #f44336);
-      background: var(--vscode-list-hoverBackground);
-    }
-    .thread-card-meta {
-      font-size: 0.85em;
-      opacity: 0.6;
+
+    /* ── Footer input bar ── */
+    .footer-input-bar {
       display: flex;
       gap: 6px;
+      padding: 10px 20px;
+      border-top: 1px solid var(--vscode-panel-border);
+      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+      flex-shrink: 0;
     }
+    .engine-select {
+      padding: 6px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      background: var(--vscode-dropdown-background, var(--vscode-input-background));
+      color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
+      font-size: 0.85em;
+      cursor: pointer;
+    }
+    .footer-prompt-input {
+      flex: 1;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+    }
+    .footer-prompt-input:focus {
+      outline: 1px solid var(--vscode-focusBorder);
+    }
+    .footer-send-btn {
+      padding: 6px 12px;
+      border: none;
+      border-radius: 4px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      cursor: pointer;
+      font-size: 0.9em;
+    }
+    .footer-send-btn:hover {
+      background: var(--vscode-button-hoverBackground);
+    }
+
+    /* ── Hidden by search ── */
+    .search-hidden { display: none !important; }
   `;
 }
 
 // ─── Webview scripts ───
+
+function sessionListScript(): string {
+  return /* js */ `
+    (function() {
+      const vscode = acquireVsCodeApi();
+
+      // Session card clicks
+      document.querySelectorAll('.session-card').forEach(card => {
+        card.addEventListener('click', (e) => {
+          if (e.target.closest('.card-delete')) return;
+          const runId = card.getAttribute('data-run-id');
+          if (runId) {
+            vscode.postMessage({ type: 'open-run', runId });
+          }
+        });
+      });
+
+      // Thread card clicks
+      document.querySelectorAll('.thread-card').forEach(card => {
+        card.addEventListener('click', (e) => {
+          if (e.target.closest('.card-delete')) return;
+          const threadId = card.getAttribute('data-thread-id');
+          if (threadId) {
+            vscode.postMessage({ type: 'open-thread', threadId });
+          }
+        });
+      });
+
+      // Active run view-details button
+      document.querySelectorAll('.active-run-open').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const runId = btn.getAttribute('data-run-id');
+          if (runId) {
+            vscode.postMessage({ type: 'open-run', runId });
+          }
+        });
+      });
+
+      // Delete buttons (sessions)
+      document.querySelectorAll('.card-delete[data-run-id]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const runId = btn.getAttribute('data-run-id');
+          if (runId) {
+            vscode.postMessage({ type: 'delete-run', runId });
+          }
+        });
+      });
+
+      // Delete buttons (threads)
+      document.querySelectorAll('.card-delete[data-thread-id]').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          const threadId = btn.getAttribute('data-thread-id');
+          if (threadId) {
+            vscode.postMessage({ type: 'delete-thread', threadId });
+          }
+        });
+      });
+
+      // Search filtering
+      const searchInput = document.getElementById('searchInput');
+      if (searchInput) {
+        searchInput.addEventListener('input', () => {
+          const query = searchInput.value.toLowerCase().trim();
+          document.querySelectorAll('.session-card, .thread-card').forEach(card => {
+            const title = card.querySelector('.session-card-title, .thread-card-title');
+            const text = (title ? title.textContent : '').toLowerCase();
+            card.classList.toggle('search-hidden', query.length > 0 && !text.includes(query));
+          });
+        });
+      }
+
+      // New conversation from footer
+      const newPromptInput = document.getElementById('newPromptInput');
+      const btnNewConversation = document.getElementById('btnNewConversation');
+      const enginePicker = document.getElementById('enginePicker');
+
+      if (btnNewConversation && newPromptInput) {
+        function startConversation() {
+          const text = newPromptInput.value.trim();
+          if (!text) return;
+          const engine = enginePicker ? enginePicker.value : 'claude';
+          vscode.postMessage({ type: 'new-conversation', text, engine });
+          newPromptInput.value = '';
+        }
+        btnNewConversation.addEventListener('click', startConversation);
+        newPromptInput.addEventListener('keydown', (e) => {
+          if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            startConversation();
+          }
+        });
+      }
+    })();
+  `;
+}
 
 function threadScript(): string {
   return /* js */ `
@@ -799,7 +1722,11 @@ function threadScript(): string {
       let streamedText = '';
 
       function scrollToBottom() {
-        chatArea.scrollTop = chatArea.scrollHeight;
+        const threshold = 50;
+        const nearBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < threshold;
+        if (nearBottom || !isStreaming) {
+          chatArea.scrollTop = chatArea.scrollHeight;
+        }
       }
       scrollToBottom();
 
@@ -815,12 +1742,14 @@ function threadScript(): string {
         vscode.postMessage({ type: 'navigate-back' });
       });
 
-      btnDelete.addEventListener('click', () => {
-        const threadId = btnDelete.getAttribute('data-thread-id');
-        if (threadId) {
-          vscode.postMessage({ type: 'delete-thread', threadId });
-        }
-      });
+      if (btnDelete) {
+        btnDelete.addEventListener('click', () => {
+          const threadId = btnDelete.getAttribute('data-thread-id');
+          if (threadId) {
+            vscode.postMessage({ type: 'delete-thread', threadId });
+          }
+        });
+      }
 
       function sendReply() {
         const text = replyInput.value.trim();
@@ -874,7 +1803,6 @@ function threadScript(): string {
             replyInput.disabled = false;
             streamingRow.style.display = 'none';
 
-            // Insert the final assistant bubble
             const row = document.createElement('div');
             row.className = 'bubble-row assistant';
             const stdout = (msg.entry && msg.entry.result && msg.entry.result.stdout) || streamedText || '(no output)';
@@ -903,29 +1831,24 @@ function threadScript(): string {
   `;
 }
 
-function emptyScript(): string {
+function runDetailScript(): string {
   return /* js */ `
     (function() {
       const vscode = acquireVsCodeApi();
-      document.querySelectorAll('.thread-card').forEach(card => {
-        card.addEventListener('click', (e) => {
-          // Don't navigate if the delete button was clicked
-          if (e.target.closest('.thread-card-delete')) return;
-          const threadId = card.getAttribute('data-thread-id');
-          if (threadId) {
-            vscode.postMessage({ type: 'open-thread', threadId });
+
+      document.getElementById('btnBack').addEventListener('click', () => {
+        vscode.postMessage({ type: 'navigate-back' });
+      });
+
+      const btnDeleteRun = document.getElementById('btnDeleteRun');
+      if (btnDeleteRun) {
+        btnDeleteRun.addEventListener('click', () => {
+          const runId = btnDeleteRun.getAttribute('data-run-id');
+          if (runId) {
+            vscode.postMessage({ type: 'delete-run', runId });
           }
         });
-      });
-      document.querySelectorAll('.thread-card-delete').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const threadId = btn.getAttribute('data-thread-id');
-          if (threadId) {
-            vscode.postMessage({ type: 'delete-thread', threadId });
-          }
-        });
-      });
+      }
     })();
   `;
 }

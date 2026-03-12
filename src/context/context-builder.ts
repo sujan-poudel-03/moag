@@ -120,6 +120,7 @@ function statusMarker(task: Task, currentTask: Task): string {
   switch (task.status) {
     case TaskStatus.Completed: return '[done]';
     case TaskStatus.Failed: return '[failed]';
+    case TaskStatus.Blocked: return '[blocked]';
     case TaskStatus.Skipped: return '[skipped]';
     case TaskStatus.Running: return '[running]';
     default: return '[upcoming]';
@@ -162,6 +163,8 @@ export function gatherCumulativeProgress(historyStore: HistoryStore, plan: Plan,
       lines.push(`- "${t.name}": completed${fileSuffix}`);
     } else if (t.status === TaskStatus.Failed) {
       lines.push(`- "${t.name}": failed`);
+    } else if (t.status === TaskStatus.Blocked) {
+      lines.push(`- "${t.name}": blocked`);
     } else if (t.status === TaskStatus.Skipped) {
       lines.push(`- "${t.name}": skipped`);
     }
@@ -309,8 +312,11 @@ function findReadme(cwd: string): string | null {
   return null;
 }
 
-function buildFileTree(dir: string, maxDepth: number, currentDepth = 0, prefix = ''): string {
-  if (currentDepth >= maxDepth) { return ''; }
+/** Max entries in file tree to prevent huge output on large repos */
+const MAX_TREE_ENTRIES = 500;
+
+function buildFileTree(dir: string, maxDepth: number, currentDepth = 0, prefix = '', counter = { count: 0 }): string {
+  if (currentDepth >= maxDepth || counter.count >= MAX_TREE_ENTRIES) { return ''; }
 
   let entries: fs.Dirent[];
   try {
@@ -329,15 +335,24 @@ function buildFileTree(dir: string, maxDepth: number, currentDepth = 0, prefix =
 
   const lines: string[] = [];
   for (const entry of entries) {
+    if (counter.count >= MAX_TREE_ENTRIES) {
+      lines.push(`${prefix}... (truncated)`);
+      break;
+    }
     if (entry.name.startsWith('.') && IGNORED_DIRS.has(entry.name)) { continue; }
     if (IGNORED_DIRS.has(entry.name)) { continue; }
 
+    // Skip symlinks to prevent infinite loops and directory escape
+    if (entry.isSymbolicLink()) { continue; }
+
     if (entry.isDirectory()) {
       lines.push(`${prefix}${entry.name}/`);
-      const sub = buildFileTree(path.join(dir, entry.name), maxDepth, currentDepth + 1, prefix + '  ');
+      counter.count++;
+      const sub = buildFileTree(path.join(dir, entry.name), maxDepth, currentDepth + 1, prefix + '  ', counter);
       if (sub) { lines.push(sub); }
     } else {
       lines.push(`${prefix}${entry.name}`);
+      counter.count++;
     }
   }
 

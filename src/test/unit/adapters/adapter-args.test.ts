@@ -54,12 +54,12 @@ describe('adapter argument building', () => {
       assert.equal(adapter.getCommand(), '/usr/local/bin/codex');
     });
 
-    it('should pass prompt as positional argument', async () => {
-      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[] } | undefined;
+    it('should use stdin for prompt (not in args)', async () => {
+      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean } | undefined;
       const { CodexAdapter: CA } = proxyquire('../../../adapters/codex-adapter', {
         vscode: vscodeMock,
         './base-cli': {
-          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[] }) => {
+          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean }) => {
             capturedConfig = config;
             return Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 });
           },
@@ -68,7 +68,9 @@ describe('adapter argument building', () => {
       const adapter = new CA();
       await adapter.runTask({ prompt: 'test prompt', cwd: '/tmp' });
       const args = capturedConfig!.buildArgs({ prompt: 'test prompt' });
-      assert.ok(args.includes('test prompt'));
+      // Prompt should NOT be in args — it's piped via stdin
+      assert.ok(!args.includes('test prompt'), 'prompt should not be in args when useStdin is true');
+      assert.equal(capturedConfig!.useStdin, true, 'useStdin should be true');
     });
   });
 
@@ -84,13 +86,13 @@ describe('adapter argument building', () => {
       assert.equal(adapter.getCommand(), 'claude');
     });
 
-    it('should include default -p flag and prompt', async () => {
+    it('should include -p flag and use stdin for prompt', async () => {
       setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'] });
-      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[] } | undefined;
+      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean } | undefined;
       const { ClaudeAdapter: CA } = proxyquire('../../../adapters/claude-adapter', {
         vscode: vscodeMock,
         './base-cli': {
-          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[] }) => {
+          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean }) => {
             capturedConfig = config;
             return Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 });
           },
@@ -100,7 +102,9 @@ describe('adapter argument building', () => {
       await adapter.runTask({ prompt: 'hello', cwd: '/tmp' });
       const args = capturedConfig!.buildArgs({ prompt: 'hello' });
       assert.ok(args.includes('-p'));
-      assert.ok(args.includes('hello'));
+      // Prompt should NOT be in args — it's piped via stdin
+      assert.ok(!args.includes('hello'), 'prompt should not be in args when useStdin is true');
+      assert.equal(capturedConfig!.useStdin, true, 'useStdin should be true');
     });
   });
 
@@ -129,13 +133,13 @@ describe('adapter argument building', () => {
       assert.equal(adapter.getCommand(), 'ollama');
     });
 
-    it('should build args with "run", model, and prompt', async () => {
+    it('should build args with "run" and model (prompt via stdin)', async () => {
       setMockConfig('agentTaskPlayer.engines.ollama', { model: 'llama3' });
-      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[] } | undefined;
+      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean } | undefined;
       const { OllamaAdapter: OA } = proxyquire('../../../adapters/ollama-adapter', {
         vscode: vscodeMock,
         './base-cli': {
-          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[] }) => {
+          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean }) => {
             capturedConfig = config;
             return Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 });
           },
@@ -144,7 +148,8 @@ describe('adapter argument building', () => {
       const adapter = new OA();
       await adapter.runTask({ prompt: 'hello', cwd: '/tmp' });
       const args = capturedConfig!.buildArgs({ prompt: 'hello' });
-      assert.deepEqual(args, ['run', 'llama3', 'hello']);
+      assert.deepEqual(args, ['run', 'llama3']);
+      assert.equal(capturedConfig!.useStdin, true, 'useStdin should be true');
     });
   });
 

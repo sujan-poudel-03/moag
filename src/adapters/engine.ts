@@ -16,6 +16,8 @@ export interface EngineRunOptions {
   signal?: AbortSignal;
   /** Callback for streaming output chunks */
   onOutput?: OutputCallback;
+  /** Model override for auto-model selection (e.g., "claude-sonnet-4") */
+  modelId?: string;
 }
 
 /** Every engine adapter implements this interface */
@@ -51,11 +53,36 @@ export interface EngineAvailability {
   available: boolean;
   command: string;
   displayName: string;
+  /** Version string if the engine responded to --version / --help */
+  version?: string;
+}
+
+/**
+ * Probe a command with --version (or --help fallback) and return the first line of output.
+ * Returns null if the command is not found or times out (5s).
+ */
+async function probeVersion(command: string): Promise<string | null> {
+  const { execFile } = await import('child_process');
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 5000);
+    execFile(command, ['--version'], { timeout: 5000 }, (err, stdout, stderr) => {
+      clearTimeout(timer);
+      if (err) {
+        // Some CLIs only respond to --help
+        resolve(null);
+        return;
+      }
+      const output = (stdout || stderr || '').trim();
+      const firstLine = output.split('\n')[0]?.trim() || null;
+      resolve(firstLine);
+    });
+  });
 }
 
 /**
  * Check availability of multiple engines in parallel.
  * Returns a Map from EngineId to availability info.
+ * First checks PATH existence, then probes --version for available engines.
  */
 export async function checkEngineAvailability(
   engineIds: EngineId[]
@@ -71,8 +98,19 @@ export async function checkEngineAvailability(
         return;
       }
       const command = adapter.getCommand();
-      const available = await commandExists(command);
-      results.set(id, { available, command, displayName: adapter.displayName });
+      const exists = await commandExists(command);
+      if (!exists) {
+        results.set(id, { available: false, command, displayName: adapter.displayName });
+        return;
+      }
+      // Probe --version to verify the command actually works
+      const version = await probeVersion(command);
+      results.set(id, {
+        available: true,
+        command,
+        displayName: adapter.displayName,
+        version: version || undefined,
+      });
     })
   );
 

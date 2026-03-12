@@ -29,8 +29,44 @@ export class HistoryStore {
     return this._entries.filter(e => e.playlistId === playlistId).reverse();
   }
 
-  /** Add a new history entry */
+  /** Add a new history entry (truncates large outputs before persisting) */
   add(entry: HistoryEntry): void {
+    // Cap stdout/stderr to prevent memento overflow (~100KB max per entry)
+    const MAX_STORED_OUTPUT = 100_000;
+    if (entry.result.stdout && entry.result.stdout.length > MAX_STORED_OUTPUT) {
+      entry = {
+        ...entry,
+        result: {
+          ...entry.result,
+          stdout: entry.result.stdout.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
+        },
+      };
+    }
+    if (entry.result.stderr && entry.result.stderr.length > MAX_STORED_OUTPUT) {
+      entry = {
+        ...entry,
+        result: {
+          ...entry.result,
+          stderr: entry.result.stderr.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
+        },
+      };
+    }
+    // Cap code changes too
+    if (entry.codeChanges && entry.codeChanges.length > MAX_STORED_OUTPUT) {
+      entry = {
+        ...entry,
+        codeChanges: entry.codeChanges.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
+      };
+    }
+    if (entry.verification?.output && entry.verification.output.length > MAX_STORED_OUTPUT) {
+      entry = {
+        ...entry,
+        verification: {
+          ...entry.verification,
+          output: entry.verification.output.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
+        },
+      };
+    }
     this._entries.push(entry);
     this.trim();
     this.persist();
@@ -62,6 +98,12 @@ export class HistoryStore {
     this._entries = this._entries.filter(e => (e.threadId ?? e.id) !== threadId);
     this.persist();
     this._onDidChange.fire();
+  }
+
+  /** Get all entries from a specific run */
+  getForRun(runId: string): HistoryEntry[] {
+    return this._entries.filter(e => e.runId === runId)
+      .sort((a, b) => a.startedAt.localeCompare(b.startedAt));
   }
 
   /** Clear all history */

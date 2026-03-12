@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "Agent Task Player",
   "description": "Define playlists of tasks and play them sequentially using coding agent CLIs (Codex, Claude Code, Gemini CLI, Ollama).",
-  "version": "0.2.0",
+  "version": "0.6.0",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -199,6 +199,114 @@
         "title": "Show Threads",
         "category": "Agent Task Player",
         "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentTaskPlayer.runPlanFile",
+        "title": "Run Plan File",
+        "category": "Agent Task Player",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "agentTaskPlayer.bulkDelete",
+        "title": "Bulk Delete Tasks...",
+        "category": "Agent Task Player",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentTaskPlayer.clearAllTasks",
+        "title": "Clear All Tasks",
+        "category": "Agent Task Player",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "agentTaskPlayer.retryTask",
+        "title": "Retry Failed Task",
+        "category": "Agent Task Player",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "agentTaskPlayer.retryTaskWithNote",
+        "title": "Retry Task with Note",
+        "category": "Agent Task Player",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentTaskPlayer.exportResults",
+        "title": "Export Results",
+        "category": "Agent Task Player",
+        "icon": "$(export)"
+      },
+      {
+        "command": "agentTaskPlayer.dryRun",
+        "title": "Dry Run (Preview)",
+        "category": "Agent Task Player",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "agentTaskPlayer.setTaskStatus",
+        "title": "Set Task Status...",
+        "category": "Agent Task Player",
+        "icon": "$(check)"
+      },
+      {
+        "command": "agentTaskPlayer.setPlaylistStatus",
+        "title": "Set Playlist Status...",
+        "category": "Agent Task Player",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "agentTaskPlayer.runSelected",
+        "title": "Run Selected",
+        "category": "Agent Task Player",
+        "icon": "$(run-all)"
+      },
+      {
+        "command": "agentTaskPlayer.openSession",
+        "title": "Open Session",
+        "category": "Agent Task Player",
+        "icon": "$(history)"
+      },
+      {
+        "command": "agentTaskPlayer.openThread",
+        "title": "Open Thread",
+        "category": "Agent Task Player",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "agentTaskPlayer.deleteSession",
+        "title": "Delete Session",
+        "category": "Agent Task Player",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentTaskPlayer.deleteThread",
+        "title": "Delete Thread",
+        "category": "Agent Task Player",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "agentTaskPlayer.renameThread",
+        "title": "Rename Conversation",
+        "category": "Agent Task Player",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "agentTaskPlayer.searchSessions",
+        "title": "Search Sessions",
+        "category": "Agent Task Player",
+        "icon": "$(search)"
+      },
+      {
+        "command": "agentTaskPlayer.clearSessions",
+        "title": "Clear All Sessions",
+        "category": "Agent Task Player",
+        "icon": "$(clear-all)"
+      },
+      {
+        "command": "agentTaskPlayer.newConversation",
+        "title": "New Conversation",
+        "category": "Agent Task Player",
+        "icon": "$(add)"
       }
     ],
     "viewsContainers": {
@@ -225,6 +333,11 @@
         {
           "id": "agentTaskPlayer.historyView",
           "name": "History",
+          "type": "tree"
+        },
+        {
+          "id": "agentTaskPlayer.sessionsView",
+          "name": "Sessions",
           "type": "tree"
         }
       ]
@@ -253,6 +366,11 @@
           "group": "navigation@3"
         },
         {
+          "command": "agentTaskPlayer.showDashboard",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@4"
+        },
+        {
           "command": "agentTaskPlayer.newPlan",
           "when": "view == agentTaskPlayer.planView",
           "group": "1_plan@1"
@@ -266,11 +384,6 @@
           "command": "agentTaskPlayer.pause",
           "when": "view == agentTaskPlayer.planView",
           "group": "2_playback@1"
-        },
-        {
-          "command": "agentTaskPlayer.showDashboard",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_playback@2"
         },
         {
           "command": "agentTaskPlayer.addPlaylist",
@@ -288,6 +401,26 @@
           "group": "3_advanced@3"
         },
         {
+          "command": "agentTaskPlayer.dryRun",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "3_advanced@4"
+        },
+        {
+          "command": "agentTaskPlayer.runPlanFile",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "1_plan@3"
+        },
+        {
+          "command": "agentTaskPlayer.bulkDelete",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "4_danger@1"
+        },
+        {
+          "command": "agentTaskPlayer.clearAllTasks",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "4_danger@2"
+        },
+        {
           "command": "agentTaskPlayer.clearHistory",
           "when": "view == agentTaskPlayer.historyView",
           "group": "navigation@1"
@@ -300,6 +433,26 @@
         {
           "command": "agentTaskPlayer.showThreadList",
           "when": "view == agentTaskPlayer.historyView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "agentTaskPlayer.exportResults",
+          "when": "view == agentTaskPlayer.historyView",
+          "group": "navigation@4"
+        },
+        {
+          "command": "agentTaskPlayer.newConversation",
+          "when": "view == agentTaskPlayer.sessionsView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "agentTaskPlayer.searchSessions",
+          "when": "view == agentTaskPlayer.sessionsView",
+          "group": "navigation@2"
+        },
+        {
+          "command": "agentTaskPlayer.clearSessions",
+          "when": "view == agentTaskPlayer.sessionsView",
           "group": "navigation@3"
         }
       ],
@@ -348,6 +501,46 @@
           "command": "agentTaskPlayer.saveTaskAsTemplate",
           "when": "view == agentTaskPlayer.planView && viewItem == task",
           "group": "2_template@1"
+        },
+        {
+          "command": "agentTaskPlayer.retryTask",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "inline@3"
+        },
+        {
+          "command": "agentTaskPlayer.retryTaskWithNote",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "3_status@2"
+        },
+        {
+          "command": "agentTaskPlayer.setTaskStatus",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "3_status@1"
+        },
+        {
+          "command": "agentTaskPlayer.setPlaylistStatus",
+          "when": "view == agentTaskPlayer.planView && viewItem == playlist",
+          "group": "3_status@1"
+        },
+        {
+          "command": "agentTaskPlayer.runSelected",
+          "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/",
+          "group": "inline@0"
+        },
+        {
+          "command": "agentTaskPlayer.deleteSession",
+          "when": "view == agentTaskPlayer.sessionsView && viewItem == session",
+          "group": "inline@1"
+        },
+        {
+          "command": "agentTaskPlayer.deleteThread",
+          "when": "view == agentTaskPlayer.sessionsView && viewItem == thread",
+          "group": "inline@1"
+        },
+        {
+          "command": "agentTaskPlayer.renameThread",
+          "when": "view == agentTaskPlayer.sessionsView && viewItem == thread",
+          "group": "inline@2"
         }
       ]
     },
@@ -432,15 +625,39 @@
         },
         "agentTaskPlayer.autoplayDelay": {
           "type": "number",
-          "default": 2000,
+          "default": 500,
           "minimum": 0,
-          "description": "Delay (ms) between tasks during autoplay."
+          "description": "Delay (ms) between tasks during autoplay. Set to 0 for instant chaining."
+        },
+        "agentTaskPlayer.parallelPlaylists": {
+          "type": "number",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 8,
+          "description": "Number of playlists to run concurrently. Set to 1 for sequential (default). Higher values run independent playlists in parallel."
+        },
+        "agentTaskPlayer.taskTimeoutMs": {
+          "type": "number",
+          "default": 600000,
+          "minimum": 30000,
+          "description": "Per-task timeout in milliseconds (default 10 minutes). Tasks exceeding this limit are killed and marked failed."
         },
         "agentTaskPlayer.maxHistoryEntries": {
           "type": "number",
           "default": 200,
           "minimum": 10,
           "description": "Maximum number of history entries to keep."
+        },
+        "agentTaskPlayer.autoModelSelection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically select the best model for each task based on complexity analysis."
+        },
+        "agentTaskPlayer.defaultReasoningPreset": {
+          "type": "string",
+          "enum": ["auto", "fast", "balanced", "deep"],
+          "default": "auto",
+          "description": "Default reasoning preset for model selection. 'auto' analyzes task complexity to pick the best model."
         },
         "agentTaskPlayer.context.enabled": {
           "type": "boolean",

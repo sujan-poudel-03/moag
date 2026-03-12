@@ -7,9 +7,20 @@ export interface TaskTemplate {
   id: string;
   name: string;
   prompt: string;
+  type?: string;
   engine?: string;
+  command?: string;
+  env?: Record<string, string>;
   files?: string[];
+  acceptanceCriteria?: string[];
   verifyCommand?: string;
+  expectedArtifacts?: string[];
+  ownerNote?: string;
+  failurePolicy?: string;
+  port?: number;
+  readyPattern?: string;
+  healthCheckUrl?: string;
+  startupTimeoutMs?: number;
   retryCount?: number;
   /** Category for grouping templates */
   category: string;
@@ -54,6 +65,7 @@ const BUILT_IN_TEMPLATES: TaskTemplate[] = [
     name: 'Write unit tests',
     prompt: 'Write comprehensive unit tests for the recent changes. Cover edge cases and error scenarios.',
     verifyCommand: 'npm test',
+    acceptanceCriteria: ['Tests cover the new behavior', 'Existing tests still pass'],
     category: 'Testing',
   },
   {
@@ -80,6 +92,27 @@ const BUILT_IN_TEMPLATES: TaskTemplate[] = [
     name: 'Add documentation',
     prompt: 'Add comprehensive documentation including README updates, inline comments for complex logic, and API documentation.',
     category: 'Docs',
+  },
+  {
+    id: 'builtin-run-test-command',
+    name: 'Run test command',
+    prompt: 'Run the test suite and capture failures.',
+    type: 'command',
+    command: 'npm test',
+    verifyCommand: 'npm test',
+    acceptanceCriteria: ['Test command exits successfully'],
+    category: 'Testing',
+  },
+  {
+    id: 'builtin-start-dev-server',
+    name: 'Start local dev server',
+    prompt: 'Start the application locally and verify that it becomes reachable.',
+    type: 'service',
+    command: 'npm run dev',
+    port: 3000,
+    healthCheckUrl: 'http://localhost:3000',
+    acceptanceCriteria: ['Service starts successfully', 'Configured port accepts connections'],
+    category: 'Operations',
   },
 ];
 

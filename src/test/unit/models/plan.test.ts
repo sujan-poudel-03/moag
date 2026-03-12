@@ -59,6 +59,7 @@ describe('createTask', () => {
     const task = createTask('Init', 'Set up the project');
     assert.equal(task.name, 'Init');
     assert.equal(task.prompt, 'Set up the project');
+    assert.equal(task.type, 'agent');
     assert.equal(task.status, TaskStatus.Pending);
     assert.ok(task.id.length > 0);
   });
@@ -93,8 +94,19 @@ describe('loadPlan / savePlan round-trip', () => {
     pl.parallel = true;
     const task = createTask('Task 1', 'Do something', 'claude');
     task.cwd = './src';
+    task.type = 'service';
+    task.command = 'npm run dev';
+    task.env = { PORT: '3000' };
     task.files = ['a.ts', 'b.ts'];
+    task.acceptanceCriteria = ['Server starts', 'Health check responds'];
     task.verifyCommand = 'npm test';
+    task.expectedArtifacts = ['dist/index.js'];
+    task.ownerNote = 'Needs PM review';
+    task.failurePolicy = 'mark-blocked';
+    task.port = 3000;
+    task.readyPattern = 'listening';
+    task.healthCheckUrl = 'http://localhost:3000/health';
+    task.startupTimeoutMs = 45000;
     task.retryCount = 2;
     task.dependsOn = ['other-task'];
     pl.tasks.push(task);
@@ -115,26 +127,52 @@ describe('loadPlan / savePlan round-trip', () => {
     const t = loaded.playlists[0].tasks[0];
     assert.equal(t.name, 'Task 1');
     assert.equal(t.prompt, 'Do something');
+    assert.equal(t.type, 'service');
     assert.equal(t.engine, 'claude');
+    assert.equal(t.command, 'npm run dev');
     assert.equal(t.cwd, './src');
+    assert.deepEqual(t.env, { PORT: '3000' });
     assert.deepEqual(t.files, ['a.ts', 'b.ts']);
+    assert.deepEqual(t.acceptanceCriteria, ['Server starts', 'Health check responds']);
     assert.equal(t.verifyCommand, 'npm test');
+    assert.deepEqual(t.expectedArtifacts, ['dist/index.js']);
+    assert.equal(t.ownerNote, 'Needs PM review');
+    assert.equal(t.failurePolicy, 'mark-blocked');
+    assert.equal(t.port, 3000);
+    assert.equal(t.readyPattern, 'listening');
+    assert.equal(t.healthCheckUrl, 'http://localhost:3000/health');
+    assert.equal(t.startupTimeoutMs, 45000);
     assert.equal(t.retryCount, 2);
     assert.deepEqual(t.dependsOn, ['other-task']);
     // Status should be hydrated back to Pending
     assert.equal(t.status, TaskStatus.Pending);
   });
 
-  it('should strip status fields from the saved file', () => {
-    const plan = createEmptyPlan('Strip Test');
-    const task = createTask('T', 'prompt');
-    task.status = TaskStatus.Completed; // should not persist
-    plan.playlists[0].tasks.push(task);
+  it('should persist non-pending status and strip pending status', () => {
+    const plan = createEmptyPlan('Status Test');
+    const completedTask = createTask('Done', 'prompt');
+    completedTask.status = TaskStatus.Completed;
+    const pendingTask = createTask('Todo', 'prompt');
+    pendingTask.status = TaskStatus.Pending;
+    plan.playlists[0].tasks.push(completedTask, pendingTask);
 
     savePlan(plan, tmpFile);
     const raw: PlanFile = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    assert.equal((raw.playlists[0].tasks[0] as any).status, undefined);
+    // Completed status should be persisted
+    assert.equal(raw.playlists[0].tasks[0].status, 'completed');
+    // Pending status should be omitted (keeps file clean)
+    assert.equal(raw.playlists[0].tasks[1].status, undefined);
+  });
+
+  it('should restore persisted status on load', () => {
+    const plan = createEmptyPlan('Restore Test');
+    const task = createTask('T', 'prompt');
+    task.status = TaskStatus.Completed;
+    plan.playlists[0].tasks.push(task);
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+    assert.equal(loaded.playlists[0].tasks[0].status, TaskStatus.Completed);
   });
 
   it('should create parent directories when saving', () => {

@@ -29,13 +29,19 @@ export class CustomAdapter implements EngineAdapter {
       };
     }
 
+    // If no {prompt} placeholder in args, pipe prompt via stdin (safer on Windows)
+    const hasPlaceholder = argTemplates.some(arg => arg.includes('{prompt}'));
+
     return runCli(
       {
         command,
         buildArgs: (opts) => {
-          // Replace {prompt} placeholder in each argument
-          return argTemplates.map(arg => arg.replace(/\{prompt\}/g, opts.prompt));
+          if (hasPlaceholder) {
+            return argTemplates.map(arg => arg.split('{prompt}').join(opts.prompt));
+          }
+          return [...argTemplates];
         },
+        useStdin: !hasPlaceholder,
       },
       options,
       options.onOutput,
