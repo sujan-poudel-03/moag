@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.7.0] - 2026-03-13
+
+### Release Polish
+
+### Added
+- **Cost budget alerts**: New `agentTaskPlayer.costBudgetUsd` setting — warns when cumulative estimated cost exceeds budget, with option to stop execution
+- **Webview ready handshake**: Dashboard now uses a proper `webview-ready` message instead of multiple setTimeout fallbacks
+- **Updated Codex model specs**: GPT-5.4, GPT-5.3-Codex, GPT-5.2-Codex, GPT-5.2, GPT-5.1-Codex-Max, GPT-5.1-Codex-Mini
+- **Legacy model replacement**: Codex adapter auto-replaces outdated GPT-4.x models with current defaults
+- **README improvements**: Added example `.agent-plan.json` and Known Limitations section
+
+### Changed
+- CLI adapters (Claude, Codex, Gemini) no longer force `--model` — each CLI uses its own default unless the user explicitly overrides via `args` setting
+- Dashboard initialization is faster and more reliable with single handshake instead of 5 retry attempts
+
+### Fixed
+- Codex tasks failing with "gpt-4.1-mini not supported" on ChatGPT accounts — adapters now respect CLI defaults
+
 ## [0.6.0] - 2026-03-12
 
 ### Execution Contracts Release
@@ -75,6 +93,13 @@ Full audit and hardening pass across the entire codebase. See [docs/robustness-h
 - Responsive CSS: @media queries for narrow panels (<300px, <420px, >600px)
 - Stdin piping for all CLI adapters (avoids Windows 8K command-line length limit)
 - Improved error messages in plan loader with file-specific validation
+
+## [0.3.0] - 2026-02-27
+
+### Added
+- Task reply ability: continue a conversation with a running agent task
+- Field open: click file references in task output to open them in the editor
+- Design reference updates for dashboard and tree views
 
 ## [0.2.0] - 2026-02-14
 
