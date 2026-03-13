@@ -1,0 +1,113 @@
+{
+  "version": "1.0",
+  "name": "MOAG v0.7.0 — Release Polish",
+  "description": "Fix critical issues and add polish for a proper marketplace release.",
+  "defaultEngine": "codex",
+  "playlists": [
+    {
+      "id": "pl-dashboard-fix",
+      "name": "Dashboard Timing Fix",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-webview-handshake",
+          "name": "Replace dashboard setTimeout hack with proper webview handshake",
+          "prompt": "In src/ui/dashboard-panel.ts, the constructor sends state 5 times with setTimeout (lines 44-48) as a workaround for webview not being ready. Replace this with a proper handshake: 1) In the webview HTML, add a script that posts a message { type: 'webview-ready' } when the DOM loads. 2) In the DashboardPanel class, listen for that message and only call this.update() once when received. 3) Remove the 4 setTimeout calls but keep the single this.update() as a fallback with a 3s timeout in case the ready message never arrives. Keep the existing onDidChangeViewState handler that re-sends state when panel becomes visible.",
+          "type": "agent",
+          "files": [
+            "src/ui/dashboard-panel.ts"
+          ],
+          "verifyCommand": "npx tsc --noEmit",
+          "failurePolicy": "continue",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "pl-cost-alert",
+      "name": "Cost Budget Alert",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-cost-setting",
+          "name": "Add cost budget alert setting and warning logic",
+          "prompt": "Add a VS Code setting agentTaskPlayer.costBudgetUsd (number, default 0 meaning disabled) in package.json under the existing configuration section. Then in src/runner/runner.ts, after a task completes and its tokenUsage.estimatedCost is available, accumulate the total cost in a private _totalCostUsd field. If the budget setting is > 0 and _totalCostUsd exceeds it, emit an event 'budget-exceeded' with { totalCost: number, budget: number }. In src/extension.ts, listen for that event and show a vscode.window.showWarningMessage telling the user the budget was exceeded, with options 'Continue' and 'Stop'. If they pick Stop, call runner.stop().",
+          "type": "agent",
+          "files": [
+            "src/runner/runner.ts",
+            "src/extension.ts",
+            "package.json"
+          ],
+          "verifyCommand": "npx tsc --noEmit",
+          "failurePolicy": "continue",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "pl-readme",
+      "name": "README Example Plan",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-readme-example",
+          "name": "Add example plan JSON to README",
+          "prompt": "In README.md, find the section about creating plans (or add one after Quick Start). Add a short example showing a minimal .agent-plan.json with 1 playlist and 2 tasks — one agent task and one command task. Keep it simple and realistic, like a 'Setup API' playlist with tasks to scaffold an Express server and run tests. Also add a 'Known Limitations' section at the bottom mentioning: tasks run sequentially by default (use parallel: true for concurrent), each CLI must be installed separately, and cost tracking is estimated from CLI output.",
+          "type": "agent",
+          "files": [
+            "README.md"
+          ],
+          "failurePolicy": "continue",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "pl-model-specs",
+      "name": "Update Model Specs",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-model-specs",
+          "name": "Update Codex model specs to current GPT-5.x models",
+          "prompt": "In src/models/model-specs.ts, the Codex models are outdated (gpt-4.1, gpt-4.1-mini, o3, o4-mini). Replace them with: gpt-5.4 (extra-high reasoning, $5/$20), gpt-5.3-codex (extra-high, $3/$12), gpt-5.2-codex (high, $2/$8), gpt-5.2 (high, $2/$8), gpt-5.1-codex-max (high, $1.50/$6), gpt-5.1-codex-mini (medium, $0.40/$1.60). All should have 1M context window and engine 'codex'. Update the defaultModels.codex to 'gpt-5.4'. Keep the existing Claude, Gemini, and Ollama specs unchanged.",
+          "type": "agent",
+          "files": [
+            "src/models/model-specs.ts"
+          ],
+          "verifyCommand": "npx tsc --noEmit",
+          "failurePolicy": "continue",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "pl-verify",
+      "name": "Build & Test",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-compile",
+          "name": "TypeScript compile check",
+          "prompt": "Compile the project",
+          "type": "command",
+          "command": "npx tsc --noEmit",
+          "failurePolicy": "stop",
+          "status": "completed"
+        },
+        {
+          "id": "t-test",
+          "name": "Run all tests",
+          "prompt": "Run test suite",
+          "type": "command",
+          "command": "npm test",
+          "failurePolicy": "stop",
+          "dependsOn": [
+            "t-compile"
+          ],
+          "status": "completed"
+        }
+      ]
+    }
+  ]
+}
