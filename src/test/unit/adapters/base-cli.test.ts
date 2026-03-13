@@ -72,6 +72,21 @@ describe('runCli', () => {
     assert.ok(result.durationMs < 25000, `Process took ${result.durationMs}ms, expected < 25000ms`);
   }).timeout(15000);
 
+  it('should include all args in the displayed command when using stdin', async () => {
+    const config: CliConfig = {
+      command: process.execPath,
+      buildArgs: () => ['-e', 'process.stdout.write("ok")', '--model', 'gpt-5.4'],
+      useStdin: true,
+    };
+
+    const result = await runCli(config, {
+      prompt: 'ignored',
+      cwd: process.cwd(),
+    });
+
+    assert.ok(result.command?.includes('--model gpt-5.4'));
+  });
+
   it('should reject when command does not exist', async () => {
     const config: CliConfig = {
       command: 'nonexistent_command_xyz_12345',

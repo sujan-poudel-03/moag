@@ -287,6 +287,33 @@ export function activate(context: vscode.ExtensionContext): void {
     DashboardPanel.currentPanel?.appendOutput(chunk, stream, task.id);
   });
 
+  runner.on('budget-exceeded', ({ totalCost, budget }) => {
+    if (runner.state === RunnerState.Playing) {
+      runner.pause();
+    }
+
+    const message = `Estimated run cost $${totalCost.toFixed(4)} exceeded the configured budget of $${budget.toFixed(4)}.`;
+    void vscode.window.showWarningMessage(message, 'Continue', 'Stop').then((action) => {
+      if (action === 'Stop') {
+        runner.stop();
+        return;
+      }
+
+      if (runner.state !== RunnerState.Paused) {
+        return;
+      }
+
+      const activePlan = getActivePlan();
+      if (!activePlan) {
+        return;
+      }
+
+      runner.play(activePlan).catch(err => {
+        vscode.window.showErrorMessage(`Runner error: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    });
+  });
+
   runner.on('task-completed', (task, _result) => {
     planTree.refresh();
     saveAndRefresh();

@@ -30,12 +30,8 @@ export class ClaudeAdapter implements EngineAdapter {
           if (autoApprove && !args.includes('--dangerously-skip-permissions')) {
             args.push('--dangerously-skip-permissions');
           }
-          // Model override from auto-model selection
-          if (opts.modelId && !args.some(a => a.startsWith('--model'))) {
-            // Strip engine prefix (e.g., "claude-sonnet-4" → "sonnet-4")
-            const model = opts.modelId.replace(/^claude-/, '');
-            args.push('--model', model);
-          }
+          // Only pass --model if explicitly set in extraArgs by the user.
+          // Otherwise let Claude Code CLI use its own default model selection.
           return args;
         },
         useStdin: true,

@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "Agent Task Player",
   "description": "Define playlists of tasks and play them sequentially using coding agent CLIs (Codex, Claude Code, Gemini CLI, Ollama).",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -641,6 +641,12 @@
           "default": 600000,
           "minimum": 30000,
           "description": "Per-task timeout in milliseconds (default 10 minutes). Tasks exceeding this limit are killed and marked failed."
+        },
+        "agentTaskPlayer.costBudgetUsd": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Estimated cost budget in USD for a run. Set to 0 to disable budget warnings."
         },
         "agentTaskPlayer.maxHistoryEntries": {
           "type": "number",

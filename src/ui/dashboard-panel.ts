@@ -16,6 +16,7 @@ export class DashboardPanel {
   private _disposables: vscode.Disposable[] = [];
   private _outputBuffer: { text: string; stream: 'stdout' | 'stderr'; taskId?: string }[] = [];
   private _outputFlushTimer: ReturnType<typeof setInterval> | null = null;
+  private _webviewReadyFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private _disposed = false;
   private _webviewReady = false;
 
@@ -28,9 +29,8 @@ export class DashboardPanel {
     private savePlanCallback: () => void,
   ) {
     this._panel = panel;
-    // Register handlers BEFORE setting HTML — setting HTML triggers the
-    // webview script which immediately sends 'refresh', so the handler
-    // must already be listening.
+    // Register handlers BEFORE setting HTML so the initial webview-ready
+    // handshake cannot race the extension-side listener.
     this._panel.onDidDispose(() => this.dispose(), null, this._disposables);
     this._panel.webview.onDidReceiveMessage(
       (msg) => this.handleMessage(msg),
@@ -40,12 +40,6 @@ export class DashboardPanel {
     const plan = this.getPlan();
     outputChannel.appendLine(`[constructor] getPlan() returned: ${plan ? plan.name + ' (' + plan.playlists.length + ' playlists)' : 'null'}`);
     this.renderWebview();
-    // Send state multiple times to ensure delivery — webview may not be ready immediately
-    this.update();
-    setTimeout(() => this.update(), 200);
-    setTimeout(() => this.update(), 600);
-    setTimeout(() => this.update(), 1500);
-    setTimeout(() => this.update(), 3000);
 
     // Resend state whenever the panel becomes visible (e.g. user switches tabs)
     this._panel.onDidChangeViewState(
@@ -69,8 +63,9 @@ export class DashboardPanel {
       DashboardPanel.currentPanel._panel.reveal(column);
       if (!DashboardPanel.currentPanel._webviewReady) {
         DashboardPanel.currentPanel.renderWebview();
+      } else {
+        DashboardPanel.currentPanel.update();
       }
-      DashboardPanel.currentPanel.update();
       return DashboardPanel.currentPanel;
     }
     outputChannel.appendLine('[createOrShow] creating new panel');
@@ -92,8 +87,23 @@ export class DashboardPanel {
   }
 
   private renderWebview(): void {
+    this.clearWebviewReadyFallback();
     this._webviewReady = false;
     this._panel.webview.html = this.getHtml();
+    this._webviewReadyFallbackTimer = setTimeout(() => {
+      this._webviewReadyFallbackTimer = null;
+      if (!this._webviewReady) {
+        outputChannel.appendLine('[renderWebview] webview-ready handshake timed out; sending fallback update');
+        this.update();
+      }
+    }, 3000);
+  }
+
+  private clearWebviewReadyFallback(): void {
+    if (this._webviewReadyFallbackTimer) {
+      clearTimeout(this._webviewReadyFallbackTimer);
+      this._webviewReadyFallbackTimer = null;
+    }
   }
 
   /** Safely post a message to the webview (no-op if disposed) */
@@ -228,8 +238,12 @@ export class DashboardPanel {
   private handleMessage(msg: { type: string; [key: string]: unknown }): void {
     outputChannel.appendLine(`[handleMessage] type=${msg.type}`);
     switch (msg.type) {
-      case 'ready':
+      case 'webview-ready':
+        if (this._webviewReady) {
+          break;
+        }
         this._webviewReady = true;
+        this.clearWebviewReadyFallback();
         this.update();
         break;
       case 'play':
@@ -320,6 +334,7 @@ export class DashboardPanel {
   private dispose(): void {
     this._disposed = true;
     DashboardPanel.currentPanel = undefined;
+    this.clearWebviewReadyFallback();
     if (this._outputFlushTimer) {
       clearInterval(this._outputFlushTimer);
       this._outputFlushTimer = null;
@@ -2270,9 +2285,15 @@ export class DashboardPanel {
       }
     })();
 
-    // Tell the extension we are ready, then request fresh state
-    vscode.postMessage({ type: 'ready' });
-    vscode.postMessage({ type: 'refresh' });
+    function notifyWebviewReady() {
+      vscode.postMessage({ type: 'webview-ready' });
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', notifyWebviewReady, { once: true });
+    } else {
+      notifyWebviewReady();
+    }
 
     // Retry polling: if no plan loaded after init, keep asking the extension
     // for up to 5 seconds (covers async plan loading race condition)

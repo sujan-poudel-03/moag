@@ -31,12 +31,18 @@ const GIT_TIMEOUT_MS = 30_000;
 const VERIFY_TIMEOUT_MS = 30_000;
 const DEFAULT_SERVICE_STARTUP_TIMEOUT_MS = 60_000;
 
+export interface BudgetExceededEvent {
+  totalCost: number;
+  budget: number;
+}
+
 export interface RunnerEvents {
   'state-changed': (state: RunnerState) => void;
   'task-started': (task: Task, playlist: Playlist, fullPrompt: string) => void;
   'task-output': (task: Task, chunk: string, stream: 'stdout' | 'stderr') => void;
   'task-completed': (task: Task, result: EngineResult) => void;
   'task-failed': (task: Task, result: EngineResult) => void;
+  'budget-exceeded': (details: BudgetExceededEvent) => void;
   'playlist-completed': (playlist: Playlist) => void;
   'all-completed': () => void;
   'error': (err: Error) => void;
@@ -73,6 +79,8 @@ export class TaskRunner {
   private _taskGitRefs = new Map<string, { ref: string; cwd: string }>();
   private _serviceProcesses = new Map<string, ServiceHandle>();
   private _currentRunId: string | null = null;
+  private _totalCostUsd = 0;
+  private _budgetExceededEmitted = false;
 
   constructor(private readonly historyStore: HistoryStore) {}
 
@@ -116,15 +124,39 @@ export class TaskRunner {
     this.emit('state-changed', state);
   }
 
+  private resetRunBudgetTracking(): void {
+    this._totalCostUsd = 0;
+    this._budgetExceededEmitted = false;
+  }
+
+  private trackTaskCost(result: EngineResult): void {
+    const estimatedCost = result.tokenUsage?.estimatedCost;
+    if (estimatedCost === undefined || !Number.isFinite(estimatedCost)) {
+      return;
+    }
+
+    this._totalCostUsd += estimatedCost;
+
+    const budget = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('costBudgetUsd', 0);
+    if (budget <= 0 || this._budgetExceededEmitted || this._totalCostUsd <= budget) {
+      return;
+    }
+
+    this._budgetExceededEmitted = true;
+    this.emit('budget-exceeded', { totalCost: this._totalCostUsd, budget });
+  }
+
   async play(plan: Plan, playlistIndex = 0, taskIndex = 0): Promise<void> {
     if (this._state === RunnerState.Playing) {
       return;
     }
 
-    if (this._state === RunnerState.Paused && this._pauseResolve) {
+    if (this._state === RunnerState.Paused) {
       this.setState(RunnerState.Playing);
-      this._pauseResolve();
-      this._pauseResolve = null;
+      if (this._pauseResolve) {
+        this._pauseResolve();
+        this._pauseResolve = null;
+      }
       return;
     }
 
@@ -137,6 +169,7 @@ export class TaskRunner {
     this._currentPlaylistIndex = playlistIndex;
     this._currentTaskIndex = taskIndex;
     this._abortController = new AbortController();
+    this.resetRunBudgetTracking();
     this._currentRunId = generateId();
     this.setState(RunnerState.Playing);
 
@@ -169,6 +202,7 @@ export class TaskRunner {
 
     this._plan = plan;
     this._abortController = new AbortController();
+    this.resetRunBudgetTracking();
     this.setState(RunnerState.Playing);
 
     const playlist = plan.playlists[playlistIndex];
@@ -197,6 +231,7 @@ export class TaskRunner {
 
     this._plan = plan;
     this._abortController = new AbortController();
+    this.resetRunBudgetTracking();
     this.setState(RunnerState.Playing);
 
     try {
@@ -554,6 +589,7 @@ export class TaskRunner {
         modelReason: (task as Task & { _modelReason?: string })._modelReason,
       };
       this.historyStore.add(entry);
+      this.trackTaskCost(result);
 
       if (task.status === TaskStatus.Completed) {
         this.emit('task-completed', task, result);
@@ -661,12 +697,18 @@ export class TaskRunner {
       .get<boolean>('autoModelSelection', true);
     const selection = autoSelect ? selectModel(task, engineId, preset) : null;
 
-    // Store selection for history entry
-    (task as Task & { _modelId?: string; _modelReason?: string })._modelId = selection?.modelId;
-    (task as Task & { _modelId?: string; _modelReason?: string })._modelReason = selection?.reason;
+    const modelMeta = task as Task & { _modelId?: string; _modelReason?: string };
+    if (engineId === 'codex') {
+      modelMeta._modelId = undefined;
+      modelMeta._modelReason = undefined;
+    } else {
+      // Non-Codex engines use the extension's selector directly.
+      modelMeta._modelId = selection?.modelId;
+      modelMeta._modelReason = selection?.reason;
+    }
 
     const engine = getEngine(engineId);
-    return engine.runTask({
+    const result = await engine.runTask({
       prompt: fullPrompt,
       cwd,
       files: task.files,
@@ -676,6 +718,12 @@ export class TaskRunner {
         this.emit('task-output', task, chunk, stream);
       },
     });
+
+    if (engineId === 'codex') {
+      modelMeta._modelId = this.parseReportedModelId(result);
+    }
+
+    return result;
   }
 
   private async runCommandTask(task: Task, cwd: string, signal: AbortSignal): Promise<EngineResult> {
@@ -1165,6 +1213,12 @@ export class TaskRunner {
       parts.push(`${task.acceptanceCriteria.length} acceptance criteria documented`);
     }
     return parts.join('; ') + '.';
+  }
+
+  private parseReportedModelId(result: EngineResult): string | undefined {
+    const combined = [result.stderr, result.stdout].filter(Boolean).join('\n');
+    const match = combined.match(/^\s*model:\s*([^\r\n]+)\s*$/mi);
+    return match?.[1]?.trim() || undefined;
   }
 
   private getErrorGuidance(errorMsg: string, engineId: EngineId): string | null {

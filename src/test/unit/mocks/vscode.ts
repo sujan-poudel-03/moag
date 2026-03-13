@@ -50,6 +50,13 @@ export class ThemeIcon {
   }
 }
 
+export class ThemeColor {
+  id: string;
+  constructor(id: string) {
+    this.id = id;
+  }
+}
+
 // Configurable mock configuration store
 const configStore: Record<string, Record<string, unknown>> = {};
 

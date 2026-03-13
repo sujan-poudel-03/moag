@@ -67,18 +67,29 @@ You can also create a `.agent-plan.json` file by hand — the extension auto-loa
 ```json
 {
   "version": "1.0",
-  "name": "My First Plan",
-  "defaultEngine": "claude",
+  "name": "Setup API",
+  "defaultEngine": "codex",
   "playlists": [
     {
-      "id": "setup",
-      "name": "Setup",
+      "id": "setup-api",
+      "name": "Setup API",
       "autoplay": true,
       "tasks": [
         {
-          "id": "task-1",
-          "name": "Create project",
-          "prompt": "Create a new Node.js project with TypeScript and Express. Set up package.json, tsconfig.json, and a basic hello world server."
+          "id": "scaffold-server",
+          "name": "Scaffold Express server",
+          "type": "agent",
+          "prompt": "Create a minimal Express server with a GET /health endpoint, a src/server.ts entrypoint, and package scripts for dev and test.",
+          "failurePolicy": "continue"
+        },
+        {
+          "id": "run-tests",
+          "name": "Run test suite",
+          "type": "command",
+          "prompt": "Run the project's tests after the API scaffold is in place.",
+          "command": "npm test",
+          "dependsOn": ["scaffold-server"],
+          "failurePolicy": "continue"
         }
       ]
     }
@@ -340,10 +351,13 @@ Plans are `.agent-plan.json` files. The extension auto-loads the first one found
 | `id` | Yes | Unique identifier |
 | `name` | Yes | Display name shown in tree view |
 | `prompt` | Yes | Instruction sent to the agent CLI |
+| `type` | No | Task mode: `agent`, `command`, `service`, or `check` |
 | `engine` | No | Override the playlist/plan default engine |
+| `command` | No | Shell command used by `command`, `service`, or `check` tasks |
 | `cwd` | No | Working directory (relative to workspace root) |
 | `files` | No | File paths whose contents are appended to the prompt as context |
 | `verifyCommand` | No | Shell command to validate the result (exit 0 = pass) |
+| `failurePolicy` | No | What to do on failure: `continue`, `stop`, or `mark-blocked` |
 | `retryCount` | No | Number of retries on failure (default: 0 = no retry) |
 | `dependsOn` | No | Array of task IDs that must complete before this task runs |
 
@@ -474,6 +488,14 @@ npm run package    # produces a .vsix file
 - Conditional task execution (run only if previous output matches pattern)
 
 For the product direction beyond the current feature list, see [docs/local-first-roadmap.md](docs/local-first-roadmap.md). It lays out the local-first execution strategy for `v0.6.0` through `v1.0.0`, including implementation order and release/deployment steps.
+
+---
+
+## Known Limitations
+
+- Tasks run sequentially by default. Set `"parallel": true` on a playlist to run its tasks concurrently.
+- Each agent CLI must be installed separately on your machine before the extension can use it.
+- Cost tracking is estimated from CLI output and depends on what the selected engine reports.
 
 ---
 

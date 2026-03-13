@@ -76,9 +76,9 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionsTre
   private _getRootNodes(): SessionsTreeItem[] {
     const roots: SessionsTreeItem[] = [];
     const sessions = this.runSessionStore.getAll();
-    const runningSessions = sessions.filter(s => s.status === 'running');
-    const pastSessions = sessions.filter(s => s.status !== 'running');
-    const threads = this.historyStore.getThreadHeads();
+    const runningSessions = sessions.filter(s => s.status === 'running' && this._matchesSession(s));
+    const pastSessions = sessions.filter(s => s.status !== 'running' && this._matchesSession(s));
+    const threads = this.historyStore.getThreadHeads().filter(h => this._matchesThread(h));
 
     if (runningSessions.length > 0) {
       const item = new SessionsTreeItem(
@@ -110,6 +110,17 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionsTre
       roots.push(item);
     }
 
+    if (roots.length === 0 && this._filter) {
+      const empty = new SessionsTreeItem(
+        'sessions-group',
+        'No matching sessions',
+        vscode.TreeItemCollapsibleState.None,
+      );
+      empty.description = 'Clear the search to show all results';
+      empty.iconPath = new vscode.ThemeIcon('search-stop');
+      roots.push(empty);
+    }
+
     if (roots.length === 0) {
       const empty = new SessionsTreeItem(
         'sessions-group',
@@ -129,14 +140,14 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionsTre
   private _getRunningSessionNodes(): SessionsTreeItem[] {
     return this.runSessionStore.getAll()
       .filter(s => s.status === 'running')
-      .filter(s => !this._filter || s.planName.toLowerCase().includes(this._filter))
+      .filter(s => this._matchesSession(s))
       .map(s => this._buildSessionNode(s));
   }
 
   private _getPastSessionNodes(): SessionsTreeItem[] {
     return this.runSessionStore.getAll()
       .filter(s => s.status !== 'running')
-      .filter(s => !this._filter || s.planName.toLowerCase().includes(this._filter))
+      .filter(s => this._matchesSession(s))
       .slice(0, 30)
       .map(s => this._buildSessionNode(s));
   }
@@ -197,7 +208,7 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionsTre
 
   private _getThreadNodes(): SessionsTreeItem[] {
     return this.historyStore.getThreadHeads()
-      .filter(h => !this._filter || h.taskName.toLowerCase().includes(this._filter))
+      .filter(h => this._matchesThread(h))
       .slice(0, 30)
       .map(head => {
         const tid = head.threadId ?? head.id;
@@ -239,9 +250,80 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionsTre
         return item;
       });
   }
+
+  private _matchesSession(session: RunSession): boolean {
+    if (!this._filter) {
+      return true;
+    }
+    return buildSessionSearchText(session, this.historyStore.getForRun(session.id)).includes(this._filter);
+  }
+
+  private _matchesThread(head: HistoryEntry): boolean {
+    if (!this._filter) {
+      return true;
+    }
+    return buildThreadSearchText(head, this.historyStore.getThread(head.threadId ?? head.id)).includes(this._filter);
+  }
 }
 
 // ─── Helpers ───
+
+function buildSessionSearchText(session: RunSession, entries: HistoryEntry[]): string {
+  const parts: string[] = [
+    session.planName,
+    session.planPath ?? '',
+    session.status,
+    ...session.engines,
+  ];
+
+  for (const entry of entries) {
+    const modelSpec = entry.modelId ? getModelSpec(entry.modelId) : undefined;
+    parts.push(
+      entry.taskName,
+      entry.playlistName,
+      entry.engine,
+      entry.modelId ?? '',
+      modelSpec?.displayName ?? '',
+      entry.prompt,
+      entry.ownerNote ?? '',
+      entry.result.summary ?? '',
+    );
+  }
+
+  return normalizeSearchText(parts);
+}
+
+function buildThreadSearchText(head: HistoryEntry, entries: HistoryEntry[]): string {
+  const parts: string[] = [
+    head.taskName,
+    head.playlistName,
+    head.engine,
+    head.modelId ?? '',
+  ];
+
+  for (const entry of entries) {
+    const modelSpec = entry.modelId ? getModelSpec(entry.modelId) : undefined;
+    parts.push(
+      entry.taskName,
+      entry.playlistName,
+      entry.engine,
+      entry.modelId ?? '',
+      modelSpec?.displayName ?? '',
+      entry.prompt,
+      entry.ownerNote ?? '',
+      entry.result.summary ?? '',
+    );
+  }
+
+  return normalizeSearchText(parts);
+}
+
+function normalizeSearchText(parts: string[]): string {
+  return parts
+    .map(part => part.trim().toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+}
 
 function formatDurationMs(ms: number): string {
   if (ms < 1000) { return `${ms}ms`; }

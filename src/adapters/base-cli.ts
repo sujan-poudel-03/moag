@@ -51,8 +51,11 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
     const startTime = Date.now();
     const args = config.buildArgs(options);
 
-    // Build a display-friendly command string (omit the last arg which is the prompt body)
-    const displayArgs = args.length > 1 ? args.slice(0, -1) : args;
+    // Build a display-friendly command string. When the prompt is sent via stdin,
+    // every CLI arg is real and should be shown.
+    const displayArgs = config.useStdin
+      ? args
+      : args.length > 1 ? args.slice(0, -1) : args;
     const commandStr = [config.command, ...displayArgs].join(' ');
 
     // Emit command and response headers before spawning

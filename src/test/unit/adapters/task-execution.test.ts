@@ -19,8 +19,8 @@ const vscodeMock = require('../mocks/vscode');
 /** Captures the CliConfig passed to runCli so we can inspect buildArgs */
 function createCapturingRunCli() {
   const calls: Array<{
-    config: { command: string; buildArgs: (opts: { prompt: string; cwd?: string }) => string[]; useStdin?: boolean };
-    options: { prompt: string; cwd: string; signal?: AbortSignal };
+    config: { command: string; buildArgs: (opts: { prompt: string; cwd?: string; modelId?: string }) => string[]; useStdin?: boolean };
+    options: { prompt: string; cwd: string; signal?: AbortSignal; modelId?: string };
     onOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void;
   }> = [];
 
@@ -148,6 +148,50 @@ describe('Codex Task Execution', () => {
     const args = calls[0].config.buildArgs({ prompt: 'test' });
     const count = args.filter(a => a === '--full-auto').length;
     assert.equal(count, 1, 'should have exactly one --full-auto');
+  });
+
+  it('should let Codex CLI auto-select when no explicit model arg is configured', async () => {
+    const { runCli, calls } = createCapturingRunCli();
+    const { CodexAdapter } = proxyquire('../../../adapters/codex-adapter', {
+      vscode: vscodeMock,
+      './base-cli': { runCli },
+    });
+    const adapter = new CodexAdapter();
+    await adapter.runTask({ prompt: 'test', cwd: '/tmp', modelId: 'gpt-5.1-codex-mini' });
+
+    const args = calls[0].config.buildArgs({ prompt: 'test', modelId: 'gpt-5.1-codex-mini' });
+    assert.deepEqual(args, ['exec', '--full-auto']);
+    assert.ok(!args.includes('--model'), 'should not force a model when no override is configured');
+  });
+
+  it('should preserve an explicit supported model arg from settings', async () => {
+    setMockConfig('agentTaskPlayer.engines.codex', { args: ['--model', 'gpt-5.3-codex'] });
+    const { runCli, calls } = createCapturingRunCli();
+    const { CodexAdapter } = proxyquire('../../../adapters/codex-adapter', {
+      vscode: vscodeMock,
+      './base-cli': { runCli },
+    });
+    const adapter = new CodexAdapter();
+    await adapter.runTask({ prompt: 'test', cwd: '/tmp', modelId: 'gpt-5.4' });
+
+    const args = calls[0].config.buildArgs({ prompt: 'test', modelId: 'gpt-5.4' });
+    assert.deepEqual(args.slice(0, 4), ['exec', '--model', 'gpt-5.3-codex', '--full-auto']);
+    assert.equal(args.filter(a => a === '--model').length, 1, 'should not add a second model flag');
+  });
+
+  it('should replace a legacy GPT-4 model arg with the selected Codex model', async () => {
+    setMockConfig('agentTaskPlayer.engines.codex', { args: ['--model', 'gpt-4.1-mini'] });
+    const { runCli, calls } = createCapturingRunCli();
+    const { CodexAdapter } = proxyquire('../../../adapters/codex-adapter', {
+      vscode: vscodeMock,
+      './base-cli': { runCli },
+    });
+    const adapter = new CodexAdapter();
+    await adapter.runTask({ prompt: 'test', cwd: '/tmp', modelId: 'gpt-5.1-codex-mini' });
+
+    const args = calls[0].config.buildArgs({ prompt: 'test', modelId: 'gpt-5.1-codex-mini' });
+    assert.deepEqual(args.slice(0, 4), ['exec', '--model', 'gpt-5.1-codex-mini', '--full-auto']);
+    assert.ok(!args.includes('gpt-4.1-mini'), 'should not keep the unsupported GPT-4 model');
   });
 
   it('should include extra args from settings', async () => {
@@ -462,8 +506,13 @@ describe('Runner Task Execution — engine integration', () => {
       assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
     });
 
-    it('should record history entry for codex execution', async () => {
-      const stub = sinon.stub().resolves({ stdout: 'ok', stderr: '', exitCode: 0, durationMs: 100 });
+    it('should record the model reported by codex in history', async () => {
+      const stub = sinon.stub().resolves({
+        stdout: 'Reading prompt from stdin...\n--------\nmodel: gpt-5.4\n--------\nok',
+        stderr: '',
+        exitCode: 0,
+        durationMs: 100,
+      });
       const { runner, historyStore } = buildRunnerWithEngine('codex', stub);
       const plan = makeSingleTaskPlan('codex');
 
@@ -473,6 +522,8 @@ describe('Runner Task Execution — engine integration', () => {
       const entry = historyStore.add.firstCall.args[0];
       assert.equal(entry.engine, 'codex');
       assert.equal(entry.status, TaskStatus.Completed);
+      assert.equal(entry.modelId, 'gpt-5.4');
+      assert.equal(entry.modelReason, undefined);
     });
 
     it('should execute multiple tasks sequentially', async () => {

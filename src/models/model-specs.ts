@@ -17,10 +17,12 @@ const specs: ModelSpec[] = [
   { id: 'haiku-4.5',    displayName: 'Claude Haiku 4.5',    engine: 'claude', contextWindow: 200_000,   inputPrice: 0.80,  outputPrice: 4,     reasoning: 'medium' },
 
   // Codex / OpenAI
-  { id: 'gpt-4.1',      displayName: 'GPT-4.1',             engine: 'codex',  contextWindow: 1_000_000, inputPrice: 2,     outputPrice: 8,     reasoning: 'high' },
-  { id: 'gpt-4.1-mini', displayName: 'GPT-4.1 Mini',        engine: 'codex',  contextWindow: 1_000_000, inputPrice: 0.40,  outputPrice: 1.60,  reasoning: 'medium' },
-  { id: 'o3',           displayName: 'o3',                   engine: 'codex',  contextWindow: 200_000,   inputPrice: 10,    outputPrice: 40,    reasoning: 'extra-high' },
-  { id: 'o4-mini',      displayName: 'o4-mini',              engine: 'codex',  contextWindow: 200_000,   inputPrice: 1.10,  outputPrice: 4.40,  reasoning: 'high' },
+  { id: 'gpt-5.4',             displayName: 'GPT-5.4',             engine: 'codex',  contextWindow: 1_000_000, inputPrice: 5,     outputPrice: 20,    reasoning: 'extra-high' },
+  { id: 'gpt-5.3-codex',       displayName: 'GPT-5.3 Codex',       engine: 'codex',  contextWindow: 1_000_000, inputPrice: 3,     outputPrice: 12,    reasoning: 'extra-high' },
+  { id: 'gpt-5.2-codex',       displayName: 'GPT-5.2 Codex',       engine: 'codex',  contextWindow: 1_000_000, inputPrice: 2,     outputPrice: 8,     reasoning: 'high' },
+  { id: 'gpt-5.2',             displayName: 'GPT-5.2',             engine: 'codex',  contextWindow: 1_000_000, inputPrice: 2,     outputPrice: 8,     reasoning: 'high' },
+  { id: 'gpt-5.1-codex-max',   displayName: 'GPT-5.1 Codex Max',   engine: 'codex',  contextWindow: 1_000_000, inputPrice: 1.50,  outputPrice: 6,     reasoning: 'high' },
+  { id: 'gpt-5.1-codex-mini',  displayName: 'GPT-5.1 Codex Mini',  engine: 'codex',  contextWindow: 1_000_000, inputPrice: 0.40,  outputPrice: 1.60,  reasoning: 'medium' },
 
   // Gemini
   { id: 'gemini-2.5-pro',   displayName: 'Gemini 2.5 Pro',   engine: 'gemini', contextWindow: 1_000_000, inputPrice: 1.25,  outputPrice: 10,    reasoning: 'high' },
@@ -34,7 +36,7 @@ const modelMap = new Map<string, ModelSpec>(specs.map(s => [s.id, s]));
 
 const defaultModels: Record<string, string> = {
   claude: 'sonnet-4',
-  codex:  'gpt-4.1',
+  codex:  'gpt-5.4',
   gemini: 'gemini-2.5-pro',
   ollama: 'local',
 };

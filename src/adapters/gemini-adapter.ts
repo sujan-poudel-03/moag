@@ -25,10 +25,8 @@ export class GeminiAdapter implements EngineAdapter {
         command,
         buildArgs: (opts) => {
           const args = [...extraArgs];
-          if (opts.modelId && !args.some(a => a.startsWith('--model'))) {
-            const model = opts.modelId.replace(/^gemini-/, '');
-            args.push('--model', model);
-          }
+          // Only pass --model if explicitly set in extraArgs by the user.
+          // Otherwise let Gemini CLI use its own default model selection.
           return args;
         },
         useStdin: true,

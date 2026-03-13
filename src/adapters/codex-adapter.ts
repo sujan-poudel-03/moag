@@ -26,14 +26,12 @@ export class CodexAdapter implements EngineAdapter {
       {
         command,
         buildArgs: (opts) => {
-          const args = ['exec', ...extraArgs];
+          const args = buildCodexArgs(extraArgs, opts.modelId);
           if (autoApprove && !args.includes('--full-auto')) {
             args.push('--full-auto');
           }
-          if (opts.modelId && !args.some(a => a.startsWith('--model'))) {
-            const model = opts.modelId.replace(/^codex-/, '');
-            args.push('--model', model);
-          }
+          // Let Codex CLI pick its own default model unless the user
+          // explicitly configured a model override in settings.
           return args;
         },
         useStdin: true,
@@ -45,6 +43,44 @@ export class CodexAdapter implements EngineAdapter {
     result.tokenUsage = parseCodexTokenUsage(result.stdout, result.stderr);
     return result;
   }
+}
+
+function buildCodexArgs(extraArgs: string[], modelId?: string): string[] {
+  const args = ['exec'];
+  let hasExplicitModel = false;
+
+  for (let i = 0; i < extraArgs.length; i++) {
+    const arg = extraArgs[i];
+
+    if (arg === '-m' || arg === '--model') {
+      hasExplicitModel = true;
+      const configuredModel = extraArgs[i + 1];
+      args.push(arg);
+      if (configuredModel !== undefined) {
+        args.push(shouldReplaceLegacyModel(configuredModel, modelId) ? modelId! : configuredModel);
+        i++;
+      }
+      continue;
+    }
+
+    if (arg.startsWith('--model=')) {
+      hasExplicitModel = true;
+      const configuredModel = arg.slice('--model='.length);
+      args.push(shouldReplaceLegacyModel(configuredModel, modelId) ? `--model=${modelId}` : arg);
+      continue;
+    }
+
+    args.push(arg);
+  }
+
+  return args;
+}
+
+function shouldReplaceLegacyModel(configuredModel: string, modelId?: string): boolean {
+  if (!modelId) {
+    return false;
+  }
+  return /^gpt-4([.-]|$)/i.test(configuredModel) || /^gpt-4o([.-]|$)/i.test(configuredModel);
 }
 
 /** Parse token usage from Codex CLI output (stdout + stderr) */

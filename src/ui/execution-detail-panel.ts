@@ -402,6 +402,35 @@ function escHtml(text: string): string {
     .replace(/"/g, '&quot;');
 }
 
+function buildSessionCardSearchText(session: RunSession): string {
+  return [
+    session.planName,
+    session.planPath ?? '',
+    session.status,
+    ...session.engines,
+  ]
+    .map(part => part.trim().toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+}
+
+function buildThreadCardSearchText(head: HistoryEntry): string {
+  const modelSpec = head.modelId ? getModelSpec(head.modelId) : null;
+  return [
+    head.taskName,
+    head.playlistName,
+    head.engine,
+    head.modelId ?? '',
+    modelSpec?.displayName ?? '',
+    head.prompt,
+    head.ownerNote ?? '',
+    head.result.summary ?? '',
+  ]
+    .map(part => part.trim().toLowerCase())
+    .filter(Boolean)
+    .join(' ');
+}
+
 function formatDuration(ms: number): string {
   if (ms < 1000) { return `${ms}ms`; }
   if (ms < 60_000) { return `${(ms / 1000).toFixed(1)}s`; }
@@ -497,7 +526,7 @@ function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[
       ? Math.round((activeSession.tasksCompleted / activeSession.taskCount) * 100)
       : 0;
     html += `
-    <div class="active-run-card">
+    <div class="active-run-card" data-search-text="${escHtml(buildSessionCardSearchText(activeSession))}">
       <div class="active-run-indicator">
         <span class="pulse-dot"></span>
         <span class="active-run-label">Running</span>
@@ -532,7 +561,7 @@ function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[
       ).join(' ');
 
       html += `
-      <div class="session-card" data-run-id="${escHtml(session.id)}">
+      <div class="session-card" data-run-id="${escHtml(session.id)}" data-search-text="${escHtml(buildSessionCardSearchText(session))}">
         <div class="session-card-row">
           <div class="session-card-title">${escHtml(session.planName)}</div>
           <button class="card-delete" data-run-id="${escHtml(session.id)}" title="Delete session">&#x2715;</button>
@@ -568,7 +597,7 @@ function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[
       const engineClass = engineBadgeClass(head.engine);
 
       html += `
-      <div class="thread-card" data-thread-id="${escHtml(tid)}">
+      <div class="thread-card" data-thread-id="${escHtml(tid)}" data-search-text="${escHtml(buildThreadCardSearchText(head))}">
         <div class="thread-card-row">
           <div class="thread-card-title">${escHtml(head.taskName)}</div>
           <button class="card-delete" data-thread-id="${escHtml(tid)}" title="Delete conversation">&#x2715;</button>
@@ -614,6 +643,11 @@ function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[
     </div>
     <div id="filterable-content">
       ${html}
+    </div>
+    <div class="empty-hint-container search-hidden" id="searchEmptyState">
+      <div class="empty-icon">&#128269;</div>
+      <p class="empty-hint-title">No matching sessions</p>
+      <p class="empty-hint-text">Try a different search term.</p>
     </div>
   </div>
 
@@ -1671,15 +1705,37 @@ function sessionListScript(): string {
 
       // Search filtering
       const searchInput = document.getElementById('searchInput');
+      const searchEmptyState = document.getElementById('searchEmptyState');
       if (searchInput) {
-        searchInput.addEventListener('input', () => {
+        const applySearchFilter = () => {
           const query = searchInput.value.toLowerCase().trim();
-          document.querySelectorAll('.session-card, .thread-card').forEach(card => {
-            const title = card.querySelector('.session-card-title, .thread-card-title');
-            const text = (title ? title.textContent : '').toLowerCase();
-            card.classList.toggle('search-hidden', query.length > 0 && !text.includes(query));
+          let visibleCount = 0;
+
+          document.querySelectorAll('.active-run-card, .session-card, .thread-card').forEach(card => {
+            const text = (card.getAttribute('data-search-text') || card.textContent || '').toLowerCase();
+            const hidden = query.length > 0 && !text.includes(query);
+            card.classList.toggle('search-hidden', hidden);
+            if (!hidden) {
+              visibleCount++;
+            }
           });
-        });
+
+          document.querySelectorAll('.section-header').forEach(header => {
+            const list = header.nextElementSibling;
+            if (!list) return;
+            const hasVisibleCards = !!list.querySelector('.session-card:not(.search-hidden), .thread-card:not(.search-hidden)');
+            header.classList.toggle('search-hidden', query.length > 0 && !hasVisibleCards);
+            if (list.classList.contains('session-list') || list.classList.contains('thread-list')) {
+              list.classList.toggle('search-hidden', query.length > 0 && !hasVisibleCards);
+            }
+          });
+          if (searchEmptyState) {
+            searchEmptyState.classList.toggle('search-hidden', query.length === 0 || visibleCount > 0);
+          }
+        };
+
+        searchInput.addEventListener('input', applySearchFilter);
+        applySearchFilter();
       }
 
       // New conversation from footer
