@@ -6,6 +6,7 @@ import * as path from 'path';
 import { Plan, RunnerState, EngineId, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task } from './models/types';
 import { loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
 import { registerAllEngines, checkEngineAvailability, getEngine } from './adapters/index';
+import { commandExists } from './utils/command-exists';
 import { TaskRunner } from './runner/runner';
 import { HistoryStore } from './history/store';
 import { TemplateStore } from './templates/store';
@@ -17,6 +18,7 @@ import { ExecutionDetailPanel } from './ui/execution-detail-panel';
 import { PromptInputViewProvider } from './ui/prompt-input-view';
 import { detectAndConfigureEngines, redetectEngines } from './engine-detection';
 import { RunSessionStore, RunSession } from './models/run-session';
+import * as UserMsg from './utils/user-messages';
 import { SessionsTreeProvider, SessionsTreeItem } from './ui/sessions-tree';
 
 // ─── Shared state ───
@@ -181,7 +183,7 @@ export function activate(context: vscode.ExtensionContext): void {
     async (prompt: string) => {
       const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
       if (!workspaceFolder) {
-        vscode.window.showErrorMessage('Open a workspace folder first.');
+        UserMsg.showError(UserMsg.noWorkspace());
         return;
       }
 
@@ -309,7 +311,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
 
       runner.play(activePlan).catch(err => {
-        vscode.window.showErrorMessage(`Runner error: ${err instanceof Error ? err.message : String(err)}`);
+        UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
       });
     });
   });
@@ -457,6 +459,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.showHistory', cmdShowHistory),
     vscode.commands.registerCommand('agentTaskPlayer.showDashboard', cmdShowDashboard),
     vscode.commands.registerCommand('agentTaskPlayer.clearHistory', cmdClearHistory),
+    vscode.commands.registerCommand('agentTaskPlayer.switchEngine', cmdSwitchEngine),
     vscode.commands.registerCommand('agentTaskPlayer.playPlaylist', cmdPlayPlaylist),
     vscode.commands.registerCommand('agentTaskPlayer.playTask', cmdPlayTask),
     vscode.commands.registerCommand('agentTaskPlayer.addTaskFromTemplate', cmdAddTaskFromTemplate),
@@ -493,22 +496,18 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.searchSessions', cmdSearchSessions),
     vscode.commands.registerCommand('agentTaskPlayer.clearSessions', cmdClearSessions),
     vscode.commands.registerCommand('agentTaskPlayer.newConversation', cmdNewConversation),
+    vscode.commands.registerCommand('agentTaskPlayer.reviewChanges', cmdReviewChanges),
   );
 
-  // Show walkthrough on first activation (no plan loaded yet)
+  // Show walkthrough on first activation — always, regardless of existing plans
   const hasSeenWalkthrough = context.globalState.get<boolean>('agentTaskPlayer.hasSeenWalkthrough', false);
   if (!hasSeenWalkthrough) {
-    // Check if there's no plan in workspace — likely a first-time user
-    vscode.workspace.findFiles('**/*.agent-plan.json', '**/node_modules/**', 1).then(files => {
-      if (files.length === 0) {
-        vscode.commands.executeCommand(
-          'workbench.action.openWalkthrough',
-          'moag.agent-task-player#agentTaskPlayer.getStarted',
-          false,
-        );
-      }
-      context.globalState.update('agentTaskPlayer.hasSeenWalkthrough', true);
-    });
+    vscode.commands.executeCommand(
+      'workbench.action.openWalkthrough',
+      'moag.agent-task-player#agentTaskPlayer.getStarted',
+      false,
+    );
+    context.globalState.update('agentTaskPlayer.hasSeenWalkthrough', true);
   }
 
   // Auto-detect installed engines on first launch (non-blocking)
@@ -662,6 +661,39 @@ function collectEngineIds(plan: Plan, playlistIndex?: number, taskIndex?: number
 }
 
 /**
+ * Lightweight pre-flight check: verify the engine for the first pending task is installed.
+ * Uses `which` (Unix) / `where` (Windows) via commandExists.
+ * Returns true if execution should proceed, false if the user cancelled.
+ */
+async function checkFirstPendingEngine(plan: Plan): Promise<boolean> {
+  // Find the first pending agent task
+  for (const playlist of plan.playlists) {
+    for (const task of playlist.tasks) {
+      if (task.status !== TaskStatus.Pending) { continue; }
+      if (getTaskType(task) !== 'agent') { continue; }
+      const engineId = task.engine ?? playlist.engine ?? plan.defaultEngine;
+      try {
+        const adapter = getEngine(engineId);
+        const command = adapter.getCommand();
+        const exists = await commandExists(command);
+        if (!exists) {
+          const action = await vscode.window.showWarningMessage(
+            `Engine "${adapter.displayName}" not found. Install it or change the engine in your plan.`,
+            'Continue Anyway',
+            'Cancel',
+          );
+          return action === 'Continue Anyway';
+        }
+      } catch {
+        // No adapter registered — fall through to full preflight
+      }
+      return true; // Only check the first pending agent task
+    }
+  }
+  return true; // No pending agent tasks
+}
+
+/**
  * Pre-flight check: validate that all required engines are available.
  * Returns true if execution should proceed, false if the user cancelled.
  */
@@ -756,8 +788,8 @@ async function cmdPlay(): Promise<void> {
     DashboardPanel.currentPanel?.clearTimeline();
   }
 
-  // Pre-flight engine check
-  if (!await preflightEngineCheck(currentPlan)) {
+  // Pre-flight engine check — verify the first pending task's engine is installed
+  if (!await checkFirstPendingEngine(currentPlan)) {
     return;
   }
 
@@ -772,7 +804,7 @@ async function cmdPlay(): Promise<void> {
   // Auto-open the dashboard so the user sees live output
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   runner.play(currentPlan).catch(err => {
-    vscode.window.showErrorMessage(`Runner error: ${err instanceof Error ? err.message : String(err)}`);
+    UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
 }
 
@@ -801,14 +833,14 @@ async function cmdOpenPlan(): Promise<void> {
     DashboardPanel.currentPanel?.update();
     vscode.window.showInformationMessage(`Loaded plan: ${currentPlan.name}`);
   } catch (err) {
-    vscode.window.showErrorMessage(err instanceof Error ? err.message : `Failed to load plan: ${err}`);
+    UserMsg.showError(UserMsg.planLoadError(err instanceof Error ? err.message : String(err)));
   }
 }
 
 async function cmdNewPlan(): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
-    vscode.window.showErrorMessage('Open a workspace folder first.');
+    UserMsg.showError(UserMsg.noWorkspace());
     return;
   }
 
@@ -936,7 +968,7 @@ async function cmdNewPlan(): Promise<void> {
 async function cmdLoadExamplePlan(): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
-    vscode.window.showErrorMessage('Open a workspace folder first.');
+    UserMsg.showError(UserMsg.noWorkspace());
     return;
   }
 
@@ -1505,7 +1537,7 @@ async function cmdRetryTask(item?: PlanTreeItem): Promise<void> {
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   runner.playTask(currentPlan, item.playlistIndex, item.taskIndex).catch(err => {
-    vscode.window.showErrorMessage(`Retry failed: ${err instanceof Error ? err.message : String(err)}`);
+    UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
   });
 }
 
@@ -1545,7 +1577,7 @@ async function cmdRetryTaskWithNote(item?: PlanTreeItem): Promise<void> {
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   runner.playTask(currentPlan, item.playlistIndex, item.taskIndex).catch(err => {
-    vscode.window.showErrorMessage(`Retry failed: ${err instanceof Error ? err.message : String(err)}`);
+    UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
   });
 }
 
@@ -1609,6 +1641,33 @@ function cmdClearHistory(): void {
   vscode.window.showInformationMessage('History cleared.');
 }
 
+async function cmdSwitchEngine(): Promise<void> {
+  if (!currentPlan) { return; }
+  const engines: Array<{ label: string; id: string }> = [
+    { label: 'Claude Code', id: 'claude' },
+    { label: 'Codex CLI', id: 'codex' },
+    { label: 'Gemini CLI', id: 'gemini' },
+    { label: 'Ollama (local)', id: 'ollama' },
+  ];
+  const current = currentPlan.defaultEngine;
+  const items = engines.map(e => ({
+    label: e.label + (e.id === current ? ' (current)' : ''),
+    description: e.id,
+    id: e.id,
+  }));
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: 'Switch default engine for this plan',
+  });
+  if (!pick || pick.id === current) { return; }
+  currentPlan.defaultEngine = pick.id as import('./models/types').EngineId;
+  if (currentPlanPath) {
+    savePlan(currentPlan, currentPlanPath);
+  }
+  planTree.refresh();
+  DashboardPanel.currentPanel?.update();
+  vscode.window.showInformationMessage(`Engine switched to ${pick.label.replace(' (current)', '')}.`);
+}
+
 async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
   if (!currentPlan || !item || item.kind !== 'playlist') { return; }
 
@@ -1639,7 +1698,7 @@ async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
   DashboardPanel.currentPanel?.clearTimeline();
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   runner.playPlaylist(currentPlan, item.playlistIndex).catch(err => {
-    vscode.window.showErrorMessage(`Runner error: ${err instanceof Error ? err.message : String(err)}`);
+    UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
 }
 
@@ -1703,7 +1762,7 @@ async function cmdRunSelected(item?: PlanTreeItem, selectedItems?: PlanTreeItem[
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   DashboardPanel.currentPanel?.clearTimeline();
   runner.playTasks(currentPlan, taskList).catch(err => {
-    vscode.window.showErrorMessage(`Runner error: ${err instanceof Error ? err.message : String(err)}`);
+    UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
 }
 
@@ -1830,7 +1889,7 @@ async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
     planTree.setPlan(currentPlan);
     planView.message = currentPlan.description || undefined;
   } catch (err) {
-    vscode.window.showErrorMessage(err instanceof Error ? err.message : `Failed to load plan: ${err}`);
+    UserMsg.showError(UserMsg.planLoadError(err instanceof Error ? err.message : String(err)));
     return;
   }
 
@@ -1876,7 +1935,7 @@ async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   runner.play(currentPlan).catch(err => {
-    vscode.window.showErrorMessage(`Runner error: ${err instanceof Error ? err.message : String(err)}`);
+    UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
 }
 
@@ -1953,7 +2012,7 @@ async function cmdImportPlan(): Promise<void> {
     try {
       plan = loadPlan(uris[0].fsPath);
     } catch (err) {
-      vscode.window.showErrorMessage(err instanceof Error ? err.message : `Failed to load plan: ${err}`);
+      UserMsg.showError(UserMsg.planLoadError(err instanceof Error ? err.message : String(err)));
       return;
     }
   }
@@ -1961,7 +2020,7 @@ async function cmdImportPlan(): Promise<void> {
   // Ask where to save the imported plan
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
-    vscode.window.showErrorMessage('Open a workspace folder first.');
+    UserMsg.showError(UserMsg.noWorkspace());
     return;
   }
 
@@ -2500,7 +2559,7 @@ async function cmdNewConversation(): Promise<void> {
 
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
-    vscode.window.showErrorMessage('Open a workspace folder first.');
+    UserMsg.showError(UserMsg.noWorkspace());
     return;
   }
 
@@ -2563,4 +2622,10 @@ async function cmdNewConversation(): Promise<void> {
       }
     },
   );
+}
+
+function cmdReviewChanges(): void {
+  const terminal = vscode.window.createTerminal('Review Changes');
+  terminal.show();
+  terminal.sendText('git diff');
 }

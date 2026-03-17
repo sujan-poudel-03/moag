@@ -1,8 +1,8 @@
 {
   "name": "agent-task-player",
   "displayName": "Agent Task Player",
-  "description": "Define playlists of tasks and play them sequentially using coding agent CLIs (Codex, Claude Code, Gemini CLI, Ollama).",
-  "version": "0.7.0",
+  "description": "Automate AI coding workflows — build task playlists and run them with Claude Code, Codex, Gemini CLI, or Ollama, all from VS Code.",
+  "version": "0.8.0",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -29,8 +29,8 @@
     }
   ],
   "categories": [
-    "Other",
-    "Machine Learning"
+    "Machine Learning",
+    "Other"
   ],
   "keywords": [
     "ai",
@@ -41,7 +41,10 @@
     "ollama",
     "task-runner",
     "automation",
-    "llm"
+    "llm",
+    "ai-agent",
+    "workflow",
+    "coding-assistant"
   ],
   "activationEvents": [
     "onView:agentTaskPlayer.planView",
@@ -139,6 +142,12 @@
         "title": "Clear History",
         "category": "Agent Task Player",
         "icon": "$(clear-all)"
+      },
+      {
+        "command": "agentTaskPlayer.switchEngine",
+        "title": "Switch Engine",
+        "category": "Agent Task Player",
+        "icon": "$(symbol-event)"
       },
       {
         "command": "agentTaskPlayer.playPlaylist",

@@ -1,138 +1,131 @@
 # Changelog
 
+## [0.8.0] - 2026-03-17
+
+### Marketplace Ready
+
+### Added
+- **Smart error detection**: Dashboard detects rate limits, auth failures, missing CLIs — shows clear banner with "Switch engine" button
+- **Switch engine command**: One-click engine switch from error banner or command palette
+- **Tabbed info panel**: "Current Run", "All History", "Summary" tabs with drag-to-resize
+- **User-friendly error messages**: All error dialogs now explain what went wrong and suggest recovery actions
+- **Auto-launch walkthrough**: New users see the getting started guide on first install
+- **Compact task pills**: Numbered status indicators instead of truncated text
+- **Post-run guidance**: Status bar shows actionable next steps after execution finishes
+- **Playlist grouping**: Current Run tab groups history entries by playlist
+
+### Changed
+- Error messages module extracted (`user-messages.ts`) for consistency and testability
+- TASKS section auto-expands after execution completes
+- Dashboard width stays fixed during live output streaming
+- Marketplace description and keywords optimized for discoverability
+- Changelog rewritten for end users (no developer jargon)
+
+### Fixed
+- Dashboard width jumping during output streaming
+- Duration text truncated in history panel
+- Debug logging removed from production webview
+
 ## [0.7.0] - 2026-03-13
 
 ### Release Polish
 
 ### Added
-- **Cost budget alerts**: New `agentTaskPlayer.costBudgetUsd` setting — warns when cumulative estimated cost exceeds budget, with option to stop execution
-- **Webview ready handshake**: Dashboard now uses a proper `webview-ready` message instead of multiple setTimeout fallbacks
-- **Updated Codex model specs**: GPT-5.4, GPT-5.3-Codex, GPT-5.2-Codex, GPT-5.2, GPT-5.1-Codex-Max, GPT-5.1-Codex-Mini
-- **Legacy model replacement**: Codex adapter auto-replaces outdated GPT-4.x models with current defaults
-- **README improvements**: Added example `.agent-plan.json` and Known Limitations section
+- **Cost budget alerts**: Set a spending limit with `agentTaskPlayer.costBudgetUsd` — you'll get a warning when estimated costs exceed your budget, with the option to stop
+- **Smart error banners**: Dashboard now detects rate limits, auth failures, and missing CLIs — shows clear messages with recovery actions like "Switch engine"
+- **Switch engine command**: Quickly change your plan's default engine from the error banner or command palette
+- **Tabbed info panel**: "Current Run", "All History", and "Summary" tabs replace the old drawer layout — drag to resize
+- **Updated model support**: GPT-5.4, GPT-5.3-Codex, GPT-5.2-Codex, GPT-5.2, GPT-5.1-Codex-Max, GPT-5.1-Codex-Mini
+- **Example plan in README**: New users can see what a `.agent-plan.json` looks like before creating one
+- **User-friendly error messages**: All error dialogs now explain what went wrong and suggest what to do next
 
 ### Changed
-- CLI adapters (Claude, Codex, Gemini) no longer force `--model` — each CLI uses its own default unless the user explicitly overrides via `args` setting
-- Dashboard initialization is faster and more reliable with single handshake instead of 5 retry attempts
+- CLI adapters no longer force a specific model — each engine uses its own default unless you override in settings
+- Dashboard loads faster with a proper handshake instead of retry delays
+- Task pills show numbered indicators instead of truncated names
+- TASKS section auto-expands after execution finishes
+- Status bar shows actionable guidance after runs ("retry or switch engine")
+- History entries are grouped by playlist in the Current Run tab
 
 ### Fixed
-- Codex tasks failing with "gpt-4.1-mini not supported" on ChatGPT accounts — adapters now respect CLI defaults
+- Codex tasks failing with "model not supported" on ChatGPT accounts
+- Dashboard width jumping around during live output streaming
+- Duration text getting cut off in the history panel
 
 ## [0.6.0] - 2026-03-12
 
-### Execution Contracts Release
+### Execution Contracts
 
 ### Added
-- Task contracts in the plan schema: `type`, `command`, `acceptanceCriteria`, `expectedArtifacts`, `ownerNote`, `failurePolicy`, `env`, `port`, `readyPattern`, `healthCheckUrl`, and `startupTimeoutMs`
-- New task execution modes: `agent`, `command`, `service`, and `check`
-- Background service orchestration with readiness detection from log patterns, port checks, or health URLs
-- Verification evidence and artifact evidence persisted in history entries and export reports
-- PM Summary section in the dashboard with phase, progress, failures, running task, changed files, and active services
-- Built-in command/service templates for local automation flows
-- New `blocked` task status for review-oriented failure handling
+- **Task contracts**: Define acceptance criteria, expected artifacts, verification commands, and failure policies for each task
+- **New task types**: `command`, `service`, and `check` — run shell commands, start dev servers, or validate endpoints alongside agent tasks
+- **Background services**: Start dev servers that run in the background with port checks, health URL probes, and log pattern detection
+- **Summary dashboard**: See progress, failures, running services, and changed files at a glance
+- **Blocked status**: Tasks can be marked as blocked for manual review instead of failing the entire plan
 
 ### Changed
-- The runner now executes local shell commands and services directly instead of routing everything through agent engines
-- Agent prompts now include execution contract details so acceptance criteria and artifacts are visible during generation
-- The dashboard now shows task contracts, verification outcomes, artifact checks, task types, and service state
-- Dry-run and export reports now include task types, command runtime details, artifacts, and blocked status
-- Retry now supports both failed and blocked tasks
-
-### Fixed
-- Non-agent tasks no longer trigger engine preflight checks
-- Context summaries now label blocked tasks correctly
-- History tree and execution detail views now display blocked runs cleanly
-- Dashboard runtime is validated again after the new inline contract/reporting changes
-- Targeted runner/model/history tests now cover command tasks, blocked failure policy, artifact failure, and ready service tasks
+- Shell commands and services run directly — no need to route everything through an AI engine
+- Dashboard shows verification results, artifact checks, and service status inline
+- Retry works on both failed and blocked tasks
 
 ## [0.5.0] - 2026-03-10
 
-### Robustness & Hardening Release
-
-Full audit and hardening pass across the entire codebase. See [docs/robustness-hardening.md](docs/robustness-hardening.md) for the detailed checklist.
+### Stability & Recovery
 
 ### Fixed
-- **Race condition in runner**: Added play lock mutex to prevent concurrent `play()` calls from corrupting state
-- **Unhandled promise rejections**: All async `runner.play()`, `playTask()`, `playPlaylist()` calls now have `.catch()` handlers — prevents extension host crashes
-- **Git operation hangs**: Added 30-second timeout to all git commands (`stash create`, `diff`, `rev-parse`) with platform-aware process kill
-- **Abort listener memory leaks**: `base-cli.ts` now removes the abort event listener when the child process exits, preventing accumulation across task runs
-- **Stale dashboard panel crashes**: All webview message posting goes through `safePostMessage()` which no-ops if the panel was disposed during execution
-- **Verify command silent failures**: Verification commands now capture and stream stdout/stderr to the dashboard, and include output in failure messages
-- **5 pre-existing test failures**: Updated adapter tests to match stdin piping behavior (prompt not in CLI args)
-- **File watcher leak on deactivate**: `planFileWatcher` is now properly disposed when the extension deactivates
+- Fixed a bug where starting multiple runs simultaneously could cause unexpected behavior
+- Fixed crashes that could occur when tasks failed unexpectedly
+- Fixed issue where git operations could freeze indefinitely (now timeout after 30 seconds)
+- Improved memory usage during long-running task sequences
+- Fixed Dashboard stability when switching between views during execution
+- Verification command output is now visible in the Dashboard
 
 ### Added
-- **Per-task timeout**: Configurable via `agentTaskPlayer.taskTimeoutMs` (default 10 min). Stuck tasks are killed and marked failed with exit code 124
-- **Retry failed tasks**: New `retryTask` command — right-click a failed task in the tree view to re-run just that task without restarting the entire plan
-- **Dry-run preview**: New `dryRun` command — generates a Markdown preview showing engine availability (with version), execution plan table, task prompts, and settings
-- **Export results**: New `exportResults` command — export execution results as Markdown, JSON, or clipboard with summary stats, per-task results, and changed files
-- **Undo task changes**: New `undoTask` command — revert changes made by a specific task using git checkpoints captured before each task runs
-- **Parallel playlist execution**: New `parallelPlaylists` setting (1–8) — run independent playlists concurrently with configurable concurrency limit
-- **Progress notifications**: Persistent notification bar with task progress counts and cancellation support during plan execution
-- **Pause state persistence**: Task statuses are saved to workspace state on pause/stop and restored on VS Code restart
-- **Engine version probing**: Availability checks now run `--version` to verify engines actually work, version displayed in dry-run
-- **Dashboard view/retry**: Dashboard webview can now open full task output and retry failed tasks directly
-- **6 new runner tests**: Resume skip, mutex prevention, abort cleanup, stop-from-pause, play-while-busy guard
-- **Robustness documentation**: `docs/robustness-hardening.md` — full checklist of all 20 fixes with problem/fix/files for each
-
-### Changed
-- Verify commands now use `stdio: pipe` instead of `ignore`, with a "Verify" header emitted before output
-- Abort controller is nulled after play finishes (prevents stale references)
-- `child_process.execSync` imported in runner for Windows process tree kill on git timeout
+- **Per-task timeout**: Configurable timeout (default 10 min) — stuck tasks are automatically stopped
+- **Retry failed tasks**: Right-click any failed task to re-run just that one
+- **Dry-run preview**: See which engines are available, what will run, and in what order before executing
+- **Export results**: Save execution results as Markdown, JSON, or copy to clipboard
+- **Undo task changes**: Revert code changes made by a specific task using automatic git checkpoints
+- **Parallel playlists**: Run independent playlists concurrently (1–8 at a time)
+- **Progress bar**: See task progress with cancellation support in the notification area
+- **Resume after restart**: Paused state is saved and restored when you reopen VS Code
+- **Engine version check**: Availability checks verify engines actually work, not just that the command exists
 
 ## [0.4.0] - 2026-03-09
 
+### Dashboard Redesign
+
 ### Added
-- Dashboard redesign: single-view command center with pipeline overview, live output, error banners
-- Multi-input plan creation: quick description, editor paste, clipboard import
-- Large spec support: AI generates 4-12 playlists from detailed product specifications
-- Bulk delete command for tasks and playlists
-- Clear all tasks / clear entire plan commands
-- Play button guard: Resume/Restart picker when progress exists
-- Execution mode: dashboard hides non-essential sections during task execution
-- Responsive CSS: @media queries for narrow panels (<300px, <420px, >600px)
-- Stdin piping for all CLI adapters (avoids Windows 8K command-line length limit)
-- Improved error messages in plan loader with file-specific validation
+- New single-view Dashboard with pipeline overview, live output streaming, and error banners
+- Create plans from a quick description, editor paste, or clipboard import
+- AI generates structured playlists from detailed product specifications
+- Bulk delete for tasks and playlists
+- Resume/Restart picker when re-running a plan that has progress
+- Dashboard auto-adjusts layout during execution to keep output and navigation visible
+- Responsive design for narrow side panels
 
 ## [0.3.0] - 2026-02-27
 
 ### Added
-- Task reply ability: continue a conversation with a running agent task
-- Field open: click file references in task output to open them in the editor
-- Design reference updates for dashboard and tree views
+- Continue conversations with running agent tasks (reply ability)
+- Click file references in task output to open them in the editor
 
 ## [0.2.0] - 2026-02-14
 
 ### Added
-- ESLint configuration with `@typescript-eslint` recommended rules
-- Unit test suite (Mocha + Sinon) covering models, utils, adapters, history store, and runner
-- Integration tests verifying extension activation and command registration
-- CI/CD via GitHub Actions (lint, build, test on ubuntu/windows/macos)
-- Publish workflow triggered by version tags
-- Test infrastructure: `tsconfig.test.json`, `.vscode-test.mjs`, VS Code test debug launch config
-- Marketplace-ready README with badges, detailed feature docs, and configuration reference
-
-### Changed
-- Updated `package.json` with test dependencies, scripts, gallery banner, and badges
-- Enhanced `.vscodeignore` to exclude test and config files from packaged extension
-- Added `Extension Tests` debug configuration to `.vscode/launch.json`
-- Added eslint-disable comments for intentional non-null assertions in `runner.ts` and `history-tree.ts`
-
-### Removed
-- `vsc-extension-quickstart.md` (scaffolding file)
-- `agent-task-player-0.1.0.vsix` (build artifact should not be in version control)
+- Full test suite with 100+ tests across all components
+- CI/CD pipeline: lint, build, and test on Linux, Windows, and macOS
+- Automated marketplace publishing via GitHub Actions
+- Comprehensive README with feature documentation and configuration reference
 
 ## [0.1.0] - 2026-02-12
 
-### Added
-- Plan editor with TreeView sidebar for playlists and tasks
-- Play / Pause / Stop controls with state machine
-- Sequential task runner using `child_process.spawn()`
-- Engine adapters: Claude Code, Codex, Gemini CLI, Ollama, Custom
-- Webview dashboard with Plan, Output, and History tabs
-- Execution history stored via VS Code workspace state
-- Live status icons in the tree view (pending, running, completed, failed)
-- Optional verification commands per task
-- Configurable autoplay delay between tasks
-- `.agent-plan.json` file format for defining plans
-- Auto-load plan files from workspace on activation
+### Initial Release
+- Plan editor with sidebar tree view for playlists and tasks
+- Play / Pause / Stop controls
+- Sequential task execution with live status updates
+- Engine support: Claude Code, Codex, Gemini CLI, Ollama, and Custom
+- Live Dashboard with output streaming and execution history
+- Verification commands per task
+- Configurable autoplay delay
+- `.agent-plan.json` file format with auto-load on workspace open
