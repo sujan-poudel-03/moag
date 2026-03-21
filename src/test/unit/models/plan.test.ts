@@ -190,4 +190,53 @@ describe('loadPlan / savePlan round-trip', () => {
   it('should throw on non-existent file', () => {
     assert.throws(() => loadPlan(path.join(tmpDir, 'nope.json')));
   });
+
+  it('should round-trip plan variables through save/load', () => {
+    const plan = createEmptyPlan('Vars Test');
+    plan.variables = { projectName: 'moag', env: 'staging' };
+    plan.playlists[0].tasks.push(createTask('T', 'Deploy {{projectName}} to {{env}}'));
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+
+    assert.deepEqual(loaded.variables, { projectName: 'moag', env: 'staging' });
+    assert.equal(loaded.playlists[0].tasks[0].prompt, 'Deploy {{projectName}} to {{env}}');
+  });
+
+  it('should omit variables from file when empty', () => {
+    const plan = createEmptyPlan('No Vars');
+    plan.variables = {};
+
+    savePlan(plan, tmpFile);
+    const raw: PlanFile = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
+    assert.equal(raw.variables, undefined);
+  });
+
+  it('should preserve variables when non-empty', () => {
+    const plan = createEmptyPlan('Has Vars');
+    plan.variables = { key: 'value' };
+
+    savePlan(plan, tmpFile);
+    const raw: PlanFile = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
+    assert.deepEqual(raw.variables, { key: 'value' });
+  });
+
+  it('should load plan without variables field as undefined', () => {
+    const plan = createEmptyPlan('No Vars Field');
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+    assert.equal(loaded.variables, undefined);
+  });
+
+  it('should round-trip skipIf through save/load', () => {
+    const plan = createEmptyPlan('SkipIf Test');
+    const task = createTask('Conditional', 'Do something');
+    task.skipIf = { taskId: 'dep-1', status: TaskStatus.Completed };
+    plan.playlists[0].tasks.push(task);
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+    const t = loaded.playlists[0].tasks[0];
+    assert.deepEqual(t.skipIf, { taskId: 'dep-1', status: TaskStatus.Completed });
+  });
 });

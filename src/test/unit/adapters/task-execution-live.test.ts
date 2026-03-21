@@ -31,13 +31,16 @@ function isInsideClaudeSession(): boolean {
   return !!process.env.CLAUDECODE;
 }
 
+const isCI = !!process.env.CI;
 const hasCodex = cliExists('codex');
 const hasClaude = cliExists('claude') && !isInsideClaudeSession();
+
+const liveDescribe = isCI ? describe.skip : describe;
 
 // ───────────────────────────────────────
 // Codex: real prompt → real answer
 // ───────────────────────────────────────
-describe('Codex Live Execution', function () {
+liveDescribe('Codex Live Execution', function () {
   this.timeout(180000);
 
   before(function () {
@@ -156,7 +159,7 @@ describe('Codex Live Execution', function () {
 // ───────────────────────────────────────
 // Claude: real prompt → real answer
 // ───────────────────────────────────────
-describe('Claude Live Execution', function () {
+liveDescribe('Claude Live Execution', function () {
   this.timeout(180000);
 
   before(function () {
@@ -267,7 +270,7 @@ describe('Claude Live Execution', function () {
 // ───────────────────────────────────────
 // Side-by-side: same prompt to both
 // ───────────────────────────────────────
-describe('Claude vs Codex: same prompt, both validate', function () {
+liveDescribe('Claude vs Codex: same prompt, both validate', function () {
   this.timeout(180000);
 
   const prompt = 'What is 9 + 10? Reply with ONLY the number, nothing else.';

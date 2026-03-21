@@ -1,0 +1,85 @@
+{
+  "version": "1.0",
+  "name": "MOAG v0.8.0 — Ship It",
+  "description": "Final packaging tasks to publish MOAG v0.8.0 to marketplace.",
+  "defaultEngine": "claude",
+  "playlists": [
+    {
+      "id": "pl-ci-fix",
+      "name": "Fix CI",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-skip-live-tests",
+          "name": "Skip Codex live tests in CI",
+          "prompt": "In src/test/unit/adapters/task-execution-live.test.ts, the Codex Live Execution tests call the real Codex CLI which fails in CI (no API key). Wrap the entire 'Codex Live Execution' describe block with a check: if the environment variable CI is set (process.env.CI), skip all tests in that block using describe.skip instead of describe. Do the same for any 'Claude Live Execution' block in the same file. Keep the tests runnable locally when CI is not set.",
+          "type": "agent",
+          "files": [
+            "src/test/unit/adapters/task-execution-live.test.ts"
+          ],
+          "verifyCommand": "npx tsc --noEmit",
+          "failurePolicy": "continue",
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "pl-compile-test",
+      "name": "Verify Build",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-compile",
+          "name": "TypeScript compile",
+          "prompt": "Compile",
+          "type": "command",
+          "command": "npx tsc --noEmit",
+          "failurePolicy": "stop",
+          "status": "completed"
+        },
+        {
+          "id": "t-lint",
+          "name": "ESLint check",
+          "prompt": "Lint",
+          "type": "command",
+          "command": "npx eslint src/ --ext .ts",
+          "failurePolicy": "continue",
+          "dependsOn": [
+            "t-compile"
+          ],
+          "status": "failed"
+        },
+        {
+          "id": "t-test",
+          "name": "Run all tests",
+          "prompt": "Test",
+          "type": "command",
+          "command": "npm test",
+          "failurePolicy": "stop",
+          "dependsOn": [
+            "t-compile"
+          ],
+          "status": "completed"
+        }
+      ]
+    },
+    {
+      "id": "pl-package",
+      "name": "Package VSIX",
+      "autoplay": true,
+      "tasks": [
+        {
+          "id": "t-package",
+          "name": "Build VSIX",
+          "prompt": "Package extension",
+          "type": "command",
+          "command": "npx vsce package",
+          "failurePolicy": "stop",
+          "dependsOn": [
+            "t-test"
+          ]
+        }
+      ]
+    }
+  ]
+}

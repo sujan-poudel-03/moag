@@ -13,7 +13,7 @@ export interface UserMessage {
 
 export function noWorkspace(): UserMessage {
   return {
-    text: 'Please open a folder in VS Code first so Agent Task Player knows where to work.',
+    text: 'Please open a folder in VS Code first so MOAG knows where to work.',
     actions: [{ label: 'Open Folder', command: 'vscode.openFolder' }],
   };
 }

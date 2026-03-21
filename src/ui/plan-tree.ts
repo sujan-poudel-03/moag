@@ -72,8 +72,9 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
           vscode.TreeItemCollapsibleState.Expanded,
         );
         item.iconPath = this.playlistIcon(pl);
-        item.tooltip = `${pl.tasks.length} tasks | Engine: ${pl.engine ?? this._plan!.defaultEngine} | Autoplay: ${pl.autoplay ? 'on' : 'off'}`;
-        item.description = `${pl.tasks.length} tasks`;
+        const desc = this.playlistDescription(pl);
+        item.tooltip = `${desc} | Engine: ${pl.engine ?? this._plan!.defaultEngine} | Autoplay: ${pl.autoplay ? 'on' : 'off'}`;
+        item.description = desc;
         return item;
       });
     }
@@ -92,10 +93,35 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
           vscode.TreeItemCollapsibleState.None,
         );
         item.iconPath = this.taskIcon(task);
-        item.tooltip = task.prompt.substring(0, 200);
+        const md = new vscode.MarkdownString();
+        md.appendMarkdown(`**${task.name}**\n\n`);
+        md.appendMarkdown(`Type: \`${task.type || 'agent'}\``);
+        if (task.engine) { md.appendMarkdown(` · Engine: \`${task.engine}\``); }
+        md.appendMarkdown(` · Status: \`${task.status}\`\n\n`);
+        if (task.prompt) {
+          const preview = task.prompt.length > 300 ? task.prompt.substring(0, 297) + '...' : task.prompt;
+          md.appendMarkdown(`---\n\n${preview}`);
+        }
+        if (task.verifyCommand) {
+          md.appendMarkdown(`\n\n*Verify:* \`${task.verifyCommand}\``);
+        }
+        if (task.dependsOn && task.dependsOn.length > 0) {
+          md.appendMarkdown(`\n\n*Depends on:* ${task.dependsOn.length} task(s)`);
+        }
+        item.tooltip = md;
+        // Build a compact description string
+        const descParts: string[] = [];
         const type = task.type ?? 'agent';
-        const runtime = type === 'agent' ? (task.engine ?? '') : type;
-        item.description = runtime;
+        if (type !== 'agent') { descParts.push(type); }
+        if (task.engine) { descParts.push(task.engine); }
+        if (task.status === TaskStatus.Completed) { descParts.push('done'); }
+        else if (task.status === TaskStatus.Failed) { descParts.push('failed'); }
+        else if (task.status === TaskStatus.Running) { descParts.push('running...'); }
+        else if (task.status === TaskStatus.Skipped) { descParts.push('skipped'); }
+        else if (task.status === TaskStatus.Blocked) { descParts.push('blocked'); }
+        if (task.verifyCommand) { descParts.push('✓ verify'); }
+        if (task.dependsOn && task.dependsOn.length > 0) { descParts.push('→ deps'); }
+        item.description = descParts.join(' · ');
         return item;
       });
     }
@@ -103,27 +129,44 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
     return [];
   }
 
+  private playlistDescription(pl: Playlist): string {
+    const total = pl.tasks.length;
+    const completed = pl.tasks.filter(t => t.status === TaskStatus.Completed).length;
+    const failed = pl.tasks.filter(t => t.status === TaskStatus.Failed).length;
+    const blocked = pl.tasks.filter(t => t.status === TaskStatus.Blocked).length;
+
+    if (completed === 0 && failed === 0) {
+      return `${total} tasks`;
+    }
+
+    const parts = [`${completed}/${total}`];
+    if (failed > 0) { parts.push(`${failed} failed`); }
+    if (blocked > 0) { parts.push(`${blocked} blocked`); }
+    if (completed === total) { parts[0] += ' ✓'; }
+    return parts.join(' · ');
+  }
+
   private playlistIcon(pl: Playlist): vscode.ThemeIcon {
     const allDone = pl.tasks.length > 0 && pl.tasks.every(t => t.status === TaskStatus.Completed);
     const anyRunning = pl.tasks.some(t => t.status === TaskStatus.Running);
     const anyFailed = pl.tasks.some(t => t.status === TaskStatus.Failed);
     const anyBlocked = pl.tasks.some(t => t.status === TaskStatus.Blocked);
-    if (anyRunning) { return new vscode.ThemeIcon('loading~spin'); }
-    if (anyBlocked) { return new vscode.ThemeIcon('debug-disconnect'); }
-    if (anyFailed) { return new vscode.ThemeIcon('error'); }
-    if (allDone) { return new vscode.ThemeIcon('check-all'); }
-    return new vscode.ThemeIcon('list-unordered');
+    if (anyRunning) { return new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('progressBar.background')); }
+    if (anyBlocked) { return new vscode.ThemeIcon('debug-disconnect', new vscode.ThemeColor('editorWarning.foreground')); }
+    if (anyFailed) { return new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed')); }
+    if (allDone) { return new vscode.ThemeIcon('check-all', new vscode.ThemeColor('testing.iconPassed')); }
+    return new vscode.ThemeIcon('list-unordered', new vscode.ThemeColor('descriptionForeground'));
   }
 
   private taskIcon(task: Task): vscode.ThemeIcon {
     switch (task.status) {
-      case TaskStatus.Pending: return new vscode.ThemeIcon('circle-outline');
-      case TaskStatus.Running: return new vscode.ThemeIcon('loading~spin');
-      case TaskStatus.Paused: return new vscode.ThemeIcon('debug-pause');
-      case TaskStatus.Completed: return new vscode.ThemeIcon('check');
-      case TaskStatus.Failed: return new vscode.ThemeIcon('error');
-      case TaskStatus.Blocked: return new vscode.ThemeIcon('debug-disconnect');
-      case TaskStatus.Skipped: return new vscode.ThemeIcon('circle-slash');
+      case TaskStatus.Pending: return new vscode.ThemeIcon('circle-outline', new vscode.ThemeColor('descriptionForeground'));
+      case TaskStatus.Running: return new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('progressBar.background'));
+      case TaskStatus.Paused: return new vscode.ThemeIcon('debug-pause', new vscode.ThemeColor('debugIcon.pauseForeground'));
+      case TaskStatus.Completed: return new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
+      case TaskStatus.Failed: return new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
+      case TaskStatus.Blocked: return new vscode.ThemeIcon('debug-disconnect', new vscode.ThemeColor('editorWarning.foreground'));
+      case TaskStatus.Skipped: return new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('descriptionForeground'));
       default: return new vscode.ThemeIcon('circle-outline');
     }
   }

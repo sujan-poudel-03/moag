@@ -1,8 +1,8 @@
 {
   "name": "agent-task-player",
-  "displayName": "Agent Task Player",
-  "description": "Automate AI coding workflows — build task playlists and run them with Claude Code, Codex, Gemini CLI, or Ollama, all from VS Code.",
-  "version": "0.8.0",
+  "displayName": "MOAG — AI Agent Orchestrator",
+  "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
+  "version": "0.9.0",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -48,6 +48,7 @@
   ],
   "activationEvents": [
     "onView:agentTaskPlayer.planView",
+    "workspaceContains:.moag/plan.json",
     "workspaceContains:**/*.agent-plan.json"
   ],
   "main": "./out/extension.js",
@@ -56,273 +57,363 @@
       {
         "command": "agentTaskPlayer.play",
         "title": "Play",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(play)"
       },
       {
         "command": "agentTaskPlayer.pause",
         "title": "Pause",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(debug-pause)"
       },
       {
         "command": "agentTaskPlayer.stop",
         "title": "Stop",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(debug-stop)"
       },
       {
         "command": "agentTaskPlayer.openPlan",
         "title": "Open Plan File",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(folder-opened)"
       },
       {
         "command": "agentTaskPlayer.newPlan",
         "title": "New Plan",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(new-file)"
       },
       {
         "command": "agentTaskPlayer.loadExamplePlan",
         "title": "Try Example Plan",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(beaker)"
       },
       {
         "command": "agentTaskPlayer.addPlaylist",
         "title": "Add Playlist",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(add)"
       },
       {
         "command": "agentTaskPlayer.addTask",
         "title": "Add Task",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(add)"
       },
       {
         "command": "agentTaskPlayer.editTask",
         "title": "Edit Task",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(edit)"
       },
       {
         "command": "agentTaskPlayer.deleteItem",
         "title": "Delete",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(trash)"
       },
       {
         "command": "agentTaskPlayer.moveUp",
         "title": "Move Up",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(arrow-up)"
       },
       {
         "command": "agentTaskPlayer.moveDown",
         "title": "Move Down",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(arrow-down)"
       },
       {
         "command": "agentTaskPlayer.showHistory",
         "title": "Show History",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(history)"
       },
       {
         "command": "agentTaskPlayer.showDashboard",
         "title": "Show Dashboard",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(dashboard)"
       },
       {
         "command": "agentTaskPlayer.clearHistory",
         "title": "Clear History",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(clear-all)"
       },
       {
         "command": "agentTaskPlayer.switchEngine",
         "title": "Switch Engine",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(symbol-event)"
       },
       {
         "command": "agentTaskPlayer.playPlaylist",
         "title": "Play Playlist",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(play)"
       },
       {
         "command": "agentTaskPlayer.playTask",
         "title": "Run Task",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(play)"
       },
       {
         "command": "agentTaskPlayer.addTaskFromTemplate",
         "title": "Add Task from Template",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(library)"
       },
       {
         "command": "agentTaskPlayer.saveTaskAsTemplate",
         "title": "Save as Template",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(save)"
       },
       {
         "command": "agentTaskPlayer.exportPlan",
         "title": "Export Plan",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(export)"
       },
       {
         "command": "agentTaskPlayer.importPlan",
         "title": "Import Plan",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(import)"
       },
       {
         "command": "agentTaskPlayer.showCostSummary",
         "title": "Show Cost & Usage Summary",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(graph)"
       },
       {
         "command": "agentTaskPlayer.gettingStarted",
         "title": "Getting Started",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(book)"
       },
       {
         "command": "agentTaskPlayer.detectEngines",
         "title": "Detect Installed Engines",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(search)"
       },
       {
         "command": "agentTaskPlayer.showThreadList",
         "title": "Show Threads",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(comment-discussion)"
       },
       {
         "command": "agentTaskPlayer.runPlanFile",
         "title": "Run Plan File",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(run-all)"
       },
       {
         "command": "agentTaskPlayer.bulkDelete",
         "title": "Bulk Delete Tasks...",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(trash)"
       },
       {
         "command": "agentTaskPlayer.clearAllTasks",
         "title": "Clear All Tasks",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(clear-all)"
       },
       {
         "command": "agentTaskPlayer.retryTask",
         "title": "Retry Failed Task",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(debug-restart)"
       },
       {
         "command": "agentTaskPlayer.retryTaskWithNote",
         "title": "Retry Task with Note",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(comment-discussion)"
       },
       {
         "command": "agentTaskPlayer.exportResults",
         "title": "Export Results",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(export)"
       },
       {
         "command": "agentTaskPlayer.dryRun",
         "title": "Dry Run (Preview)",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(eye)"
       },
       {
         "command": "agentTaskPlayer.setTaskStatus",
         "title": "Set Task Status...",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(check)"
       },
       {
         "command": "agentTaskPlayer.setPlaylistStatus",
         "title": "Set Playlist Status...",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(checklist)"
       },
       {
         "command": "agentTaskPlayer.runSelected",
         "title": "Run Selected",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(run-all)"
       },
       {
         "command": "agentTaskPlayer.openSession",
         "title": "Open Session",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(history)"
       },
       {
         "command": "agentTaskPlayer.openThread",
         "title": "Open Thread",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(comment-discussion)"
       },
       {
         "command": "agentTaskPlayer.deleteSession",
         "title": "Delete Session",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(trash)"
       },
       {
         "command": "agentTaskPlayer.deleteThread",
         "title": "Delete Thread",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(trash)"
       },
       {
         "command": "agentTaskPlayer.renameThread",
         "title": "Rename Conversation",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(edit)"
       },
       {
         "command": "agentTaskPlayer.searchSessions",
         "title": "Search Sessions",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(search)"
       },
       {
         "command": "agentTaskPlayer.clearSessions",
         "title": "Clear All Sessions",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(clear-all)"
       },
       {
         "command": "agentTaskPlayer.newConversation",
         "title": "New Conversation",
-        "category": "Agent Task Player",
+        "category": "MOAG",
         "icon": "$(add)"
+      },
+      {
+        "command": "agentTaskPlayer.duplicateTask",
+        "title": "Duplicate Task",
+        "category": "MOAG",
+        "icon": "$(copy)"
+      },
+      {
+        "command": "agentTaskPlayer.smartNewPlan",
+        "title": "Smart Plan (auto-detect)",
+        "category": "MOAG",
+        "icon": "$(sparkle)"
+      },
+      {
+        "command": "agentTaskPlayer.splitTask",
+        "title": "Split Task",
+        "category": "MOAG",
+        "icon": "$(split-horizontal)"
+      },
+      {
+        "command": "agentTaskPlayer.planFromGitHubIssue",
+        "title": "Plan from GitHub Issue",
+        "category": "MOAG",
+        "icon": "$(github)"
+      },
+      {
+        "command": "agentTaskPlayer.quickAddTask",
+        "title": "Quick Add Task",
+        "category": "MOAG",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentTaskPlayer.addTaskFromSelection",
+        "title": "Add as MOAG Task",
+        "category": "MOAG",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentTaskPlayer.reviewChanges",
+        "title": "Review All Changes",
+        "category": "MOAG",
+        "icon": "$(diff)"
+      },
+      {
+        "command": "agentTaskPlayer.createPR",
+        "title": "Create Pull Request",
+        "category": "MOAG",
+        "icon": "$(git-pull-request)"
+      },
+      {
+        "command": "agentTaskPlayer.newPlanFromTemplate",
+        "title": "New Plan from Template",
+        "category": "MOAG",
+        "icon": "$(library)"
+      },
+      {
+        "command": "agentTaskPlayer.addReviewStep",
+        "title": "Add Review Step",
+        "category": "MOAG",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "agentTaskPlayer.sharePlan",
+        "title": "Share Plan (Gist)",
+        "category": "MOAG",
+        "icon": "$(link)"
+      },
+      {
+        "command": "agentTaskPlayer.importPlanFromUrl",
+        "title": "Import Plan from URL",
+        "category": "MOAG",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "agentTaskPlayer.switchProfile",
+        "title": "Switch Execution Profile",
+        "category": "MOAG",
+        "icon": "$(symbol-event)"
+      },
+      {
+        "command": "agentTaskPlayer.watchMode",
+        "title": "Toggle Watch Mode",
+        "category": "MOAG",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "agentTaskPlayer.managePromptSnippets",
+        "title": "Manage Prompt Snippets",
+        "category": "MOAG",
+        "icon": "$(bookmark)"
       }
     ],
     "viewsContainers": {
       "activitybar": [
         {
           "id": "agentTaskPlayer",
-          "title": "Agent Task Player",
+          "title": "MOAG",
           "icon": "$(rocket)"
         }
       ]
@@ -354,11 +445,16 @@
     "viewsWelcome": [
       {
         "view": "agentTaskPlayer.planView",
-        "contents": "No plan loaded.\n\nDescribe what you want built and the AI agent will create a structured plan for you.\n[New Plan](command:agentTaskPlayer.newPlan)\n\nOr try a ready-made example to see how it works:\n[Try Example Plan](command:agentTaskPlayer.loadExamplePlan)\n\nAlready have a plan file?\n[Open Plan File](command:agentTaskPlayer.openPlan)"
+        "contents": "No plan loaded.\n\nDescribe what you want built and the AI agent will create a structured plan for you.\n[New Plan](command:agentTaskPlayer.newPlan)\n\nOr pick from a gallery of ready-to-play plans:\n[Browse Templates](command:agentTaskPlayer.newPlanFromTemplate)\n\nOr try a ready-made example to see how it works:\n[Try Example Plan](command:agentTaskPlayer.loadExamplePlan)\n\nAlready have a plan file?\n[Open Plan File](command:agentTaskPlayer.openPlan)"
       }
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "agentTaskPlayer.quickAddTask",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "navigation@0"
+        },
         {
           "command": "agentTaskPlayer.addTask",
           "when": "view == agentTaskPlayer.planView",
@@ -380,19 +476,49 @@
           "group": "navigation@4"
         },
         {
-          "command": "agentTaskPlayer.newPlan",
+          "command": "agentTaskPlayer.newPlanFromTemplate",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "1_plan@0"
+        },
+        {
+          "command": "agentTaskPlayer.smartNewPlan",
           "when": "view == agentTaskPlayer.planView",
           "group": "1_plan@1"
         },
         {
-          "command": "agentTaskPlayer.openPlan",
+          "command": "agentTaskPlayer.newPlan",
           "when": "view == agentTaskPlayer.planView",
           "group": "1_plan@2"
+        },
+        {
+          "command": "agentTaskPlayer.importPlanFromUrl",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "1_plan@5"
+        },
+        {
+          "command": "agentTaskPlayer.planFromGitHubIssue",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "1_plan@6"
+        },
+        {
+          "command": "agentTaskPlayer.openPlan",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "1_plan@3"
         },
         {
           "command": "agentTaskPlayer.pause",
           "when": "view == agentTaskPlayer.planView",
           "group": "2_playback@1"
+        },
+        {
+          "command": "agentTaskPlayer.switchProfile",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "2_playback@2"
+        },
+        {
+          "command": "agentTaskPlayer.watchMode",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "2_playback@3"
         },
         {
           "command": "agentTaskPlayer.addPlaylist",
@@ -415,9 +541,14 @@
           "group": "3_advanced@4"
         },
         {
+          "command": "agentTaskPlayer.sharePlan",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "3_advanced@5"
+        },
+        {
           "command": "agentTaskPlayer.runPlanFile",
           "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@3"
+          "group": "1_plan@4"
         },
         {
           "command": "agentTaskPlayer.bulkDelete",
@@ -512,6 +643,21 @@
           "group": "2_template@1"
         },
         {
+          "command": "agentTaskPlayer.duplicateTask",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "2_template@2"
+        },
+        {
+          "command": "agentTaskPlayer.splitTask",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "2_template@3"
+        },
+        {
+          "command": "agentTaskPlayer.addReviewStep",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "2_template@4"
+        },
+        {
           "command": "agentTaskPlayer.retryTask",
           "when": "view == agentTaskPlayer.planView && viewItem == task",
           "group": "inline@3"
@@ -551,10 +697,24 @@
           "when": "view == agentTaskPlayer.sessionsView && viewItem == thread",
           "group": "inline@2"
         }
+      ],
+      "editor/context": [
+        {
+          "command": "agentTaskPlayer.addTaskFromSelection",
+          "when": "editorHasSelection",
+          "group": "9_moag@1"
+        }
       ]
     },
+    "keybindings": [
+      {
+        "command": "agentTaskPlayer.quickAddTask",
+        "key": "ctrl+shift+t",
+        "mac": "cmd+shift+t"
+      }
+    ],
     "configuration": {
-      "title": "Agent Task Player",
+      "title": "MOAG",
       "properties": {
         "agentTaskPlayer.defaultEngine": {
           "type": "string",
@@ -632,6 +792,19 @@
           "items": { "type": "string" },
           "description": "Custom engine arguments. Use {prompt} as placeholder."
         },
+        "agentTaskPlayer.fallbackEngine": {
+          "type": "string",
+          "default": "",
+          "enum": [
+            "",
+            "codex",
+            "claude",
+            "gemini",
+            "ollama",
+            "custom"
+          ],
+          "description": "Backup engine to switch to when the primary engine hits a rate limit. Leave empty to disable auto-fallback."
+        },
         "agentTaskPlayer.autoplayDelay": {
           "type": "number",
           "default": 500,
@@ -663,6 +836,24 @@
           "minimum": 10,
           "description": "Maximum number of history entries to keep."
         },
+        "agentTaskPlayer.executionProfile": {
+          "type": "string",
+          "enum": ["auto", "fast", "balanced", "quality", "budget"],
+          "default": "auto",
+          "enumDescriptions": [
+            "Use default settings (balanced)",
+            "Claude, fast model, 3min timeout, no auto-fix — ship fast",
+            "Claude, balanced model, 10min timeout, auto-fix on — default",
+            "Claude, deep model, 20min timeout, auto-fix on — ship right",
+            "Ollama (local), fast model, 5min timeout, no auto-fix — zero cost"
+          ],
+          "description": "Execution profile that controls engine, model, timeout, and auto-fix behavior. Switch between 'ship fast' and 'ship right' modes."
+        },
+        "agentTaskPlayer.autoFix": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a task fails, automatically analyze the error and retry with a repair prompt. The AI agent reviews what went wrong and attempts to fix it."
+        },
         "agentTaskPlayer.autoModelSelection": {
           "type": "boolean",
           "default": true,
@@ -673,6 +864,21 @@
           "enum": ["auto", "fast", "balanced", "deep"],
           "default": "auto",
           "description": "Default reasoning preset for model selection. 'auto' analyzes task complexity to pick the best model."
+        },
+        "agentTaskPlayer.promptRulesEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Inject execution rules into agent task prompts (best-practice guardrails). Disable to send raw prompts only."
+        },
+        "agentTaskPlayer.promptRules": {
+          "type": "string",
+          "default": "[EXECUTION RULES]\n- Work within the existing codebase patterns and conventions\n- Do not delete or overwrite files unless explicitly asked\n- Run existing tests after making changes to verify nothing is broken\n- If you encounter an error, fix it before moving on\n- Commit logical units of work with descriptive messages\n- Prefer editing existing files over creating new ones\n[/EXECUTION RULES]",
+          "description": "System-level instruction block injected before each agent task prompt. Customize or clear to remove."
+        },
+        "agentTaskPlayer.promptSnippets.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-inject prompt snippets (marked as auto-inject) into agent task prompts. Disable to skip snippet injection."
         },
         "agentTaskPlayer.context.enabled": {
           "type": "boolean",
@@ -691,8 +897,8 @@
         },
         "agentTaskPlayer.context.allPriorOutputs": {
           "type": "boolean",
-          "default": false,
-          "description": "Include ALL prior playlist task outputs (not just dependencies)."
+          "default": true,
+          "description": "Output chaining — include ALL prior playlist task outputs (not just dependencies). Enables each task to see what previous tasks produced."
         },
         "agentTaskPlayer.context.projectState": {
           "type": "boolean",
@@ -708,6 +914,17 @@
           "type": "boolean",
           "default": true,
           "description": "Include summary of completed tasks with file change counts."
+        },
+        "agentTaskPlayer.context.relevantFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-detect file paths mentioned in the task prompt and include their content as context."
+        },
+        "agentTaskPlayer.context.maxFileContextChars": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1000,
+          "description": "Maximum characters for auto-included relevant file content. Files are skipped once this budget is exhausted."
         },
         "agentTaskPlayer.context.maxContextChars": {
           "type": "number",
@@ -733,13 +950,13 @@
     "walkthroughs": [
       {
         "id": "agentTaskPlayer.getStarted",
-        "title": "Get Started with Agent Task Player",
+        "title": "Get Started with MOAG",
         "description": "Learn how to automate your AI coding workflow — define task playlists and run them with any coding agent CLI.",
         "steps": [
           {
             "id": "installCli",
             "title": "Install a Coding Agent CLI",
-            "description": "Agent Task Player **automatically detects** installed CLIs and sets your default engine on first launch.\n\nYou need at least one AI coding agent CLI installed on your system. Pick one and install it globally:\n\n**Claude Code** (recommended):\n```\nnpm install -g @anthropic-ai/claude-code\n```\n\nOr: [Codex](https://www.npmjs.com/package/@openai/codex) · [Gemini CLI](https://www.npmjs.com/package/@google/gemini-cli) · [Ollama](https://ollama.com)\n\nVerify it works by running ``claude -p \"say hello\"`` in your terminal.\n\n[Re-run Engine Detection](command:agentTaskPlayer.detectEngines)",
+            "description": "MOAG **automatically detects** installed CLIs and sets your default engine on first launch.\n\nYou need at least one AI coding agent CLI installed on your system. Pick one and install it globally:\n\n**Claude Code** (recommended):\n```\nnpm install -g @anthropic-ai/claude-code\n```\n\nOr: [Codex](https://www.npmjs.com/package/@openai/codex) · [Gemini CLI](https://www.npmjs.com/package/@google/gemini-cli) · [Ollama](https://ollama.com)\n\nVerify it works by running ``claude -p \"say hello\"`` in your terminal.\n\n[Re-run Engine Detection](command:agentTaskPlayer.detectEngines)",
             "media": {
               "altText": "Terminal showing CLI install command",
               "markdown": "media/walkthrough-install.md"
@@ -748,10 +965,10 @@
           },
           {
             "id": "openPanel",
-            "title": "Open the Agent Task Player Panel",
-            "description": "Click the **rocket icon** $(rocket) in the Activity Bar on the left side of VS Code. This opens the Agent Task Player panel with two sections:\n\n- **Plan** — your playlists and tasks\n- **History** — past execution logs\n\n[Open Agent Task Player Panel](command:workbench.view.extension.agentTaskPlayer)",
+            "title": "Open the MOAG Panel",
+            "description": "Click the **rocket icon** $(rocket) in the Activity Bar on the left side of VS Code. This opens the MOAG panel with two sections:\n\n- **Plan** — your playlists and tasks\n- **History** — past execution logs\n\n[Open MOAG Panel](command:workbench.view.extension.agentTaskPlayer)",
             "media": {
-              "altText": "Agent Task Player panel in the activity bar",
+              "altText": "MOAG panel in the activity bar",
               "markdown": "media/walkthrough-panel.md"
             },
             "completionEvents": ["onView:agentTaskPlayer.planView"]

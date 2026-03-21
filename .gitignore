@@ -16,3 +16,5 @@ out/test-output.agent-plan.json
 # Environment
 .env
 .env.local
+# MOAG agent orchestrator
+.moag/

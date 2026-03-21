@@ -1,501 +1,281 @@
-# Agent Task Player
+# MOAG — AI Agent Orchestrator
 
 [![CI](https://github.com/sujan-poudel-03/moag/actions/workflows/ci.yml/badge.svg)](https://github.com/sujan-poudel-03/moag/actions/workflows/ci.yml)
 [![Visual Studio Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
 [![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Website](https://img.shields.io/badge/moag.dev-website-blue)](https://moag.dev)
 
-> Define structured plans of AI coding tasks and execute them automatically through agent CLIs — Claude Code, Codex, Gemini CLI, Ollama, or any custom CLI.
-
-**The problem:** You're building a project and need to give an AI agent 10+ separate instructions — scaffold the project, add auth, write tests, etc. Doing them one by one is tedious. You lose context between tasks, forget steps, and can't reproduce the workflow.
-
-**The solution:** Write all your instructions in a plan file, organize them into playlists (phases), then hit Play. The extension feeds each prompt to the agent CLI sequentially, streams the output, and tracks what passed or failed.
+> **Run AI agents like a playlist.** Build a plan, pick your engines, hit Play — Claude, Codex, Gemini, and Ollama execute your tasks while you watch.
 
 ---
 
-## How It Works
+## Why MOAG
 
-```
-┌─────────────────────┐     ┌──────────────┐     ┌──────────────┐
-│  .agent-plan.json   │     │  Extension   │     │  Agent CLI   │
-│                     │────>│  reads plan, │────>│  claude -p   │
-│  Playlists > Tasks  │     │  feeds each  │     │  codex exec  │
-│  (your prompts)     │<────│  prompt      │<────│  gemini      │
-│                     │     │  to the CLI  │     │  ollama run  │
-└─────────────────────┘     └──────────────┘     └──────────────┘
-```
+- **Smart Planning** — Describe what you want and MOAG generates a structured plan with playlists, tasks, and verification steps. Or pick from 12 built-in templates. Every prompt is enriched with project context, relevant files, and best practices automatically.
 
-1. You write a `.agent-plan.json` file with your prompts organized into playlists
-2. The extension sends each prompt to the agent CLI installed on your machine
-3. The agent reads/writes your actual project files
-4. The extension tracks results, moves to the next task, and reports status
+- **Multi-Agent Review** — After a task completes, a different engine reviews the changes. Or run the same task on multiple engines and keep the first success (consensus mode). Catch bugs one model misses.
+
+- **Auto-Fix & Recovery** — When a task fails, MOAG reads the error, generates a targeted repair prompt, and retries. Combine with verify commands for fully autonomous execution chains. Recovered tasks show a badge so you know what was fixed.
 
 ---
 
 ## Quick Start
 
-### Prerequisites
+### 1. Install
 
-You need at least **one** coding agent CLI installed and available in your terminal:
+Search **"MOAG"** in VS Code Extensions, or grab it from the [Marketplace](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player).
+
+You need at least one agent CLI:
 
 ```bash
-# Pick one (or more):
-npm install -g @anthropic-ai/claude-code   # Claude Code
-npm install -g @openai/codex               # OpenAI Codex
-npm install -g @google/gemini-cli          # Gemini CLI
+npm i -g @anthropic-ai/claude-code   # Claude Code
+npm i -g @openai/codex               # OpenAI Codex
+npm i -g @google/gemini-cli          # Gemini CLI
 # Or install Ollama from https://ollama.com
 ```
 
-Verify it works by running the CLI directly, e.g.: `claude -p "say hello"`.
+### 2. Create a Plan
 
-### Step-by-Step
+- **Smart Plan** (recommended): `Ctrl+Shift+P` → `MOAG: Smart New Plan` → describe your goal → get a full plan
+- **From Template**: `MOAG: New Plan from Template` → 12 ready-made plans
+- **From GitHub Issue**: `MOAG: Plan from GitHub Issue` → paste an issue URL
+- **Manual**: Click the rocket icon in the Activity Bar → New Plan → add playlists and tasks
 
-1. **Install** the extension from the VS Code Marketplace (or `.vsix` file)
-2. **Open a workspace** folder where you want the agent to work
-3. Click the **rocket icon** in the Activity Bar — the Agent Task Player panel opens
-4. Click **New Plan** — give it a name — a `.agent-plan.json` file is created
-5. Click the **+** button to **Add Playlist** — name it (e.g., "Setup")
-6. Click the **+** on the playlist to **Add Task** — enter a name and a prompt
-7. Hit **Play** — the extension validates the engine is installed, then starts executing
+### 3. Hit Play
 
-The agent CLI receives your prompt, works on your project files, and the extension streams the output in real-time in the Dashboard panel.
-
-### Or: Write the Plan File Directly
-
-You can also create a `.agent-plan.json` file by hand — the extension auto-loads it:
-
-```json
-{
-  "version": "1.0",
-  "name": "Setup API",
-  "defaultEngine": "codex",
-  "playlists": [
-    {
-      "id": "setup-api",
-      "name": "Setup API",
-      "autoplay": true,
-      "tasks": [
-        {
-          "id": "scaffold-server",
-          "name": "Scaffold Express server",
-          "type": "agent",
-          "prompt": "Create a minimal Express server with a GET /health endpoint, a src/server.ts entrypoint, and package scripts for dev and test.",
-          "failurePolicy": "continue"
-        },
-        {
-          "id": "run-tests",
-          "name": "Run test suite",
-          "type": "command",
-          "prompt": "Run the project's tests after the API scaffold is in place.",
-          "command": "npm test",
-          "dependsOn": ["scaffold-server"],
-          "failurePolicy": "continue"
-        }
-      ]
-    }
-  ]
-}
-```
-
-Save it in your workspace, open the Agent Task Player panel, and hit Play.
-
----
-
-## Use Cases
-
-### 1. Scaffold a Full Project from Scratch
-
-Create a plan that builds a project step by step — each task builds on the previous one:
-
-```json
-{
-  "version": "1.0",
-  "name": "Build a FastAPI Backend",
-  "defaultEngine": "claude",
-  "playlists": [
-    {
-      "id": "setup",
-      "name": "Project Setup",
-      "autoplay": true,
-      "tasks": [
-        {
-          "id": "init",
-          "name": "Initialize project",
-          "prompt": "Create a Python FastAPI project with pyproject.toml. Set up app/ directory with main.py. Add a health check endpoint at GET /health."
-        },
-        {
-          "id": "db",
-          "name": "Add database layer",
-          "prompt": "Add SQLAlchemy with SQLite. Create app/models/ with a User model (id, email, name, created_at). Add Alembic for migrations.",
-          "dependsOn": ["init"]
-        }
-      ]
-    },
-    {
-      "id": "features",
-      "name": "Build Features",
-      "autoplay": true,
-      "tasks": [
-        {
-          "id": "crud",
-          "name": "User CRUD endpoints",
-          "prompt": "Create CRUD endpoints for users: GET /users, POST /users, GET /users/{id}, PUT /users/{id}, DELETE /users/{id}. Use Pydantic schemas for validation.",
-          "verifyCommand": "python -m pytest tests/ -x --tb=short"
-        },
-        {
-          "id": "auth",
-          "name": "JWT authentication",
-          "prompt": "Add JWT auth with python-jose. Create POST /auth/login and POST /auth/register. Protect write endpoints with auth middleware.",
-          "dependsOn": ["crud"],
-          "retryCount": 1
-        }
-      ]
-    }
-  ]
-}
-```
-
-**What happens:** Hit Play — the agent creates the project, adds the database, builds CRUD endpoints (verified with pytest), then adds auth. Each task works on the same workspace files, building on the previous results.
-
-### 2. Add Features to an Existing Project
-
-Already have a codebase? Create a plan to add a batch of features:
-
-```json
-{
-  "version": "1.0",
-  "name": "Q1 Feature Sprint",
-  "defaultEngine": "claude",
-  "playlists": [
-    {
-      "id": "features",
-      "name": "New Features",
-      "autoplay": true,
-      "tasks": [
-        {
-          "id": "dark-mode",
-          "name": "Add dark mode",
-          "prompt": "Add dark mode to this React app. Create a ThemeContext, toggle button in the navbar, CSS variables for theming, persist preference in localStorage.",
-          "files": ["src/App.tsx", "src/styles/globals.css"]
-        },
-        {
-          "id": "search",
-          "name": "Add search",
-          "prompt": "Add a search bar that filters the product list in real-time with debounced input (300ms). Search across name, description, and category.",
-          "files": ["src/components/ProductList.tsx", "src/types.ts"]
-        }
-      ]
-    }
-  ]
-}
-```
-
-**Tip:** The `files` field injects file contents into the prompt, giving the agent context about your existing code without you having to paste it manually.
-
-### 3. Testing & Code Quality Sprint
-
-Run a quality pass — write tests in parallel, then refactor:
-
-```json
-{
-  "version": "1.0",
-  "name": "Code Quality Pass",
-  "defaultEngine": "claude",
-  "playlists": [
-    {
-      "id": "testing",
-      "name": "Write Tests",
-      "parallel": true,
-      "tasks": [
-        {
-          "id": "unit-tests",
-          "name": "Unit tests for utils",
-          "prompt": "Write unit tests for all functions in src/utils/ using Jest. Cover edge cases and error handling.",
-          "verifyCommand": "npx jest src/utils/ --coverage"
-        },
-        {
-          "id": "api-tests",
-          "name": "API integration tests",
-          "prompt": "Write integration tests for all routes in src/routes/ using supertest. Test success, validation errors, auth failures, 404s.",
-          "verifyCommand": "npx jest src/routes/"
-        }
-      ]
-    },
-    {
-      "id": "refactor",
-      "name": "Refactor",
-      "tasks": [
-        {
-          "id": "cleanup",
-          "name": "Fix code smells",
-          "prompt": "Review the codebase for duplicated logic, long functions, deeply nested conditionals, magic numbers. Refactor what you find. Do not change public API signatures."
-        }
-      ]
-    }
-  ]
-}
-```
-
-**Note:** `"parallel": true` makes both test tasks run concurrently since they don't depend on each other.
-
-### 4. Multi-Engine Workflow
-
-Use different agents for different tasks based on their strengths:
-
-```json
-{
-  "version": "1.0",
-  "name": "Multi-Agent Build",
-  "defaultEngine": "claude",
-  "playlists": [
-    {
-      "id": "build",
-      "name": "Build & Review",
-      "autoplay": true,
-      "tasks": [
-        {
-          "id": "implement",
-          "name": "Implement feature",
-          "prompt": "Implement user authentication with JWT tokens, bcrypt password hashing, and login/register endpoints.",
-          "engine": "claude"
-        },
-        {
-          "id": "review",
-          "name": "Code review",
-          "prompt": "Review all code in this project. List any bugs, security issues, or improvements needed.",
-          "engine": "ollama"
-        }
-      ]
-    }
-  ]
-}
-```
-
-Engine priority: **task** `engine` > **playlist** `engine` > **plan** `defaultEngine` > **VS Code setting**.
+Click **Play** in the title bar. MOAG opens the Dashboard, validates engines, and starts executing. Tasks stream live output, run verification commands, and auto-fix failures.
 
 ---
 
 ## Features
 
-### Plan Editor
-- Side panel tree showing playlists and tasks
-- Add, edit, reorder, and delete playlists and tasks inline
-- Drag-and-drop reordering in the tree view
-- Live status icons: pending, running, completed, failed, skipped
+| Feature | Description | How to Use |
+|---------|-------------|------------|
+| **Smart New Plan** | AI generates a plan from a description | `MOAG: Smart New Plan` |
+| **Plan from GitHub Issue** | Turn any issue into a runnable plan | `MOAG: Plan from GitHub Issue` |
+| **Plan Templates** | 12 pre-built plans for common workflows | `MOAG: New Plan from Template` |
+| **Task Editor** | Single-form webview for task editing | `MOAG: Edit Task` |
+| **Quick Add Task** | Keyboard-first task creation | `Ctrl+Shift+T` |
+| **Task from Selection** | Create a task from highlighted code | `MOAG: Add Task from Selection` |
+| **Duplicate Task** | Clone any task | Context menu |
+| **Split Task** | AI breaks a large task into focused steps | Context menu |
+| **Peer Review** | A different engine reviews code changes | `MOAG: Add Review Step` |
+| **Consensus Mode** | Run on N engines, first success wins | Set task type to `review` |
+| **AI Auto-Fix** | Retries failures with a repair prompt | Profile setting or `autoFix` field |
+| **Prompt Snippets** | Reusable prompt fragments (6 built-in) | `MOAG: Manage Prompt Snippets` |
+| **Watch Mode** | Re-runs on file changes | `MOAG: Watch Mode` |
+| **Execution Profiles** | Fast / Balanced / Quality / Budget | `MOAG: Switch Profile` |
+| **Plan Variables** | `{{varName}}` substitution in prompts | Plan JSON |
+| **Conditional Tasks** | `skipIf` controls whether a task runs | Task field |
+| **Output Chaining** | Previous output feeds into next prompt | On by default |
+| **Parallel Playlists** | Run playlists concurrently (1-8) | `agentTaskPlayer.parallelPlaylists` |
+| **Dry Run** | Preview what will execute | `MOAG: Dry Run` |
+| **Export Results** | Markdown, JSON, or clipboard | `MOAG: Export Results` |
+| **Share as Gist** | Upload plan to GitHub Gist | `MOAG: Share Plan` |
+| **Import from URL** | Load plans from any JSON URL | `MOAG: Import Plan from URL` |
+| **Create PR** | Open a pull request after execution | `MOAG: Create PR` |
+| **Review Changes** | Inline diff viewer for all changes | `MOAG: Review Changes` |
+| **Dashboard** | Live output, progress bar, ETA, diffs | `MOAG: Show Dashboard` |
+| **Cost Tracking** | Token usage and cost by engine | `MOAG: Show Cost & Usage Summary` |
+| **Execution History** | Timestamped logs with stdout/stderr | `MOAG: Show History` |
 
-### Transport Controls (Play / Pause / Stop)
-- **Play** — runs tasks sequentially across all playlists
-- **Pause** — waits for the current task to finish, then holds
-- **Stop** — kills the running process and halts immediately
-- Configurable autoplay delay between tasks
+---
 
-### Pre-flight Engine Validation
-- Before running, the extension checks if the required CLI tools are installed on your system
-- Shows a clear warning with options: **Run Anyway** or **Open Settings**
-- Scoped: validates only the engines needed for what you're about to run
+## Plan Templates
 
-### Multi-Engine Support
+Run `MOAG: New Plan from Template` to start with one of these:
 
-| Engine | CLI Command | Install |
-|--------|-------------|---------|
-| Claude Code | `claude -p` | `npm i -g @anthropic-ai/claude-code` |
-| Codex | `codex exec` | `npm i -g @openai/codex` |
-| Gemini | `gemini` | `npm i -g @google/gemini-cli` |
-| Ollama | `ollama run <model>` | [ollama.com](https://ollama.com) |
-| Custom | Configurable | Any CLI with `{prompt}` placeholder |
+| Category | Template | What It Does |
+|----------|----------|-------------|
+| **Scaffold** | Next.js Full-Stack App | Pages, API routes, Prisma, auth, tests |
+| **Scaffold** | Express REST API | Routes, middleware, validation, error handling |
+| **Scaffold** | React Component Library | Components, Storybook, testing, Vite build |
+| **Improve** | Add Comprehensive Tests | Unit + integration tests, coverage config |
+| **Improve** | TypeScript Migration | Incremental JS-to-TS with strict checks |
+| **Improve** | Add CI/CD Pipeline | GitHub Actions: lint, test, build, deploy |
+| **Fix** | Security Audit & Fix | OWASP top 10, dependency audit, headers |
+| **Fix** | Performance Optimization | Bundle analysis, lazy loading, caching |
+| **Fix** | Accessibility Audit | WCAG, ARIA, keyboard nav, a11y tests |
+| **Automate** | API Documentation | OpenAPI spec, JSDoc, docs site, examples |
+| **Automate** | Database Migration | Migration scripts, seeds, rollback |
+| **Automate** | Monorepo Setup | Workspaces, shared packages, Turborepo/Nx |
 
-### Task Dependencies & Retries
-- **Dependencies** — `dependsOn` ensures tasks run only after prerequisites complete successfully
-- **Retries** — `retryCount` automatically retries failed tasks
-- **Parallel** — `parallel: true` on a playlist runs all its tasks concurrently
+---
 
-### Task Templates
-- Built-in template library (setup, features, testing, bugfix, refactor, docs)
-- Save any task as a reusable template
-- Add tasks from templates via right-click context menu
+## Smart Features
 
-### Plan Import / Export
-- Export to file or clipboard for sharing with teammates
-- Import from file or clipboard
-- Plans are portable `.agent-plan.json` files with no runtime state
+### AI Auto-Fix
 
-### Cost & Usage Tracking
-- Token usage tracking per task execution (when available from the engine)
-- Aggregated cost summary by engine
-- View via **Show Cost & Usage Summary** command
+When a task fails, MOAG reads the error output, generates a targeted repair prompt, and retries automatically. Enable via the **Balanced** or **Quality** profile, or set `autoFix: true` on any task. Recovered tasks show a badge in the Dashboard.
 
-### Execution History
-- Timestamped logs for every task run with stdout, stderr, exit code, duration
-- Grouped by date in the History sidebar
-- Click any entry for full details
+### Project Analyzer
 
-### Dashboard Webview
-- Tabbed UI: **Plan** / **Output** / **History**
-- Live output streaming during execution
-- Inline play/pause/stop controls and status badge
+MOAG scans your workspace to detect frameworks, languages, missing config, and testing gaps. This powers Smart New Plan — it generates tasks tailored to your actual project, not generic boilerplate.
 
-### Verification Commands
-- Attach a shell command (e.g., `npm test`) to any task
-- Runs after a successful task — if it exits non-zero, the task is marked as failed
+### Prompt Enhancement
+
+Every prompt is automatically enriched with project context, referenced files, and coding rules. Customize with `agentTaskPlayer.promptRules.*` settings or create reusable snippets via `MOAG: Manage Prompt Snippets`.
+
+### Multi-Agent Peer Review
+
+Insert a review step after any task (`MOAG: Add Review Step`). A different engine reviews the changes and flags bugs, security issues, or style problems.
+
+### Consensus Mode
+
+Run the same task on multiple engines simultaneously. First successful result wins. Use for high-stakes tasks where you want the best output from competing models.
+
+### Watch Mode
+
+Toggle `MOAG: Watch Mode` to re-run tasks when source files change. Edit a spec, watch the agent implement it.
+
+---
+
+## GitHub Integration
+
+| Action | Command | What Happens |
+|--------|---------|-------------|
+| **Plan from Issue** | `MOAG: Plan from GitHub Issue` | Paste an issue URL, get a runnable plan |
+| **Create PR** | `MOAG: Create PR` | Opens a pull request with an execution summary |
+| **Share Plan** | `MOAG: Share Plan` | Uploads plan as a GitHub Gist, copies link |
+| **Import Plan** | `MOAG: Import Plan from URL` | Load from gist, raw GitHub URL, or any JSON endpoint |
+| **Review Changes** | `MOAG: Review Changes` | Inline diff viewer for all file changes |
+
+---
+
+## Configuration
+
+### Execution Profiles
+
+Switch with `MOAG: Switch Profile` or the status bar icon:
+
+| Profile | Engine | Timeout | Auto-Fix | Best For |
+|---------|--------|---------|----------|----------|
+| **Fast** | Claude (fast) | 3 min | Off | Quick iterations |
+| **Balanced** | Claude (balanced) | 10 min | On | Daily work |
+| **Quality** | Claude (deep) | 20 min | On | Critical tasks |
+| **Budget** | Ollama (local) | 5 min | Off | Free, offline |
+
+### Settings
+
+Open `Ctrl+,` → search `agentTaskPlayer`:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `defaultEngine` | `claude` | Default agent engine |
+| `autoplayDelay` | `2000` | Delay between tasks (ms) |
+| `taskTimeoutMs` | `600000` | Per-task timeout (default 10 min) |
+| `parallelPlaylists` | `1` | Concurrent playlists (1-8) |
+| `costBudgetUsd` | -- | Spending limit with warning |
+| `maxHistoryEntries` | `200` | History entries to retain |
+| `engines.*.command` | varies | CLI path per engine |
+| `engines.*.args` | varies | Extra CLI arguments |
+| `engines.ollama.model` | `codellama` | Ollama model name |
+| `engines.custom.command` | `""` | Custom engine command |
+
+---
+
+## Keyboard Shortcuts
+
+| Shortcut | Action |
+|----------|--------|
+| `Ctrl+Shift+T` | Quick Add Task |
+| `Ctrl+Shift+P` → "MOAG" | All commands |
+
+---
+
+## Supported Engines
+
+| Engine | CLI | Install |
+|--------|-----|---------|
+| **Claude Code** | `claude` | `npm i -g @anthropic-ai/claude-code` |
+| **Codex** | `codex` | `npm i -g @openai/codex` |
+| **Gemini** | `gemini` | `npm i -g @google/gemini-cli` |
+| **Ollama** | `ollama run <model>` | [ollama.com](https://ollama.com) |
+| **Custom** | Configurable | Any CLI that accepts a prompt |
+
+Engine priority: **task** > **playlist** > **plan `defaultEngine`** > **VS Code setting** > **execution profile**.
 
 ---
 
 ## Plan File Format
 
-Plans are `.agent-plan.json` files. The extension auto-loads the first one found in your workspace.
+Plans are `.agent-plan.json` files. MOAG auto-loads the first one found in your workspace.
+
+```json
+{
+  "version": "1.0",
+  "name": "My Plan",
+  "defaultEngine": "claude",
+  "playlists": [
+    {
+      "id": "setup",
+      "name": "Setup",
+      "tasks": [
+        {
+          "id": "init",
+          "name": "Initialize project",
+          "prompt": "Create a TypeScript Express API with routes, tests, and error handling",
+          "verifyCommand": "npm test",
+          "failurePolicy": "continue"
+        }
+      ]
+    }
+  ]
+}
+```
 
 ### Task Fields
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `id` | Yes | Unique identifier |
-| `name` | Yes | Display name shown in tree view |
-| `prompt` | Yes | Instruction sent to the agent CLI |
-| `type` | No | Task mode: `agent`, `command`, `service`, or `check` |
-| `engine` | No | Override the playlist/plan default engine |
-| `command` | No | Shell command used by `command`, `service`, or `check` tasks |
-| `cwd` | No | Working directory (relative to workspace root) |
-| `files` | No | File paths whose contents are appended to the prompt as context |
-| `verifyCommand` | No | Shell command to validate the result (exit 0 = pass) |
-| `failurePolicy` | No | What to do on failure: `continue`, `stop`, or `mark-blocked` |
-| `retryCount` | No | Number of retries on failure (default: 0 = no retry) |
-| `dependsOn` | No | Array of task IDs that must complete before this task runs |
+| `name` | Yes | Display name |
+| `prompt` | Yes | Instruction sent to the agent |
+| `type` | No | `agent`, `command`, `service`, `check`, or `review` |
+| `engine` | No | Override engine for this task |
+| `command` | No | Shell command (for command/service/check types) |
+| `verifyCommand` | No | Validation command (exit 0 = pass) |
+| `failurePolicy` | No | `continue`, `stop`, or `mark-blocked` |
+| `retryCount` | No | Retries on failure (default: 0) |
+| `autoFix` | No | AI auto-fix on failure |
+| `dependsOn` | No | Task IDs that must complete first |
+| `files` | No | Files to include as context |
+| `skipIf` | No | Condition to skip this task |
+| `cwd` | No | Working directory (relative to workspace) |
 
 ### Playlist Fields
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `id` | Yes | Unique identifier |
-| `name` | Yes | Display name shown in tree view |
+| `name` | Yes | Display name |
 | `engine` | No | Default engine for tasks in this playlist |
-| `autoplay` | No | Auto-advance to next task (default: true) |
-| `autoplayDelay` | No | Delay in ms between tasks (overrides global setting) |
 | `parallel` | No | Run all tasks concurrently (default: false) |
-
----
-
-## Configuration Reference
-
-Open VS Code Settings (`Ctrl+,`) and search for `agentTaskPlayer`:
-
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `agentTaskPlayer.defaultEngine` | `claude` | Default agent engine for all tasks |
-| `agentTaskPlayer.engines.codex.command` | `codex` | Codex CLI path or command name |
-| `agentTaskPlayer.engines.codex.args` | `[]` | Extra arguments for Codex CLI |
-| `agentTaskPlayer.engines.claude.command` | `claude` | Claude Code CLI path or command name |
-| `agentTaskPlayer.engines.claude.args` | `["-p"]` | Arguments for Claude Code (default: print mode) |
-| `agentTaskPlayer.engines.gemini.command` | `gemini` | Gemini CLI path or command name |
-| `agentTaskPlayer.engines.gemini.args` | `[]` | Extra arguments for Gemini CLI |
-| `agentTaskPlayer.engines.ollama.command` | `ollama` | Ollama CLI path or command name |
-| `agentTaskPlayer.engines.ollama.model` | `codellama` | Model name for Ollama |
-| `agentTaskPlayer.engines.custom.command` | `""` | Custom engine command (required for custom engine) |
-| `agentTaskPlayer.engines.custom.args` | `[]` | Custom engine arguments; use `{prompt}` as placeholder |
-| `agentTaskPlayer.autoplayDelay` | `2000` | Delay in ms between tasks during autoplay |
-| `agentTaskPlayer.maxHistoryEntries` | `200` | Maximum number of history entries to keep |
-
----
-
-## Commands Reference
-
-All commands are available via the Command Palette (`Ctrl+Shift+P`):
-
-| Command | Description |
-|---------|-------------|
-| Agent Task Player: Play | Start or resume execution |
-| Agent Task Player: Pause | Pause between tasks |
-| Agent Task Player: Stop | Stop execution and kill running process |
-| Agent Task Player: Open Plan File | Load an existing `.agent-plan.json` |
-| Agent Task Player: New Plan | Create a new plan file |
-| Agent Task Player: Add Playlist | Add a playlist to the current plan |
-| Agent Task Player: Add Task | Add a task to a playlist |
-| Agent Task Player: Add Task from Template | Add a task from the template library |
-| Agent Task Player: Save as Template | Save a task as a reusable template |
-| Agent Task Player: Edit Task | Edit task properties |
-| Agent Task Player: Delete | Delete a playlist or task |
-| Agent Task Player: Move Up | Move item up in its list |
-| Agent Task Player: Move Down | Move item down in its list |
-| Agent Task Player: Show History | View execution history details |
-| Agent Task Player: Show Dashboard | Open the webview dashboard |
-| Agent Task Player: Clear History | Clear all execution history |
-| Agent Task Player: Play Playlist | Run a single playlist |
-| Agent Task Player: Run Task | Run a single task |
-| Agent Task Player: Export Plan | Export plan to file or clipboard |
-| Agent Task Player: Import Plan | Import plan from file or clipboard |
-| Agent Task Player: Show Cost & Usage Summary | View token usage and cost breakdown |
+| `autoplay` | No | Auto-advance to next task (default: true) |
+| `autoplayDelay` | No | Delay between tasks (ms) |
 
 ---
 
 ## Development
 
-### Prerequisites
-- Node.js 20+
-- VS Code 1.85.0+
-
-### Setup
 ```bash
 git clone https://github.com/sujan-poudel-03/moag.git
-cd moag
-npm install
-```
-
-### Build
-```bash
-npm run compile    # one-time build
-npm run watch      # watch mode
-```
-
-### Test
-```bash
-npm run test:unit          # unit tests (Mocha + Sinon)
-npm run test:integration   # integration tests (VS Code Extension Host)
-npm test                   # alias for test:unit
-```
-
-### Lint
-```bash
-npm run lint
-```
-
-### Package
-```bash
-npm run package    # produces a .vsix file
+cd moag && npm install
+npm run compile      # build
+npm run watch        # dev mode
+npm test             # unit tests (Mocha + Sinon)
+npm run lint         # ESLint
+npm run package      # build .vsix
 ```
 
 ---
 
 ## Contributing
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Make your changes and add tests
-4. Run `npm run lint && npm test` to verify
-5. Commit and push
-6. Open a Pull Request
-
----
-
-## Roadmap
-
-- ~~Parallel task execution within a playlist~~ Done
-- ~~Drag-and-drop reordering in the tree view~~ Done
-- ~~Task templates and snippet library~~ Done
-- ~~Cost/token tracking per engine~~ Done
-- ~~Plan import/export and sharing~~ Done
-- ~~Pre-flight engine availability validation~~ Done
-- Visual dependency graph between tasks
-- Multi-workspace plan management
-- Conditional task execution (run only if previous output matches pattern)
-
-For the product direction beyond the current feature list, see [docs/local-first-roadmap.md](docs/local-first-roadmap.md). It lays out the local-first execution strategy for `v0.6.0` through `v1.0.0`, including implementation order and release/deployment steps.
-
----
-
-## Known Limitations
-
-- Tasks run sequentially by default. Set `"parallel": true` on a playlist to run its tasks concurrently.
-- Each agent CLI must be installed separately on your machine before the extension can use it.
-- Cost tracking is estimated from CLI output and depends on what the selected engine reports.
+1. Fork → branch → make changes → add tests
+2. `npm run lint && npm test`
+3. Open a Pull Request
 
 ---
 

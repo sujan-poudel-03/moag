@@ -14,9 +14,11 @@ export interface ContextSettings {
   allPriorOutputs: boolean;
   projectState: boolean;
   changedFiles: boolean;
+  relevantFiles: boolean;
   cumulativeProgress: boolean;
   maxContextChars: number;
   maxOutputPerTask: number;
+  maxFileContextChars: number;
   fileTreeDepth: number;
 }
 
@@ -41,8 +43,10 @@ export function getContextSettings(): ContextSettings {
     projectState: cfg.get<boolean>('projectState', true),
     changedFiles: cfg.get<boolean>('changedFiles', true),
     cumulativeProgress: cfg.get<boolean>('cumulativeProgress', true),
+    relevantFiles: cfg.get<boolean>('relevantFiles', true),
     maxContextChars: Math.max(cfg.get<number>('maxContextChars', 30000), 1000),
     maxOutputPerTask: Math.max(cfg.get<number>('maxOutputPerTask', 3000), 500),
+    maxFileContextChars: Math.max(cfg.get<number>('maxFileContextChars', 10000), 1000),
     fileTreeDepth: Math.min(Math.max(cfg.get<number>('fileTreeDepth', 3), 1), 6),
   };
 }
@@ -83,6 +87,13 @@ export function buildContext(options: ContextOptions): string {
     const body = gatherChangedFiles(options.historyStore, options.playlist, options.task);
     if (body) {
       sections.push({ priority: 3, header: '=== FILES CHANGED BY PRIOR TASKS ===', body });
+    }
+  }
+
+  if (settings.relevantFiles) {
+    const body = gatherRelevantFiles(options.task, options.cwd, settings);
+    if (body) {
+      sections.push({ priority: 3.5, header: '=== RELEVANT FILES ===', body });
     }
   }
 
@@ -246,6 +257,130 @@ export function gatherPriorOutputs(
   }
 
   return parts.length > 0 ? parts.join('\n\n') : '';
+}
+
+/** Max size for a single file to be included as relevant context */
+const MAX_RELEVANT_FILE_BYTES = 5 * 1024;
+
+/** File extensions that signal a path reference in a prompt */
+const PATH_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|rs|java|rb|css|scss|html|json|yaml|yml|toml|md|sh|sql)$/;
+
+/** Match file-path-like tokens in text */
+const PATH_PATTERN = /(?:^|\s|['"`(,])([a-zA-Z0-9_\-./\\]+(?:\/[a-zA-Z0-9_\-./\\]+)+(?:\.[a-zA-Z0-9]+)?)/g;
+
+/** Always-include files: extract only relevant portions to save budget */
+const ALWAYS_INCLUDE: { file: string; extract: (raw: string) => string | null }[] = [
+  {
+    file: 'package.json',
+    extract: (raw) => {
+      try {
+        const pkg = JSON.parse(raw);
+        const slim: Record<string, unknown> = {};
+        for (const key of ['scripts', 'dependencies', 'devDependencies']) {
+          if (pkg[key]) { slim[key] = pkg[key]; }
+        }
+        return Object.keys(slim).length > 0 ? JSON.stringify(slim, null, 2) : null;
+      } catch { return null; }
+    },
+  },
+  {
+    file: 'tsconfig.json',
+    extract: (raw) => {
+      try {
+        const tsconfig = JSON.parse(raw);
+        if (tsconfig.compilerOptions) {
+          return JSON.stringify({ compilerOptions: tsconfig.compilerOptions }, null, 2);
+        }
+        return null;
+      } catch { return null; }
+    },
+  },
+];
+
+/**
+ * Scan the task prompt for file paths, read existing ones, and include their content.
+ * Also always includes package.json (scripts+deps) and tsconfig.json (compilerOptions) if present.
+ */
+export function gatherRelevantFiles(task: Task, cwd: string, settings: ContextSettings): string {
+  const budget = settings.maxFileContextChars;
+  const parts: string[] = [];
+  let totalChars = 0;
+  const included = new Set<string>();
+
+  // Helper: add a file's content (or extracted portion) to the output
+  const addFile = (relPath: string, content: string): boolean => {
+    if (included.has(relPath)) { return false; }
+    if (totalChars + content.length > budget) { return false; }
+    included.add(relPath);
+    const block = `--- ${relPath} ---\n${content}`;
+    parts.push(block);
+    totalChars += block.length;
+    return true;
+  };
+
+  // 1. Always-include files (extracted portions only)
+  for (const { file, extract } of ALWAYS_INCLUDE) {
+    const fullPath = path.join(cwd, file);
+    try {
+      const raw = fs.readFileSync(fullPath, 'utf-8');
+      const extracted = extract(raw);
+      if (extracted) {
+        addFile(file, extracted);
+      }
+    } catch {
+      // file doesn't exist — skip
+    }
+  }
+
+  // 2. Scan prompt for file path references
+  const prompt = task.prompt || '';
+  const detectedPaths = new Set<string>();
+
+  let match: RegExpExecArray | null;
+  const pattern = new RegExp(PATH_PATTERN.source, 'g');
+  while ((match = pattern.exec(prompt)) !== null) {
+    detectedPaths.add(match[1]);
+  }
+
+  // Also look for simple filenames with known extensions (e.g., "package.json", "tsconfig.json")
+  const simpleFilePattern = /(?:^|\s|['"`(,])([a-zA-Z0-9_\-]+\.[a-zA-Z0-9]+)/g;
+  while ((match = simpleFilePattern.exec(prompt)) !== null) {
+    if (PATH_EXTENSIONS.test(match[1])) {
+      detectedPaths.add(match[1]);
+    }
+  }
+
+  // 3. Resolve and read each detected path
+  for (const detectedPath of detectedPaths) {
+    // Normalize separators
+    const normalized = detectedPath.replace(/\\/g, '/');
+    const resolved = path.join(cwd, normalized);
+
+    // Security: ensure the resolved path is within cwd
+    const realCwd = fs.realpathSync(cwd);
+    let realResolved: string;
+    try {
+      realResolved = fs.realpathSync(resolved);
+    } catch {
+      continue; // file doesn't exist
+    }
+    if (!realResolved.startsWith(realCwd)) { continue; }
+
+    try {
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) { continue; }
+      if (stat.size > MAX_RELEVANT_FILE_BYTES) { continue; }
+
+      const content = fs.readFileSync(resolved, 'utf-8');
+      if (!addFile(normalized, content)) {
+        break; // budget exhausted
+      }
+    } catch {
+      // can't read — skip
+    }
+  }
+
+  return parts.length > 0 ? parts.join('\n') : '';
 }
 
 const IGNORED_DIRS = new Set([

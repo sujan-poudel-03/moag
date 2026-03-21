@@ -72,7 +72,7 @@ export class DashboardPanel {
 
     const panel = vscode.window.createWebviewPanel(
       'agentTaskPlayerDashboard',
-      'Agent Task Player',
+      'MOAG',
       column,
       {
         enableScripts: true,
@@ -148,6 +148,11 @@ export class DashboardPanel {
     this.clearTimeline();
   }
 
+  /** Notify the webview about an engine fallback due to rate limiting */
+  public postEngineFallback(fromEngine: string, toEngine: string): void {
+    this.safePostMessage({ type: 'engine-fallback', fromEngine, toEngine });
+  }
+
   /** Append output chunk to the live output panel (rate-limited to prevent webview freeze) */
   public appendOutput(text: string, stream: 'stdout' | 'stderr', taskId?: string): void {
     this._outputBuffer.push({ text, stream, taskId });
@@ -203,6 +208,7 @@ export class DashboardPanel {
     codeChanges?: string,
     verification?: VerificationResult,
     artifacts?: TaskArtifact[],
+    autoFixed?: boolean,
   ): void {
     // Send stderr/stdout snippet so the dashboard can show WHY a task failed
     const stderrSnippet = result.stderr
@@ -227,6 +233,7 @@ export class DashboardPanel {
       codeChanges,
       verification,
       artifacts,
+      autoFixed: autoFixed || false,
     });
   }
 
@@ -328,17 +335,40 @@ export class DashboardPanel {
         }
         break;
       }
+      case 'open-diff': {
+        const diffTaskId = msg.taskId as string | undefined;
+        if (diffTaskId) {
+          const entries = this.historyStore.getForTask(diffTaskId);
+          const entry = entries[0];
+          if (entry?.codeChanges) {
+            const os = require('os') as typeof import('os');
+            const tmpPath = require('path').join(os.tmpdir(), `moag-diff-${diffTaskId}.diff`);
+            require('fs').writeFileSync(tmpPath, entry.codeChanges, 'utf-8');
+            vscode.workspace.openTextDocument(tmpPath)
+              .then(doc => vscode.window.showTextDocument(doc, { preview: true }));
+          }
+        }
+        break;
+      }
+      case 'create-pr':
+        vscode.commands.executeCommand('agentTaskPlayer.createPR');
+        break;
       case 'refresh':
         this.update();
         break;
       case 'review-changes':
-        vscode.commands.executeCommand('agentTaskPlayer.reviewChanges');
+        vscode.commands.executeCommand('agentTaskPlayer.exportResults');
         break;
       case 'new-plan':
-        vscode.commands.executeCommand('agentTaskPlayer.newPlan');
+        vscode.commands.executeCommand('agentTaskPlayer.createPlan');
         break;
       case 'export-results':
         vscode.commands.executeCommand('agentTaskPlayer.exportResults');
+        break;
+      case 'retry-failed':
+        vscode.commands.executeCommand('agentTaskPlayer.retryFailed').then(undefined, () => {
+          vscode.commands.executeCommand('agentTaskPlayer.play');
+        });
         break;
     }
   }
@@ -376,7 +406,7 @@ export class DashboardPanel {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Agent Task Player</title>
+  <title>MOAG</title>
   <style>
     :root {
       --bg: var(--vscode-editor-background);
@@ -652,12 +682,95 @@ export class DashboardPanel {
     .engine-gemini { background: #4285f422; color: #4285f4; }
     .engine-ollama { background: #9c27b022; color: #9c27b0; }
     .engine-custom { background: rgba(128,128,128,0.15); color: var(--dimmed); }
+    .autofix-badge {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 600;
+      padding: 1px 6px;
+      border-radius: 3px;
+      margin-left: 6px;
+      background: rgba(56, 132, 244, 0.15);
+      color: #3884f4;
+      vertical-align: middle;
+    }
     .active-timer {
       font-size: 11px;
       font-family: var(--vscode-editor-font-family, monospace);
       color: var(--dimmed);
       flex-shrink: 0;
     }
+    /* ─ Progress bar ─ */
+    .progress-bar-container {
+      height: 3px;
+      background: rgba(128,128,128,0.2);
+      width: 100%;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: var(--vscode-progressBar-background, #0e70c0);
+      transition: width 0.3s ease;
+      width: 0%;
+    }
+    .eta-display {
+      font-size: 11px;
+      color: var(--dimmed);
+      padding: 2px 12px;
+      text-align: right;
+    }
+    /* ─ Diff viewer ─ */
+    .diff-section {
+      margin-top: 8px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .diff-section summary {
+      padding: 6px 10px;
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 600;
+      background: rgba(128,128,128,0.08);
+      user-select: none;
+    }
+    .diff-section summary:hover { background: rgba(128,128,128,0.14); }
+    .diff-view {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      line-height: 1.5;
+      overflow-x: auto;
+      padding: 8px;
+      margin: 0;
+      white-space: pre;
+    }
+    .diff-add { background: rgba(78,201,176,0.15); color: inherit; }
+    .diff-remove { background: rgba(244,71,71,0.15); color: inherit; }
+    .diff-hunk { color: var(--dimmed); font-style: italic; }
+    .diff-header { font-weight: 700; color: var(--fg); }
+    .diff-file-summary {
+      font-size: 10px;
+      color: var(--dimmed);
+      padding: 4px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .diff-actions {
+      display: flex;
+      gap: 6px;
+      padding: 4px 10px;
+      border-top: 1px solid var(--border);
+    }
+    .diff-actions button {
+      font-size: 10px;
+      padding: 2px 8px;
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: none;
+      border-radius: 2px;
+      cursor: pointer;
+    }
+    .diff-actions button:hover { opacity: 0.85; }
     .active-task-output {
       background: var(--terminal-bg);
       color: var(--terminal-fg);
@@ -1313,8 +1426,8 @@ export class DashboardPanel {
       margin: 8px;
       padding: 12px 14px;
       border-radius: 6px;
-      background: rgba(76,175,80,0.12);
-      border: 1px solid var(--success);
+      background: rgba(78,201,176,0.12);
+      border: 1px solid rgba(78,201,176,0.5);
       display: none;
     }
     .success-banner.visible { display: block; }
@@ -1330,9 +1443,9 @@ export class DashboardPanel {
       flex-wrap: wrap;
     }
     .success-banner-btn {
-      background: rgba(76,175,80,0.18);
+      background: rgba(78,201,176,0.18);
       color: var(--success);
-      border: 1px solid rgba(76,175,80,0.4);
+      border: 1px solid rgba(78,201,176,0.4);
       padding: 5px 14px;
       border-radius: 4px;
       font-size: 11px;
@@ -1341,7 +1454,43 @@ export class DashboardPanel {
       white-space: nowrap;
     }
     .success-banner-btn:hover {
-      background: rgba(76,175,80,0.3);
+      background: rgba(78,201,176,0.3);
+    }
+
+    /* ─── Amber completion banner (has failures) ─── */
+    .amber-banner {
+      margin: 8px;
+      padding: 12px 14px;
+      border-radius: 6px;
+      background: rgba(200,140,40,0.12);
+      border: 1px solid rgba(220,160,50,0.6);
+      display: none;
+    }
+    .amber-banner.visible { display: block; }
+    .amber-banner-title {
+      font-weight: 700;
+      font-size: 13px;
+      color: #e8a838;
+      margin-bottom: 8px;
+    }
+    .amber-banner-actions {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+    .amber-banner-btn {
+      background: rgba(220,160,50,0.18);
+      color: #e8a838;
+      border: 1px solid rgba(220,160,50,0.4);
+      padding: 5px 14px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .amber-banner-btn:hover {
+      background: rgba(220,160,50,0.35);
     }
 
     /* ─── Responsive: narrow panel (<400px) ─── */
@@ -1426,7 +1575,7 @@ export class DashboardPanel {
 
   <!-- Header -->
   <div class="header">
-    <span class="plan-name" id="plan-name">Agent Task Player</span>
+    <span class="plan-name" id="plan-name">MOAG</span>
     <span id="runner-status" class="status-badge status-idle">Idle</span>
     <div class="transport">
       <button id="btn-play" class="icon-btn primary" title="Play">&#9654;</button>
@@ -1434,6 +1583,10 @@ export class DashboardPanel {
       <button id="btn-stop" class="icon-btn" title="Stop">&#9632;</button>
     </div>
   </div>
+
+  <!-- Progress bar -->
+  <div class="progress-bar-container"><div class="progress-bar-fill" id="global-progress-bar"></div></div>
+  <div class="eta-display" id="eta-display" style="display:none;"></div>
 
   <!-- Pipeline overview -->
   <div class="pipeline" id="pipeline" style="display:none;">
@@ -1487,6 +1640,15 @@ export class DashboardPanel {
         <button class="success-banner-btn" onclick="vscode.postMessage({type:'review-changes'})">Review Changes</button>
         <button class="success-banner-btn" onclick="vscode.postMessage({type:'new-plan'})">New Plan</button>
         <button class="success-banner-btn" onclick="vscode.postMessage({type:'export-results'})">Export Results</button>
+      </div>
+    </div>
+
+    <!-- Amber banner (shown when run completes with failures) -->
+    <div class="amber-banner" id="amber-banner">
+      <div class="amber-banner-title" id="amber-banner-title"></div>
+      <div class="amber-banner-actions">
+        <button class="amber-banner-btn" onclick="vscode.postMessage({type:'retry-failed'})">Retry Failed</button>
+        <button class="amber-banner-btn" onclick="vscode.postMessage({type:'export-results'})">Export Results</button>
       </div>
     </div>
 
@@ -1608,6 +1770,28 @@ export class DashboardPanel {
         case 'complete-task-card':
           completeTask(msg);
           break;
+
+        case 'engine-fallback': {
+          const targetId = currentTaskId;
+          if (targetId) {
+            const fallbackText = '[MOAG] Switching from ' + msg.fromEngine + ' to ' + msg.toEngine + ' due to rate limit';
+            // Store in card state
+            const st = cardState[targetId];
+            if (st) { st.output += '\\n' + fallbackText + '\\n'; }
+            // Render as a yellow info line in the active output
+            const outputEl = document.getElementById('active-output');
+            if (outputEl && targetId === currentTaskId) {
+              clearActiveOutputPlaceholder();
+              const span = document.createElement('span');
+              span.style.color = 'var(--warning)';
+              span.style.fontWeight = '600';
+              span.textContent = '\\n' + fallbackText + '\\n';
+              outputEl.appendChild(span);
+              outputEl.scrollTop = outputEl.scrollHeight;
+            }
+          }
+          break;
+        }
       }
     });
 
@@ -1630,6 +1814,10 @@ export class DashboardPanel {
       document.getElementById('active-contract').innerHTML = '';
       document.getElementById('completed-section').innerHTML = '';
       document.getElementById('error-banner').classList.remove('visible');
+      var sb = document.getElementById('success-banner');
+      var ab = document.getElementById('amber-banner');
+      if (sb) { sb.classList.remove('visible'); }
+      if (ab) { ab.classList.remove('visible'); }
       syncCurrentTaskMarker();
       updateProgress();
       renderPmSummary();
@@ -2060,11 +2248,14 @@ export class DashboardPanel {
       // Summary row
       const row = document.createElement('div');
       row.className = 'completed-task-row';
+      var autoFixBadge = msg.autoFixed
+        ? '<span class="autofix-badge">\\uD83D\\uDD27 Auto-fixed</span>'
+        : '';
       row.innerHTML =
         '<span class="ct-icon ' + (passed ? 'pass' : skipped ? 'skip' : blocked ? 'fail' : 'fail') + '">' +
           (passed ? '\\u2713' : skipped ? '\\u2212' : blocked ? '!' : '\\u2717') +
         '</span>' +
-        '<span class="ct-name">' + escHtml(taskName) + '</span>' +
+        '<span class="ct-name">' + escHtml(taskName) + autoFixBadge + '</span>' +
         '<span class="ct-stats">' +
           (state.taskType ? '<span class="engine-badge engine-custom">' + escHtml(state.taskType) + '</span>' : '') +
           (state.engine ? '<span class="engine-badge engine-' + state.engine + '">' + state.engine + '</span>' : '') +
@@ -2180,16 +2371,31 @@ export class DashboardPanel {
         detail.appendChild(artifactsSection);
       }
 
-      // Code diff
+      // Code diff with enhanced viewer
       if (msg.codeChanges) {
         const diffSection = document.createElement('details');
-        diffSection.className = 'ct-detail-section';
-        const diffText = msg.codeChanges.length > 5000
-          ? msg.codeChanges.substring(0, 5000) + '\\n... (truncated)'
+        diffSection.className = 'diff-section';
+        const diffText = msg.codeChanges.length > 8000
+          ? msg.codeChanges.substring(0, 8000) + '\\n... (truncated)'
           : msg.codeChanges;
+        // Parse file-level summary from diff headers
+        var fileSummaries = [];
+        var fileMatches = diffText.match(/^diff --git a\/(.+?) b\/.+$/gm) || [];
+        for (var fi = 0; fi < fileMatches.length; fi++) {
+          var fname = fileMatches[fi].replace(/^diff --git a\//, '').replace(/ b\/.*$/, '');
+          fileSummaries.push(fname);
+        }
+        var fileSummaryHtml = fileSummaries.length > 0
+          ? '<div class="diff-file-summary">' + fileSummaries.map(function(f) { return escHtml(f); }).join(' &middot; ') + '</div>'
+          : '';
         diffSection.innerHTML =
-          '<summary>Code Changes</summary>' +
-          '<pre>' + colorDiff(diffText) + '</pre>';
+          '<summary>Changes (' + (msg.changedFiles || []).length + ' files)</summary>' +
+          fileSummaryHtml +
+          '<div class="diff-view">' + colorDiff(diffText) + '</div>' +
+          '<div class="diff-actions">' +
+            '<button onclick="navigator.clipboard.writeText(this.closest(\\'.diff-section\\').querySelector(\\'.diff-view\\').textContent)">Copy Diff</button>' +
+            '<button onclick="vscode.postMessage({type:\\x27open-diff\\x27, taskId:\\x27' + taskId + '\\x27})">Open in Editor</button>' +
+          '</div>';
         detail.appendChild(diffSection);
       }
 
@@ -2237,6 +2443,27 @@ export class DashboardPanel {
 
       document.getElementById('stats-files').textContent =
         totalFilesChanged > 0 ? totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's' : '') : '';
+
+      // Global progress bar
+      var gpb = document.getElementById('global-progress-bar');
+      if (gpb) { gpb.style.width = (totalTasks > 0 ? pct : 0) + '%'; }
+
+      // ETA calculation
+      var etaEl = document.getElementById('eta-display');
+      if (etaEl && runStartTime && completedCount > 0 && completedCount < totalTasks) {
+        var elapsed = Date.now() - runStartTime;
+        var avgPerTask = elapsed / completedCount;
+        var remaining = (totalTasks - completedCount) * avgPerTask;
+        var mins = Math.floor(remaining / 60000);
+        var secs = Math.round((remaining % 60000) / 1000);
+        etaEl.textContent = 'ETA: ~' + (mins > 0 ? mins + 'm ' : '') + secs + 's remaining (' + (totalTasks - completedCount) + ' tasks left)';
+        etaEl.style.display = 'block';
+      } else if (etaEl && completedCount >= totalTasks && totalTasks > 0) {
+        etaEl.textContent = 'All tasks complete';
+        etaEl.style.display = 'block';
+      } else if (etaEl) {
+        etaEl.style.display = 'none';
+      }
     }
 
     function startTimer() {
@@ -2386,14 +2613,24 @@ export class DashboardPanel {
             ((failedTasks > 0 || blockedTasks > 0)
               ? ' \\u2014 ' + [failedTasks > 0 ? failedTasks + ' failed' : '', blockedTasks > 0 ? blockedTasks + ' blocked' : ''].filter(Boolean).join(', ')
               : ' \\u2014 All done');
-          // Show success banner if all tasks passed
+          // Show completion banner
           var successBanner = document.getElementById('success-banner');
-          if (successBanner) {
-            if (failedTasks === 0 && blockedTasks === 0 && passedTasks === totalTasks && passedTasks > 0) {
-              successBanner.classList.add('visible');
-            } else {
-              successBanner.classList.remove('visible');
+          var amberBanner = document.getElementById('amber-banner');
+          if (failedTasks === 0 && blockedTasks === 0 && passedTasks === totalTasks && passedTasks > 0) {
+            if (successBanner) { successBanner.classList.add('visible'); }
+            if (amberBanner) { amberBanner.classList.remove('visible'); }
+          } else if (failedTasks > 0 || blockedTasks > 0) {
+            if (successBanner) { successBanner.classList.remove('visible'); }
+            if (amberBanner) {
+              var amberTitle = document.getElementById('amber-banner-title');
+              if (amberTitle) {
+                amberTitle.textContent = 'Run complete \\u2014 ' + passedTasks + ' passed, ' + (failedTasks + blockedTasks) + ' failed';
+              }
+              amberBanner.classList.add('visible');
             }
+          } else {
+            if (successBanner) { successBanner.classList.remove('visible'); }
+            if (amberBanner) { amberBanner.classList.remove('visible'); }
           }
           // Auto-expand TASKS section after run
           if (collapsedSections['tasks']) {
@@ -2401,9 +2638,11 @@ export class DashboardPanel {
           }
         }
       } else {
-        // Not idle or not complete — hide success banner
+        // Not idle or not complete — hide completion banners
         var successBannerEl = document.getElementById('success-banner');
+        var amberBannerEl = document.getElementById('amber-banner');
         if (successBannerEl) { successBannerEl.classList.remove('visible'); }
+        if (amberBannerEl) { amberBannerEl.classList.remove('visible'); }
       }
     }
 
@@ -2433,7 +2672,7 @@ export class DashboardPanel {
       if (!plan || !plan.playlists) {
         section.innerHTML = '';
         emptyState.style.display = '';
-        planName.textContent = 'Agent Task Player';
+        planName.textContent = 'MOAG';
         return;
       }
 
@@ -2703,10 +2942,11 @@ export class DashboardPanel {
     function colorDiff(diff) {
       return diff.split('\\n').map(function(line) {
         const escaped = escHtml(line);
-        if (line.startsWith('+++') || line.startsWith('---')) return '<span class="diff-meta">' + escaped + '</span>';
+        if (line.startsWith('diff --git')) return '<span class="diff-header">' + escaped + '</span>';
+        if (line.startsWith('+++') || line.startsWith('---')) return '<span class="diff-header">' + escaped + '</span>';
         if (line.startsWith('@@')) return '<span class="diff-hunk">' + escaped + '</span>';
         if (line.startsWith('+')) return '<span class="diff-add">' + escaped + '</span>';
-        if (line.startsWith('-')) return '<span class="diff-del">' + escaped + '</span>';
+        if (line.startsWith('-')) return '<span class="diff-remove">' + escaped + '</span>';
         return escaped;
       }).join('\\n');
     }

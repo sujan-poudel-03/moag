@@ -22,9 +22,11 @@ import {
 } from '../models/types';
 import { generateId } from '../models/plan';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
+import { resolveProfile, ProfileName, ProfileConfig } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
 import { HistoryStore } from '../history/store';
 import { buildContext, getContextSettings } from '../context/context-builder';
+import { PromptLibraryStore } from '../templates/prompt-library';
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const GIT_TIMEOUT_MS = 30_000;
@@ -42,6 +44,7 @@ export interface RunnerEvents {
   'task-output': (task: Task, chunk: string, stream: 'stdout' | 'stderr') => void;
   'task-completed': (task: Task, result: EngineResult) => void;
   'task-failed': (task: Task, result: EngineResult) => void;
+  'engine-fallback': (details: { taskId: string; fromEngine: EngineId; toEngine: EngineId }) => void;
   'budget-exceeded': (details: BudgetExceededEvent) => void;
   'playlist-completed': (playlist: Playlist) => void;
   'all-completed': () => void;
@@ -82,7 +85,13 @@ export class TaskRunner {
   private _totalCostUsd = 0;
   private _budgetExceededEmitted = false;
 
+  private _promptLibrary: PromptLibraryStore | null = null;
+
   constructor(private readonly historyStore: HistoryStore) {}
+
+  setPromptLibrary(store: PromptLibraryStore): void {
+    this._promptLibrary = store;
+  }
 
   get currentRunId(): string | null {
     return this._currentRunId;
@@ -408,6 +417,13 @@ export class TaskRunner {
         }
       }
 
+      if (this.shouldSkipIf(task, plan)) {
+        task.status = TaskStatus.Skipped;
+        this.emit('task-output', task, `[Skipped] "${task.name}" - skipIf condition met\n`, 'stderr');
+        this.emit('task-completed', task, { stdout: '', stderr: 'Skipped: skipIf condition met', exitCode: 0, durationMs: 0 });
+        continue;
+      }
+
       await this.executeTaskWithRetry(task, playlist, plan);
 
       if (this.isStopping()) {
@@ -441,6 +457,11 @@ export class TaskRunner {
             return;
           }
         }
+        if (this.shouldSkipIf(task, plan)) {
+          task.status = TaskStatus.Skipped;
+          this.emit('task-output', task, `[Skipped] "${task.name}" - skipIf condition met\n`, 'stderr');
+          return;
+        }
         await this.executeTaskWithRetry(task, playlist, plan);
       })();
       taskPromises.set(task.id, promise);
@@ -463,6 +484,14 @@ export class TaskRunner {
     return 'ok';
   }
 
+  private shouldSkipIf(task: Task, plan: Plan): boolean {
+    if (!task.skipIf) { return false; }
+    const allTasks = plan.playlists.flatMap(pl => pl.tasks);
+    const ref = allTasks.find(t => t.id === task.skipIf!.taskId);
+    if (!ref) { return false; }
+    return ref.status === task.skipIf.status;
+  }
+
   private async executeTaskWithRetry(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
     const maxAttempts = (task.retryCount ?? 0) + 1;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -476,13 +505,92 @@ export class TaskRunner {
         await this.sleep(2000);
       }
     }
+
+    // Auto-fix: if task still failed and auto-fix is enabled, attempt AI-driven repair
+    if (task.status !== TaskStatus.Completed && this.getTaskType(task) === 'agent') {
+      await this.autoFixTask(task, playlist, plan);
+    }
+  }
+
+  private async autoFixTask(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
+    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const profileName = cfg.get<string>('executionProfile', 'auto');
+    const profile = resolveProfile(profileName as ProfileName);
+    const autoFix = profile.autoFix && cfg.get<boolean>('autoFix', true);
+    if (!autoFix || this.state === RunnerState.Stopping) { return; }
+
+    // Gather error context from the most recent history entry
+    if (!this.historyStore?.getForTask) { return; }
+    const entries = this.historyStore.getForTask(task.id);
+    const lastEntry = entries[0];
+    if (!lastEntry) { return; }
+
+    const errorOutput = [lastEntry.result.stderr, lastEntry.result.stdout]
+      .filter(Boolean)
+      .join('\n')
+      .slice(-2000);
+    const changedFiles = lastEntry.changedFiles?.join(', ') || 'none';
+
+    this.emit('task-output', task, '\n\n━━━ MOAG Auto-Fix ━━━\n', 'stdout');
+    this.emit('task-output', task, '[Auto-Fix] Analyzing failure and attempting repair...\n', 'stdout');
+
+    const repairPrompt = [
+      `The previous attempt to complete this task FAILED. Here is the context:`,
+      ``,
+      `ORIGINAL TASK: ${task.name}`,
+      `ORIGINAL PROMPT:`,
+      task.prompt,
+      ``,
+      `ERROR OUTPUT (last 2000 chars):`,
+      errorOutput,
+      ``,
+      `FILES CHANGED BY FAILED ATTEMPT: ${changedFiles}`,
+      ``,
+      `INSTRUCTIONS: Analyze the failure above. Fix the issues and complete the original task. ` +
+      `Do NOT start over from scratch — build on what the previous attempt already did. ` +
+      `Focus specifically on what went wrong and correct it.`,
+    ].join('\n');
+
+    // Save original prompt, swap in repair prompt, run, restore
+    const originalPrompt = task.prompt;
+    task.prompt = repairPrompt;
+    task.status = TaskStatus.Pending;
+
+    await this.executeTask(task, playlist, plan);
+
+    // Restore original prompt regardless of outcome
+    task.prompt = originalPrompt;
+
+    // Mark the history entry as auto-fixed
+    const fixEntries = this.historyStore.getForTask(task.id);
+    const fixEntry = fixEntries[0];
+    if (fixEntry) {
+      fixEntry.autoFixed = true;
+    }
+
+    if ((task.status as string) === TaskStatus.Completed) {
+      this.emit('task-output', task, '[Auto-Fix] Repair succeeded!\n', 'stdout');
+    } else {
+      this.emit('task-output', task, '[Auto-Fix] Repair also failed. Manual intervention needed.\n', 'stderr');
+    }
   }
 
   private async executeTask(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
     const taskType = this.getTaskType(task);
-    const engineId = task.engine ?? playlist.engine ?? plan.defaultEngine;
+    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+
+    // Resolve execution profile
+    const profileName = cfg.get<string>('executionProfile', 'auto');
+    const profile = resolveProfile(profileName as ProfileName);
+
+    // Engine: task-level override > playlist > plan > profile
+    const engineId = task.engine ?? playlist.engine ?? plan.defaultEngine ?? profile.preferredEngine;
+
+    // Store profile's model preset on the task for runAgentOnEngine to pick up
+    (task as Task & { _profileModelPreset?: string })._profileModelPreset = profile.modelPreset;
+
     const cwd = this.resolveCwd(task.cwd);
-    const executionDescription = taskType === 'agent'
+    const executionDescription = (taskType === 'agent' || taskType === 'review')
       ? this.buildPrompt(task, cwd, plan, playlist)
       : this.buildTaskDescription(task);
 
@@ -498,7 +606,7 @@ export class TaskRunner {
     const taskAbort = new AbortController();
     const taskTimeoutMs = taskType === 'service'
       ? (task.startupTimeoutMs ?? DEFAULT_SERVICE_STARTUP_TIMEOUT_MS)
-      : vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('taskTimeoutMs', DEFAULT_TASK_TIMEOUT_MS);
+      : profile.taskTimeoutMs;
     const timeoutId = setTimeout(() => taskAbort.abort(), taskTimeoutMs);
     const onParentAbort = () => taskAbort.abort();
     this._abortController?.signal.addEventListener('abort', onParentAbort, { once: true });
@@ -507,7 +615,13 @@ export class TaskRunner {
     let artifacts: TaskArtifact[] | undefined;
 
     try {
-      let result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal);
+      let result: EngineResult;
+
+      if (task.consensus && task.consensus.engines.length > 0 && taskType === 'agent') {
+        result = await this.runConsensusTask(task, cwd, executionDescription, taskAbort.signal, plan);
+      } else {
+        result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal, plan, plan.fallbackEngine);
+      }
 
       if (taskAbort.signal.aborted && !this._abortController?.signal.aborted) {
         result = {
@@ -668,16 +782,20 @@ export class TaskRunner {
     cwd: string,
     fullPrompt: string,
     signal: AbortSignal,
+    plan: Plan,
+    fallbackEngine?: EngineId,
   ): Promise<EngineResult> {
     switch (taskType) {
       case 'agent':
-        return this.runAgentTask(task, engineId, cwd, fullPrompt, signal);
+        return this.runAgentTask(task, engineId, cwd, fullPrompt, signal, fallbackEngine);
       case 'command':
         return this.runCommandTask(task, cwd, signal);
       case 'service':
         return this.runServiceTask(task, cwd, signal);
       case 'check':
         return this.runCheckTask(task, cwd, signal);
+      case 'review':
+        return this.runReviewTask(task, engineId, cwd, signal, plan, fallbackEngine);
       default:
         return { stdout: '', stderr: `Unsupported task type "${taskType}"`, exitCode: 1, durationMs: 0 };
     }
@@ -689,10 +807,42 @@ export class TaskRunner {
     cwd: string,
     fullPrompt: string,
     signal: AbortSignal,
+    fallbackEngine?: EngineId,
   ): Promise<EngineResult> {
-    // Auto-model selection
-    const preset = vscode.workspace.getConfiguration('agentTaskPlayer')
+    const result = await this.runAgentOnEngine(task, engineId, cwd, fullPrompt, signal);
+
+    // Rate-limit fallback: retry once on a different engine
+    if (
+      result.exitCode !== 0 &&
+      fallbackEngine &&
+      fallbackEngine !== engineId &&
+      this.isRateLimited(result)
+    ) {
+      this.emit('engine-fallback', { taskId: task.id, fromEngine: engineId, toEngine: fallbackEngine });
+      this.emit('task-output', task, `\n[Fallback] Rate limit detected on "${engineId}", retrying with "${fallbackEngine}"...\n`, 'stderr');
+      return this.runAgentOnEngine(task, fallbackEngine, cwd, fullPrompt, signal);
+    }
+
+    return result;
+  }
+
+  private isRateLimited(result: EngineResult): boolean {
+    const combined = ((result.stdout || '') + '\n' + (result.stderr || '')).toLowerCase();
+    return /usage limit|rate limit|quota exceeded|too many requests/.test(combined);
+  }
+
+  private async runAgentOnEngine(
+    task: Task,
+    engineId: EngineId,
+    cwd: string,
+    fullPrompt: string,
+    signal: AbortSignal,
+  ): Promise<EngineResult> {
+    // Auto-model selection — profile's modelPreset takes priority over the setting
+    const profilePreset = (task as Task & { _profileModelPreset?: string })._profileModelPreset;
+    const settingPreset = vscode.workspace.getConfiguration('agentTaskPlayer')
       .get<ReasoningPreset>('defaultReasoningPreset', 'auto');
+    const preset: ReasoningPreset = profilePreset ? (profilePreset as ReasoningPreset) : settingPreset;
     const autoSelect = vscode.workspace.getConfiguration('agentTaskPlayer')
       .get<boolean>('autoModelSelection', true);
     const selection = autoSelect ? selectModel(task, engineId, preset) : null;
@@ -724,6 +874,140 @@ export class TaskRunner {
     }
 
     return result;
+  }
+
+  private async runReviewTask(
+    task: Task,
+    originalEngineId: EngineId,
+    cwd: string,
+    signal: AbortSignal,
+    plan: Plan,
+    fallbackEngine?: EngineId,
+  ): Promise<EngineResult> {
+    // Find the dependency task's history entry
+    const depId = task.dependsOn?.[0];
+    if (!depId) {
+      return { stdout: '', stderr: 'Review task requires "dependsOn" pointing to the task to review.', exitCode: 1, durationMs: 0 };
+    }
+
+    const entries = this.historyStore?.getForTask?.(depId);
+    const depEntry = entries?.[0];
+    if (!depEntry) {
+      return { stdout: '', stderr: `No history found for dependency task "${depId}". The task must run before it can be reviewed.`, exitCode: 1, durationMs: 0 };
+    }
+
+    // Pick a different engine for the review
+    const reviewEngine = task.engine ?? this.rotateEngine(depEntry.engine, plan.defaultEngine);
+
+    this.emit('task-output', task, `[Peer Review] Reviewing changes with ${reviewEngine}...\n`, 'stdout');
+
+    // Build the review prompt
+    const changedFiles = depEntry.changedFiles?.join(', ') || 'none';
+    const codeChanges = depEntry.codeChanges || '(no diff available)';
+    const reviewPrompt = [
+      `Review the code changes made by the previous task. The task was: ${depEntry.prompt}`,
+      ``,
+      `Files changed: ${changedFiles}`,
+      ``,
+      `Code diff:`,
+      codeChanges,
+      ``,
+      `Check for: bugs, security issues, missing error handling, test coverage, and adherence to the original requirements. If you find issues, fix them directly.`,
+    ].join('\n');
+
+    return this.runAgentTask(task, reviewEngine, cwd, reviewPrompt, signal, fallbackEngine);
+  }
+
+  private async runConsensusTask(
+    task: Task,
+    cwd: string,
+    fullPrompt: string,
+    signal: AbortSignal,
+    plan: Plan,
+  ): Promise<EngineResult> {
+    const consensus = task.consensus!;
+    const engines = consensus.engines;
+    const strategy = consensus.strategy || 'first-pass';
+
+    this.emit('task-output', task, `\n[Consensus] Running on ${engines.length} engines (${strategy}): ${engines.join(', ')}\n`, 'stdout');
+
+    const results: Array<{ engine: EngineId; result: EngineResult; changedFiles: string[] }> = [];
+
+    for (const engine of engines) {
+      if (signal.aborted) { break; }
+
+      // Capture git state before this attempt
+      const beforeRef = await this.captureGitRef(cwd);
+
+      this.emit('task-output', task, `\n[Consensus] Trying engine: ${engine}...\n`, 'stdout');
+      const result = await this.runAgentTask(task, engine, cwd, fullPrompt, signal, plan.fallbackEngine);
+
+      // Capture what changed
+      const { changedFiles } = beforeRef
+        ? await this.captureGitDiff(beforeRef, cwd)
+        : { changedFiles: [] };
+
+      results.push({ engine, result, changedFiles });
+
+      if (strategy === 'first-pass' && result.exitCode === 0) {
+        this.emit('task-output', task,
+          `\n[Consensus] Winner: ${engine} (passed, ${changedFiles.length} files changed)\n`, 'stdout');
+        return result;
+      }
+
+      // Revert this attempt's changes before trying the next engine
+      if (beforeRef && engines.indexOf(engine) < engines.length - 1) {
+        await this.runGitCommand(['checkout', '.'], cwd);
+        await this.runGitCommand(['clean', '-fd'], cwd);
+      }
+    }
+
+    // All engines have run — pick the best result based on strategy
+    if (strategy === 'best-diff') {
+      // Pick the result that changed the most files
+      let best = results[0];
+      for (const entry of results) {
+        if (entry.result.exitCode === 0 && (best.result.exitCode !== 0 || entry.changedFiles.length > best.changedFiles.length)) {
+          best = entry;
+        }
+      }
+      // If the best isn't the last one, we need to revert and re-run the winner
+      // For v1 simplicity, the last result's changes are in the working tree
+      // If the best is not the last, report it but keep last result (sequential limitation)
+      this.emit('task-output', task,
+        `\n[Consensus] Best result: ${best.engine} (${best.changedFiles.length} files changed, exit ${best.result.exitCode})\n`, 'stdout');
+      return best.result;
+    }
+
+    // first-pass strategy but none passed — pick the one with most stdout
+    let bestFallback = results[0];
+    for (const entry of results) {
+      if (entry.result.stdout.length > bestFallback.result.stdout.length) {
+        bestFallback = entry;
+      }
+    }
+    this.emit('task-output', task,
+      `\n[Consensus] No engine passed. Best effort: ${bestFallback.engine} (${bestFallback.result.stdout.length} chars output)\n`, 'stderr');
+    return bestFallback.result;
+  }
+
+  private rotateEngine(originalEngine: EngineId, defaultEngine: EngineId): EngineId {
+    const rotation: Record<string, EngineId> = {
+      claude: 'codex',
+      codex: 'gemini',
+      gemini: 'claude',
+      ollama: 'claude',
+      custom: 'claude',
+    };
+    const rotated = rotation[originalEngine];
+    if (rotated && rotated !== originalEngine) {
+      return rotated;
+    }
+    // Fallback: if rotation gives same engine, use defaultEngine if different
+    if (defaultEngine !== originalEngine) {
+      return defaultEngine;
+    }
+    return rotation[defaultEngine] ?? 'claude';
   }
 
   private async runCommandTask(task: Task, cwd: string, signal: AbortSignal): Promise<EngineResult> {
@@ -1108,6 +1392,29 @@ export class TaskRunner {
         prompt += ctx + '\n\n';
       }
     }
+    // Inject execution rules before the task prompt
+    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const rulesEnabled = cfg.get<boolean>('promptRulesEnabled', true);
+    if (rulesEnabled) {
+      const rules = cfg.get<string>('promptRules', '');
+      if (rules) {
+        prompt += rules + '\n\n';
+      }
+    }
+
+    // Inject auto-inject prompt snippets
+    const snippetsEnabled = cfg.get<boolean>('promptSnippets.enabled', true);
+    if (snippetsEnabled && this._promptLibrary) {
+      const snippets = this._promptLibrary.getAutoInject();
+      if (snippets.length > 0) {
+        prompt += '[PROMPT SNIPPETS]\n';
+        for (const s of snippets) {
+          prompt += `- ${s.text}\n`;
+        }
+        prompt += '[/PROMPT SNIPPETS]\n\n';
+      }
+    }
+
     prompt += task.prompt;
 
     const contract = this.buildTaskContract(task);
@@ -1129,7 +1436,28 @@ export class TaskRunner {
       prompt += `\n\nContext files:\n\n${fileContents.join('\n\n')}`;
     }
 
+    // Variable substitution: {{varName}} → value
+    prompt = this.substituteVariables(prompt, plan, cwd);
+
     return prompt;
+  }
+
+  private substituteVariables(prompt: string, plan: Plan, cwd: string): string {
+    if (!prompt.includes('{{')) { return prompt; }
+
+    // Built-in variables
+    const builtIn: Record<string, string> = {
+      planName: plan.name,
+      workspaceFolder: cwd,
+      date: new Date().toISOString().split('T')[0],
+    };
+
+    // Merge user-defined variables (user vars take precedence)
+    const vars = { ...builtIn, ...(plan.variables ?? {}) };
+
+    return prompt.replace(/\{\{(\w+)\}\}/g, (match, name) => {
+      return vars[name] !== undefined ? vars[name] : match;
+    });
   }
 
   private buildTaskDescription(task: Task): string {

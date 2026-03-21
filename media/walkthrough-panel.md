@@ -1,4 +1,4 @@
-## The Agent Task Player Panel
+## The MOAG Panel
 
 ```
 ┌─────────────────────────────────┐

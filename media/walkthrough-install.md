@@ -1,4 +1,4 @@
-> **Auto-detection**: Agent Task Player scans your PATH for known CLIs on first launch and auto-selects the best available engine. Re-run anytime via Command Palette: **Agent Task Player: Detect Installed Engines**.
+> **Auto-detection**: MOAG scans your PATH for known CLIs on first launch and auto-selects the best available engine. Re-run anytime via Command Palette: **MOAG: Detect Installed Engines**.
 
 ## Install a Coding Agent CLI
 

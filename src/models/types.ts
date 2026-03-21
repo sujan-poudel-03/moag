@@ -4,7 +4,7 @@
 export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom';
 
 /** Supported task execution modes */
-export type TaskType = 'agent' | 'command' | 'service' | 'check';
+export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review';
 
 /** How the runner should react when a task fails */
 export type FailurePolicy = 'stop' | 'continue' | 'mark-blocked';
@@ -67,6 +67,10 @@ export interface Task {
   retryCount?: number;
   /** Task IDs that must complete before this task runs */
   dependsOn?: string[];
+  /** Skip this task if a referenced task has a specific status */
+  skipIf?: { taskId: string; status: TaskStatus };
+  /** Consensus mode: run the same task on multiple engines, pick the best result */
+  consensus?: { engines: EngineId[]; strategy: 'first-pass' | 'best-diff' };
   /** Runtime status (not persisted in the plan file) */
   status: TaskStatus;
 }
@@ -94,6 +98,10 @@ export interface Plan {
   description?: string;
   /** Global default engine */
   defaultEngine: EngineId;
+  /** Backup engine to switch to when the primary hits a rate limit */
+  fallbackEngine?: EngineId;
+  /** User-defined variables for template substitution in prompts */
+  variables?: Record<string, string>;
   playlists: Playlist[];
 }
 
@@ -174,6 +182,8 @@ export interface HistoryEntry {
   modelId?: string;
   /** Why this model was selected by auto-selection */
   modelReason?: string;
+  /** Whether this task was auto-fixed after initial failure */
+  autoFixed?: boolean;
 }
 
 /** Serializable plan file format (status fields stripped) */
@@ -182,6 +192,10 @@ export interface PlanFile {
   name: string;
   description?: string;
   defaultEngine: EngineId;
+  /** Backup engine to switch to when the primary hits a rate limit */
+  fallbackEngine?: EngineId;
+  /** User-defined variables for template substitution in prompts */
+  variables?: Record<string, string>;
   playlists: PlanFilePlaylist[];
 }
 
@@ -216,6 +230,10 @@ export interface PlanFileTask {
   startupTimeoutMs?: number;
   retryCount?: number;
   dependsOn?: string[];
+  /** Skip this task if a referenced task has a specific status */
+  skipIf?: { taskId: string; status: string };
+  /** Consensus mode: run the same task on multiple engines, pick the best result */
+  consensus?: { engines: EngineId[]; strategy: 'first-pass' | 'best-diff' };
   /** Persisted execution status (omitted or 'pending' means not yet run) */
   status?: string;
 }

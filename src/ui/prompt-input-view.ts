@@ -70,8 +70,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
     textarea {
       width: 100%;
-      min-height: 60px;
-      max-height: 200px;
+      min-height: 80px;
+      max-height: 160px;
       resize: vertical;
       padding: 6px 8px;
       font-family: var(--vscode-font-family);
@@ -81,6 +81,13 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       border: 1px solid var(--vscode-input-border, var(--vscode-widget-border, transparent));
       border-radius: 2px;
       outline: none;
+      overflow-y: auto;
+    }
+    .textarea-footer {
+      display: flex;
+      justify-content: space-between;
+      font-size: 11px;
+      color: var(--vscode-descriptionForeground);
     }
     textarea:focus {
       border-color: var(--vscode-focusBorder);
@@ -119,7 +126,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
 </head>
 <body>
   <div class="container">
-    <textarea id="prompt" placeholder="Describe a task for the AI agent..." rows="3"></textarea>
+    <textarea id="prompt" placeholder="Describe a task for the AI agent...&#10;&#10;Tip: Be specific. Include file names, expected behavior, and acceptance criteria." rows="4"></textarea>
+    <div class="textarea-footer">
+      <span id="charCount">0 chars</span>
+    </div>
     <button id="run" type="button">Run</button>
     <div class="hint">Ctrl+Enter to submit</div>
   </div>
@@ -127,6 +137,18 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const textarea = document.getElementById('prompt');
     const btn = document.getElementById('run');
+    const charCount = document.getElementById('charCount');
+
+    function autoResize() {
+      textarea.style.height = 'auto';
+      const minH = 80;
+      const maxH = 160;
+      textarea.style.height = Math.min(Math.max(textarea.scrollHeight, minH), maxH) + 'px';
+    }
+
+    function updateCharCount() {
+      charCount.textContent = textarea.value.length + ' chars';
+    }
 
     function submit() {
       const text = textarea.value.trim();
@@ -135,6 +157,11 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
 
     btn.addEventListener('click', submit);
+
+    textarea.addEventListener('input', () => {
+      autoResize();
+      updateCharCount();
+    });
 
     textarea.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
@@ -151,6 +178,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         btn.textContent = msg.busy ? 'Running...' : 'Run';
       } else if (msg.type === 'clear') {
         textarea.value = '';
+        autoResize();
+        updateCharCount();
       }
     });
   </script>

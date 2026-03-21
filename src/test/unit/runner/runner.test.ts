@@ -109,6 +109,7 @@ function createMockHistoryStore() {
   return {
     add: sinon.stub(),
     getAll: sinon.stub().returns([]),
+    getForTask: sinon.stub().returns([]),
     clear: sinon.stub(),
     onDidChange: sinon.stub(),
   };
@@ -637,5 +638,268 @@ describe('TaskRunner', () => {
     await p1;
 
     assert.equal(runner.state, RunnerState.Idle);
+  });
+
+  // ─── skipIf Tests ───
+
+  it('should skip task when skipIf condition matches', async () => {
+    const { runner } = buildRunner();
+    const taskNames: string[] = [];
+    runner.on('task-started', (task: { name: string }) => taskNames.push(task.name));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].id = 'task-a';
+    plan.playlists[0].tasks[0].status = TaskStatus.Completed;
+    // Task 2 should be skipped because task-a is Completed
+    plan.playlists[0].tasks[1].skipIf = { taskId: 'task-a', status: TaskStatus.Completed };
+
+    await runner.play(plan);
+
+    // Task 1 was already completed (skipped on resume), Task 2 skipped via skipIf
+    assert.deepEqual(taskNames, []);
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Skipped);
+  });
+
+  it('should run task when skipIf condition does not match', async () => {
+    const { runner } = buildRunner();
+    const taskNames: string[] = [];
+    runner.on('task-started', (task: { name: string }) => taskNames.push(task.name));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].id = 'task-a';
+    // Task 2 skipIf references task-a with Failed, but task-a is Pending → no match
+    plan.playlists[0].tasks[1].skipIf = { taskId: 'task-a', status: TaskStatus.Failed };
+
+    await runner.play(plan);
+
+    // Both tasks should run since skipIf doesn't match
+    assert.deepEqual(taskNames, ['Task 1', 'Task 2']);
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
+  });
+
+  it('should run task when skipIf references non-existent task', async () => {
+    const { runner } = buildRunner();
+    const taskNames: string[] = [];
+    runner.on('task-started', (task: { name: string }) => taskNames.push(task.name));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks[1].skipIf = { taskId: 'no-such-task', status: TaskStatus.Completed };
+
+    await runner.play(plan);
+
+    assert.deepEqual(taskNames, ['Task 1', 'Task 2']);
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
+  });
+
+  it('should handle skipIf across playlists', async () => {
+    const { runner } = buildRunner();
+
+    const plan = makePlan();
+    // First playlist has task-a that will succeed
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].id = 'task-a';
+    // Second playlist has task-b that should be skipped when task-a completed
+    const pl2 = createPlaylist('Phase 2');
+    pl2.autoplay = true;
+    pl2.autoplayDelay = 0;
+    const taskB = createTask('Task B', 'Do something');
+    taskB.skipIf = { taskId: 'task-a', status: TaskStatus.Completed };
+    pl2.tasks.push(taskB);
+    plan.playlists.push(pl2);
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.equal(plan.playlists[1].tasks[0].status, TaskStatus.Skipped);
+  });
+
+  // ─── Plan Variables Tests ───
+
+  it('should substitute {{planName}} in task prompt', async () => {
+    const { runner } = buildRunner();
+    let capturedPrompt = '';
+    engineRunStub.callsFake(async (opts: { prompt: string }) => {
+      capturedPrompt = opts.prompt;
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].prompt = 'Working on {{planName}}';
+
+    await runner.play(plan);
+
+    assert.ok(capturedPrompt.includes('Working on Test Plan'), `Expected planName substitution, got: ${capturedPrompt}`);
+  });
+
+  it('should substitute user-defined variables in prompt', async () => {
+    const { runner } = buildRunner();
+    let capturedPrompt = '';
+    engineRunStub.callsFake(async (opts: { prompt: string }) => {
+      capturedPrompt = opts.prompt;
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    plan.variables = { framework: 'React', version: '18' };
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].prompt = 'Upgrade {{framework}} to v{{version}}';
+
+    await runner.play(plan);
+
+    assert.ok(capturedPrompt.includes('Upgrade React to v18'), `Expected variable substitution, got: ${capturedPrompt}`);
+  });
+
+  it('should leave unknown variables as-is', async () => {
+    const { runner } = buildRunner();
+    let capturedPrompt = '';
+    engineRunStub.callsFake(async (opts: { prompt: string }) => {
+      capturedPrompt = opts.prompt;
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].prompt = 'Use {{unknownVar}} here';
+
+    await runner.play(plan);
+
+    assert.ok(capturedPrompt.includes('{{unknownVar}}'), `Unknown var should remain, got: ${capturedPrompt}`);
+  });
+
+  it('should let user variables override built-in variables', async () => {
+    const { runner } = buildRunner();
+    let capturedPrompt = '';
+    engineRunStub.callsFake(async (opts: { prompt: string }) => {
+      capturedPrompt = opts.prompt;
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    plan.variables = { planName: 'Custom Name' };
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].prompt = 'Project: {{planName}}';
+
+    await runner.play(plan);
+
+    assert.ok(capturedPrompt.includes('Project: Custom Name'), `User var should override built-in, got: ${capturedPrompt}`);
+  });
+
+  // ─── Auto-Fix Tests ───
+
+  it('should auto-fix a failed agent task', async () => {
+    const { runner, historyStore } = buildRunner();
+    // getForTask must return a history entry with error context for auto-fix
+    historyStore.getForTask = sinon.stub().returns([{
+      result: { stderr: 'compilation error', stdout: 'partial output' },
+      changedFiles: ['src/foo.ts'],
+    }]);
+
+    let callCount = 0;
+    engineRunStub.callsFake(async () => {
+      callCount++;
+      // First call fails, second (auto-fix) succeeds
+      if (callCount === 1) {
+        return { ...mockEngineResult, exitCode: 1 };
+      }
+      return mockEngineResult;
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].autoplayDelay = 0;
+
+    await runner.play(plan);
+
+    // Auto-fix should have retried and succeeded
+    assert.equal(callCount, 2);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('should skip auto-fix when autoFix setting is disabled', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask = sinon.stub().returns([{
+      result: { stderr: 'error', stdout: '' },
+      changedFiles: [],
+    }]);
+
+    // Disable auto-fix via config
+    vscodeMock.setMockConfig('agentTaskPlayer', { autoFix: false });
+
+    engineRunStub.resolves({ ...mockEngineResult, exitCode: 1 });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].autoplayDelay = 0;
+
+    await runner.play(plan);
+
+    // Engine should only be called once — no auto-fix retry
+    assert.equal(engineRunStub.callCount, 1);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+
+    vscodeMock.clearMockConfig();
+  });
+
+  it('should skip auto-fix for command tasks', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask = sinon.stub().returns([{
+      result: { stderr: 'boom', stdout: '' },
+      changedFiles: [],
+    }]);
+
+    spawnStub.callsFake((command: string) => {
+      if (command === 'git') {
+        return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
+      }
+      return createSpawnProc({ stderrChunks: ['boom'], closeCode: 1 });
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'command';
+    plan.playlists[0].tasks[0].command = 'failing-cmd';
+    plan.playlists[0].autoplayDelay = 0;
+
+    await runner.play(plan);
+
+    // Command task fails — auto-fix should NOT be attempted (engine never called)
+    assert.equal(engineRunStub.callCount, 0);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+  });
+
+  it('should restore original prompt after auto-fix attempt', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask = sinon.stub().returns([{
+      result: { stderr: 'error output', stdout: '' },
+      changedFiles: ['file.ts'],
+    }]);
+
+    const originalPrompt = 'Do first thing';
+    let capturedPrompt: string | undefined;
+    let callCount = 0;
+    engineRunStub.callsFake(async (opts: { prompt: string }) => {
+      callCount++;
+      if (callCount === 2) {
+        // Capture the prompt during auto-fix execution
+        capturedPrompt = opts.prompt;
+      }
+      // Both attempts fail so we can check prompt restoration
+      return { ...mockEngineResult, exitCode: 1 };
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].autoplayDelay = 0;
+
+    await runner.play(plan);
+
+    // During auto-fix, a repair prompt should have been used (not the original)
+    assert.ok(capturedPrompt);
+    assert.ok(capturedPrompt!.includes('FAILED'), 'repair prompt should contain failure context');
+    assert.ok(capturedPrompt!.includes(originalPrompt), 'repair prompt should include original prompt');
+
+    // After completion, the original prompt should be restored
+    assert.equal(plan.playlists[0].tasks[0].prompt, originalPrompt);
   });
 });

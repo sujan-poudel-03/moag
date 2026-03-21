@@ -23,6 +23,8 @@ export function hydratePlan(file: PlanFile): Plan {
     name: file.name,
     description: file.description,
     defaultEngine: file.defaultEngine,
+    fallbackEngine: file.fallbackEngine,
+    variables: file.variables,
     playlists: file.playlists.map(hydratePlaylist),
   };
 }
@@ -61,19 +63,28 @@ function hydrateTask(t: PlanFileTask): Task {
     startupTimeoutMs: t.startupTimeoutMs,
     retryCount: t.retryCount,
     dependsOn: t.dependsOn,
+    skipIf: t.skipIf ? { taskId: t.skipIf.taskId, status: t.skipIf.status as TaskStatus } : undefined,
+    consensus: t.consensus,
     status: (t.status as TaskStatus) || TaskStatus.Pending,
   };
 }
 
 /** Strip runtime status from Plan to get a serializable PlanFile */
 export function dehydratePlan(plan: Plan): PlanFile {
-  return {
+  const result: PlanFile = {
     version: plan.version,
     name: plan.name,
     description: plan.description,
     defaultEngine: plan.defaultEngine,
     playlists: plan.playlists.map(dehydratePlaylist),
   };
+  if (plan.fallbackEngine) {
+    result.fallbackEngine = plan.fallbackEngine;
+  }
+  if (plan.variables && Object.keys(plan.variables).length > 0) {
+    result.variables = plan.variables;
+  }
+  return result;
 }
 
 function dehydratePlaylist(p: Playlist): PlanFilePlaylist {
@@ -110,6 +121,8 @@ function dehydrateTask(t: Task): PlanFileTask {
     startupTimeoutMs: t.startupTimeoutMs,
     retryCount: t.retryCount,
     dependsOn: t.dependsOn,
+    skipIf: t.skipIf ? { taskId: t.skipIf.taskId, status: t.skipIf.status } : undefined,
+    consensus: t.consensus,
   };
   // Only persist non-pending statuses to keep plan files clean
   if (t.status && t.status !== TaskStatus.Pending) {
