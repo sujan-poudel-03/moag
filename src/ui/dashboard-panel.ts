@@ -357,7 +357,10 @@ export class DashboardPanel {
         this.update();
         break;
       case 'review-changes':
-        vscode.commands.executeCommand('agentTaskPlayer.exportResults');
+        vscode.commands.executeCommand('agentTaskPlayer.reviewChanges');
+        break;
+      case 'switch-plan':
+        vscode.commands.executeCommand('agentTaskPlayer.switchPlan');
         break;
       case 'new-plan':
         vscode.commands.executeCommand('agentTaskPlayer.createPlan');
@@ -430,6 +433,7 @@ export class DashboardPanel {
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
+    [hidden] { display: none !important; }
 
     body {
       font-family: var(--vscode-font-family);
@@ -465,10 +469,20 @@ export class DashboardPanel {
       font-weight: 600;
       font-size: 12px;
       flex: 1;
+      min-width: 0;
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      background: none;
+      border: none;
+      color: inherit;
+      cursor: pointer;
+      font-family: inherit;
+      padding: 0;
+      text-align: left;
     }
+    .plan-name:hover { opacity: 0.8; }
+    .plan-name:focus-visible { outline: 1px solid var(--focus-border); }
     .status-badge {
       font-size: 10px;
       font-weight: 600;
@@ -550,6 +564,32 @@ export class DashboardPanel {
       overflow: hidden;
       margin: 0;
     }
+    /* Compact minimap mode for large plans (>30 tasks) */
+    .pill-row.minimap {
+      gap: 2px;
+      max-height: 22px;
+      overflow: hidden;
+    }
+    .pill-row.minimap .pill-separator { display: none; }
+    .pill-row.minimap .task-pill {
+      width: 6px; min-width: 6px; max-width: 6px;
+      height: 6px;
+      border-radius: 1px;
+      font-size: 0;
+      line-height: 6px;
+      padding: 0;
+      border: none;
+    }
+    .pill-row.minimap.expanded {
+      max-height: 60px;
+      overflow-y: auto;
+    }
+    .pill-row.minimap.expanded .task-pill {
+      width: 10px; min-width: 10px; max-width: 10px;
+      height: 10px;
+      line-height: 10px;
+      border-radius: 2px;
+    }
     .pill-separator {
       width: 1px;
       background: var(--border);
@@ -617,12 +657,13 @@ export class DashboardPanel {
       border: 1px solid var(--focus-border);
       border-radius: 6px;
       overflow: hidden;
-      display: none;
+      display: flex;
+      flex-direction: column;
       flex-shrink: 0;
       flex-grow: 1;
       min-height: 180px;
     }
-    .active-task.visible { display: flex; flex-direction: column; animation: border-pulse 2s ease-in-out infinite; }
+    .active-task { animation: border-pulse 2s ease-in-out infinite; }
     @keyframes border-pulse {
       0%, 100% { border-color: var(--focus-border); }
       50% { border-color: var(--success); }
@@ -699,21 +740,6 @@ export class DashboardPanel {
       color: var(--dimmed);
       flex-shrink: 0;
     }
-    /* ─ Progress bar ─ */
-    .progress-bar-container {
-      height: 3px;
-      background: rgba(128,128,128,0.2);
-      width: 100%;
-      position: sticky;
-      top: 0;
-      z-index: 10;
-    }
-    .progress-bar-fill {
-      height: 100%;
-      background: var(--vscode-progressBar-background, #0e70c0);
-      transition: width 0.3s ease;
-      width: 0%;
-    }
     .eta-display {
       font-size: 11px;
       color: var(--dimmed);
@@ -771,20 +797,23 @@ export class DashboardPanel {
       cursor: pointer;
     }
     .diff-actions button:hover { opacity: 0.85; }
-    .active-task-output {
+    /* ─── Shared terminal output style ─── */
+    .terminal-output {
       background: var(--terminal-bg);
       color: var(--terminal-fg);
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 11px;
-      padding: 8px 10px;
-      min-height: 80px;
-      flex: 1;
       overflow-y: auto;
-      overflow-x: hidden;
       white-space: pre-wrap;
       word-break: break-all;
       word-wrap: break-word;
       line-height: 1.4;
+    }
+    .active-task-output {
+      padding: 8px 10px;
+      min-height: 80px;
+      flex: 1;
+      overflow-x: hidden;
       max-width: 100%;
     }
     .active-task-contract {
@@ -838,6 +867,19 @@ export class DashboardPanel {
       color: var(--dimmed);
       font-size: 10px;
     }
+    .active-task-contract-inline {
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      font-size: 11px;
+      display: grid;
+      gap: 4px;
+    }
+    .active-task-contract-inline .contract-label {
+      font-size: 9px;
+      color: var(--dimmed);
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
     .active-task-prompt pre {
       background: var(--terminal-bg);
       color: var(--terminal-fg);
@@ -851,45 +893,51 @@ export class DashboardPanel {
       word-break: break-all;
     }
 
-    /* ─── Collapsible Section Headers ─── */
+    /* ─── Collapsible Section Headers (VS Code tree-view style) ─── */
     .section-toggle {
       display: flex;
       align-items: center;
-      gap: 4px;
-      padding: 8px 4px 6px;
+      gap: 0;
+      padding: 0;
       cursor: pointer;
       user-select: none;
       border: none;
       background: none;
       width: 100%;
       text-align: left;
-      color: var(--dimmed);
+      color: var(--fg);
+      height: 22px;
+      line-height: 22px;
+      border-radius: 0;
     }
-    .section-toggle:hover { color: var(--fg); }
+    .section-toggle:hover { background: var(--hover-bg); }
+    .section-toggle:focus-visible { outline: 1px solid var(--focus-border); outline-offset: -1px; }
     .section-toggle-icon {
-      font-size: 8px;
-      transition: transform 0.15s;
-      width: 12px;
+      font-size: 12px;
+      width: 20px;
       text-align: center;
       flex-shrink: 0;
+      transition: transform 0.1s ease;
+      opacity: 0.8;
     }
     .section-toggle.collapsed .section-toggle-icon {
       transform: rotate(-90deg);
     }
     .section-toggle-label {
-      font-size: 10px;
-      font-weight: 600;
+      font-size: 11px;
+      font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.5px;
+      flex: 1;
     }
     .section-toggle-count {
       font-size: 10px;
       font-weight: normal;
-      opacity: 0.7;
+      opacity: 0.6;
+      padding-right: 8px;
     }
     .section-body {
       overflow: hidden;
-      transition: max-height 0.2s ease;
     }
     .section-body.collapsed {
       max-height: 0 !important;
@@ -903,10 +951,7 @@ export class DashboardPanel {
       overflow-y: auto;
       min-height: 0;
     }
-    /* During execution, cap completed list so active output gets priority */
-    body.task-active .completed-section {
-      max-height: 180px;
-    }
+    /* Completed section compact styling is in the execution mode block below */
     .section-label {
       font-size: 10px;
       font-weight: 600;
@@ -961,15 +1006,8 @@ export class DashboardPanel {
     }
     .completed-task.expanded .ct-detail { display: block; }
     .ct-detail-output {
-      background: var(--terminal-bg);
-      color: var(--terminal-fg);
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 11px;
       padding: 6px 8px;
       max-height: 200px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
     }
     .ct-detail-section {
       border-top: 1px solid var(--border);
@@ -1004,22 +1042,86 @@ export class DashboardPanel {
     }
     .ct-detail-section li::before { content: '\\2022 '; opacity: 0.4; }
 
-    /* ─── Task List (Plan View) ─── */
+    /* ─── Plan Overview ─── */
     .plan-section {
-      padding: 0 8px 8px;
+      padding: 8px;
       min-height: 0;
       overflow-y: auto;
     }
-    .playlist-group {
-      margin-bottom: 6px;
+    .plan-overview {
+      display: grid;
+      gap: 8px;
     }
-    .playlist-header {
+    .plan-overview-header {
       display: flex;
       align-items: center;
-      gap: 6px;
-      padding: 6px 4px;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 0 2px 4px;
+    }
+    .plan-overview-title {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: var(--dimmed);
+    }
+    .plan-overview-meta {
+      font-size: 11px;
+      color: var(--dimmed);
+    }
+    .plan-placeholder {
+      padding: 16px 14px;
+      border: 1px dashed var(--border);
+      border-radius: 6px;
+      color: var(--dimmed);
+      font-size: 12px;
+      line-height: 1.6;
+      background: rgba(128,128,128,0.05);
+    }
+    .playlist-summary-card {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px 12px;
+      display: grid;
+      gap: 8px;
+      background: rgba(128,128,128,0.05);
+    }
+    .playlist-summary-card.is-running {
+      border-color: rgba(76,175,80,0.5);
+      background: rgba(76,175,80,0.08);
+    }
+    .playlist-summary-card.has-failure {
+      border-color: rgba(244,71,71,0.45);
+    }
+    .playlist-summary-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+    .playlist-summary-name {
       font-size: 11px;
       font-weight: 600;
+      flex: 1;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .playlist-summary-status {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--dimmed);
+      flex-shrink: 0;
+      text-transform: capitalize;
+    }
+    .playlist-summary-meta {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      font-size: 11px;
+      color: var(--dimmed);
     }
     .playlist-engine {
       font-size: 9px;
@@ -1030,106 +1132,56 @@ export class DashboardPanel {
       background: var(--badge-bg);
       color: var(--badge-fg);
     }
-    .playlist-meta {
+    .playlist-summary-mode {
       font-size: 10px;
       color: var(--dimmed);
-      font-weight: normal;
     }
-    .task-row {
+    .playlist-summary-stats {
       display: flex;
-      align-items: center;
+      flex-wrap: wrap;
       gap: 6px;
-      padding: 4px 8px;
-      font-size: 12px;
-      border-radius: 3px;
-      cursor: pointer;
-      transition: background 0.15s ease, box-shadow 0.15s ease;
     }
-    .task-row:hover { background: var(--hover-bg); }
-    .task-row:hover .task-edit-btn { opacity: 1; }
-    .task-row.current-task {
-      background: rgba(0,122,204,0.14);
-      box-shadow: inset 2px 0 0 var(--focus-border);
-    }
-    .task-row.current-task .tr-name {
-      font-weight: 600;
-      color: var(--fg);
-    }
-    .task-row.focus-flash {
-      animation: row-flash 0.9s ease;
-    }
-    @keyframes row-flash {
-      0% { background: rgba(0,122,204,0.26); }
-      100% { background: rgba(0,122,204,0.14); }
-    }
-    .tr-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-    .tr-dot.pending { border: 1.5px solid var(--dimmed); background: transparent; }
-    .tr-dot.running { background: var(--success); animation: dot-pulse 1s ease-in-out infinite; }
-    .tr-dot.completed { background: var(--success); }
-    .tr-dot.failed { background: var(--error); }
-    .tr-dot.paused { background: var(--warning); }
-    .tr-dot.skipped { background: var(--dimmed); }
-    .tr-name {
-      flex: 1;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .tr-engine-tag {
-      font-size: 9px;
-      color: var(--dimmed);
-      flex-shrink: 0;
-    }
-    .tr-elapsed {
+    .summary-chip {
       font-size: 10px;
-      font-family: var(--vscode-editor-font-family, monospace);
+      padding: 3px 7px;
+      border-radius: 999px;
+      background: rgba(128,128,128,0.12);
       color: var(--dimmed);
-      flex-shrink: 0;
+      border: 1px solid transparent;
     }
-    .tr-elapsed.running {
+    .summary-chip.pass {
+      background: rgba(76,175,80,0.14);
       color: var(--success);
+      border-color: rgba(76,175,80,0.22);
     }
-    .task-edit-btn {
-      opacity: 0;
-      background: none;
-      border: none;
+    .summary-chip.fail {
+      background: rgba(244,71,71,0.14);
+      color: var(--error);
+      border-color: rgba(244,71,71,0.22);
+    }
+    .summary-chip.running {
+      background: rgba(0,122,204,0.14);
+      color: var(--focus-border);
+      border-color: rgba(0,122,204,0.22);
+    }
+    .summary-chip.pending {
+      background: rgba(128,128,128,0.09);
       color: var(--dimmed);
-      cursor: pointer;
-      font-size: 12px;
-      padding: 2px 4px;
-      border-radius: 2px;
-      transition: opacity 0.15s;
     }
-    .task-edit-btn:hover { color: var(--fg); background: var(--hover-bg); }
+    .playlist-summary-foot {
+      font-size: 11px;
+      color: var(--dimmed);
+      line-height: 1.5;
+    }
     .task-pill.current-task {
       box-shadow: inset 0 0 0 1px var(--focus-border), 0 0 0 1px rgba(0,122,204,0.16);
     }
-    .add-btn {
-      background: transparent;
-      border: 1px dashed var(--border);
-      color: var(--dimmed);
-      padding: 4px 10px;
-      border-radius: 3px;
-      cursor: pointer;
-      font-size: 11px;
-      margin-top: 4px;
-      width: 100%;
-      text-align: center;
-    }
-    .add-btn:hover { color: var(--fg); border-color: var(--fg); background: var(--hover-bg); }
 
-    /* ─── History Drawer ─── */
-    /* ─── Unified info panel (Current Run / All History / Summary) ─── */
-    .info-panel {
+    /* ─── History / Info panel ─── */
+    .info-panel-body-wrap {
       border-top: 1px solid var(--border);
       display: flex;
       flex-direction: column;
-      min-height: 80px;
       max-height: 280px;
       position: relative;
     }
@@ -1159,18 +1211,6 @@ export class DashboardPanel {
       color: var(--accent, var(--fg));
       border-bottom-color: var(--accent, var(--fg));
     }
-    .info-panel-resize {
-      height: 5px;
-      cursor: ns-resize;
-      background: transparent;
-      flex-shrink: 0;
-      position: relative;
-    }
-    .info-panel-resize:hover,
-    .info-panel-resize.dragging {
-      background: var(--accent, var(--fg));
-      opacity: 0.25;
-    }
     .info-panel-body {
       flex: 1;
       overflow-y: auto;
@@ -1190,9 +1230,6 @@ export class DashboardPanel {
       margin-left: auto;
     }
     .history-clear-btn:hover { color: var(--error); background: var(--hover-bg); }
-    .history-list {
-      padding-bottom: 4px;
-    }
     .hist-row {
       display: flex;
       align-items: center;
@@ -1241,125 +1278,6 @@ export class DashboardPanel {
     }
     .status-bar .spacer { flex: 1; }
 
-    /* ─── Empty state ─── */
-    .empty-state {
-      text-align: center;
-      padding: 48px 24px;
-      color: var(--dimmed);
-      display: none;
-    }
-    .empty-state-icon {
-      font-size: 32px;
-      margin-bottom: 12px;
-      opacity: 0.4;
-    }
-    .empty-state-text {
-      font-size: 12px;
-      line-height: 1.6;
-    }
-    .empty-state-text strong {
-      color: var(--fg);
-    }
-
-    /* ─── Error banner ─── */
-    .error-banner {
-      margin: 8px;
-      padding: 10px 12px;
-      border-radius: 6px;
-      font-size: 11px;
-      display: none;
-      max-width: 100%;
-    }
-    .error-banner.visible { display: block; }
-    /* Default red style for generic errors */
-    .error-banner.error-generic {
-      background: rgba(244,71,71,0.1);
-      border: 1px solid var(--error);
-    }
-    .error-banner.error-generic .error-banner-title { color: var(--error); }
-    /* Amber style for rate limits / recoverable issues */
-    .error-banner.error-ratelimit {
-      background: rgba(200,140,40,0.12);
-      border: 1px solid rgba(220,160,50,0.6);
-    }
-    .error-banner.error-ratelimit .error-banner-title { color: #e8a838; }
-    .error-banner-header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .error-banner-title {
-      font-weight: 700;
-      font-size: 12px;
-      flex: 1;
-    }
-    .error-banner-action {
-      background: rgba(220,160,50,0.25);
-      color: #e8a838;
-      border: 1px solid rgba(220,160,50,0.5);
-      padding: 4px 12px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      white-space: nowrap;
-      flex-shrink: 0;
-    }
-    .error-banner-action:hover {
-      background: rgba(220,160,50,0.4);
-    }
-    .error-banner-action.error-action-red {
-      background: rgba(244,71,71,0.15);
-      color: var(--error);
-      border-color: rgba(244,71,71,0.4);
-    }
-    .error-banner-action.error-action-red:hover { background: rgba(244,71,71,0.3); }
-    .error-banner-summary {
-      background: rgba(0,0,0,0.2);
-      color: var(--terminal-fg);
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 11px;
-      padding: 8px 10px;
-      border-radius: 4px;
-      margin-top: 8px;
-      max-height: 100px;
-      overflow-y: auto;
-      overflow-x: hidden;
-      white-space: pre-wrap;
-      word-break: break-all;
-      word-wrap: break-word;
-      max-width: 100%;
-    }
-    .error-banner-toggle {
-      margin-top: 6px;
-      font-size: 10px;
-      color: var(--accent, #569cd6);
-      cursor: pointer;
-      background: none;
-      border: none;
-      padding: 2px 0;
-      text-decoration: underline;
-    }
-    .error-banner-toggle:hover { opacity: 0.8; }
-    .error-banner-detail {
-      background: var(--terminal-bg);
-      color: var(--terminal-fg);
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 11px;
-      padding: 6px 8px;
-      border-radius: 3px;
-      max-height: 120px;
-      overflow-y: auto;
-      overflow-x: hidden;
-      white-space: pre-wrap;
-      word-break: break-all;
-      word-wrap: break-word;
-      margin-top: 4px;
-      max-width: 100%;
-      display: none;
-    }
-    .error-banner-detail.visible { display: block; }
-
     /* ─── Inline error for failed tasks ─── */
     .ct-error-line {
       font-size: 11px;
@@ -1400,97 +1318,124 @@ export class DashboardPanel {
       border-top: 1px solid rgba(244,71,71,0.15);
     }
 
-    /* ─── Execution mode: keep output and navigation visible together ─── */
-    body.task-active .active-task {
-      flex-grow: 0;
-      min-height: 220px;
-      max-height: 46vh;
+    /* ─── Executing layout ─── */
+    body[data-dashboard-state="executing"] .main-content {
+      overflow: hidden;
     }
-    body.task-active .plan-section {
-      max-height: 280px;
-      overflow-y: auto;
+    body[data-dashboard-state="executing"] .pipeline {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: center;
+      gap: 10px;
+      padding: 6px 12px;
     }
-    body.task-active .info-panel { max-height: 120px; }
-    body.task-active .empty-state { display: none; }
-    body.task-active .pill-row { max-height: 40px; }
-    body.task-active .pipeline { padding: 6px 12px 4px; }
+    body[data-dashboard-state="executing"] .progress-track {
+      margin-bottom: 0;
+    }
+    body[data-dashboard-state="executing"] .stats-row {
+      gap: 10px;
+      margin-bottom: 0;
+      white-space: nowrap;
+      justify-content: flex-end;
+    }
+    body[data-dashboard-state="executing"] .active-task {
+      margin: 0;
+      min-height: 0;
+      border-left: none;
+      border-right: none;
+      border-bottom: none;
+      border-radius: 0;
+      flex: 1;
+    }
+    body[data-dashboard-state="executing"] .active-task-output {
+      padding: 10px 12px;
+    }
+    body[data-dashboard-state="complete"] .main-content {
+      overflow: hidden;
+    }
+    body[data-dashboard-state="complete"] .completed-section {
+      flex: 1;
+    }
 
     /* ─── Diff colors ─── */
     .diff-add { color: #4ec94e; }
-    .diff-del { color: #f44747; }
     .diff-hunk { color: #569cd6; }
-    .diff-meta { color: #888; font-weight: bold; }
 
-    /* ─── Success banner ─── */
-    .success-banner {
+    /* ─── Result banner ─── */
+    .result-banner {
       margin: 8px;
       padding: 12px 14px;
       border-radius: 6px;
-      background: rgba(78,201,176,0.12);
-      border: 1px solid rgba(78,201,176,0.5);
-      display: none;
+      border: 1px solid var(--border);
+      background: rgba(128,128,128,0.08);
     }
-    .success-banner.visible { display: block; }
-    .success-banner-title {
+    .result-banner.result-success {
+      background: rgba(78,201,176,0.12);
+      border-color: rgba(78,201,176,0.5);
+    }
+    .result-banner.result-warning {
+      background: rgba(200,140,40,0.12);
+      border-color: rgba(220,160,50,0.6);
+    }
+    .result-banner-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .result-banner-copy {
+      min-width: 0;
+      flex: 1;
+    }
+    .result-banner-title {
       font-weight: 700;
       font-size: 13px;
-      color: var(--success);
-      margin-bottom: 8px;
+      margin-bottom: 4px;
     }
-    .success-banner-actions {
+    .result-banner.result-success .result-banner-title {
+      color: var(--success);
+    }
+    .result-banner.result-warning .result-banner-title {
+      color: #e8a838;
+    }
+    .result-banner-meta {
+      font-size: 11px;
+      color: var(--dimmed);
+      line-height: 1.5;
+    }
+    .result-banner-actions {
       display: flex;
       gap: 6px;
       flex-wrap: wrap;
     }
-    .success-banner-btn {
+    .result-banner-btn {
+      padding: 5px 14px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      border: 1px solid transparent;
+    }
+    .result-banner.result-success .result-banner-btn {
       background: rgba(78,201,176,0.18);
       color: var(--success);
-      border: 1px solid rgba(78,201,176,0.4);
-      padding: 5px 14px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      white-space: nowrap;
+      border-color: rgba(78,201,176,0.4);
     }
-    .success-banner-btn:hover {
+    .result-banner.result-success .result-banner-btn:hover:not(:disabled) {
       background: rgba(78,201,176,0.3);
     }
-
-    /* ─── Amber completion banner (has failures) ─── */
-    .amber-banner {
-      margin: 8px;
-      padding: 12px 14px;
-      border-radius: 6px;
-      background: rgba(200,140,40,0.12);
-      border: 1px solid rgba(220,160,50,0.6);
-      display: none;
-    }
-    .amber-banner.visible { display: block; }
-    .amber-banner-title {
-      font-weight: 700;
-      font-size: 13px;
-      color: #e8a838;
-      margin-bottom: 8px;
-    }
-    .amber-banner-actions {
-      display: flex;
-      gap: 6px;
-      flex-wrap: wrap;
-    }
-    .amber-banner-btn {
+    .result-banner.result-warning .result-banner-btn {
       background: rgba(220,160,50,0.18);
       color: #e8a838;
-      border: 1px solid rgba(220,160,50,0.4);
-      padding: 5px 14px;
-      border-radius: 4px;
-      font-size: 11px;
-      font-weight: 600;
-      cursor: pointer;
-      white-space: nowrap;
+      border-color: rgba(220,160,50,0.4);
     }
-    .amber-banner-btn:hover {
+    .result-banner.result-warning .result-banner-btn:hover:not(:disabled) {
       background: rgba(220,160,50,0.35);
+    }
+    .result-banner-btn:disabled {
+      opacity: 0.45;
+      cursor: default;
     }
 
     /* ─── Responsive: narrow panel (<400px) ─── */
@@ -1533,8 +1478,9 @@ export class DashboardPanel {
 
       .status-bar { padding: 4px 8px; font-size: 10px; }
 
-      .error-banner { margin: 6px; padding: 6px 8px; font-size: 10px; }
-      .error-banner-detail { font-size: 10px; max-height: 80px; }
+      .result-banner { margin: 6px; padding: 10px 12px; }
+      .result-banner-title { font-size: 12px; }
+      .result-banner-meta { font-size: 10px; }
 
       .hist-row { font-size: 10px; padding: 3px 4px; }
     }
@@ -1575,7 +1521,7 @@ export class DashboardPanel {
 
   <!-- Header -->
   <div class="header">
-    <span class="plan-name" id="plan-name">MOAG</span>
+    <button type="button" class="plan-name" id="plan-name" onclick="vscode.postMessage({type:'switch-plan'})">MOAG</button>
     <span id="runner-status" class="status-badge status-idle">Idle</span>
     <div class="transport">
       <button id="btn-play" class="icon-btn primary" title="Play">&#9654;</button>
@@ -1584,27 +1530,23 @@ export class DashboardPanel {
     </div>
   </div>
 
-  <!-- Progress bar -->
-  <div class="progress-bar-container"><div class="progress-bar-fill" id="global-progress-bar"></div></div>
-  <div class="eta-display" id="eta-display" style="display:none;"></div>
-
   <!-- Pipeline overview -->
-  <div class="pipeline" id="pipeline" style="display:none;">
+  <div class="pipeline" id="pipeline" hidden>
     <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
     <div class="stats-row">
       <span id="stats-tasks">0 / 0 tasks</span>
       <span id="stats-elapsed"></span>
       <span id="stats-files"></span>
-      <button style="background:none;border:none;color:var(--dimmed);cursor:pointer;font-size:9px;padding:0 2px;" id="pill-toggle" onclick="togglePillRow()" title="Toggle task pills">&#9660;</button>
+      <button style="background:none;border:none;color:var(--dimmed);cursor:pointer;font-size:9px;padding:0 2px;" id="pill-toggle" onclick="togglePillRow()" title="Toggle task pills" hidden>&#9660;</button>
     </div>
-    <div class="pill-row" id="pill-row"></div>
+    <div class="pill-row" id="pill-row" hidden></div>
   </div>
 
   <!-- Scrollable main area -->
   <div class="main-content" id="main-content">
 
     <!-- Active task panel -->
-    <div class="active-task" id="active-task">
+    <div class="active-task" id="active-task" hidden>
       <div class="active-task-header">
         <div class="active-dot"></div>
         <div class="active-task-main">
@@ -1614,77 +1556,28 @@ export class DashboardPanel {
         <span class="engine-badge" id="active-engine"></span>
         <span class="active-timer" id="active-timer">0s</span>
       </div>
-      <div class="active-task-output" id="active-output"></div>
-      <div class="active-task-contract" id="active-contract" style="display:none;"></div>
-      <details class="active-task-prompt" id="active-prompt-section">
-        <summary>Show prompt</summary>
-        <pre id="active-prompt"></pre>
-      </details>
+      <div class="terminal-output active-task-output" id="active-output"></div>
     </div>
 
-    <!-- Error banner (shown when first failure occurs) -->
-    <div class="error-banner" id="error-banner">
-      <div class="error-banner-header">
-        <div class="error-banner-title" id="error-banner-title"></div>
-        <button class="error-banner-action" id="error-banner-action" style="display:none;"></button>
-      </div>
-      <div class="error-banner-summary" id="error-banner-summary" style="display:none;"></div>
-      <button class="error-banner-toggle" id="error-banner-toggle" style="display:none;">View Detailed Error Log</button>
-      <div class="error-banner-detail" id="error-banner-detail"></div>
-    </div>
-
-    <!-- Success banner (shown when all tasks complete successfully) -->
-    <div class="success-banner" id="success-banner">
-      <div class="success-banner-title">&#10003; All tasks completed!</div>
-      <div class="success-banner-actions">
-        <button class="success-banner-btn" onclick="vscode.postMessage({type:'review-changes'})">Review Changes</button>
-        <button class="success-banner-btn" onclick="vscode.postMessage({type:'new-plan'})">New Plan</button>
-        <button class="success-banner-btn" onclick="vscode.postMessage({type:'export-results'})">Export Results</button>
-      </div>
-    </div>
-
-    <!-- Amber banner (shown when run completes with failures) -->
-    <div class="amber-banner" id="amber-banner">
-      <div class="amber-banner-title" id="amber-banner-title"></div>
-      <div class="amber-banner-actions">
-        <button class="amber-banner-btn" onclick="vscode.postMessage({type:'retry-failed'})">Retry Failed</button>
-        <button class="amber-banner-btn" onclick="vscode.postMessage({type:'export-results'})">Export Results</button>
-      </div>
-    </div>
-
-    <!-- Completed tasks -->
-    <div class="completed-section" id="completed-section"></div>
-
-    <!-- Unified info panel with tabs: Current Run | All History | Summary -->
-    <div class="info-panel" id="info-panel" style="display:none;">
-      <div class="info-panel-tabs">
-        <button class="info-tab active" id="tab-current-run" onclick="switchInfoTab('current')">Current Run</button>
-        <button class="info-tab" id="tab-all-history" onclick="switchInfoTab('all')">All History</button>
-        <button class="info-tab" id="tab-summary" onclick="switchInfoTab('summary')">Summary</button>
-        <button class="history-clear-btn" id="btn-clear-history">Clear</button>
-      </div>
-      <div class="info-panel-resize" id="info-panel-resize"></div>
-      <div class="info-panel-body" id="info-panel-body">
-        <div class="info-pane active" id="pane-current"></div>
-        <div class="info-pane" id="pane-all"></div>
-        <div class="info-pane" id="pane-summary" style="padding:8px 4px;">
-          <div id="pm-summary-content"></div>
+    <div class="result-banner" id="result-banner" hidden>
+      <div class="result-banner-header">
+        <div class="result-banner-copy">
+          <div class="result-banner-title" id="result-banner-title"></div>
+          <div class="result-banner-meta" id="result-banner-meta"></div>
+        </div>
+        <div class="result-banner-actions">
+          <button class="result-banner-btn" id="result-banner-review">Review Changes</button>
+          <button class="result-banner-btn" id="result-banner-retry">Retry Failed</button>
+          <button class="result-banner-btn" id="result-banner-export">Export</button>
         </div>
       </div>
     </div>
 
-    <!-- Plan / task list -->
-    <div class="plan-section" id="plan-section"></div>
+    <!-- Plan / task list (primary view when idle) -->
+    <div class="plan-section" id="plan-section" hidden></div>
 
-    <!-- Empty state -->
-    <div class="empty-state" id="empty-state">
-      <div class="empty-state-icon">&#9881;</div>
-      <div class="empty-state-text">
-        No plan loaded.<br>
-        Open a <strong>.agent-plan.json</strong> file<br>
-        or use the sidebar to create one.
-      </div>
-    </div>
+    <!-- Completed tasks (populated during execution) -->
+    <div class="completed-section" id="completed-section" hidden></div>
 
   </div>
 
@@ -1722,13 +1615,229 @@ export class DashboardPanel {
     let currentPlan = null;
     let currentServices = [];
     let lastPlanHash = '';
+    let dashboardState = 'idle';
     const taskStartTimes = {};
 
     // ─── Toolbar ───
     document.getElementById('btn-play').onclick = () => vscode.postMessage({ type: 'play' });
     document.getElementById('btn-pause').onclick = () => vscode.postMessage({ type: 'pause' });
     document.getElementById('btn-stop').onclick = () => vscode.postMessage({ type: 'stop' });
-    document.getElementById('btn-clear-history').onclick = () => vscode.postMessage({ type: 'clearHistory' });
+    document.getElementById('result-banner-review').onclick = () => vscode.postMessage({ type: 'review-changes' });
+    document.getElementById('result-banner-retry').onclick = () => vscode.postMessage({ type: 'retry-failed' });
+    document.getElementById('result-banner-export').onclick = () => vscode.postMessage({ type: 'export-results' });
+
+    function getPlanTasks(plan) {
+      return plan && plan.playlists ? plan.playlists.flatMap(function(pl) { return pl.tasks || []; }) : [];
+    }
+
+    function getTaskStats(tasks) {
+      return tasks.reduce(function(stats, task) {
+        switch (task.status) {
+          case 'completed':
+            stats.completed++;
+            break;
+          case 'failed':
+            stats.failed++;
+            break;
+          case 'blocked':
+            stats.blocked++;
+            break;
+          case 'running':
+            stats.running++;
+            break;
+          case 'skipped':
+            stats.skipped++;
+            break;
+          default:
+            stats.pending++;
+            break;
+        }
+        return stats;
+      }, {
+        total: tasks.length,
+        pending: 0,
+        running: 0,
+        completed: 0,
+        failed: 0,
+        blocked: 0,
+        skipped: 0,
+      });
+    }
+
+    function getPlanStats(plan) {
+      return getTaskStats(getPlanTasks(plan));
+    }
+
+    function hasPlanLoaded() {
+      return !!(currentPlan && currentPlan.playlists && currentPlan.playlists.length > 0);
+    }
+
+    function hasTaskResults(stats) {
+      return (stats.completed + stats.failed + stats.blocked + stats.skipped) > 0;
+    }
+
+    function formatCountSummary(stats) {
+      const parts = [];
+      if (stats.completed > 0) { parts.push(stats.completed + ' passed'); }
+      if (stats.failed > 0) { parts.push(stats.failed + ' failed'); }
+      if (stats.blocked > 0) { parts.push(stats.blocked + ' blocked'); }
+      if (stats.skipped > 0) { parts.push(stats.skipped + ' skipped'); }
+      if (stats.running > 0) { parts.push(stats.running + ' running'); }
+      if (stats.pending > 0) { parts.push(stats.pending + ' pending'); }
+      return parts.join(' · ');
+    }
+
+    function getNextTask(tasks) {
+      return tasks.find(function(task) { return task.status === 'running'; })
+        || tasks.find(function(task) { return !task.status || task.status === 'pending' || task.status === 'paused'; })
+        || null;
+    }
+
+    function renderResultBanner() {
+      const banner = document.getElementById('result-banner');
+      const title = document.getElementById('result-banner-title');
+      const meta = document.getElementById('result-banner-meta');
+      const reviewBtn = document.getElementById('result-banner-review');
+      const retryBtn = document.getElementById('result-banner-retry');
+      const exportBtn = document.getElementById('result-banner-export');
+      const stats = getPlanStats(currentPlan);
+      const failures = stats.failed + stats.blocked;
+      const hasResults = hasTaskResults(stats);
+      banner.className = 'result-banner ' + (failures > 0 ? 'result-warning' : 'result-success');
+
+      if (!hasResults) {
+        title.textContent = '';
+        meta.textContent = '';
+        reviewBtn.disabled = true;
+        retryBtn.disabled = true;
+        exportBtn.disabled = true;
+        return;
+      }
+
+      title.textContent = failures > 0
+        ? (dashboardState === 'idle' ? 'Last run needs attention' : 'Run finished with failures')
+        : (dashboardState === 'idle' ? 'Last run succeeded' : 'Run finished successfully');
+
+      const metaParts = [formatCountSummary(stats)];
+      if (totalFilesChanged > 0) {
+        metaParts.push(totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's changed' : ' changed'));
+      }
+      if (runStartTime && dashboardState === 'complete') {
+        metaParts.push('Elapsed ' + formatDuration(Date.now() - runStartTime));
+      }
+      meta.textContent = metaParts.filter(Boolean).join(' · ');
+      reviewBtn.disabled = false;
+      retryBtn.disabled = failures === 0;
+      exportBtn.disabled = false;
+    }
+
+    function shouldShowCompletedRun() {
+      return completedOrder.length > 0 && hasTaskResults(getPlanStats(currentPlan));
+    }
+
+    function setSectionVisibility(id, visible) {
+      const el = document.getElementById(id);
+      if (el) {
+        el.hidden = !visible;
+      }
+    }
+
+    function setDashboardState(state) {
+      dashboardState = state;
+      document.body.dataset.dashboardState = state;
+
+      ['pipeline', 'plan-section', 'active-task', 'result-banner', 'completed-section'].forEach(function(id) {
+        setSectionVisibility(id, false);
+      });
+
+      const showPipeline = hasPlanLoaded();
+      const showPills = showPipeline && state === 'idle' && totalTasks > 0;
+      const showResult = state !== 'executing' && hasTaskResults(getPlanStats(currentPlan));
+
+      setSectionVisibility('pill-toggle', showPills && totalTasks > 12);
+      setSectionVisibility('pill-row', showPills);
+
+      if (state === 'idle') {
+        setSectionVisibility('pipeline', showPipeline);
+        setSectionVisibility('plan-section', true);
+        setSectionVisibility('result-banner', showResult);
+        return;
+      }
+
+      if (state === 'executing') {
+        setSectionVisibility('pipeline', showPipeline);
+        setSectionVisibility('active-task', true);
+        return;
+      }
+
+      setSectionVisibility('pipeline', showPipeline);
+      setSectionVisibility('result-banner', showResult);
+      setSectionVisibility('completed-section', completedOrder.length > 0);
+    }
+
+    function resolveDashboardState(runnerState) {
+      if (runnerState !== 'idle') {
+        return 'executing';
+      }
+      return shouldShowCompletedRun() ? 'complete' : 'idle';
+    }
+
+    function getPlaylistStatusLabel(stats) {
+      if (stats.running > 0) { return 'running'; }
+      if ((stats.failed + stats.blocked) > 0) { return 'needs attention'; }
+      if (stats.total > 0 && (stats.completed + stats.skipped) === stats.total) { return 'complete'; }
+      if (stats.completed > 0) { return 'in progress'; }
+      return 'pending';
+    }
+
+    function renderPlaylistSummaryCard(playlist, planDefaultEngine) {
+      const tasks = playlist.tasks || [];
+      const stats = getTaskStats(tasks);
+      const nextTask = getNextTask(tasks);
+      const isRunning = stats.running > 0;
+      const hasFailure = (stats.failed + stats.blocked) > 0;
+      const resolvedCount = stats.completed + stats.failed + stats.blocked + stats.skipped;
+      const classes = ['playlist-summary-card'];
+      if (isRunning) { classes.push('is-running'); }
+      if (hasFailure) { classes.push('has-failure'); }
+
+      const chips = [];
+      chips.push('<span class="summary-chip">' + stats.total + ' task' + (stats.total !== 1 ? 's' : '') + '</span>');
+      if (stats.completed > 0) { chips.push('<span class="summary-chip pass">' + stats.completed + ' passed</span>'); }
+      if (stats.failed > 0) { chips.push('<span class="summary-chip fail">' + stats.failed + ' failed</span>'); }
+      if (stats.blocked > 0) { chips.push('<span class="summary-chip fail">' + stats.blocked + ' blocked</span>'); }
+      if (stats.running > 0) { chips.push('<span class="summary-chip running">' + stats.running + ' running</span>'); }
+      if (stats.pending > 0) { chips.push('<span class="summary-chip pending">' + stats.pending + ' pending</span>'); }
+      if (stats.skipped > 0) { chips.push('<span class="summary-chip pending">' + stats.skipped + ' skipped</span>'); }
+
+      let foot = 'Not started yet.';
+      if (isRunning) {
+        const activeTask = tasks.find(function(task) { return task.status === 'running'; });
+        foot = activeTask ? ('Running now: ' + escHtml(activeTask.name)) : 'Execution in progress.';
+      } else if (stats.total > 0 && resolvedCount === stats.total) {
+        foot = hasFailure
+          ? 'Finished with failures.'
+          : 'All tasks finished successfully.';
+      } else if (nextTask) {
+        foot = 'Next: ' + escHtml(nextTask.name);
+      } else if (stats.completed > 0) {
+        foot = 'Paused after ' + stats.completed + ' completed task' + (stats.completed !== 1 ? 's' : '') + '.';
+      }
+
+      return '' +
+        '<article class="' + classes.join(' ') + '">' +
+          '<div class="playlist-summary-header">' +
+            '<span class="playlist-summary-name">' + escHtml(playlist.name || 'Untitled Playlist') + '</span>' +
+            '<span class="playlist-summary-status">' + getPlaylistStatusLabel(stats) + '</span>' +
+          '</div>' +
+          '<div class="playlist-summary-meta">' +
+            '<span class="playlist-engine">' + escHtml(playlist.engine || planDefaultEngine || 'agent') + '</span>' +
+            '<span class="playlist-summary-mode">' + (playlist.parallel ? 'Parallel' : 'Sequential') + '</span>' +
+          '</div>' +
+          '<div class="playlist-summary-stats">' + chips.join('') + '</div>' +
+          '<div class="playlist-summary-foot">' + foot + '</div>' +
+        '</article>';
+    }
 
     // ─── Message Handler ───
     window.addEventListener('message', event => {
@@ -1736,17 +1845,46 @@ export class DashboardPanel {
 
       switch (msg.type) {
         case 'update': {
-          const newHash = msg.plan ? msg.plan.name + '|' + msg.plan.playlists.map(p => p.tasks.map(t => t.status || 'p').join('')).join('|') : '';
-          currentPlan = msg.plan;
-          currentServices = msg.services || [];
-          if (newHash !== lastPlanHash) {
-            lastPlanHash = newHash;
+          try {
+            console.log('[MOAG] Update msg: plan=' + (msg.plan ? msg.plan.name + ', playlists=' + msg.plan.playlists.length : 'null'));
+            var planPlaylists = (msg.plan && msg.plan.playlists) ? msg.plan.playlists : [];
+            var newHash = msg.plan
+              ? msg.plan.name + '|' + planPlaylists.map(function(playlist) {
+                return [
+                  playlist.name || '',
+                  playlist.engine || '',
+                  playlist.parallel ? 'parallel' : 'sequential',
+                  (playlist.tasks || []).map(function(task) {
+                    return [
+                      task.id || '',
+                      task.name || '',
+                      task.status || 'pending',
+                    ].join(':');
+                  }).join(','),
+                ].join('|');
+              }).join('||')
+              : '';
+            var planSection = document.getElementById('plan-section');
+            var shouldRenderPlan = newHash !== lastPlanHash || !!(planSection && !planSection.innerHTML.trim());
+            currentPlan = msg.plan;
+            currentServices = msg.services || [];
+            if (shouldRenderPlan) {
+              lastPlanHash = newHash;
+              renderPlan(msg.plan);
+            }
+            renderPills(msg.plan);
+            updateProgress();
+            renderStatus(msg.runnerState);
+          } catch(updateErr) {
+            console.error('[MOAG Dashboard] Update error:', updateErr);
+            // Force render even if hash logic fails
+            currentPlan = msg.plan;
+            currentServices = msg.services || [];
             renderPlan(msg.plan);
             renderPills(msg.plan);
+            updateProgress();
+            renderStatus(msg.runnerState || 'idle');
           }
-          renderStatus(msg.runnerState);
-          renderHistory(msg.history || []);
-          renderPmSummary();
           break;
         }
 
@@ -1799,6 +1937,7 @@ export class DashboardPanel {
 
     function resetExecution() {
       Object.keys(cardState).forEach(k => delete cardState[k]);
+      Object.keys(taskStartTimes).forEach(k => delete taskStartTimes[k]);
       currentTaskId = null;
       completedOrder = [];
       completedCount = 0;
@@ -1808,19 +1947,17 @@ export class DashboardPanel {
       runStartTime = null;
       taskStartTime = null;
       stopTimer();
-      document.getElementById('active-task').classList.remove('visible');
+      document.getElementById('active-task-name').textContent = '';
       document.getElementById('active-task-meta').textContent = '';
-      document.getElementById('active-contract').style.display = 'none';
-      document.getElementById('active-contract').innerHTML = '';
-      document.getElementById('completed-section').innerHTML = '';
-      document.getElementById('error-banner').classList.remove('visible');
-      var sb = document.getElementById('success-banner');
-      var ab = document.getElementById('amber-banner');
-      if (sb) { sb.classList.remove('visible'); }
-      if (ab) { ab.classList.remove('visible'); }
+      document.getElementById('active-output').textContent = '';
+      document.getElementById('active-engine').textContent = '';
+      document.getElementById('active-engine').className = 'engine-badge engine-custom';
+      document.getElementById('active-timer').textContent = '0s';
+      const completedSection = document.getElementById('completed-section');
+      completedSection.innerHTML = '';
       syncCurrentTaskMarker();
       updateProgress();
-      renderPmSummary();
+      renderStatus('idle');
     }
 
     function setActiveTaskMeta(playlistName, engine, phase) {
@@ -1850,106 +1987,27 @@ export class DashboardPanel {
       }
     }
 
-    function renderActiveContract(state) {
-      const el = document.getElementById('active-contract');
-      const sections = [];
-      if (state.command) {
-        sections.push('<div class="contract-row"><span class="contract-label">Command</span><span class="contract-inline">' + escHtml(state.command) + '</span></div>');
-      }
-      if (state.acceptanceCriteria && state.acceptanceCriteria.length) {
-        sections.push(
-          '<div class="contract-row"><span class="contract-label">Acceptance Criteria</span>' +
-          '<ul class="contract-list">' + state.acceptanceCriteria.map(item => '<li>' + escHtml(item) + '</li>').join('') + '</ul></div>',
-        );
-      }
-      if (state.expectedArtifacts && state.expectedArtifacts.length) {
-        sections.push(
-          '<div class="contract-row"><span class="contract-label">Expected Artifacts</span>' +
-          '<ul class="contract-list">' + state.expectedArtifacts.map(item => '<li>' + escHtml(item) + '</li>').join('') + '</ul></div>',
-        );
-      }
-      if (state.ownerNote) {
-        sections.push('<div class="contract-row"><span class="contract-label">Owner Note</span><span class="contract-inline">' + escHtml(state.ownerNote) + '</span></div>');
-      }
-      if (state.failurePolicy) {
-        sections.push('<div class="contract-row"><span class="contract-label">Failure Policy</span><span class="contract-inline">' + escHtml(state.failurePolicy) + '</span></div>');
-      }
-
-      if (sections.length === 0) {
-        el.style.display = 'none';
-        el.innerHTML = '';
-        return;
-      }
-
-      el.style.display = '';
-      el.innerHTML = sections.join('');
-    }
-
-    function expandSectionBody(body) {
-      if (!body || !body.id) { return; }
-      body.classList.remove('collapsed');
-      const sectionId = body.id.replace(/^body-/, '');
-      collapsedSections[sectionId] = false;
-      const toggle = document.querySelector('[data-section="' + sectionId + '"]');
-      if (toggle) {
-        toggle.classList.remove('collapsed');
-      }
-    }
-
-    function revealTask(taskId, flash) {
-      if (!taskId) { return; }
-      const row = document.querySelector('.task-row[data-task-id="' + taskId + '"]');
-      if (row) {
-        document.querySelectorAll('.section-body.collapsed').forEach(body => {
-          if (body.contains(row)) {
-            expandSectionBody(body);
-          }
-        });
-        row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-        if (flash) {
-          row.classList.remove('focus-flash');
-          void row.offsetWidth;
-          row.classList.add('focus-flash');
-        }
-      }
-      const pill = document.querySelector('.task-pill[data-task-id="' + taskId + '"]');
-      if (pill) {
-        pill.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'nearest' });
-      }
-      syncCurrentTaskMarker();
-    }
-
     function syncCurrentTaskMarker() {
-      document.querySelectorAll('.task-row.current-task, .task-pill.current-task').forEach(el => {
+      document.querySelectorAll('.task-pill.current-task').forEach(el => {
         el.classList.remove('current-task');
       });
       if (!currentTaskId) { return; }
-      const row = document.querySelector('.task-row[data-task-id="' + currentTaskId + '"]');
       const pill = document.querySelector('.task-pill[data-task-id="' + currentTaskId + '"]');
-      if (row) { row.classList.add('current-task'); }
       if (pill) { pill.classList.add('current-task'); }
     }
 
     function wireTaskNavigation() {
-      document.querySelectorAll('.task-row').forEach(row => {
-        row.onclick = (event) => {
-          const clickTarget = event.target instanceof Element ? event.target : null;
-          if (clickTarget && clickTarget.closest('.task-edit-btn')) { return; }
-          const taskId = row.dataset.taskId;
-          revealTask(taskId, true);
-          if (taskId === currentTaskId) {
+      document.querySelectorAll('.task-pill').forEach(pill => {
+        pill.onclick = () => {
+          if (pill.dataset.taskId === currentTaskId) {
             document.getElementById('active-task').scrollIntoView({ behavior: 'smooth', block: 'start' });
           }
         };
-      });
-      document.querySelectorAll('.task-pill').forEach(pill => {
-        pill.onclick = () => revealTask(pill.dataset.taskId, true);
       });
     }
 
     function startTask(msg) {
       // Enter execution mode — hides non-essential sections for max output visibility
-      document.body.classList.add('task-active');
 
       // Initialize run timer on first task
       if (!runStartTime) {
@@ -1981,9 +2039,6 @@ export class DashboardPanel {
         summary: '',
       };
 
-      // Show active panel
-      const panel = document.getElementById('active-task');
-      panel.classList.add('visible');
       document.getElementById('active-task-name').textContent = msg.taskName;
       const runtimeLabel = msg.taskType === 'agent'
         ? (msg.engine || 'agent')
@@ -1997,27 +2052,10 @@ export class DashboardPanel {
       document.getElementById('active-timer').textContent = '0s';
       showActiveOutputPlaceholder((msg.engine || 'Agent') + ' is running. Live output will appear here as soon as the task starts emitting logs.');
 
-      const promptPre = document.getElementById('active-prompt');
-      const promptSection = document.getElementById('active-prompt-section');
-      if (msg.prompt) {
-        promptPre.textContent = msg.prompt.length > 2000
-          ? msg.prompt.substring(0, 2000) + '\\n... (truncated)'
-          : msg.prompt;
-        promptSection.style.display = '';
-        promptSection.removeAttribute('open');
-      } else {
-        promptSection.style.display = 'none';
-      }
-
-      renderActiveContract(cardState[msg.taskId]);
-
-      // Update pill
       updatePillStatus(msg.taskId, 'running');
       syncCurrentTaskMarker();
-      revealTask(msg.taskId, false);
-
-      // Scroll active task into view
-      panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      setDashboardState('executing');
+      document.getElementById('active-task').scrollIntoView({ behavior: 'smooth', block: 'start' });
       updateStatusBar();
     }
 
@@ -2073,25 +2111,18 @@ export class DashboardPanel {
       // Update pill
       updatePillStatus(msg.taskId, msg.status);
 
-      // Show error banner on first failure with the actual error
-      if (!passed && msg.status !== 'skipped' && msg.status !== 'blocked') {
-        showErrorBanner(msg);
-      }
-
       // Move to completed list
       addCompletedCard(msg.taskId, msg.taskName, msg);
 
-      // Hide active panel (next start-task-card will re-show it)
       if (msg.taskId === currentTaskId) {
-        document.getElementById('active-task').classList.remove('visible');
         document.getElementById('active-task-meta').textContent = '';
         currentTaskId = null;
       }
 
       syncCurrentTaskMarker();
       updateProgress();
+      renderResultBanner();
       updateStatusBar();
-      renderPmSummary();
     }
 
     function detectErrorReason(text) {
@@ -2136,78 +2167,6 @@ export class DashboardPanel {
         errorLines = lines.filter(function(l) { return l.trim(); }).slice(-5);
       }
       return errorLines.map(function(l) { return l.length > 200 ? l.substring(0, 200) + '...' : l; }).join('\\n');
-    }
-
-    var failedTaskNames = [];
-
-    function showErrorBanner(msg) {
-      var banner = document.getElementById('error-banner');
-      var title = document.getElementById('error-banner-title');
-      var summary = document.getElementById('error-banner-summary');
-      var toggle = document.getElementById('error-banner-toggle');
-      var detail = document.getElementById('error-banner-detail');
-      var action = document.getElementById('error-banner-action');
-
-      // Track failed task names
-      if (failedTaskNames.indexOf(msg.taskName) === -1) {
-        failedTaskNames.push(msg.taskName);
-      }
-
-      // Search ALL available text for error patterns
-      var stderr = msg.stderr || '';
-      var output = (cardState[msg.taskId] || {}).output || '';
-      var combined = stderr + '\\n' + output;
-      var reason = detectErrorReason(combined);
-      var errorLines = extractErrorLines(combined);
-      var isRateLimit = reason && reason.indexOf('Rate limit') >= 0;
-
-      // Set banner style based on error type
-      banner.className = 'error-banner visible ' + (isRateLimit ? 'error-ratelimit' : 'error-generic');
-
-      // Title
-      if (isRateLimit) {
-        title.innerHTML = '\\u26A0 <strong>RATE LIMIT EXCEEDED</strong> \\u2013 ' +
-          escHtml(reason.replace(/.*resets /, 'resets ').replace(/\\..*/, '')) +
-          (failedCount > 1 ? ' (' + failedCount + ' tasks failed)' : '');
-      } else if (reason) {
-        title.textContent = reason + (failedCount > 1 ? ' (' + failedCount + ' tasks failed)' : '');
-      } else {
-        title.textContent = failedCount === 1
-          ? '\\u2717 Task "' + escHtml(msg.taskName) + '" failed (exit ' + msg.exitCode + ')'
-          : '\\u2717 ' + failedCount + ' tasks failed \\u2013 latest: "' + escHtml(msg.taskName) + '"';
-      }
-
-      // Action button
-      if (isRateLimit) {
-        action.textContent = 'Switch engine';
-        action.style.display = '';
-        action.className = 'error-banner-action';
-        action.onclick = function() { vscode.postMessage({ type: 'switch-engine' }); };
-      } else if (reason && reason.indexOf('CLI not found') >= 0) {
-        action.textContent = 'Configure engine';
-        action.style.display = '';
-        action.className = 'error-banner-action error-action-red';
-        action.onclick = function() { vscode.postMessage({ type: 'switch-engine' }); };
-      } else {
-        action.style.display = 'none';
-      }
-
-      // Failed task summary
-      var summaryLines = failedTaskNames.map(function(n) { return '[failed] ' + escHtml(n); }).join('\\n');
-      summary.textContent = summaryLines;
-      summary.style.display = failedTaskNames.length > 0 ? '' : 'none';
-
-      // Toggle for detailed error log
-      toggle.style.display = '';
-      toggle.onclick = function() {
-        var d = document.getElementById('error-banner-detail');
-        var showing = d.classList.contains('visible');
-        d.classList.toggle('visible');
-        toggle.textContent = showing ? '\\u25B7 View Detailed Error Log' : '\\u25BD View Detailed Error Log';
-      };
-      toggle.textContent = '\\u25B7 View Detailed Error Log';
-      detail.classList.remove('visible');
-      detail.textContent = errorLines || 'Exit code ' + msg.exitCode + ' \\u2014 no error output captured';
     }
 
     function addCompletedCard(taskId, taskName, msg) {
@@ -2307,21 +2266,21 @@ export class DashboardPanel {
 
       if (state.summary) {
         const summaryDiv = document.createElement('div');
-        summaryDiv.className = 'ct-detail-output';
+        summaryDiv.className = 'terminal-output ct-detail-output';
         summaryDiv.textContent = state.summary;
         detail.appendChild(summaryDiv);
       }
 
       if (state.command) {
         const cmdDiv = document.createElement('div');
-        cmdDiv.className = 'ct-detail-output';
+        cmdDiv.className = 'terminal-output ct-detail-output';
         cmdDiv.textContent = state.command;
         detail.appendChild(cmdDiv);
       }
 
       if (state.verification) {
         const verifyDiv = document.createElement('div');
-        verifyDiv.className = 'ct-detail-output';
+        verifyDiv.className = 'terminal-output ct-detail-output';
         verifyDiv.textContent =
           'Verify: ' + state.verification.command + ' -> ' +
           (state.verification.passed ? 'passed' : 'failed') +
@@ -2332,7 +2291,7 @@ export class DashboardPanel {
       // Stderr (for failed tasks, show prominently)
       if (msg.stderr) {
         const stderrDiv = document.createElement('div');
-        stderrDiv.className = 'ct-detail-output';
+        stderrDiv.className = 'terminal-output ct-detail-output';
         stderrDiv.style.color = 'var(--error)';
         stderrDiv.textContent = msg.stderr;
         detail.appendChild(stderrDiv);
@@ -2343,7 +2302,7 @@ export class DashboardPanel {
         const lines = state.output.split('\\n');
         const tail = lines.length > 100 ? lines.slice(-100).join('\\n') : state.output;
         const outDiv = document.createElement('div');
-        outDiv.className = 'ct-detail-output';
+        outDiv.className = 'terminal-output ct-detail-output';
         outDiv.textContent = tail;
         detail.appendChild(outDiv);
       }
@@ -2380,10 +2339,14 @@ export class DashboardPanel {
           : msg.codeChanges;
         // Parse file-level summary from diff headers
         var fileSummaries = [];
-        var fileMatches = diffText.match(/^diff --git a\/(.+?) b\/.+$/gm) || [];
-        for (var fi = 0; fi < fileMatches.length; fi++) {
-          var fname = fileMatches[fi].replace(/^diff --git a\//, '').replace(/ b\/.*$/, '');
-          fileSummaries.push(fname);
+        var diffLines = diffText.split('\\n');
+        for (var fi = 0; fi < diffLines.length; fi++) {
+          var diffLine = diffLines[fi];
+          if (!diffLine.startsWith('diff --git a/')) { continue; }
+          var afterPrefix = diffLine.slice('diff --git a/'.length);
+          var separatorIndex = afterPrefix.indexOf(' b/');
+          if (separatorIndex === -1) { continue; }
+          fileSummaries.push(afterPrefix.slice(0, separatorIndex));
         }
         var fileSummaryHtml = fileSummaries.length > 0
           ? '<div class="diff-file-summary">' + fileSummaries.map(function(f) { return escHtml(f); }).join(' &middot; ') + '</div>'
@@ -2416,16 +2379,22 @@ export class DashboardPanel {
       const passedTasks = tasks.filter(task => task.status === 'completed').length;
       const failedTasks = tasks.filter(task => task.status === 'failed').length;
       const blockedTasks = tasks.filter(task => task.status === 'blocked').length;
+      const skippedTasks = tasks.filter(task => task.status === 'skipped').length;
+      // Use plan-derived counts as the floor — completedCount only tracks the current session
+      const effectiveCompleted = Math.max(completedCount, passedTasks + failedTasks + blockedTasks + skippedTasks);
+      const effectiveFailed = Math.max(failedCount, failedTasks);
       if (totalTasks === 0) {
         fill.style.width = '0%';
+        fill.classList.remove('has-errors');
         document.getElementById('stats-tasks').textContent = '0 / 0 tasks';
+        document.getElementById('stats-files').textContent = '';
         return;
       }
-      const pct = Math.round((completedCount / totalTasks) * 100);
+      const pct = Math.round((effectiveCompleted / totalTasks) * 100);
       fill.style.width = pct + '%';
 
-      if (failedCount > 0) {
-        const passPct = Math.round(((completedCount - failedCount) / totalTasks) * 100);
+      if (effectiveFailed > 0) {
+        const passPct = Math.round(((effectiveCompleted - effectiveFailed) / totalTasks) * 100);
         fill.classList.add('has-errors');
         fill.style.setProperty('--pass-pct', passPct + '%');
       } else {
@@ -2433,7 +2402,7 @@ export class DashboardPanel {
       }
 
       document.getElementById('stats-tasks').textContent =
-        completedCount + ' / ' + totalTasks + ' tasks' +
+        effectiveCompleted + ' / ' + totalTasks + ' tasks' +
         (failedTasks > 0 || blockedTasks > 0
           ? ' (' + [
             failedTasks > 0 ? failedTasks + ' failed' : '',
@@ -2443,27 +2412,6 @@ export class DashboardPanel {
 
       document.getElementById('stats-files').textContent =
         totalFilesChanged > 0 ? totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's' : '') : '';
-
-      // Global progress bar
-      var gpb = document.getElementById('global-progress-bar');
-      if (gpb) { gpb.style.width = (totalTasks > 0 ? pct : 0) + '%'; }
-
-      // ETA calculation
-      var etaEl = document.getElementById('eta-display');
-      if (etaEl && runStartTime && completedCount > 0 && completedCount < totalTasks) {
-        var elapsed = Date.now() - runStartTime;
-        var avgPerTask = elapsed / completedCount;
-        var remaining = (totalTasks - completedCount) * avgPerTask;
-        var mins = Math.floor(remaining / 60000);
-        var secs = Math.round((remaining % 60000) / 1000);
-        etaEl.textContent = 'ETA: ~' + (mins > 0 ? mins + 'm ' : '') + secs + 's remaining (' + (totalTasks - completedCount) + ' tasks left)';
-        etaEl.style.display = 'block';
-      } else if (etaEl && completedCount >= totalTasks && totalTasks > 0) {
-        etaEl.textContent = 'All tasks complete';
-        etaEl.style.display = 'block';
-      } else if (etaEl) {
-        etaEl.style.display = 'none';
-      }
     }
 
     function startTimer() {
@@ -2485,13 +2433,6 @@ export class DashboardPanel {
       if (taskStartTime && currentTaskId) {
         document.getElementById('active-timer').textContent = formatDuration(Date.now() - taskStartTime);
       }
-      // Update elapsed timers in task rows for running tasks
-      document.querySelectorAll('.tr-elapsed.running').forEach(function(el) {
-        var tid = el.dataset.taskId;
-        if (tid && taskStartTimes[tid]) {
-          el.textContent = formatDuration(Date.now() - taskStartTimes[tid]);
-        }
-      });
       updateStatusBar();
     }
 
@@ -2542,30 +2483,43 @@ export class DashboardPanel {
 
     // ─── Pill Row ───
 
+    var minimapMode = false;
+
     function renderPills(plan) {
-      const pipeline = document.getElementById('pipeline');
       const row = document.getElementById('pill-row');
       if (!plan || !plan.playlists || plan.playlists.length === 0) {
-        pipeline.style.display = 'none';
+        totalTasks = 0;
+        minimapMode = false;
+        row.className = 'pill-row';
+        row.innerHTML = '';
+        updateProgress();
         return;
       }
-      pipeline.style.display = '';
+
+      // Count tasks first to decide pill vs minimap
+      let taskCount = 0;
+      plan.playlists.forEach(pl => { taskCount += pl.tasks.length; });
+      minimapMode = taskCount > 30;
 
       let html = '';
-      let taskCount = 0;
+      let idx = 0;
       plan.playlists.forEach((pl, pi) => {
-        if (pi > 0) { html += '<div class="pill-separator"></div>'; }
+        if (pi > 0 && !minimapMode) { html += '<div class="pill-separator"></div>'; }
         pl.tasks.forEach(task => {
-          taskCount++;
+          idx++;
           const isCurrent = task.id === currentTaskId || task.status === 'running';
-          html += '<div class="task-pill ' + (task.status || 'pending') + (isCurrent ? ' current-task' : '') + '" ' +
+          const pillStatus = isCurrent ? 'running' : (task.status || 'pending');
+          html += '<div class="task-pill ' + pillStatus + (isCurrent ? ' current-task' : '') + '" ' +
             'data-task-id="' + task.id + '" ' +
-            'title="' + escHtml(task.name) + '">' +
-            taskCount +
+            'title="' + idx + '. ' + escHtml(task.name) + '">' +
+            (minimapMode ? '' : idx) +
             '</div>';
         });
       });
       totalTasks = taskCount;
+
+      // Apply minimap class
+      row.className = 'pill-row' + (minimapMode ? ' minimap' : '') + (pillRowCollapsed ? ' collapsed' : '');
       row.innerHTML = html;
       wireTaskNavigation();
       syncCurrentTaskMarker();
@@ -2596,54 +2550,12 @@ export class DashboardPanel {
 
       // Toggle play button style
       playBtn.className = playBtn.disabled ? 'icon-btn' : 'icon-btn primary';
-
+      setDashboardState(resolveDashboardState(state));
+      renderResultBanner();
       if (state === 'idle') {
-        // Exit execution mode — show all sections again
-        document.body.classList.remove('task-active');
         stopTimer();
-        updateTimers();
-        updateStatusBar();
-        if (completedCount > 0 && completedCount >= totalTasks) {
-          const tasks = currentPlan ? currentPlan.playlists.flatMap(pl => pl.tasks || []) : [];
-          const passedTasks = tasks.filter(task => task.status === 'completed').length;
-          const failedTasks = tasks.filter(task => task.status === 'failed').length;
-          const blockedTasks = tasks.filter(task => task.status === 'blocked').length;
-          document.getElementById('status-summary').textContent =
-            passedTasks + '/' + totalTasks + ' passed' +
-            ((failedTasks > 0 || blockedTasks > 0)
-              ? ' \\u2014 ' + [failedTasks > 0 ? failedTasks + ' failed' : '', blockedTasks > 0 ? blockedTasks + ' blocked' : ''].filter(Boolean).join(', ')
-              : ' \\u2014 All done');
-          // Show completion banner
-          var successBanner = document.getElementById('success-banner');
-          var amberBanner = document.getElementById('amber-banner');
-          if (failedTasks === 0 && blockedTasks === 0 && passedTasks === totalTasks && passedTasks > 0) {
-            if (successBanner) { successBanner.classList.add('visible'); }
-            if (amberBanner) { amberBanner.classList.remove('visible'); }
-          } else if (failedTasks > 0 || blockedTasks > 0) {
-            if (successBanner) { successBanner.classList.remove('visible'); }
-            if (amberBanner) {
-              var amberTitle = document.getElementById('amber-banner-title');
-              if (amberTitle) {
-                amberTitle.textContent = 'Run complete \\u2014 ' + passedTasks + ' passed, ' + (failedTasks + blockedTasks) + ' failed';
-              }
-              amberBanner.classList.add('visible');
-            }
-          } else {
-            if (successBanner) { successBanner.classList.remove('visible'); }
-            if (amberBanner) { amberBanner.classList.remove('visible'); }
-          }
-          // Auto-expand TASKS section after run
-          if (collapsedSections['tasks']) {
-            toggleSection('tasks');
-          }
-        }
-      } else {
-        // Not idle or not complete — hide completion banners
-        var successBannerEl = document.getElementById('success-banner');
-        var amberBannerEl = document.getElementById('amber-banner');
-        if (successBannerEl) { successBannerEl.classList.remove('visible'); }
-        if (amberBannerEl) { amberBannerEl.classList.remove('visible'); }
       }
+      updateTimers();
     }
 
     // Track collapsed state for sections
@@ -2666,268 +2578,68 @@ export class DashboardPanel {
 
     function renderPlan(plan) {
       const section = document.getElementById('plan-section');
-      const emptyState = document.getElementById('empty-state');
       const planName = document.getElementById('plan-name');
 
-      if (!plan || !plan.playlists) {
-        section.innerHTML = '';
-        emptyState.style.display = '';
-        planName.textContent = 'MOAG';
+      if (!plan || !plan.playlists || plan.playlists.length === 0) {
+        section.innerHTML = '<div class="plan-placeholder">No plan loaded - use the sidebar to create one.</div>';
+        planName.textContent = plan && plan.name ? plan.name : 'MOAG';
         return;
       }
 
-      emptyState.style.display = 'none';
       planName.textContent = plan.name || 'Untitled Plan';
-      // Show info panel when a plan is loaded
-      var infoPanel = document.getElementById('info-panel');
-      if (infoPanel) { infoPanel.style.display = ''; }
-
-      const totalTaskCount = plan.playlists.reduce((s, pl) => s + pl.tasks.length, 0);
-      const isCollapsed = collapsedSections['tasks'] || false;
-
-      let html = '<button class="section-toggle' + (isCollapsed ? ' collapsed' : '') + '" data-section="tasks" onclick="toggleSection(&quot;tasks&quot;)">' +
-        '<span class="section-toggle-icon">\\u25BC</span>' +
-        '<span class="section-toggle-label">Tasks</span>' +
-        '<span class="section-toggle-count">' + totalTaskCount + '</span>' +
-        '</button>';
-
-      html += '<div id="body-tasks" class="section-body' + (isCollapsed ? ' collapsed' : '') + '">';
-
-      plan.playlists.forEach((pl, pi) => {
-        const plCompleted = pl.tasks.filter(t => t.status === 'completed').length;
-        const plFailed = pl.tasks.filter(t => t.status === 'failed').length;
-        const plTotal = pl.tasks.length;
-        const plStatusText = plCompleted > 0 || plFailed > 0
-          ? ' (' + plCompleted + '/' + plTotal + (plFailed > 0 ? ', ' + plFailed + ' failed' : '') + ')'
-          : '';
-        const plSectionId = 'playlist-' + pi;
-        const plCollapsed = collapsedSections[plSectionId] || false;
-
-        html += '<div class="playlist-group">';
-        if (plan.playlists.length > 1) {
-          html += '<button class="section-toggle' + (plCollapsed ? ' collapsed' : '') + '" data-section="' + plSectionId + '" onclick="toggleSection(&quot;' + plSectionId + '&quot;)" style="padding:5px 4px 3px;">' +
-            '<span class="section-toggle-icon" style="font-size:7px;">\\u25BC</span>' +
-            '<span style="font-size:11px;font-weight:600;">' + escHtml(pl.name) + '</span>' +
-            '<span class="playlist-engine">' + (pl.engine || plan.defaultEngine) + '</span>' +
-            (pl.parallel ? '<span class="playlist-meta">parallel</span>' : '') +
-            '<span class="section-toggle-count">' + plStatusText + '</span>' +
-            '</button>';
-        }
-
-        html += '<div id="body-' + plSectionId + '" class="section-body' + (plCollapsed ? ' collapsed' : '') + '">';
-        pl.tasks.forEach((task, ti) => {
-          const isCurrent = task.id === currentTaskId || task.status === 'running';
-          const taskType = task.type || 'agent';
-          const criteriaCount = task.acceptanceCriteria?.length || 0;
-          const artifactCount = task.expectedArtifacts?.length || 0;
-          html += '<div class="task-row' + (isCurrent ? ' current-task' : '') + '" data-task-id="' + task.id + '" data-pi="' + pi + '" data-ti="' + ti + '" title="Click to jump to this task">' +
-            '<div class="tr-dot ' + (task.status || 'pending') + '"></div>' +
-            '<span class="tr-name">' + escHtml(task.name) + '</span>' +
-            '<span class="tr-engine-tag">' + escHtml(taskType) + '</span>' +
-            (task.engine && taskType === 'agent' ? '<span class="tr-engine-tag">' + task.engine + '</span>' : '') +
-            (criteriaCount > 0 ? '<span class="playlist-meta">' + criteriaCount + ' criteria</span>' : '') +
-            (artifactCount > 0 ? '<span class="playlist-meta">' + artifactCount + ' artifacts</span>' : '') +
-            (task.status === 'running' && taskStartTimes[task.id]
-              ? '<span class="tr-elapsed running" data-task-id="' + task.id + '">' + formatDuration(Date.now() - taskStartTimes[task.id]) + '</span>'
-              : (task.status === 'completed' || task.status === 'failed') && cardState[task.id] && cardState[task.id].durationMs
-                ? '<span class="tr-elapsed">' + formatDuration(cardState[task.id].durationMs) + '</span>'
-                : '') +
-            '<button class="task-edit-btn" onclick="editTask(' + pi + ',' + ti + ')" title="Edit">\\u270E</button>' +
-            '</div>';
-        });
-
-        html += '<button class="add-btn" onclick="addTask(' + pi + ')">+ Add Task</button>';
-        html += '</div>'; // section-body
-        html += '</div>'; // playlist-group
-      });
-
-      html += '<button class="add-btn" onclick="addPlaylist()" style="margin-top:4px;">+ Add Playlist</button>';
-      html += '</div>'; // section-body for tasks
-      section.innerHTML = html;
-      wireTaskNavigation();
-      syncCurrentTaskMarker();
-    }
-
-    var allHistoryEntries = [];
-    var activeInfoTab = 'current';
-    var currentRunId = null;
-
-    function switchInfoTab(tab) {
-      activeInfoTab = tab;
-      ['current', 'all', 'summary'].forEach(function(t) {
-        var tabEl = document.getElementById('tab-' + (t === 'current' ? 'current-run' : t === 'all' ? 'all-history' : 'summary'));
-        var paneEl = document.getElementById('pane-' + t);
-        if (tabEl) { tabEl.className = 'info-tab' + (t === tab ? ' active' : ''); }
-        if (paneEl) { paneEl.className = 'info-pane' + (t === tab ? ' active' : ''); }
-      });
-      if (tab === 'current' || tab === 'all') { renderHistoryList(); }
-      if (tab === 'summary') { renderPmSummary(); }
-    }
-
-    function renderHistory(entries) {
-      var panel = document.getElementById('info-panel');
-      allHistoryEntries = entries;
-      if (entries.length > 0 && entries[0].runId) {
-        currentRunId = entries[0].runId;
-      }
-      // Always show the panel once we have history or a plan
-      if (entries.length > 0 || currentPlan) {
-        panel.style.display = '';
-      }
-      renderHistoryList();
-    }
-
-    function renderHistoryList() {
-      var entries = allHistoryEntries;
-      var isCurrent = activeInfoTab === 'current';
-      var container = document.getElementById(isCurrent ? 'pane-current' : 'pane-all');
-      if (!container) { return; }
-
-      if (isCurrent && currentRunId) {
-        entries = entries.filter(function(e) { return e.runId === currentRunId; });
+      const stats = getPlanStats(plan);
+      const metaParts = [
+        plan.playlists.length + ' playlist' + (plan.playlists.length !== 1 ? 's' : ''),
+        stats.total + ' task' + (stats.total !== 1 ? 's' : ''),
+      ];
+      if (stats.total > 0) {
+        metaParts.push(formatCountSummary(stats) || 'Ready to run');
       }
 
-      // Update tab labels with counts
-      var currentCount = currentRunId ? allHistoryEntries.filter(function(e) { return e.runId === currentRunId; }).length : 0;
-      document.getElementById('tab-current-run').textContent = 'Current Run' + (currentCount ? ' (' + currentCount + ')' : '');
-      document.getElementById('tab-all-history').textContent = 'All History (' + allHistoryEntries.length + ')';
-
-      var html = '';
-      var lastPlaylist = '';
-      entries.slice(0, 30).forEach(function(entry, idx) {
-        var passed = entry.status === 'completed';
-        var durStr = formatDuration(entry.result.durationMs || 0);
-
-        // Show playlist grouping header in current run view
-        if (isCurrent && entry.playlistName && entry.playlistName !== lastPlaylist) {
-          lastPlaylist = entry.playlistName;
-          html += '<div style="font-size:9px;padding:6px 4px 2px;color:var(--dimmed);text-transform:uppercase;letter-spacing:0.4px;font-weight:600;">' +
-            escHtml(entry.playlistName) + '</div>';
-        }
-
-        html += '<div class="hist-row" id="hist-' + idx + '" onclick="toggleHistRow(this)">' +
-          '<span class="hist-icon ' + (passed ? 'pass' : 'fail') + '">' + (passed ? '\\u2713' : '\\u2717') + '</span>' +
-          '<span class="hist-name">' + escHtml(entry.taskName) + '</span>' +
-          '<span class="hist-meta">' + durStr + '</span>' +
-          '</div>';
-
-        html += '<div class="hist-detail">';
-        if (entry.taskType) {
-          html += '<div style="font-size:10px;padding:2px 0;color:var(--dimmed);">Type: ' + escHtml(entry.taskType) + '</div>';
-        }
-        if (entry.result.summary) {
-          html += '<div style="font-size:10px;padding:2px 0;">' + escHtml(entry.result.summary) + '</div>';
-        }
-        if (entry.result.command) {
-          html += '<pre>' + escHtml(entry.result.command) + '</pre>';
-        }
-        if (entry.verification) {
-          html += '<div style="font-size:10px;padding:2px 0;">Verify: ' + escHtml(entry.verification.command) + ' -> ' + (entry.verification.passed ? 'pass' : 'fail') + '</div>';
-        }
-        if (entry.result.stdout) {
-          var outText = entry.result.stdout.length > 500
-            ? entry.result.stdout.substring(0, 500) + '...'
-            : entry.result.stdout;
-          html += '<pre>' + escHtml(outText) + '</pre>';
-        }
-        if (entry.artifacts && entry.artifacts.length > 0) {
-          html += '<div style="font-size:10px;padding:2px 0;">Artifacts: ' + entry.artifacts.filter(function(a) { return a.exists; }).length + '/' + entry.artifacts.length + '</div>';
-        }
-        if (entry.changedFiles && entry.changedFiles.length > 0) {
-          html += '<div style="font-size:10px;padding:2px 0;">' + entry.changedFiles.length + ' files changed</div>';
-        }
-        html += '</div>';
-      });
-
-      if (!entries.length) {
-        html = '<div style="padding:12px 4px;color:var(--dimmed);font-size:11px;">' +
-          (isCurrent ? 'No tasks in current run yet.' : 'No history recorded.') + '</div>';
-      }
-      container.innerHTML = html;
-    }
-
-    // ─── Info panel drag-to-resize ───
-    (function() {
-      var handle = document.getElementById('info-panel-resize');
-      var panel = document.getElementById('info-panel');
-      if (!handle || !panel) { return; }
-      var startY, startH;
-      handle.addEventListener('mousedown', function(e) {
-        e.preventDefault();
-        startY = e.clientY;
-        startH = panel.offsetHeight;
-        handle.classList.add('dragging');
-        document.addEventListener('mousemove', onMove);
-        document.addEventListener('mouseup', onUp);
-      });
-      function onMove(e) {
-        var newH = Math.max(80, Math.min(600, startH - (startY - e.clientY)));
-        panel.style.maxHeight = newH + 'px';
-        panel.style.minHeight = newH + 'px';
-      }
-      function onUp() {
-        handle.classList.remove('dragging');
-        document.removeEventListener('mousemove', onMove);
-        document.removeEventListener('mouseup', onUp);
-      }
-    })();
-
-    function renderPmSummary() {
-      const container = document.getElementById('pm-summary-content');
-      if (!container) { return; }
-
-      if (!currentPlan) {
-        container.innerHTML = '<div class="hist-detail">No plan loaded.</div>';
-        return;
-      }
-
-      const tasks = currentPlan.playlists.flatMap(pl => pl.tasks || []);
-      const total = tasks.length;
-      const completed = tasks.filter(task => task.status === 'completed').length;
-      const failed = tasks.filter(task => task.status === 'failed').length;
-      const blocked = tasks.filter(task => task.status === 'blocked').length;
-      const running = tasks.find(task => task.status === 'running');
-      const currentPhase = currentPlan.playlists.find(pl => pl.tasks.some(task => task.status === 'running' || task.status === 'failed' || task.status === 'blocked'))
-        || currentPlan.playlists.find(pl => pl.tasks.some(task => task.status !== 'completed' && task.status !== 'skipped'))
-        || currentPlan.playlists[currentPlan.playlists.length - 1];
-      const latestDone = completedOrder.length > 0 ? cardState[completedOrder[completedOrder.length - 1]] : null;
-      const servicesHtml = currentServices.length > 0
-        ? currentServices.map(service => '<li>' + escHtml(service.taskName) + (service.port ? ' (port ' + service.port + ')' : '') + '</li>').join('')
-        : '<li>No services running</li>';
-
-      container.innerHTML =
-        '<div class="hist-detail">' +
-          '<div><strong>Phase:</strong> ' + escHtml(currentPhase?.name || 'N/A') + '</div>' +
-          '<div><strong>Progress:</strong> ' + completed + ' / ' + total + ' complete</div>' +
-          '<div><strong>Failures:</strong> ' + failed + ' failed, ' + blocked + ' blocked</div>' +
-          '<div><strong>Latest outcome:</strong> ' + escHtml(latestDone?.summary || latestDone?.status || 'No completed tasks yet') + '</div>' +
-          '<div><strong>Files changed:</strong> ' + totalFilesChanged + '</div>' +
-          '<div><strong>Running now:</strong> ' + escHtml(running?.name || 'Idle') + '</div>' +
-          '<div style="margin-top:6px;"><strong>Services</strong><ul style="padding-left:16px;margin:4px 0 0;">' + servicesHtml + '</ul></div>' +
+      let html = '<div class="plan-overview">';
+      html += '<div class="plan-overview-header">' +
+        '<span class="plan-overview-title">Plan Overview</span>' +
+        '<span class="plan-overview-meta">' + escHtml(metaParts.join(' · ')) + '</span>' +
         '</div>';
+      html += plan.playlists.map(function(playlist) {
+        return renderPlaylistSummaryCard(playlist, plan.defaultEngine);
+      }).join('');
+      html += '</div>';
+      section.innerHTML = html;
     }
 
     // ─── Interactions ───
 
-    function toggleHistRow(el) {
-      el.classList.toggle('expanded');
-    }
-
-    function addPlaylist() { vscode.postMessage({ type: 'addPlaylist' }); }
-    function addTask(pi) { vscode.postMessage({ type: 'addTask', playlistIndex: pi }); }
-    function editTask(pi, ti) { vscode.postMessage({ type: 'editTask', playlistIndex: pi, taskIndex: ti }); }
-
     let pillRowCollapsed = false;
     function togglePillRow() {
-      pillRowCollapsed = !pillRowCollapsed;
       const row = document.getElementById('pill-row');
       const toggle = document.getElementById('pill-toggle');
-      if (pillRowCollapsed) {
-        row.classList.add('collapsed');
-        toggle.innerHTML = '\\u25B6';
+      if (minimapMode) {
+        // In minimap mode, toggle between collapsed → compact → expanded
+        var isExpanded = row.classList.contains('expanded');
+        if (pillRowCollapsed) {
+          pillRowCollapsed = false;
+          row.classList.remove('collapsed');
+          row.classList.remove('expanded');
+          toggle.innerHTML = '\\u25BC';
+        } else if (!isExpanded) {
+          row.classList.add('expanded');
+          toggle.innerHTML = '\\u25B2';
+        } else {
+          pillRowCollapsed = true;
+          row.classList.add('collapsed');
+          row.classList.remove('expanded');
+          toggle.innerHTML = '\\u25B6';
+        }
       } else {
-        row.classList.remove('collapsed');
-        toggle.innerHTML = '\\u25BC';
+        pillRowCollapsed = !pillRowCollapsed;
+        if (pillRowCollapsed) {
+          row.classList.add('collapsed');
+          toggle.innerHTML = '\\u25B6';
+        } else {
+          row.classList.remove('collapsed');
+          toggle.innerHTML = '\\u25BC';
+        }
       }
     }
 
@@ -2957,19 +2669,30 @@ export class DashboardPanel {
     // no postMessage round-trip needed for first paint.
     (function() {
       try {
-        const initState = JSON.parse(decodeBase64Utf8('${initialStateBase64}'));
+        console.log('[MOAG] Init: decoding base64, length=' + '${initialStateBase64}'.length);
+        var rawState = decodeBase64Utf8('${initialStateBase64}');
+        var initState = JSON.parse(rawState);
+        console.log('[MOAG] Init: parsed JSON, plan=' + (initState.plan ? initState.plan.name : 'null'));
         if (initState && initState.plan) {
           currentPlan = initState.plan;
           renderPlan(initState.plan);
-          renderStatus(initState.runnerState || 'idle');
           renderPills(initState.plan);
-          renderHistory(initState.history || []);
+          updateProgress();
+          renderStatus(initState.runnerState || 'idle');
         } else {
-          // No plan embedded — show empty state
-          document.getElementById('empty-state').style.display = '';
+          currentPlan = null;
+          renderPlan(null);
+          renderPills(null);
+          updateProgress();
+          renderStatus('idle');
         }
-      } catch(_) {
-        document.getElementById('empty-state').style.display = '';
+      } catch(initErr) {
+        console.error('[MOAG Dashboard] Init error:', initErr);
+        currentPlan = null;
+        renderPlan(null);
+        renderPills(null);
+        updateProgress();
+        renderStatus('idle');
       }
     })();
 
@@ -2990,14 +2713,18 @@ export class DashboardPanel {
       const maxRetries = 10;
       const interval = setInterval(function() {
         retries++;
-        if (currentPlan || retries >= maxRetries) {
+        var planSection = document.getElementById('plan-section');
+        var hasRenderedPlan = !!(planSection && planSection.innerHTML.trim());
+        if ((currentPlan && hasRenderedPlan) || retries >= maxRetries) {
           clearInterval(interval);
-          if (!currentPlan) {
-            document.getElementById('empty-state').style.display = '';
+          if (currentPlan && !hasRenderedPlan) {
+            vscode.postMessage({ type: 'refresh' });
           }
           return;
         }
-        vscode.postMessage({ type: 'refresh' });
+        if (!currentPlan || !hasRenderedPlan) {
+          vscode.postMessage({ type: 'refresh' });
+        }
       }, 500);
     })();
   </script>
