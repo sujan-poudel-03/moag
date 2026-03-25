@@ -459,11 +459,11 @@ export class DashboardPanel {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 12px;
+      padding: 0 12px;
       background: var(--sidebar-bg);
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
-      min-height: 40px;
+      min-height: 44px;
     }
     .plan-name {
       font-weight: 600;
@@ -547,10 +547,12 @@ export class DashboardPanel {
     }
     .stats-row {
       display: flex;
+      align-items: center;
       justify-content: space-between;
+      gap: 8px;
       font-size: 11px;
       color: var(--dimmed);
-      margin-bottom: 6px;
+      min-height: 16px;
     }
     .pill-row {
       display: flex;
@@ -653,34 +655,27 @@ export class DashboardPanel {
 
     /* ─── Active Task Panel ─── */
     .active-task {
-      margin: 8px;
-      border: 1px solid var(--focus-border);
-      border-radius: 6px;
-      overflow: hidden;
-      display: flex;
+      display: none;
       flex-direction: column;
-      flex-shrink: 0;
       flex-grow: 1;
-      min-height: 180px;
+      margin: 0 6px;
+      border: 1px solid var(--focus-border);
+      border-radius: 4px;
+      overflow: hidden;
+      min-height: 0;
     }
-    .active-task { animation: border-pulse 2s ease-in-out infinite; }
-    @keyframes border-pulse {
-      0%, 100% { border-color: var(--focus-border); }
-      50% { border-color: var(--success); }
+    .active-task.visible {
+      display: flex;
     }
     .active-task-header {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 8px 10px;
-      background: rgba(0,122,204,0.06);
-    }
-    .active-task-main {
-      flex: 1;
-      min-width: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 2px;
+      min-height: 32px;
+      padding: 0 10px;
+      background: rgba(0,122,204,0.04);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
     }
     .active-dot {
       width: 8px;
@@ -698,13 +693,6 @@ export class DashboardPanel {
       flex: 1;
       font-weight: 600;
       font-size: 12px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .active-task-meta {
-      font-size: 10px;
-      color: var(--dimmed);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
@@ -739,12 +727,6 @@ export class DashboardPanel {
       font-family: var(--vscode-editor-font-family, monospace);
       color: var(--dimmed);
       flex-shrink: 0;
-    }
-    .eta-display {
-      font-size: 11px;
-      color: var(--dimmed);
-      padding: 2px 12px;
-      text-align: right;
     }
     /* ─ Diff viewer ─ */
     .diff-section {
@@ -810,36 +792,19 @@ export class DashboardPanel {
       line-height: 1.4;
     }
     .active-task-output {
-      padding: 8px 10px;
-      min-height: 80px;
       flex: 1;
+      min-height: 0;
+      overflow-y: auto;
       overflow-x: hidden;
-      max-width: 100%;
-    }
-    .active-task-contract {
-      border-top: 1px solid var(--border);
       padding: 8px 10px;
-      display: grid;
-      gap: 6px;
-      background: color-mix(in srgb, var(--sidebar-bg) 84%, transparent);
-    }
-    .contract-row {
-      display: grid;
-      gap: 4px;
-      font-size: 11px;
-    }
-    .contract-label {
-      color: var(--dimmed);
-      font-size: 10px;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-    }
-    .contract-list {
-      margin: 0;
-      padding-left: 16px;
-    }
-    .contract-inline {
-      word-break: break-word;
+      background: var(--terminal-bg);
+      color: var(--terminal-fg);
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.5;
+      max-width: 100%;
     }
     .active-output-empty {
       color: var(--dimmed);
@@ -856,41 +821,6 @@ export class DashboardPanel {
     @keyframes cursor-blink {
       0%, 50% { opacity: 1; }
       51%, 100% { opacity: 0; }
-    }
-    .active-task-prompt {
-      font-size: 11px;
-      border-top: 1px solid var(--border);
-    }
-    .active-task-prompt summary {
-      padding: 5px 10px;
-      cursor: pointer;
-      color: var(--dimmed);
-      font-size: 10px;
-    }
-    .active-task-contract-inline {
-      padding: 6px 10px;
-      border-bottom: 1px solid var(--border);
-      font-size: 11px;
-      display: grid;
-      gap: 4px;
-    }
-    .active-task-contract-inline .contract-label {
-      font-size: 9px;
-      color: var(--dimmed);
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-    }
-    .active-task-prompt pre {
-      background: var(--terminal-bg);
-      color: var(--terminal-fg);
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 11px;
-      padding: 6px 10px;
-      margin: 0;
-      max-height: 150px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
     }
 
     /* ─── Collapsible Section Headers (VS Code tree-view style) ─── */
@@ -1269,7 +1199,8 @@ export class DashboardPanel {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 5px 12px;
+      min-height: 28px;
+      padding: 0 12px;
       border-top: 1px solid var(--border);
       background: var(--sidebar-bg);
       font-size: 11px;
@@ -1327,28 +1258,23 @@ export class DashboardPanel {
       grid-template-columns: minmax(0, 1fr) auto;
       align-items: center;
       gap: 10px;
-      padding: 6px 12px;
+      min-height: 30px;
+      padding: 0 12px;
     }
     body[data-dashboard-state="executing"] .progress-track {
       margin-bottom: 0;
     }
     body[data-dashboard-state="executing"] .stats-row {
-      gap: 10px;
-      margin-bottom: 0;
       white-space: nowrap;
       justify-content: flex-end;
     }
     body[data-dashboard-state="executing"] .active-task {
-      margin: 0;
-      min-height: 0;
-      border-left: none;
-      border-right: none;
-      border-bottom: none;
-      border-radius: 0;
+      margin: 0 6px;
       flex: 1;
     }
-    body[data-dashboard-state="executing"] .active-task-output {
-      padding: 10px 12px;
+    body[data-dashboard-state="executing"] #pill-row,
+    body[data-dashboard-state="executing"] #pill-toggle {
+      display: none !important;
     }
     body[data-dashboard-state="complete"] .main-content {
       overflow: hidden;
@@ -1456,10 +1382,9 @@ export class DashboardPanel {
       .pipeline { padding: 6px 8px 5px; }
       .progress-track { margin-bottom: 4px; }
 
-      .active-task-header { padding: 6px 8px; gap: 6px; }
+      .active-task-header { padding: 0 8px; gap: 6px; }
       .active-task-name { font-size: 11px; }
-      .active-task-meta { font-size: 9px; }
-      .active-task-output { min-height: 80px; padding: 6px 8px; font-size: 10px; }
+      .active-task-output { min-height: 0; padding: 6px 8px; font-size: 10px; }
 
       .completed-task-row { padding: 4px 6px; font-size: 11px; }
       .ct-stats { gap: 4px; font-size: 9px; }
@@ -1476,7 +1401,7 @@ export class DashboardPanel {
       .status-badge { font-size: 9px; padding: 1px 5px; }
       .icon-btn { width: 22px; height: 22px; font-size: 12px; }
 
-      .status-bar { padding: 4px 8px; font-size: 10px; }
+      .status-bar { min-height: 28px; padding: 0 8px; font-size: 10px; }
 
       .result-banner { margin: 6px; padding: 10px 12px; }
       .result-banner-title { font-size: 12px; }
@@ -1498,7 +1423,7 @@ export class DashboardPanel {
       .ct-stats .engine-badge { display: none; }
       .tr-engine-tag { display: none; }
       .task-edit-btn { display: none; }
-      .active-task-output { min-height: 60px; }
+      .active-task-output { min-height: 0; }
     }
 
     /* ─── Responsive: wide panel (>600px) ─── */
@@ -1536,7 +1461,6 @@ export class DashboardPanel {
     <div class="stats-row">
       <span id="stats-tasks">0 / 0 tasks</span>
       <span id="stats-elapsed"></span>
-      <span id="stats-files"></span>
       <button style="background:none;border:none;color:var(--dimmed);cursor:pointer;font-size:9px;padding:0 2px;" id="pill-toggle" onclick="togglePillRow()" title="Toggle task pills" hidden>&#9660;</button>
     </div>
     <div class="pill-row" id="pill-row" hidden></div>
@@ -1549,10 +1473,7 @@ export class DashboardPanel {
     <div class="active-task" id="active-task" hidden>
       <div class="active-task-header">
         <div class="active-dot"></div>
-        <div class="active-task-main">
-          <span class="active-task-name" id="active-task-name"></span>
-          <span class="active-task-meta" id="active-task-meta"></span>
-        </div>
+        <span class="active-task-name" id="active-task-name"></span>
         <span class="engine-badge" id="active-engine"></span>
         <span class="active-timer" id="active-timer">0s</span>
       </div>
@@ -1739,6 +1660,9 @@ export class DashboardPanel {
       const el = document.getElementById(id);
       if (el) {
         el.hidden = !visible;
+        if (id === 'active-task') {
+          el.classList.toggle('visible', visible);
+        }
       }
     }
 
@@ -1948,7 +1872,7 @@ export class DashboardPanel {
       taskStartTime = null;
       stopTimer();
       document.getElementById('active-task-name').textContent = '';
-      document.getElementById('active-task-meta').textContent = '';
+      setActiveTaskMeta('', '', '');
       document.getElementById('active-output').textContent = '';
       document.getElementById('active-engine').textContent = '';
       document.getElementById('active-engine').className = 'engine-badge engine-custom';
@@ -1967,8 +1891,31 @@ export class DashboardPanel {
       if (phase) { parts.push(phase); }
       const text = parts.join(' • ');
       const meta = document.getElementById('active-task-meta');
+      if (!meta) { return; }
       meta.textContent = text;
       meta.title = text;
+    }
+
+    function getActiveRuntimeLabel(task) {
+      if (task.engine) { return task.engine; }
+      if (task.taskType && task.taskType !== 'agent') { return task.taskType; }
+      return 'agent';
+    }
+
+    function getExecutionEtaText(effectiveCompleted) {
+      if (!runStartTime || totalTasks === 0) {
+        return '';
+      }
+
+      const processedTasks = effectiveCompleted > 0 ? effectiveCompleted : (currentTaskId ? 1 : 0);
+      if (processedTasks === 0) {
+        return 'ETA --';
+      }
+
+      const remainingTasks = Math.max(totalTasks - effectiveCompleted, 0);
+      const elapsedMs = Date.now() - runStartTime;
+      const etaMs = Math.round((elapsedMs / processedTasks) * remainingTasks);
+      return 'ETA ~' + formatDuration(Math.max(etaMs, 0));
     }
 
     function showActiveOutputPlaceholder(text) {
@@ -2020,15 +1967,10 @@ export class DashboardPanel {
       currentTaskId = msg.taskId;
       cardState[msg.taskId] = {
         output: '',
-        prompt: msg.prompt || '',
         engine: msg.engine || '',
         taskType: msg.taskType || 'agent',
         command: msg.command || '',
         playlistName: msg.playlistName || '',
-        acceptanceCriteria: msg.acceptanceCriteria || [],
-        expectedArtifacts: msg.expectedArtifacts || [],
-        ownerNote: msg.ownerNote || '',
-        failurePolicy: msg.failurePolicy || 'continue',
         durationMs: 0,
         exitCode: null,
         status: 'running',
@@ -2040,17 +1982,15 @@ export class DashboardPanel {
       };
 
       document.getElementById('active-task-name').textContent = msg.taskName;
-      const runtimeLabel = msg.taskType === 'agent'
-        ? (msg.engine || 'agent')
-        : (msg.taskType + (msg.command ? ': ' + msg.command : ''));
-      setActiveTaskMeta(msg.playlistName || '', runtimeLabel, 'Waiting for live output');
+      const runtimeLabel = getActiveRuntimeLabel(msg);
+      setActiveTaskMeta('', '', '');
 
       const engineEl = document.getElementById('active-engine');
-      engineEl.textContent = msg.engine || '';
+      engineEl.textContent = runtimeLabel;
       engineEl.className = 'engine-badge engine-' + (msg.engine || 'custom');
 
       document.getElementById('active-timer').textContent = '0s';
-      showActiveOutputPlaceholder((msg.engine || 'Agent') + ' is running. Live output will appear here as soon as the task starts emitting logs.');
+      showActiveOutputPlaceholder('Waiting for terminal output...');
 
       updatePillStatus(msg.taskId, 'running');
       syncCurrentTaskMarker();
@@ -2070,16 +2010,11 @@ export class DashboardPanel {
       if (taskId === currentTaskId) {
         const outputEl = document.getElementById('active-output');
         clearActiveOutputPlaceholder();
-        const isNearBottom = outputEl.scrollHeight - outputEl.scrollTop - outputEl.clientHeight < 50;
         outputEl.appendChild(document.createTextNode(text));
-        const active = cardState[taskId] || {};
-        setActiveTaskMeta(active.playlistName || '', active.engine || '', 'Streaming live output');
         while (outputEl.childNodes.length > 500) {
           outputEl.removeChild(outputEl.firstChild);
         }
-        if (isNearBottom) {
-          outputEl.scrollTop = outputEl.scrollHeight;
-        }
+        outputEl.scrollTop = outputEl.scrollHeight;
       }
     }
 
@@ -2115,7 +2050,7 @@ export class DashboardPanel {
       addCompletedCard(msg.taskId, msg.taskName, msg);
 
       if (msg.taskId === currentTaskId) {
-        document.getElementById('active-task-meta').textContent = '';
+        setActiveTaskMeta('', '', '');
         currentTaskId = null;
       }
 
@@ -2386,8 +2321,8 @@ export class DashboardPanel {
       if (totalTasks === 0) {
         fill.style.width = '0%';
         fill.classList.remove('has-errors');
-        document.getElementById('stats-tasks').textContent = '0 / 0 tasks';
-        document.getElementById('stats-files').textContent = '';
+        document.getElementById('stats-tasks').textContent = dashboardState === 'executing' ? '0/0' : '0 / 0 tasks';
+        document.getElementById('stats-elapsed').textContent = '';
         return;
       }
       const pct = Math.round((effectiveCompleted / totalTasks) * 100);
@@ -2401,6 +2336,12 @@ export class DashboardPanel {
         fill.classList.remove('has-errors');
       }
 
+      if (dashboardState === 'executing') {
+        document.getElementById('stats-tasks').textContent = effectiveCompleted + '/' + totalTasks;
+        document.getElementById('stats-elapsed').textContent = getExecutionEtaText(effectiveCompleted);
+        return;
+      }
+
       document.getElementById('stats-tasks').textContent =
         effectiveCompleted + ' / ' + totalTasks + ' tasks' +
         (failedTasks > 0 || blockedTasks > 0
@@ -2409,9 +2350,8 @@ export class DashboardPanel {
             blockedTasks > 0 ? blockedTasks + ' blocked' : '',
           ].filter(Boolean).join(', ') + ')'
           : '');
-
-      document.getElementById('stats-files').textContent =
-        totalFilesChanged > 0 ? totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's' : '') : '';
+      document.getElementById('stats-elapsed').textContent =
+        runStartTime ? formatDuration(Date.now() - runStartTime) : '';
     }
 
     function startTimer() {
@@ -2427,9 +2367,7 @@ export class DashboardPanel {
     }
 
     function updateTimers() {
-      if (runStartTime) {
-        document.getElementById('stats-elapsed').textContent = formatDuration(Date.now() - runStartTime);
-      }
+      updateProgress();
       if (taskStartTime && currentTaskId) {
         document.getElementById('active-timer').textContent = formatDuration(Date.now() - taskStartTime);
       }
@@ -2456,7 +2394,9 @@ export class DashboardPanel {
       const failedTasks = tasks.filter(task => task.status === 'failed').length;
       const blockedTasks = tasks.filter(task => task.status === 'blocked').length;
       if (currentTaskId && cardState[currentTaskId]) {
-        summary.textContent = 'Running: ' + (document.getElementById('active-task-name').textContent || cardState[currentTaskId].playlistName || 'Task');
+        summary.textContent = 'Running: ' + (document.getElementById('active-task-name').textContent || 'Task');
+        right.textContent = runStartTime ? formatDuration(Date.now() - runStartTime) : '';
+        return;
       } else if (completedCount > 0 && completedCount >= totalTasks) {
         // Run finished — show actionable summary
         if (failedTasks > 0 && passedTasks === 0) {
