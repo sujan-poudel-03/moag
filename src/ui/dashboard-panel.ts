@@ -1440,6 +1440,36 @@ export class DashboardPanel {
       .ct-detail-output { max-height: 250px; }
       .stats-row { font-size: 12px; }
     }
+
+    /* ─── Execution sizing contract ─── */
+    body[data-dashboard-state="executing"] .header {
+      min-height: 44px;
+      padding: 0 12px;
+    }
+    body[data-dashboard-state="executing"] #btn-play {
+      display: none;
+    }
+    body[data-dashboard-state="executing"] .pipeline {
+      min-height: 30px;
+      padding: 0 12px;
+    }
+    body[data-dashboard-state="executing"] .active-task {
+      flex: 1;
+      min-height: 0;
+      margin: 0 6px;
+    }
+    body[data-dashboard-state="executing"] .active-task-header {
+      min-height: 32px;
+      padding: 0 10px;
+    }
+    body[data-dashboard-state="executing"] .active-task-output {
+      padding: 8px 10px;
+      font-size: 12px;
+    }
+    body[data-dashboard-state="executing"] .status-bar {
+      min-height: 28px;
+      padding: 0 12px;
+    }
   </style>
 </head>
 <body>
@@ -1872,7 +1902,6 @@ export class DashboardPanel {
       taskStartTime = null;
       stopTimer();
       document.getElementById('active-task-name').textContent = '';
-      setActiveTaskMeta('', '', '');
       document.getElementById('active-output').textContent = '';
       document.getElementById('active-engine').textContent = '';
       document.getElementById('active-engine').className = 'engine-badge engine-custom';
@@ -1882,18 +1911,6 @@ export class DashboardPanel {
       syncCurrentTaskMarker();
       updateProgress();
       renderStatus('idle');
-    }
-
-    function setActiveTaskMeta(playlistName, engine, phase) {
-      const parts = [];
-      if (playlistName) { parts.push(playlistName); }
-      if (engine) { parts.push(engine.toUpperCase()); }
-      if (phase) { parts.push(phase); }
-      const text = parts.join(' • ');
-      const meta = document.getElementById('active-task-meta');
-      if (!meta) { return; }
-      meta.textContent = text;
-      meta.title = text;
     }
 
     function getActiveRuntimeLabel(task) {
@@ -1983,7 +2000,6 @@ export class DashboardPanel {
 
       document.getElementById('active-task-name').textContent = msg.taskName;
       const runtimeLabel = getActiveRuntimeLabel(msg);
-      setActiveTaskMeta('', '', '');
 
       const engineEl = document.getElementById('active-engine');
       engineEl.textContent = runtimeLabel;
@@ -1995,7 +2011,6 @@ export class DashboardPanel {
       updatePillStatus(msg.taskId, 'running');
       syncCurrentTaskMarker();
       setDashboardState('executing');
-      document.getElementById('active-task').scrollIntoView({ behavior: 'smooth', block: 'start' });
       updateStatusBar();
     }
 
@@ -2050,7 +2065,6 @@ export class DashboardPanel {
       addCompletedCard(msg.taskId, msg.taskName, msg);
 
       if (msg.taskId === currentTaskId) {
-        setActiveTaskMeta('', '', '');
         currentTaskId = null;
       }
 
