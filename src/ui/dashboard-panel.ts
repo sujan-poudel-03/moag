@@ -1960,16 +1960,6 @@ export class DashboardPanel {
       if (pill) { pill.classList.add('current-task'); }
     }
 
-    function wireTaskNavigation() {
-      document.querySelectorAll('.task-pill').forEach(pill => {
-        pill.onclick = () => {
-          if (pill.dataset.taskId === currentTaskId) {
-            document.getElementById('active-task').scrollIntoView({ behavior: 'smooth', block: 'start' });
-          }
-        };
-      });
-    }
-
     function startTask(msg) {
       // Enter execution mode — hides non-essential sections for max output visibility
 
@@ -2475,7 +2465,6 @@ export class DashboardPanel {
       // Apply minimap class
       row.className = 'pill-row' + (minimapMode ? ' minimap' : '') + (pillRowCollapsed ? ' collapsed' : '');
       row.innerHTML = html;
-      wireTaskNavigation();
       syncCurrentTaskMarker();
       updateProgress();
     }
