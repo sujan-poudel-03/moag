@@ -785,25 +785,29 @@ export class DashboardPanel {
       max-width: 520px;
     }
 
-    #progress-section {
-      padding: 10px 12px 8px;
+    .progress-section {
+      padding: 6px 12px;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
     }
-    .progress-track {
-      height: 3px; background: var(--border); border-radius: 2px;
-      overflow: hidden; margin-bottom: 6px;
-    }
-    .progress-fill {
-      height: 100%; background: var(--progress-bg); border-radius: 2px;
-      transition: width 0.4s ease; width: 0%;
-    }
+    .progress-track { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 4px; }
+    .progress-fill { height: 100%; background: var(--success); border-radius: 2px; transition: width 0.4s ease; width: 0%; }
     .progress-fill.has-errors {
       background: linear-gradient(90deg, var(--success) 0%, var(--success) var(--pass-pct), var(--error) var(--pass-pct), var(--error) 100%);
     }
-    .stats-row {
-      display: flex; align-items: center; justify-content: space-between;
-      gap: 8px; font-size: 11px; color: var(--dimmed); min-height: 16px;
+    .stats-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--dimmed); margin-bottom: 4px; }
+    .minimap { display: flex; flex-wrap: wrap; gap: 2px; max-height: 22px; overflow: hidden; }
+    .minimap .dot {
+      width: 6px; height: 6px; border-radius: 1px;
+    }
+    .minimap .dot.completed { background: var(--success); }
+    .minimap .dot.failed { background: var(--error); }
+    .minimap .dot.pending { background: rgba(128,128,128,0.3); }
+    .minimap .dot.running { background: var(--success); animation: pill-pulse 1.5s infinite; }
+    .minimap .dot.skipped { background: rgba(128,128,128,0.15); }
+    @keyframes pill-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
     }
 
     /* ─── Playlist Tiles ─── */
@@ -927,20 +931,16 @@ export class DashboardPanel {
 
     /* ─── Section Toggle ─── */
     .section-toggle {
-      display: flex; align-items: center; gap: 6px; width: 100%;
-      padding: 6px 12px; background: none; border: none;
-      border-top: 1px solid var(--border); color: var(--dimmed); cursor: pointer;
-      font-family: var(--vscode-font-family); font-size: 10px; font-weight: 700;
-      letter-spacing: 0.5px; text-transform: uppercase; text-align: left;
+      display: flex; align-items: center; gap: 0;
+      width: 100%; height: 22px; line-height: 22px;
+      padding: 0; border: none; background: none;
+      cursor: pointer; user-select: none; color: var(--fg);
     }
-    .section-toggle:hover { background: var(--hover-bg); color: var(--fg); }
-    .section-toggle-icon { font-size: 8px; transition: transform 0.15s; }
+    .section-toggle:hover { background: var(--hover-bg); }
+    .section-toggle-icon { font-size: 12px; width: 20px; text-align: center; flex-shrink: 0; transition: transform 0.1s; opacity: 0.8; }
     .section-toggle.collapsed .section-toggle-icon { transform: rotate(-90deg); }
-    .section-toggle-label { flex: 1; }
-    .section-toggle-count {
-      font-size: 10px; background: var(--badge-bg); color: var(--badge-fg);
-      padding: 1px 6px; border-radius: 8px;
-    }
+    .section-toggle-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; flex: 1; }
+    .section-toggle-count { font-size: 10px; font-weight: normal; opacity: 0.6; padding-right: 8px; }
     .section-body { overflow: hidden; }
     .section-body.collapsed { display: none; }
 
@@ -1006,40 +1006,68 @@ export class DashboardPanel {
     /* ─── Plan Tab Tree View ─── */
     .plan-section { padding: 8px 0; flex: 1; }
     .plan-placeholder { padding: 20px 16px; color: var(--dimmed); font-size: 12px; text-align: center; }
-    .tree-section-header {
-      display: flex; align-items: center; gap: 6px; padding: 4px 12px;
-      cursor: pointer; user-select: none; min-height: 26px;
-    }
-    .tree-section-header:hover { background: var(--hover-bg); }
-    .tree-chevron { font-size: 9px; color: var(--dimmed); transition: transform 0.15s; width: 12px; flex-shrink: 0; }
-    .tree-section-header.collapsed .tree-chevron { transform: rotate(-90deg); }
-    .tree-section-label { font-size: 11px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase; flex: 1; }
-    .tree-section-count { font-size: 10px; color: var(--dimmed); }
-    .tree-section-body.collapsed { display: none; }
-    .playlist-tree-header {
-      display: flex; align-items: center; gap: 6px; padding: 3px 12px 3px 24px;
-      cursor: pointer; user-select: none; min-height: 22px;
-    }
-    .playlist-tree-header:hover { background: var(--hover-bg); }
-    .playlist-tree-header.collapsed .tree-chevron { transform: rotate(-90deg); }
-    .playlist-tree-name { font-size: 11px; font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .playlist-tree-fraction { font-size: 10px; color: var(--dimmed); flex-shrink: 0; }
-    .playlist-tree-body.collapsed { display: none; }
-    .task-tree-row {
+    .playlist-block { margin-top: 2px; }
+    .playlist-toggle { padding-left: 16px; }
+    .playlist-toggle .section-toggle-label {
       display: flex; align-items: center; gap: 6px;
-      padding: 2px 12px 2px 44px; min-height: 20px; font-size: 11px;
+      font-size: 11px; font-weight: 600; text-transform: none; letter-spacing: 0;
+      min-width: 0;
     }
-    .task-tree-row:hover { background: var(--hover-bg); }
-    .task-tree-icon { width: 14px; flex-shrink: 0; font-size: 10px; text-align: center; }
-    .task-tree-icon.pass { color: var(--success); }
-    .task-tree-icon.fail { color: var(--error); }
-    .task-tree-icon.running { color: var(--success); animation: dot-pulse 1s ease-in-out infinite; }
-    .task-tree-icon.skip { color: var(--dimmed); }
-    .task-tree-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--fg); }
-    .task-tree-name.dimmed { color: var(--dimmed); }
+    .playlist-name {
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      min-width: 0; flex: 1;
+    }
+    .playlist-progress {
+      font-size: 10px; color: var(--dimmed); flex-shrink: 0;
+      padding-right: 8px;
+    }
+    .task-list { padding: 0; }
+    .task-row {
+      display: flex; align-items: center; gap: 8px;
+      height: 24px; line-height: 24px; padding: 0 8px 0 40px;
+      font-size: 11px;
+    }
+    .task-row:hover { background: var(--hover-bg); }
+    .task-status-dot {
+      width: 10px; height: 10px; border-radius: 50%;
+      flex-shrink: 0; background: rgba(128,128,128,0.4);
+    }
+    .task-status-dot.completed { background: var(--success); }
+    .task-status-dot.failed, .task-status-dot.blocked { background: var(--error); }
+    .task-status-dot.running { background: var(--success); animation: dot-pulse 1s ease-in-out infinite; }
+    .task-status-dot.skipped { background: rgba(128,128,128,0.2); }
+    .task-name {
+      flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .task-duration {
+      font-size: 10px; color: var(--dimmed); flex-shrink: 0;
+    }
+    .task-edit-btn {
+      height: 18px; min-width: 18px; padding: 0 4px;
+      border: 1px solid transparent; border-radius: 3px;
+      background: transparent; color: var(--dimmed); font-size: 10px;
+      cursor: pointer; opacity: 0; transition: opacity 0.1s;
+      flex-shrink: 0;
+    }
+    .task-row:hover .task-edit-btn { opacity: 1; }
+    .task-edit-btn:hover { border-color: var(--border); color: var(--fg); background: var(--hover-bg); }
+    .tree-add-btn {
+      width: calc(100% - 40px); margin: 2px 8px 4px 32px;
+      height: 22px; line-height: 20px; border: 1px dashed var(--border);
+      border-radius: 4px; background: transparent; color: var(--dimmed);
+      font-size: 11px; text-align: left; padding: 0 8px; cursor: pointer;
+    }
+    .tree-add-btn:hover { background: var(--hover-bg); color: var(--fg); }
+    .tree-add-playlist-btn {
+      width: calc(100% - 16px); margin: 6px 8px 0;
+      height: 22px; line-height: 20px; border: 1px dashed var(--border);
+      border-radius: 4px; background: transparent; color: var(--dimmed);
+      font-size: 11px; text-align: left; padding: 0 8px; cursor: pointer;
+    }
+    .tree-add-playlist-btn:hover { background: var(--hover-bg); color: var(--fg); }
 
     /* ─── History Section ─── */
-    .history-section { border-top: 1px solid var(--border); flex-shrink: 0; }
+    .history-section { border-top: 1px solid var(--border); flex-shrink: 0; padding-top: 2px; }
     .history-entry {
       display: flex; align-items: center; gap: 8px; padding: 5px 12px;
       font-size: 11px; border-bottom: 1px solid rgba(128,128,128,0.06);
@@ -1069,7 +1097,7 @@ export class DashboardPanel {
   <div class="progress-section" id="progress-section" style="display:none;">
     <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
     <div class="stats-row">
-      <span id="stats-tasks">0 / 0 tasks</span>
+      <span id="stats-tasks">0/0 tasks (0 failed)</span>
       <span id="stats-elapsed"></span>
     </div>
     <div class="minimap" id="minimap"></div>
@@ -1527,6 +1555,7 @@ export class DashboardPanel {
               renderPlan(planForRender);
             }
             renderPlaylistTiles(planForRender);
+            renderPills(planForRender);
             syncActiveTaskFromPlan(planForRender);
             updateProgress();
             renderStatus(msg.runnerState);
@@ -1541,6 +1570,7 @@ export class DashboardPanel {
             syncPromptEngineOptions(msg.promptEngines || [], msg.selectedPromptEngineId);
             renderPlan(currentPlan);
             renderPlaylistTiles(currentPlan);
+            renderPills(currentPlan);
             syncActiveTaskFromPlan(currentPlan);
             updateProgress();
             renderStatus(msg.runnerState || 'idle');
@@ -1974,6 +2004,24 @@ export class DashboardPanel {
 
     // ─── Progress + Stats ───
 
+    function renderPills(plan) {
+      var minimap = document.getElementById('minimap');
+      if (!minimap || !plan || !plan.playlists) { if (minimap) minimap.innerHTML = ''; return; }
+      var html = '';
+      var count = 0;
+      plan.playlists.forEach(function(pl) {
+        pl.tasks.forEach(function(task) {
+          count++;
+          var isCurrent = task.id === currentTaskId || task.status === 'running';
+          var status = isCurrent ? 'running' : (task.status || 'pending');
+          html += '<div class="dot ' + status + '" data-task-id="' + task.id + '" title="' + count + '. ' + escHtml(task.name) + '"></div>';
+        });
+      });
+      totalTasks = count;
+      minimap.innerHTML = html;
+      updateProgress();
+    }
+
     function updateProgress() {
       const fill = document.getElementById('progress-fill');
       const progressSection = document.getElementById('progress-section');
@@ -1990,7 +2038,7 @@ export class DashboardPanel {
       if (totalTasks === 0) {
         fill.style.width = '0%';
         fill.classList.remove('has-errors');
-        document.getElementById('stats-tasks').textContent = '0 / 0 tasks';
+        document.getElementById('stats-tasks').textContent = '0/0 tasks (0 failed)';
         document.getElementById('stats-elapsed').textContent = '';
         return;
       }
@@ -1999,7 +2047,9 @@ export class DashboardPanel {
       fill.style.width = pct + '%';
 
       if (effectiveFailed > 0) {
-        const passPct = Math.round(((effectiveCompleted - effectiveFailed) / totalTasks) * 100);
+        const passPct = effectiveCompleted > 0
+          ? Math.round(((effectiveCompleted - effectiveFailed) / effectiveCompleted) * 100)
+          : 0;
         fill.classList.add('has-errors');
         fill.style.setProperty('--pass-pct', passPct + '%');
       } else {
@@ -2007,15 +2057,12 @@ export class DashboardPanel {
       }
 
       const isExecuting = currentTaskId !== null;
+      var failureCount = failedTasks + blockedTasks;
       if (isExecuting) {
-        document.getElementById('stats-tasks').textContent = effectiveCompleted + '/' + totalTasks;
+        document.getElementById('stats-tasks').textContent = effectiveCompleted + '/' + totalTasks + ' tasks (' + failureCount + ' failed)';
         document.getElementById('stats-elapsed').textContent = getExecutionEtaText(effectiveCompleted);
       } else {
-        document.getElementById('stats-tasks').textContent =
-          effectiveCompleted + ' / ' + totalTasks + ' tasks' +
-          (failedTasks > 0 || blockedTasks > 0
-            ? ' (' + [failedTasks > 0 ? failedTasks + ' failed' : '', blockedTasks > 0 ? blockedTasks + ' blocked' : ''].filter(Boolean).join(', ') + ')'
-            : '');
+        document.getElementById('stats-tasks').textContent = effectiveCompleted + '/' + totalTasks + ' tasks (' + failureCount + ' failed)';
         document.getElementById('stats-elapsed').textContent = runStartTime ? formatDuration(Date.now() - runStartTime) : '';
       }
     }
@@ -2123,7 +2170,7 @@ export class DashboardPanel {
       updateTimers();
     }
 
-    const collapsedSections = {};
+    const collapsedSections = { info: true };
 
     function toggleSection(sectionId) {
       collapsedSections[sectionId] = !collapsedSections[sectionId];
@@ -2137,15 +2184,24 @@ export class DashboardPanel {
 
     // ─── Plan Tab: Tree View ───
 
-    function getTaskTreeIcon(task) {
-      switch (task.status) {
-        case 'completed': return { cls: 'pass', ch: '\\u2713' };
-        case 'failed': return { cls: 'fail', ch: '\\u2717' };
-        case 'blocked': return { cls: 'fail', ch: '!' };
-        case 'running': return { cls: 'running', ch: '\\u25CF' };
-        case 'skipped': return { cls: 'skip', ch: '\\u2212' };
-        default: return { cls: '', ch: '\\u25CB' };
+    function getTaskDurationMs(task) {
+      var taskState = cardState[task.id];
+      if (taskState && typeof taskState.durationMs === 'number' && taskState.durationMs > 0) {
+        return taskState.durationMs;
       }
+      if (typeof task.durationMs === 'number' && task.durationMs > 0) {
+        return task.durationMs;
+      }
+      return 0;
+    }
+
+    function getTaskDurationLabel(task) {
+      var status = String(task.status || '').toLowerCase();
+      if (status !== 'completed' && status !== 'failed' && status !== 'blocked' && status !== 'skipped') {
+        return '';
+      }
+      var ms = getTaskDurationMs(task);
+      return ms > 0 ? formatDuration(ms) : '';
     }
 
     function renderPlan(plan) {
@@ -2156,6 +2212,7 @@ export class DashboardPanel {
         section.innerHTML = '<div class="plan-placeholder">No plan loaded \\u2014 use the sidebar to create one.</div>';
         planName.textContent = plan && plan.name ? plan.name : 'MOAG';
         totalTasks = 0;
+        renderPills(null);
         setDashboardState('empty');
         renderPromptComposerState();
         return;
@@ -2166,37 +2223,49 @@ export class DashboardPanel {
       plan.playlists.forEach(function(pl) { taskCount += (pl.tasks || []).length; });
       totalTasks = taskCount;
 
-      var html = '<div class="tree-section-header" onclick="toggleTreeSection(this)">' +
-        '<span class="tree-chevron">\\u25BC</span>' +
-        '<span class="tree-section-label">Tasks</span>' +
-        '<span class="tree-section-count">' + taskCount + '</span>' +
-      '</div>';
-      html += '<div class="tree-section-body">';
+      var tasksCollapsed = !!collapsedSections.tasks;
+      var html = '<button class="section-toggle' + (tasksCollapsed ? ' collapsed' : '') + '" data-section="tasks" onclick="toggleSection(\\'tasks\\')">' +
+        '<span class="section-toggle-icon">\\u25BC</span>' +
+        '<span class="section-toggle-label">TASKS</span>' +
+        '<span class="section-toggle-count">' + taskCount + '</span>' +
+      '</button>';
+      html += '<div class="section-body' + (tasksCollapsed ? ' collapsed' : '') + '" id="body-tasks">';
 
-      plan.playlists.forEach(function(pl) {
+      plan.playlists.forEach(function(pl, playlistIndex) {
         const tasks = pl.tasks || [];
         const stats = getTaskStats(tasks);
         const doneCount = stats.completed + stats.failed + stats.blocked + stats.skipped;
-        const isAllDone = tasks.length > 0 && doneCount === tasks.length;
+        const playlistSectionId = 'playlist-' + playlistIndex;
+        const playlistCollapsed = !!collapsedSections[playlistSectionId];
+        const engineId = String(pl.engine || 'custom').toLowerCase();
 
-        html += '<div class="playlist-tree-header" onclick="togglePlaylistTree(this)">' +
-          '<span class="tree-chevron">\\u25BC</span>' +
-          '<span class="playlist-tree-name">' + escHtml(pl.name || 'Playlist') + '</span>' +
-          '<span class="playlist-tree-fraction">' + doneCount + '/' + tasks.length + '</span>' +
-        '</div>';
-        html += '<div class="playlist-tree-body' + (isAllDone ? ' collapsed' : '') + '">';
+        html += '<div class="playlist-block">';
+        html += '<button class="section-toggle playlist-toggle' + (playlistCollapsed ? ' collapsed' : '') + '" data-section="' + playlistSectionId + '" onclick="toggleSection(\\'' + playlistSectionId + '\\')">' +
+          '<span class="section-toggle-icon">\\u25BC</span>' +
+          '<span class="section-toggle-label">' +
+            '<span class="playlist-name">' + escHtml(pl.name || 'Playlist') + '</span>' +
+            '<span class="engine-badge engine-' + escHtml(engineId) + '">' + escHtml(pl.engine || 'custom') + '</span>' +
+          '</span>' +
+          '<span class="playlist-progress">' + doneCount + '/' + tasks.length + '</span>' +
+        '</button>';
+        html += '<div class="section-body task-list' + (playlistCollapsed ? ' collapsed' : '') + '" id="body-' + playlistSectionId + '">';
 
-        tasks.forEach(function(task) {
-          var icon = getTaskTreeIcon(task);
-          html += '<div class="task-tree-row">' +
-            '<span class="task-tree-icon ' + icon.cls + '">' + icon.ch + '</span>' +
-            '<span class="task-tree-name' + (task.status === 'skipped' ? ' dimmed' : '') + '">' + escHtml(task.name) + '</span>' +
+        tasks.forEach(function(task, taskIndex) {
+          var duration = getTaskDurationLabel(task);
+          html += '<div class="task-row">' +
+            '<span class="task-status-dot ' + escHtml(String(task.status || 'pending').toLowerCase()) + '"></span>' +
+            '<span class="task-name">' + escHtml(task.name) + '</span>' +
+            '<span class="task-duration">' + escHtml(duration) + '</span>' +
+            '<button class="task-edit-btn" onclick="event.stopPropagation();vscode.postMessage({type:\\'editTask\\',playlistIndex:' + playlistIndex + ',taskIndex:' + taskIndex + '})" title="Edit task">Edit</button>' +
           '</div>';
         });
 
+        html += '<button class="tree-add-btn" onclick="vscode.postMessage({type:\\'addTask\\',playlistIndex:' + playlistIndex + '})">+ Add task</button>';
+        html += '</div>';
         html += '</div>';
       });
 
+      html += '<button class="tree-add-playlist-btn" onclick="vscode.postMessage({type:\\'addPlaylist\\'})">+ Add playlist</button>';
       html += '</div>';
       section.innerHTML = html;
       if (dashboardState === 'empty') {
@@ -2205,23 +2274,12 @@ export class DashboardPanel {
       renderPromptComposerState();
     }
 
-    function toggleTreeSection(headerEl) {
-      headerEl.classList.toggle('collapsed');
-      var body = headerEl.nextElementSibling;
-      if (body) { body.classList.toggle('collapsed'); }
-    }
-
-    function togglePlaylistTree(headerEl) {
-      headerEl.classList.toggle('collapsed');
-      var body = headerEl.nextElementSibling;
-      if (body) { body.classList.toggle('collapsed'); }
-    }
-
     // ─── History Section ───
 
     function renderHistory(history) {
-      const section = document.getElementById('history-section');
-      if (!history || history.length === 0) { section.hidden = true; return; }
+      const section = document.getElementById('info-panel');
+      if (!section) { return; }
+      if (!history || history.length === 0) { section.innerHTML = ''; section.hidden = true; return; }
       section.hidden = false;
 
       // Group entries into runs (gap > 60s = new run)
@@ -2237,12 +2295,14 @@ export class DashboardPanel {
         else if (entry.status !== 'skipped') { currentRun.failed++; }
       });
 
-      var html = '<button class="section-toggle" onclick="toggleTreeSection(this)">' +
-        '<span class="section-toggle-icon">\\u25B6</span>' +
-        '<span class="section-toggle-label">History</span>' +
+      var infoCollapsed = !!collapsedSections.info;
+      var html = '<div class="history-section">';
+      html += '<button class="section-toggle' + (infoCollapsed ? ' collapsed' : '') + '" data-section="info" onclick="toggleSection(\\'info\\')">' +
+        '<span class="section-toggle-icon">\\u25BC</span>' +
+        '<span class="section-toggle-label">HISTORY</span>' +
         '<span class="section-toggle-count">' + runs.length + ' run' + (runs.length !== 1 ? 's' : '') + '</span>' +
       '</button>' +
-      '<div class="section-body collapsed">';
+      '<div class="section-body' + (infoCollapsed ? ' collapsed' : '') + '" id="body-info">';
 
       runs.slice(0, 20).forEach(function(run, i) {
         var dateStr = run.time ? new Date(run.time).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Unknown';
@@ -2255,7 +2315,7 @@ export class DashboardPanel {
         '</div>';
       });
 
-      html += '</div>';
+      html += '</div></div>';
       section.innerHTML = html;
     }
 
@@ -2304,6 +2364,7 @@ export class DashboardPanel {
           renderPlan(initState.plan);
           renderEngineStatus();
           renderPlaylistTiles(initState.plan);
+          renderPills(initState.plan);
           updateProgress();
           renderStatus(initState.runnerState || 'idle');
           renderHistory(initState.history || []);
@@ -2312,6 +2373,7 @@ export class DashboardPanel {
           renderPlan(null);
           renderEngineStatus();
           renderPlaylistTiles(null);
+          renderPills(null);
           updateProgress();
           renderStatus('idle');
         }
@@ -2324,6 +2386,7 @@ export class DashboardPanel {
         renderPlan(null);
         renderEngineStatus();
         renderPlaylistTiles(null);
+        renderPills(null);
         updateProgress();
         renderStatus('idle');
       }
