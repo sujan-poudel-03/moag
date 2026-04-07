@@ -15,7 +15,7 @@ const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '3';
+const HTML_VERSION = '4';
 
 export class DashboardPanel {
   public static currentPanel: DashboardPanel | undefined;
@@ -347,6 +347,21 @@ export class DashboardPanel {
         break;
       case 'generate-plan':
         void this.handlePlanGeneration({ prompt: msg.prompt });
+        break;
+      case 'run-prompt':
+        vscode.commands.executeCommand('agentTaskPlayer.runPrompt', msg.prompt);
+        break;
+      case 'smart-plan':
+        vscode.commands.executeCommand('agentTaskPlayer.smartNewPlan');
+        break;
+      case 'new-plan-template':
+        vscode.commands.executeCommand('agentTaskPlayer.newPlanFromTemplate');
+        break;
+      case 'open-plan':
+        vscode.commands.executeCommand('agentTaskPlayer.openPlan');
+        break;
+      case 'detect-engines':
+        vscode.commands.executeCommand('agentTaskPlayer.detectEngines');
         break;
       case 'editTask': {
         const plan = this.getPlan();
@@ -712,6 +727,36 @@ export class DashboardPanel {
     .composer-note { font-size: 10px; color: var(--dimmed); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .composer-chars { font-size: 10px; color: var(--dimmed); white-space: nowrap; flex-shrink: 0; }
 
+    /* ─── State 1: Empty ─── */
+    .state-empty { padding: 24px 12px; }
+    .hero-input-wrap { margin-bottom: 20px; }
+    .hero-input {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 15px;
+      font-family: var(--vscode-font-family);
+      background: var(--bg);
+      color: var(--fg);
+      border: 2px solid var(--focus-border);
+      border-radius: 6px;
+      outline: none;
+      box-sizing: border-box;
+    }
+    .hero-input:focus { border-color: var(--button-bg); }
+    .hero-input::placeholder { color: var(--dimmed); }
+    .secondary-actions { display: flex; flex-direction: column; gap: 8px; padding: 0 20px; }
+    .or-divider { text-align: center; color: var(--dimmed); font-size: 13px; margin: 4px 0; }
+    .action-btn {
+      width: 100%; padding: 10px 16px; border: 1px solid var(--border); border-radius: 6px;
+      font-size: 14px; cursor: pointer; text-align: center;
+      background: transparent; color: var(--fg);
+    }
+    .action-btn:hover { background: var(--hover-bg); }
+    .action-primary { border-color: var(--button-bg); background: rgba(0,122,204,0.08); }
+    .action-secondary { border-color: var(--border); }
+    .action-tertiary { border-color: var(--border); color: var(--dimmed); }
+    .engine-status { padding: 16px 20px; font-size: 12px; color: var(--dimmed); }
+
     /* ─── Progress Section ─── */
     .run-intro {
       display: flex;
@@ -818,6 +863,15 @@ export class DashboardPanel {
     .active-task-name {
       flex: 1; font-weight: 600; font-size: 12px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .active-task-context {
+      max-width: 42%;
+      font-size: 10px;
+      color: var(--dimmed);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      flex-shrink: 0;
     }
     .engine-badge {
       font-size: 9px; font-weight: 700; text-transform: uppercase;
@@ -1046,6 +1100,7 @@ export class DashboardPanel {
       <div class="active-task-header">
         <div class="active-dot"></div>
         <span class="active-task-name" id="active-task-name"></span>
+        <span class="active-task-context" id="active-task-context"></span>
         <span class="engine-badge" id="active-engine"></span>
         <span class="active-timer" id="active-timer">0s</span>
       </div>
@@ -1125,31 +1180,47 @@ export class DashboardPanel {
     const promptCharCountEl = document.getElementById('prompt-char-count');
 
     // ─── Toolbar ───
-    promptSubmitEl.onclick = submitPromptFromComposer;
-    promptGeneratePlanEl.onclick = generatePlanFromComposer;
-    promptAddTaskEl.onclick = function() { vscode.postMessage({ type: 'addTask' }); };
-    promptAddPlaylistEl.onclick = function() { vscode.postMessage({ type: 'addPlaylist' }); };
-    promptInputEl.addEventListener('input', function() {
-      autoResizePromptInput();
-      updatePromptCharCount();
-      renderPromptComposerState();
-    });
-    promptInputEl.addEventListener('keydown', function(event) {
-      if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
-        event.preventDefault();
-        submitPromptFromComposer();
-      }
-    });
-    promptEngineEl.addEventListener('change', function() {
-      selectedPromptEngineId = promptEngineEl.value;
-      renderPromptComposerState();
-    });
+    if (promptSubmitEl) { promptSubmitEl.onclick = submitPromptFromComposer; }
+    if (promptGeneratePlanEl) { promptGeneratePlanEl.onclick = generatePlanFromComposer; }
+    if (promptAddTaskEl) { promptAddTaskEl.onclick = function() { vscode.postMessage({ type: 'addTask' }); }; }
+    if (promptAddPlaylistEl) { promptAddPlaylistEl.onclick = function() { vscode.postMessage({ type: 'addPlaylist' }); }; }
+    if (promptInputEl) {
+      promptInputEl.addEventListener('input', function() {
+        autoResizePromptInput();
+        updatePromptCharCount();
+        renderPromptComposerState();
+      });
+      promptInputEl.addEventListener('keydown', function(event) {
+        if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+          event.preventDefault();
+          submitPromptFromComposer();
+        }
+      });
+    }
+    if (promptEngineEl) {
+      promptEngineEl.addEventListener('change', function() {
+        selectedPromptEngineId = promptEngineEl.value;
+        renderPromptComposerState();
+      });
+    }
+    var heroInput = document.getElementById('hero-input');
+    if (heroInput) {
+      heroInput.addEventListener('keydown', function(e) {
+        if (e.key === 'Enter' && heroInput.value.trim()) {
+          vscode.postMessage({ type: 'run-prompt', prompt: heroInput.value.trim() });
+          heroInput.value = '';
+        }
+      });
+    }
     document.getElementById('btn-play').onclick = () => vscode.postMessage({ type: 'play' });
     document.getElementById('btn-pause').onclick = () => vscode.postMessage({ type: 'pause' });
     document.getElementById('btn-stop').onclick = () => vscode.postMessage({ type: 'stop' });
-    document.getElementById('result-banner-review').onclick = () => vscode.postMessage({ type: 'review-changes' });
-    document.getElementById('result-banner-retry').onclick = () => vscode.postMessage({ type: 'retry-failed' });
-    document.getElementById('result-banner-export').onclick = () => vscode.postMessage({ type: 'export-results' });
+    var resultBannerReview = document.getElementById('result-banner-review');
+    if (resultBannerReview) { resultBannerReview.onclick = () => vscode.postMessage({ type: 'review-changes' }); }
+    var resultBannerRetry = document.getElementById('result-banner-retry');
+    if (resultBannerRetry) { resultBannerRetry.onclick = () => vscode.postMessage({ type: 'retry-failed' }); }
+    var resultBannerExport = document.getElementById('result-banner-export');
+    if (resultBannerExport) { resultBannerExport.onclick = () => vscode.postMessage({ type: 'export-results' }); }
 
     // ─── State Machine ───
     function setDashboardState(newState) {
@@ -1229,7 +1300,47 @@ export class DashboardPanel {
         || null;
     }
 
+    function findRunningOrNextTask(plan) {
+      if (!plan || !Array.isArray(plan.playlists)) {
+        return null;
+      }
+      for (var i = 0; i < plan.playlists.length; i++) {
+        var runningPlaylist = plan.playlists[i];
+        var runningTasks = Array.isArray(runningPlaylist.tasks) ? runningPlaylist.tasks : [];
+        for (var ri = 0; ri < runningTasks.length; ri++) {
+          var rt = runningTasks[ri];
+          if (String(rt && rt.status || '').toLowerCase() === 'running') {
+            return {
+              phase: 'running',
+              playlistName: runningPlaylist.name || ('Playlist ' + (i + 1)),
+              task: rt,
+              playlist: runningPlaylist,
+            };
+          }
+        }
+      }
+
+      for (var j = 0; j < plan.playlists.length; j++) {
+        var pendingPlaylist = plan.playlists[j];
+        var pendingTasks = Array.isArray(pendingPlaylist.tasks) ? pendingPlaylist.tasks : [];
+        for (var pi = 0; pi < pendingTasks.length; pi++) {
+          var pt = pendingTasks[pi];
+          var s = String(pt && pt.status || '').toLowerCase();
+          if (!s || s === 'pending' || s === 'queued' || s === 'todo') {
+            return {
+              phase: 'queued',
+              playlistName: pendingPlaylist.name || ('Playlist ' + (j + 1)),
+              task: pt,
+              playlist: pendingPlaylist,
+            };
+          }
+        }
+      }
+      return null;
+    }
+
     function autoResizePromptInput() {
+      if (!promptInputEl) { return; }
       promptInputEl.style.height = 'auto';
       const minHeight = 118;
       const maxHeight = 240;
@@ -1237,10 +1348,15 @@ export class DashboardPanel {
     }
 
     function updatePromptCharCount() {
+      if (!promptInputEl || !promptCharCountEl) { return; }
       promptCharCountEl.textContent = promptInputEl.value.length + ' chars | Ctrl+Enter';
     }
 
     function syncPromptEngineOptions(engines, preferredId) {
+      if (!promptEngineEl) {
+        promptEngines = Array.isArray(engines) ? engines : [];
+        return;
+      }
       promptEngines = Array.isArray(engines) ? engines : [];
       const currentValue = selectedPromptEngineId || promptEngineEl.value;
       const preferredValue = typeof preferredId === 'string' ? preferredId : '';
@@ -1273,6 +1389,7 @@ export class DashboardPanel {
     }
 
     function submitPromptFromComposer() {
+      if (!promptInputEl || !promptSubmitEl) { return; }
       const prompt = promptInputEl.value.trim();
       if (!prompt || promptSubmitEl.disabled) {
         return;
@@ -1289,6 +1406,7 @@ export class DashboardPanel {
     }
 
     function generatePlanFromComposer() {
+      if (!promptInputEl || !promptGeneratePlanEl) { return; }
       const prompt = promptInputEl.value.trim();
       if (!prompt || promptGeneratePlanEl.disabled) {
         return;
@@ -1304,6 +1422,7 @@ export class DashboardPanel {
     }
 
     function clearPromptComposer() {
+      if (!promptInputEl) { return; }
       promptInputEl.value = '';
       autoResizePromptInput();
       updatePromptCharCount();
@@ -1314,6 +1433,19 @@ export class DashboardPanel {
     }
 
     function renderPromptComposerState() {
+      if (
+        !promptComposerEl ||
+        !promptInputEl ||
+        !promptEngineEl ||
+        !promptSubmitEl ||
+        !promptGeneratePlanEl ||
+        !promptAddTaskEl ||
+        !promptAddPlaylistEl ||
+        !promptContextPillEl ||
+        !promptContextNoteEl
+      ) {
+        return;
+      }
       const hasEngines = promptEngines.length > 0;
       const isIdle = runnerState === 'idle';
       const hasPrompt = !!promptInputEl.value.trim();
@@ -1375,32 +1507,41 @@ export class DashboardPanel {
       switch (msg.type) {
         case 'update': {
           try {
-            var planPlaylists = (msg.plan && msg.plan.playlists) ? msg.plan.playlists : [];
-            var newHash = msg.plan
-              ? msg.plan.name + '|' + planPlaylists.map(function(pl) {
+            var incomingPlan = msg.plan || null;
+            if (incomingPlan) {
+              currentPlan = incomingPlan;
+            }
+            var planForRender = currentPlan;
+            var planPlaylists = (planForRender && planForRender.playlists) ? planForRender.playlists : [];
+            var newHash = planForRender
+              ? planForRender.name + '|' + planPlaylists.map(function(pl) {
                 return [pl.name||'', pl.engine||'', pl.parallel?'parallel':'sequential',
                   (pl.tasks||[]).map(function(t) { return [t.id||'',t.name||'',t.status||'pending'].join(':'); }).join(',')
                 ].join('|');
               }).join('||') : '';
             var shouldRenderPlan = newHash !== lastPlanHash || !document.getElementById('plan-section').innerHTML.trim();
-            currentPlan = msg.plan;
             currentServices = msg.services || [];
             syncPromptEngineOptions(msg.promptEngines || [], msg.selectedPromptEngineId);
             if (shouldRenderPlan) {
               lastPlanHash = newHash;
-              renderPlan(msg.plan);
+              renderPlan(planForRender);
             }
-            renderPlaylistTiles(msg.plan);
+            renderPlaylistTiles(planForRender);
+            syncActiveTaskFromPlan(planForRender);
             updateProgress();
             renderStatus(msg.runnerState);
             renderHistory(msg.history || []);
           } catch(e) {
             console.error('[MOAG Dashboard] Update error:', e);
-            currentPlan = msg.plan;
+            const incomingPlan = msg.plan || null;
+            if (incomingPlan) {
+              currentPlan = incomingPlan;
+            }
             currentServices = msg.services || [];
             syncPromptEngineOptions(msg.promptEngines || [], msg.selectedPromptEngineId);
-            renderPlan(msg.plan);
-            renderPlaylistTiles(msg.plan);
+            renderPlan(currentPlan);
+            renderPlaylistTiles(currentPlan);
+            syncActiveTaskFromPlan(currentPlan);
             updateProgress();
             renderStatus(msg.runnerState || 'idle');
           }
@@ -1470,6 +1611,7 @@ export class DashboardPanel {
       taskStartTime = null;
       stopTimer();
       document.getElementById('active-task-name').textContent = '';
+      document.getElementById('active-task-context').textContent = '';
       document.getElementById('active-output').textContent = '';
       document.getElementById('active-engine').textContent = '';
       document.getElementById('active-engine').className = 'engine-badge engine-custom';
@@ -1481,6 +1623,7 @@ export class DashboardPanel {
       activeCard.className = 'active-task-card';
       updateProgress();
       renderResultBanner();
+      updateStatusSummary('Ready');
       if (!currentPlan || !currentPlan.playlists || currentPlan.playlists.length === 0) {
         setDashboardState('empty');
       } else {
@@ -1513,6 +1656,11 @@ export class DashboardPanel {
       outputEl.appendChild(hint);
     }
 
+    function updateStatusSummary(text) {
+      var el = document.getElementById('status-summary');
+      if (el) { el.textContent = text || 'Ready'; }
+    }
+
     function clearActiveOutputPlaceholder() {
       const hint = document.querySelector('#active-output .active-output-empty');
       if (hint) { hint.remove(); }
@@ -1530,6 +1678,7 @@ export class DashboardPanel {
         changedFiles: null, codeChanges: null, verification: null, artifacts: null, summary: '',
       };
       document.getElementById('active-task-name').textContent = msg.taskName;
+      document.getElementById('active-task-context').textContent = msg.playlistName || '';
       const engineEl = document.getElementById('active-engine');
       engineEl.textContent = getActiveRuntimeLabel(msg);
       engineEl.className = 'engine-badge engine-' + (msg.engine || 'custom');
@@ -1538,6 +1687,50 @@ export class DashboardPanel {
       const activeCard = document.getElementById('active-task');
       activeCard.hidden = false;
       activeCard.className = 'active-task-card visible';
+      updateStatusSummary('Running: ' + (msg.playlistName || 'Playlist') + ' -> ' + msg.taskName);
+      setDashboardState('executing');
+    }
+
+    function syncActiveTaskFromPlan(plan) {
+      if (runnerState !== 'playing') {
+        return;
+      }
+      if (currentTaskId && cardState[currentTaskId]) {
+        return;
+      }
+      const candidate = findRunningOrNextTask(plan);
+      if (!candidate || !candidate.task) {
+        updateStatusSummary('Running: preparing next task...');
+        return;
+      }
+
+      const activeCard = document.getElementById('active-task');
+      const taskName = candidate.task.name || 'Untitled task';
+      const playlistName = candidate.playlistName || 'Playlist';
+      const contextText = candidate.phase === 'queued'
+        ? (playlistName + ' (queued next)')
+        : playlistName;
+
+      document.getElementById('active-task-name').textContent = taskName;
+      document.getElementById('active-task-context').textContent = contextText;
+
+      const engineEl = document.getElementById('active-engine');
+      const engineId = candidate.task.engine || (candidate.playlist && candidate.playlist.engine) || 'custom';
+      engineEl.textContent = candidate.phase === 'queued'
+        ? ('QUEUED - ' + getActiveRuntimeLabel(candidate.task))
+        : getActiveRuntimeLabel(candidate.task);
+      engineEl.className = 'engine-badge engine-' + engineId;
+      document.getElementById('active-timer').textContent = candidate.phase === 'queued' ? '--' : '0s';
+
+      if (candidate.phase === 'queued') {
+        showActiveOutputPlaceholder('Task is queued. Runner will start it next.');
+      } else {
+        showActiveOutputPlaceholder('Waiting for terminal output...');
+      }
+
+      activeCard.hidden = false;
+      activeCard.className = 'active-task-card visible';
+      updateStatusSummary('Running: ' + playlistName + ' -> ' + taskName);
       setDashboardState('executing');
     }
 
@@ -1904,6 +2097,9 @@ export class DashboardPanel {
       playBtn.className = playBtn.disabled ? 'icon-btn' : 'icon-btn primary';
       renderResultBanner();
       renderPromptComposerState();
+      if (state === 'playing') {
+        syncActiveTaskFromPlan(currentPlan);
+      }
       if (state === 'idle' && completedCount > 0 && completedCount >= totalTasks) {
         setDashboardState('complete');
       } else if (state === 'idle' && currentPlan) {
@@ -1912,12 +2108,17 @@ export class DashboardPanel {
         setDashboardState('executing');
       }
       if (state === 'idle') {
+        updateStatusSummary('Ready');
         stopTimer();
         if (currentTaskId === null) {
           const activeCard = document.getElementById('active-task');
           activeCard.hidden = true;
           activeCard.className = 'active-task-card';
         }
+      } else if (state === 'paused') {
+        updateStatusSummary('Paused');
+      } else if (state === 'stopping') {
+        updateStatusSummary('Stopping...');
       }
       updateTimers();
     }
@@ -2078,6 +2279,15 @@ export class DashboardPanel {
       }).join('\\n');
     }
 
+    function renderEngineStatus() {
+      var el = document.getElementById('engine-status');
+      if (!el) return;
+      // Engine detection happens on the extension side.
+      // For now show a placeholder that the extension will update.
+      el.innerHTML = '<span style="color:var(--dimmed)">Detecting engines...</span>';
+      vscode.postMessage({ type: 'detect-engines' });
+    }
+
     // ─── Init ───
 
     (function() {
@@ -2092,6 +2302,7 @@ export class DashboardPanel {
         if (initState && initState.plan) {
           currentPlan = initState.plan;
           renderPlan(initState.plan);
+          renderEngineStatus();
           renderPlaylistTiles(initState.plan);
           updateProgress();
           renderStatus(initState.runnerState || 'idle');
@@ -2099,6 +2310,7 @@ export class DashboardPanel {
         } else {
           currentPlan = null;
           renderPlan(null);
+          renderEngineStatus();
           renderPlaylistTiles(null);
           updateProgress();
           renderStatus('idle');
@@ -2110,6 +2322,7 @@ export class DashboardPanel {
         autoResizePromptInput();
         updatePromptCharCount();
         renderPlan(null);
+        renderEngineStatus();
         renderPlaylistTiles(null);
         updateProgress();
         renderStatus('idle');
