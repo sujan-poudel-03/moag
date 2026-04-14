@@ -26,6 +26,7 @@ import { resolveProfile, ProfileName, ProfileConfig } from '../models/execution-
 import { getEngine } from '../adapters/index';
 import { HistoryStore } from '../history/store';
 import { buildContext, getContextSettings } from '../context/context-builder';
+import { analyzeProject } from '../context/project-analyzer';
 import { PromptLibraryStore } from '../templates/prompt-library';
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
@@ -84,6 +85,7 @@ export class TaskRunner {
   private _currentRunId: string | null = null;
   private _totalCostUsd = 0;
   private _budgetExceededEmitted = false;
+  private _autoFixedTasks = new Set<string>();
 
   private _promptLibrary: PromptLibraryStore | null = null;
 
@@ -136,6 +138,7 @@ export class TaskRunner {
   private resetRunBudgetTracking(): void {
     this._totalCostUsd = 0;
     this._budgetExceededEmitted = false;
+    this._autoFixedTasks.clear();
   }
 
   private trackTaskCost(result: EngineResult): void {
@@ -320,7 +323,11 @@ export class TaskRunner {
   }
 
   private async runPlaylistsSequentially(plan: Plan): Promise<void> {
-    for (let pi = this._currentPlaylistIndex; pi < plan.playlists.length; pi++) {
+    // Capture resume position before the loop — _currentPlaylistIndex is mutated inside
+    const resumePlaylistIndex = this._currentPlaylistIndex;
+    const resumeTaskIndex = this._currentTaskIndex;
+
+    for (let pi = resumePlaylistIndex; pi < plan.playlists.length; pi++) {
       const playlist = plan.playlists[pi];
       this._currentPlaylistIndex = pi;
 
@@ -331,7 +338,8 @@ export class TaskRunner {
       if (playlist.parallel) {
         await this.runPlaylistParallel(playlist, plan);
       } else {
-        const startTask = pi === this._currentPlaylistIndex ? this._currentTaskIndex : 0;
+        // Only resume mid-playlist for the first playlist we enter; all others start from 0
+        const startTask = pi === resumePlaylistIndex ? resumeTaskIndex : 0;
         await this.runPlaylistSequential(playlist, plan, startTask);
       }
 
@@ -493,31 +501,43 @@ export class TaskRunner {
   }
 
   private async executeTaskWithRetry(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
-    const maxAttempts = (task.retryCount ?? 0) + 1;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const fullAuto = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('fullAuto', false);
+    const effectiveMaxAttempts = fullAuto ? Math.max((task.retryCount ?? 0) + 1, 4) : (task.retryCount ?? 0) + 1;
+
+    if (fullAuto) {
+      this.emit('task-output', task, '[Full Auto] Write → Test → Fix loop active\n', 'stdout');
+    }
+
+    for (let attempt = 1; attempt <= effectiveMaxAttempts; attempt++) {
       await this.executeTask(task, playlist, plan);
       if (task.status === TaskStatus.Completed || this.state === RunnerState.Stopping) {
         return;
       }
-      if (attempt < maxAttempts) {
+      if (attempt < effectiveMaxAttempts) {
         this.emit('task-output', task, `\n[Retry ${attempt}/${task.retryCount}] Retrying "${task.name}"...\n`, 'stderr');
         task.status = TaskStatus.Pending;
         await this.sleep(2000);
       }
     }
 
-    // Auto-fix: if task still failed and auto-fix is enabled, attempt AI-driven repair
-    if (task.status !== TaskStatus.Completed && this.getTaskType(task) === 'agent') {
+    // Auto-fix: if task still failed and auto-fix is enabled (or fullAuto), attempt AI-driven repair
+    const autoFixEnabled = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
+    if (task.status !== TaskStatus.Completed && this.getTaskType(task) === 'agent' && (autoFixEnabled || fullAuto)) {
       await this.autoFixTask(task, playlist, plan);
     }
   }
 
   private async autoFixTask(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
+    // One auto-fix attempt per task per run — prevents retry→autofix→retry→autofix loops
+    if (this._autoFixedTasks.has(task.id)) { return; }
+
     const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
     const profileName = cfg.get<string>('executionProfile', 'auto');
     const profile = resolveProfile(profileName as ProfileName);
     const autoFix = profile.autoFix && cfg.get<boolean>('autoFix', true);
     if (!autoFix || this.state === RunnerState.Stopping) { return; }
+
+    this._autoFixedTasks.add(task.id);
 
     // Gather error context from the most recent history entry
     if (!this.historyStore?.getForTask) { return; }
@@ -669,6 +689,18 @@ export class TaskRunner {
         }
       }
 
+      // Auto-test: run project tests after successful agent task
+      if (result.exitCode === 0 && this.getTaskType(task) === 'agent') {
+        const testResult = await this.autoTestAfterTask(task, cwd, taskAbort.signal);
+        if (!testResult.passed) {
+          result = {
+            ...result,
+            exitCode: 1,
+            stderr: (result.stderr ? result.stderr + '\n' : '') + '[Auto-Test] Tests failed:\n' + testResult.output.slice(-1000),
+          };
+        }
+      }
+
       result = {
         ...result,
         summary: this.buildResultSummary(task, result, verification, artifacts),
@@ -676,6 +708,7 @@ export class TaskRunner {
 
       const { changedFiles, codeChanges } = await this.captureGitDiff(gitRef, cwd);
       const finishedAt = new Date().toISOString();
+      const threadMeta = task as Task & { _threadId?: string; _turnIndex?: number };
 
       task.status = this.resolveFinalStatus(task, result.exitCode);
 
@@ -698,6 +731,8 @@ export class TaskRunner {
         artifacts,
         failurePolicy: task.failurePolicy,
         ownerNote: task.ownerNote,
+        threadId: threadMeta._threadId,
+        turnIndex: threadMeta._turnIndex,
         runId: this._currentRunId || undefined,
         modelId: (task as Task & { _modelId?: string })._modelId,
         modelReason: (task as Task & { _modelReason?: string })._modelReason,
@@ -725,6 +760,7 @@ export class TaskRunner {
       };
 
       task.status = this.resolveFinalStatus(task, errorResult.exitCode);
+      const threadMeta = task as Task & { _threadId?: string; _turnIndex?: number };
       this.historyStore.add({
         id: generateId(),
         taskId: task.id,
@@ -740,6 +776,8 @@ export class TaskRunner {
         finishedAt,
         failurePolicy: task.failurePolicy,
         ownerNote: task.ownerNote,
+        threadId: threadMeta._threadId,
+        turnIndex: threadMeta._turnIndex,
         runId: this._currentRunId || undefined,
       });
 
@@ -897,23 +935,41 @@ export class TaskRunner {
     }
 
     // Pick a different engine for the review
-    const reviewEngine = task.engine ?? this.rotateEngine(depEntry.engine, plan.defaultEngine);
+    const rotated = this.rotateEngine(depEntry.engine, plan.defaultEngine);
+    const reviewEngine = task.engine ?? rotated;
+
+    if (reviewEngine === depEntry.engine) {
+      this.emit('task-output', task, '[Peer Review] Warning: same engine reviewing its own work — consider adding a second engine\n', 'stderr');
+    }
 
     this.emit('task-output', task, `[Peer Review] Reviewing changes with ${reviewEngine}...\n`, 'stdout');
 
     // Build the review prompt
-    const changedFiles = depEntry.changedFiles?.join(', ') || 'none';
-    const codeChanges = depEntry.codeChanges || '(no diff available)';
-    const reviewPrompt = [
-      `Review the code changes made by the previous task. The task was: ${depEntry.prompt}`,
-      ``,
-      `Files changed: ${changedFiles}`,
-      ``,
-      `Code diff:`,
-      codeChanges,
-      ``,
-      `Check for: bugs, security issues, missing error handling, test coverage, and adherence to the original requirements. If you find issues, fix them directly.`,
-    ].join('\n');
+    const hasDiff = (depEntry.changedFiles && depEntry.changedFiles.length > 0) || !!depEntry.codeChanges;
+
+    let reviewPrompt: string;
+    if (hasDiff) {
+      const changedFiles = depEntry.changedFiles?.join(', ') || 'none';
+      const rawDiff = depEntry.codeChanges || '';
+      const codeChanges = rawDiff.length > 8000 ? rawDiff.slice(0, 8000) + '\n...[truncated]' : rawDiff;
+      reviewPrompt = [
+        `Review the code changes made by the previous task. The task was: ${depEntry.prompt}`,
+        ``,
+        `Files changed: ${changedFiles}`,
+        ``,
+        `Code diff:`,
+        codeChanges,
+        ``,
+        `Check for: bugs, security issues, missing error handling, test coverage, and adherence to the original requirements. If you find issues, fix them directly.`,
+      ].join('\n');
+    } else {
+      this.emit('task-output', task, '[Peer Review] No diff available — reviewing based on task prompt only\n', 'stdout');
+      reviewPrompt = [
+        `Review the following task for correctness. The task was: ${depEntry.prompt}`,
+        ``,
+        `Check for: bugs, security issues, missing error handling, test coverage, and adherence to the original requirements. If you find issues, fix them directly.`,
+      ].join('\n');
+    }
 
     return this.runAgentTask(task, reviewEngine, cwd, reviewPrompt, signal, fallbackEngine);
   }
@@ -955,11 +1011,8 @@ export class TaskRunner {
         return result;
       }
 
-      // Revert this attempt's changes before trying the next engine
-      if (beforeRef && engines.indexOf(engine) < engines.length - 1) {
-        await this.runGitCommand(['checkout', '.'], cwd);
-        await this.runGitCommand(['clean', '-fd'], cwd);
-      }
+      // Each engine builds on the previous attempt's work — no destructive revert.
+      // First success returns early (first-pass), failed attempts leave changes for the next engine.
     }
 
     // All engines have run — pick the best result based on strategy
@@ -1424,11 +1477,21 @@ export class TaskRunner {
 
     if (task.files && task.files.length > 0) {
       const fileContents: string[] = [];
+      let remainingFileBudget = Math.max(settings.maxFileContextChars, 1000);
       for (const filePath of task.files) {
+        if (remainingFileBudget <= 0) {
+          fileContents.push(`--- ${filePath} --- (skipped: context budget exhausted)`);
+          continue;
+        }
         const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwd, filePath);
         try {
           const content = fs.readFileSync(resolved, 'utf-8');
-          fileContents.push(`--- ${filePath} ---\n${content}`);
+          const clipped = content.length > remainingFileBudget
+            ? content.slice(0, remainingFileBudget) + '\n...[truncated]'
+            : content;
+          const block = `--- ${filePath} ---\n${clipped}`;
+          fileContents.push(block);
+          remainingFileBudget -= clipped.length;
         } catch {
           fileContents.push(`--- ${filePath} --- (file not found)`);
         }
@@ -1620,6 +1683,55 @@ export class TaskRunner {
     const diff = await this.runGitCommand(['diff', '--no-color', ref], cwd);
     const changedFiles = nameOnly ? nameOnly.split('\n').filter(f => f.length > 0) : [];
     return { changedFiles, codeChanges: diff || '' };
+  }
+
+  private detectTestCommand(cwd: string): string | null {
+    const analysis = analyzeProject(cwd);
+    if (analysis.testFramework) {
+      const commandMap: Record<string, string> = {
+        'jest': 'npx jest --passWithNoTests',
+        'vitest': 'npx vitest run',
+        'mocha': 'npm test',
+        'ava': 'npx ava',
+        'pytest': 'pytest',
+        'go test': 'go test ./...',
+        'cargo test': 'cargo test',
+      };
+      return commandMap[analysis.testFramework] ?? null;
+    }
+    return analysis.hasTests ? 'npm test' : null;
+  }
+
+  private async autoTestAfterTask(
+    task: Task,
+    cwd: string,
+    signal: AbortSignal,
+  ): Promise<{ passed: boolean; output: string }> {
+    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    if (!cfg.get<boolean>('autoTest', false)) {
+      return { passed: true, output: '' };
+    }
+
+    const testCmd = this.detectTestCommand(cwd);
+    if (!testCmd) {
+      return { passed: true, output: '' };
+    }
+
+    this.emit('task-output', task, `\n[Auto-Test] Running: ${testCmd}...\n`, 'stdout');
+
+    const result = await this.runLocalCommand(testCmd, {
+      cwd,
+      signal,
+      onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
+    });
+
+    if (result.exitCode === 0) {
+      this.emit('task-output', task, '[Auto-Test] Tests passed \u2713\n', 'stdout');
+      return { passed: true, output: result.stdout };
+    }
+
+    this.emit('task-output', task, `[Auto-Test] Tests failed (exit ${result.exitCode})\n`, 'stderr');
+    return { passed: false, output: [result.stderr, result.stdout].filter(Boolean).join('\n') };
   }
 
   private sleep(ms: number): Promise<void> {

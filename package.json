@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
   "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
-  "version": "0.9.0",
+  "version": "0.9.3",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -47,13 +47,19 @@
     "coding-assistant"
   ],
   "activationEvents": [
-    "onView:agentTaskPlayer.planView",
+    "onView:agentTaskPlayer.promptView",
     "workspaceContains:.moag/plan.json",
     "workspaceContains:**/*.agent-plan.json"
   ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
+      {
+        "command": "agentTaskPlayer.runPrompt",
+        "title": "Run Prompt",
+        "category": "MOAG",
+        "icon": "$(zap)"
+      },
       {
         "command": "agentTaskPlayer.play",
         "title": "Play",
@@ -77,6 +83,18 @@
         "title": "Open Plan File",
         "category": "MOAG",
         "icon": "$(folder-opened)"
+      },
+      {
+        "command": "agentTaskPlayer.switchPlan",
+        "title": "Switch Plan",
+        "category": "MOAG",
+        "icon": "$(files)"
+      },
+      {
+        "command": "agentTaskPlayer.savePlanAs",
+        "title": "Save Plan As...",
+        "category": "MOAG",
+        "icon": "$(save)"
       },
       {
         "command": "agentTaskPlayer.newPlan",
@@ -197,6 +215,12 @@
         "title": "Getting Started",
         "category": "MOAG",
         "icon": "$(book)"
+      },
+      {
+        "command": "agentTaskPlayer.showChangelog",
+        "title": "What's New",
+        "category": "MOAG",
+        "icon": "$(history)"
       },
       {
         "command": "agentTaskPlayer.detectEngines",
@@ -407,6 +431,12 @@
         "title": "Manage Prompt Snippets",
         "category": "MOAG",
         "icon": "$(bookmark)"
+      },
+      {
+        "command": "agentTaskPlayer.toggleFullAuto",
+        "title": "Toggle Full Auto",
+        "category": "MOAG",
+        "icon": "$(zap)"
       }
     ],
     "viewsContainers": {
@@ -414,7 +444,7 @@
         {
           "id": "agentTaskPlayer",
           "title": "MOAG",
-          "icon": "$(rocket)"
+          "icon": "media/moag-icon.svg"
         }
       ]
     },
@@ -422,68 +452,59 @@
       "agentTaskPlayer": [
         {
           "id": "agentTaskPlayer.promptView",
-          "name": "Prompt",
-          "type": "webview"
-        },
-        {
-          "id": "agentTaskPlayer.planView",
-          "name": "Plan",
-          "type": "tree"
-        },
-        {
-          "id": "agentTaskPlayer.historyView",
-          "name": "History",
-          "type": "tree"
-        },
-        {
-          "id": "agentTaskPlayer.sessionsView",
-          "name": "Sessions",
-          "type": "tree"
+          "name": "CHAT",
+          "type": "webview",
+          "visibility": "visible"
         }
       ]
     },
     "viewsWelcome": [
       {
-        "view": "agentTaskPlayer.planView",
-        "contents": "No plan loaded.\n\nDescribe what you want built and the AI agent will create a structured plan for you.\n[New Plan](command:agentTaskPlayer.newPlan)\n\nOr pick from a gallery of ready-to-play plans:\n[Browse Templates](command:agentTaskPlayer.newPlanFromTemplate)\n\nOr try a ready-made example to see how it works:\n[Try Example Plan](command:agentTaskPlayer.loadExamplePlan)\n\nAlready have a plan file?\n[Open Plan File](command:agentTaskPlayer.openPlan)"
+        "view": "agentTaskPlayer.promptView",
+        "contents": "No plan loaded.\n\nRun a quick task with one prompt:\n[Run Prompt](command:agentTaskPlayer.runPrompt)\n\nOr create a full plan:\n[Smart Plan (auto-detect)](command:agentTaskPlayer.smartNewPlan)\n[Browse Templates](command:agentTaskPlayer.newPlanFromTemplate)\n[New Empty Plan](command:agentTaskPlayer.newPlan)\n\nAlready have a plan?\n[Open Plan File](command:agentTaskPlayer.openPlan)\n[Switch Plan](command:agentTaskPlayer.switchPlan)\n\nRecent plans are available from Switch Plan."
       }
     ],
     "menus": {
       "view/title": [
         {
-          "command": "agentTaskPlayer.quickAddTask",
+          "command": "agentTaskPlayer.switchPlan",
           "when": "view == agentTaskPlayer.planView",
           "group": "navigation@0"
         },
         {
-          "command": "agentTaskPlayer.addTask",
+          "command": "agentTaskPlayer.play",
           "when": "view == agentTaskPlayer.planView",
           "group": "navigation@1"
         },
         {
-          "command": "agentTaskPlayer.play",
+          "command": "agentTaskPlayer.pause",
           "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@2"
+          "group": "2_run@0"
         },
         {
           "command": "agentTaskPlayer.stop",
           "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@3"
+          "group": "navigation@2"
         },
         {
-          "command": "agentTaskPlayer.showDashboard",
+          "command": "agentTaskPlayer.quickAddTask",
           "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@4"
+          "group": "0_add@0"
+        },
+        {
+          "command": "agentTaskPlayer.addTask",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "0_add@1"
         },
         {
           "command": "agentTaskPlayer.newPlanFromTemplate",
           "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@0"
+          "group": "1_plan@1"
         },
         {
           "command": "agentTaskPlayer.smartNewPlan",
           "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@1"
+          "group": "1_plan@0"
         },
         {
           "command": "agentTaskPlayer.newPlan",
@@ -493,12 +514,12 @@
         {
           "command": "agentTaskPlayer.importPlanFromUrl",
           "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@5"
+          "group": "3_share@3"
         },
         {
           "command": "agentTaskPlayer.planFromGitHubIssue",
           "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@6"
+          "group": "3_share@4"
         },
         {
           "command": "agentTaskPlayer.openPlan",
@@ -506,49 +527,59 @@
           "group": "1_plan@3"
         },
         {
-          "command": "agentTaskPlayer.pause",
+          "command": "agentTaskPlayer.runPrompt",
           "when": "view == agentTaskPlayer.planView",
-          "group": "2_playback@1"
+          "group": "0_add@0"
+        },
+        {
+          "command": "agentTaskPlayer.savePlanAs",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "1_plan@5"
         },
         {
           "command": "agentTaskPlayer.switchProfile",
           "when": "view == agentTaskPlayer.planView",
-          "group": "2_playback@2"
+          "group": "2_run@3"
         },
         {
           "command": "agentTaskPlayer.watchMode",
           "when": "view == agentTaskPlayer.planView",
-          "group": "2_playback@3"
+          "group": "2_run@1"
+        },
+        {
+          "command": "agentTaskPlayer.toggleFullAuto",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "2_run@2"
         },
         {
           "command": "agentTaskPlayer.addPlaylist",
           "when": "view == agentTaskPlayer.planView",
-          "group": "3_advanced@1"
+          "group": "0_add@2"
         },
         {
           "command": "agentTaskPlayer.exportPlan",
           "when": "view == agentTaskPlayer.planView",
-          "group": "3_advanced@2"
+          "group": "3_share@1"
         },
         {
           "command": "agentTaskPlayer.importPlan",
           "when": "view == agentTaskPlayer.planView",
-          "group": "3_advanced@3"
+          "group": "3_share@2"
         },
         {
           "command": "agentTaskPlayer.dryRun",
           "when": "view == agentTaskPlayer.planView",
-          "group": "3_advanced@4"
+          "group": "4_danger@0"
         },
         {
           "command": "agentTaskPlayer.sharePlan",
           "when": "view == agentTaskPlayer.planView",
-          "group": "3_advanced@5"
+          "group": "3_share@0"
         },
         {
           "command": "agentTaskPlayer.runPlanFile",
           "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@4"
+          "group": "2_run@0"
         },
         {
           "command": "agentTaskPlayer.bulkDelete",
@@ -581,19 +612,9 @@
           "group": "navigation@4"
         },
         {
-          "command": "agentTaskPlayer.newConversation",
-          "when": "view == agentTaskPlayer.sessionsView",
-          "group": "navigation@1"
-        },
-        {
-          "command": "agentTaskPlayer.searchSessions",
-          "when": "view == agentTaskPlayer.sessionsView",
-          "group": "navigation@2"
-        },
-        {
-          "command": "agentTaskPlayer.clearSessions",
-          "when": "view == agentTaskPlayer.sessionsView",
-          "group": "navigation@3"
+          "command": "agentTaskPlayer.showChangelog",
+          "when": "view == agentTaskPlayer.planView",
+          "group": "5_help@1"
         }
       ],
       "view/item/context": [
@@ -605,22 +626,22 @@
         {
           "command": "agentTaskPlayer.addTask",
           "when": "view == agentTaskPlayer.planView && viewItem == playlist",
-          "group": "inline@2"
+          "group": "1_edit@1"
         },
         {
           "command": "agentTaskPlayer.deleteItem",
           "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/",
-          "group": "inline@3"
+          "group": "9_manage@9"
         },
         {
           "command": "agentTaskPlayer.playTask",
           "when": "view == agentTaskPlayer.planView && viewItem == task",
-          "group": "inline@1"
+          "group": "0_run@1"
         },
         {
           "command": "agentTaskPlayer.editTask",
           "when": "view == agentTaskPlayer.planView && viewItem == task",
-          "group": "inline@2"
+          "group": "1_edit@0"
         },
         {
           "command": "agentTaskPlayer.moveUp",
@@ -660,7 +681,7 @@
         {
           "command": "agentTaskPlayer.retryTask",
           "when": "view == agentTaskPlayer.planView && viewItem == task",
-          "group": "inline@3"
+          "group": "3_status@0"
         },
         {
           "command": "agentTaskPlayer.retryTaskWithNote",
@@ -679,23 +700,8 @@
         },
         {
           "command": "agentTaskPlayer.runSelected",
-          "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/",
-          "group": "inline@0"
-        },
-        {
-          "command": "agentTaskPlayer.deleteSession",
-          "when": "view == agentTaskPlayer.sessionsView && viewItem == session",
-          "group": "inline@1"
-        },
-        {
-          "command": "agentTaskPlayer.deleteThread",
-          "when": "view == agentTaskPlayer.sessionsView && viewItem == thread",
-          "group": "inline@1"
-        },
-        {
-          "command": "agentTaskPlayer.renameThread",
-          "when": "view == agentTaskPlayer.sessionsView && viewItem == thread",
-          "group": "inline@2"
+          "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/ && listMultiSelection",
+          "group": "0_run@0"
         }
       ],
       "editor/context": [
@@ -708,9 +714,14 @@
     },
     "keybindings": [
       {
+        "command": "agentTaskPlayer.runPrompt",
+        "key": "ctrl+alt+m",
+        "mac": "cmd+alt+m"
+      },
+      {
         "command": "agentTaskPlayer.quickAddTask",
-        "key": "ctrl+shift+t",
-        "mac": "cmd+shift+t"
+        "key": "ctrl+alt+t",
+        "mac": "cmd+alt+t"
       }
     ],
     "configuration": {
@@ -854,6 +865,21 @@
           "default": true,
           "description": "When a task fails, automatically analyze the error and retry with a repair prompt. The AI agent reviews what went wrong and attempts to fix it."
         },
+        "agentTaskPlayer.autoTest": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically run the project test suite after each agent task completes. If tests fail, auto-fix is triggered."
+        },
+        "agentTaskPlayer.fullAuto": {
+          "type": "boolean",
+          "default": false,
+          "description": "Full Auto mode: agent writes code → tests run → auto-fix if tests fail → repeat until green. Enables autoTest and autoFix together with up to 3 fix cycles."
+        },
+        "agentTaskPlayer.showTaskNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show task completion and failure notifications when the dashboard is not visible."
+        },
         "agentTaskPlayer.autoModelSelection": {
           "type": "boolean",
           "default": true,
@@ -897,12 +923,12 @@
         },
         "agentTaskPlayer.context.allPriorOutputs": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Output chaining — include ALL prior playlist task outputs (not just dependencies). Enables each task to see what previous tasks produced."
         },
         "agentTaskPlayer.context.projectState": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Auto-scan and include README, package.json, and file tree."
         },
         "agentTaskPlayer.context.changedFiles": {
@@ -922,21 +948,27 @@
         },
         "agentTaskPlayer.context.maxFileContextChars": {
           "type": "number",
-          "default": 10000,
+          "default": 6000,
           "minimum": 1000,
           "description": "Maximum characters for auto-included relevant file content. Files are skipped once this budget is exhausted."
         },
         "agentTaskPlayer.context.maxContextChars": {
           "type": "number",
-          "default": 30000,
+          "default": 12000,
           "minimum": 1000,
           "description": "Maximum characters for the context section. Low-priority sections are dropped first."
         },
         "agentTaskPlayer.context.maxOutputPerTask": {
           "type": "number",
-          "default": 3000,
+          "default": 1500,
           "minimum": 500,
           "description": "Maximum characters per prior task stdout output."
+        },
+        "agentTaskPlayer.context.maxPriorTasks": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "description": "Maximum number of prior task outputs to include in context. Most recent tasks are kept first."
         },
         "agentTaskPlayer.context.fileTreeDepth": {
           "type": "number",

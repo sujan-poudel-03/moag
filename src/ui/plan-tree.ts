@@ -72,9 +72,9 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
           vscode.TreeItemCollapsibleState.Expanded,
         );
         item.iconPath = this.playlistIcon(pl);
-        const desc = this.playlistDescription(pl);
-        item.tooltip = `${desc} | Engine: ${pl.engine ?? this._plan!.defaultEngine} | Autoplay: ${pl.autoplay ? 'on' : 'off'}`;
-        item.description = desc;
+        const progress = this.playlistProgress(pl);
+        item.tooltip = `${pl.name}\n\n${progress}`;
+        item.description = progress;
         return item;
       });
     }
@@ -93,35 +93,8 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
           vscode.TreeItemCollapsibleState.None,
         );
         item.iconPath = this.taskIcon(task);
-        const md = new vscode.MarkdownString();
-        md.appendMarkdown(`**${task.name}**\n\n`);
-        md.appendMarkdown(`Type: \`${task.type || 'agent'}\``);
-        if (task.engine) { md.appendMarkdown(` · Engine: \`${task.engine}\``); }
-        md.appendMarkdown(` · Status: \`${task.status}\`\n\n`);
-        if (task.prompt) {
-          const preview = task.prompt.length > 300 ? task.prompt.substring(0, 297) + '...' : task.prompt;
-          md.appendMarkdown(`---\n\n${preview}`);
-        }
-        if (task.verifyCommand) {
-          md.appendMarkdown(`\n\n*Verify:* \`${task.verifyCommand}\``);
-        }
-        if (task.dependsOn && task.dependsOn.length > 0) {
-          md.appendMarkdown(`\n\n*Depends on:* ${task.dependsOn.length} task(s)`);
-        }
-        item.tooltip = md;
-        // Build a compact description string
-        const descParts: string[] = [];
-        const type = task.type ?? 'agent';
-        if (type !== 'agent') { descParts.push(type); }
-        if (task.engine) { descParts.push(task.engine); }
-        if (task.status === TaskStatus.Completed) { descParts.push('done'); }
-        else if (task.status === TaskStatus.Failed) { descParts.push('failed'); }
-        else if (task.status === TaskStatus.Running) { descParts.push('running...'); }
-        else if (task.status === TaskStatus.Skipped) { descParts.push('skipped'); }
-        else if (task.status === TaskStatus.Blocked) { descParts.push('blocked'); }
-        if (task.verifyCommand) { descParts.push('✓ verify'); }
-        if (task.dependsOn && task.dependsOn.length > 0) { descParts.push('→ deps'); }
-        item.description = descParts.join(' · ');
+        item.tooltip = this.taskTooltip(task);
+        item.description = this.taskDescription(task, playlist);
         return item;
       });
     }
@@ -129,21 +102,10 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
     return [];
   }
 
-  private playlistDescription(pl: Playlist): string {
+  private playlistProgress(pl: Playlist): string {
     const total = pl.tasks.length;
     const completed = pl.tasks.filter(t => t.status === TaskStatus.Completed).length;
-    const failed = pl.tasks.filter(t => t.status === TaskStatus.Failed).length;
-    const blocked = pl.tasks.filter(t => t.status === TaskStatus.Blocked).length;
-
-    if (completed === 0 && failed === 0) {
-      return `${total} tasks`;
-    }
-
-    const parts = [`${completed}/${total}`];
-    if (failed > 0) { parts.push(`${failed} failed`); }
-    if (blocked > 0) { parts.push(`${blocked} blocked`); }
-    if (completed === total) { parts[0] += ' ✓'; }
-    return parts.join(' · ');
+    return `${completed}/${total} tasks`;
   }
 
   private playlistIcon(pl: Playlist): vscode.ThemeIcon {
@@ -151,11 +113,11 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
     const anyRunning = pl.tasks.some(t => t.status === TaskStatus.Running);
     const anyFailed = pl.tasks.some(t => t.status === TaskStatus.Failed);
     const anyBlocked = pl.tasks.some(t => t.status === TaskStatus.Blocked);
-    if (anyRunning) { return new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('progressBar.background')); }
-    if (anyBlocked) { return new vscode.ThemeIcon('debug-disconnect', new vscode.ThemeColor('editorWarning.foreground')); }
-    if (anyFailed) { return new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed')); }
-    if (allDone) { return new vscode.ThemeIcon('check-all', new vscode.ThemeColor('testing.iconPassed')); }
-    return new vscode.ThemeIcon('list-unordered', new vscode.ThemeColor('descriptionForeground'));
+    if (anyFailed) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('testing.iconFailed')); }
+    if (allDone) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('testing.iconPassed')); }
+    if (anyRunning) { return new vscode.ThemeIcon('folder-opened', new vscode.ThemeColor('progressBar.background')); }
+    if (anyBlocked) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('editorWarning.foreground')); }
+    return new vscode.ThemeIcon('folder', new vscode.ThemeColor('descriptionForeground'));
   }
 
   private taskIcon(task: Task): vscode.ThemeIcon {
@@ -164,11 +126,58 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
       case TaskStatus.Running: return new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('progressBar.background'));
       case TaskStatus.Paused: return new vscode.ThemeIcon('debug-pause', new vscode.ThemeColor('debugIcon.pauseForeground'));
       case TaskStatus.Completed: return new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
-      case TaskStatus.Failed: return new vscode.ThemeIcon('error', new vscode.ThemeColor('testing.iconFailed'));
+      case TaskStatus.Failed: return new vscode.ThemeIcon('close', new vscode.ThemeColor('testing.iconFailed'));
       case TaskStatus.Blocked: return new vscode.ThemeIcon('debug-disconnect', new vscode.ThemeColor('editorWarning.foreground'));
       case TaskStatus.Skipped: return new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('descriptionForeground'));
       default: return new vscode.ThemeIcon('circle-outline');
     }
+  }
+
+  private taskDescription(task: Task, playlist: Playlist): string {
+    const executor = this.taskExecutorLabel(task, playlist);
+    return `${executor} | ${this.taskStatusLabel(task.status)}`;
+  }
+
+  private taskTooltip(task: Task): string {
+    const preview = this.promptPreview(task.prompt, 100);
+    return preview ? `${task.name}\n\n${preview}` : task.name;
+  }
+
+  private taskExecutorLabel(task: Task, playlist: Playlist): string {
+    const executor = task.engine
+      ?? ((task.type && task.type !== 'agent') ? task.type : undefined)
+      ?? playlist.engine
+      ?? this._plan?.defaultEngine
+      ?? 'agent';
+
+    return executor.charAt(0).toUpperCase() + executor.slice(1);
+  }
+
+  private taskStatusLabel(status: TaskStatus): string {
+    switch (status) {
+      case TaskStatus.Completed: return 'done';
+      case TaskStatus.Failed: return 'failed';
+      case TaskStatus.Running: return 'running';
+      case TaskStatus.Paused: return 'paused';
+      case TaskStatus.Blocked: return 'blocked';
+      case TaskStatus.Skipped: return 'skipped';
+      case TaskStatus.Pending:
+      default:
+        return 'pending';
+    }
+  }
+
+  private promptPreview(prompt: string | undefined, limit: number): string | undefined {
+    if (!prompt) {
+      return undefined;
+    }
+
+    const cleaned = prompt.replace(/\s+/g, ' ').trim();
+    if (!cleaned) {
+      return undefined;
+    }
+
+    return cleaned.length > limit ? `${cleaned.substring(0, limit)}...` : cleaned;
   }
 
   // ─── Drag & Drop ───

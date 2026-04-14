@@ -20,6 +20,7 @@ export interface ContextSettings {
   maxOutputPerTask: number;
   maxFileContextChars: number;
   fileTreeDepth: number;
+  maxPriorTasks: number;
 }
 
 /** Arguments passed to buildContext */
@@ -40,14 +41,15 @@ export function getContextSettings(): ContextSettings {
     planOverview: cfg.get<boolean>('planOverview', true),
     priorTaskOutputs: cfg.get<boolean>('priorTaskOutputs', true),
     allPriorOutputs: cfg.get<boolean>('allPriorOutputs', false),
-    projectState: cfg.get<boolean>('projectState', true),
+    projectState: cfg.get<boolean>('projectState', false),
     changedFiles: cfg.get<boolean>('changedFiles', true),
     cumulativeProgress: cfg.get<boolean>('cumulativeProgress', true),
     relevantFiles: cfg.get<boolean>('relevantFiles', true),
-    maxContextChars: Math.max(cfg.get<number>('maxContextChars', 30000), 1000),
-    maxOutputPerTask: Math.max(cfg.get<number>('maxOutputPerTask', 3000), 500),
-    maxFileContextChars: Math.max(cfg.get<number>('maxFileContextChars', 10000), 1000),
+    maxContextChars: Math.max(cfg.get<number>('maxContextChars', 12000), 1000),
+    maxOutputPerTask: Math.max(cfg.get<number>('maxOutputPerTask', 1500), 500),
+    maxFileContextChars: Math.max(cfg.get<number>('maxFileContextChars', 6000), 1000),
     fileTreeDepth: Math.min(Math.max(cfg.get<number>('fileTreeDepth', 3), 1), 6),
+    maxPriorTasks: Math.max(cfg.get<number>('maxPriorTasks', 3), 1),
   };
 }
 
@@ -216,30 +218,35 @@ export function gatherPriorOutputs(
   currentTask: Task,
   settings: ContextSettings,
 ): string {
-  // Collect task IDs whose output we want
-  const taskIds = new Set<string>();
+  // Collect candidate task IDs, ordered most-recent-first (closest to current task)
+  const playlistTaskIds = playlist.tasks.map(t => t.id);
+  const currentIdx = playlistTaskIds.indexOf(currentTask.id);
+  const priorPlaylistIds = currentIdx > 0 ? playlistTaskIds.slice(0, currentIdx).reverse() : [];
 
-  if (currentTask.dependsOn) {
-    for (const depId of currentTask.dependsOn) {
-      taskIds.add(depId);
-    }
-  }
+  // Explicit dependencies take priority; then same-playlist prior tasks (most recent first)
+  const depIds = new Set(currentTask.dependsOn ?? []);
+  const ordered: string[] = [
+    ...priorPlaylistIds.filter(id => depIds.has(id)),   // deps that are in this playlist first
+    ...priorPlaylistIds.filter(id => !depIds.has(id)),  // then remaining playlist tasks
+    ...[...depIds].filter(id => !playlistTaskIds.includes(id)), // cross-playlist deps last
+  ];
 
   if (settings.allPriorOutputs) {
-    for (const t of playlist.tasks) {
-      if (t.id === currentTask.id) { break; }
-      taskIds.add(t.id);
-    }
+    // allPriorOutputs already included via priorPlaylistIds above — just ensure all deps present
+  } else if (depIds.size === 0) {
+    // No explicit deps and allPriorOutputs=false: include only the N most recent same-playlist tasks
+    ordered.splice(0, ordered.length, ...priorPlaylistIds.slice(0, settings.maxPriorTasks));
   }
 
-  if (taskIds.size === 0) { return ''; }
+  // Apply maxPriorTasks cap
+  const capped = ordered.slice(0, settings.maxPriorTasks);
+  if (capped.length === 0) { return ''; }
 
-  // Resolve task names from plan
   const allTasks = plan.playlists.flatMap(pl => pl.tasks);
   const taskNameMap = new Map(allTasks.map(t => [t.id, t.name]));
 
   const parts: string[] = [];
-  for (const taskId of taskIds) {
+  for (const taskId of capped) {
     const entries = historyStore.getForTask(taskId);
     const latest = entries[0]; // newest first
     if (!latest || latest.status !== TaskStatus.Completed) { continue; }
@@ -389,7 +396,17 @@ const IGNORED_DIRS = new Set([
   'venv', '.venv', 'env', '.env',
 ]);
 
+const PROJECT_STATE_CACHE_TTL_MS = 15000;
+const projectStateCache = new Map<string, { builtAt: number; value: string }>();
+
 export function gatherProjectState(cwd: string, settings: ContextSettings): string {
+  const cacheKey = `${cwd}|depth:${settings.fileTreeDepth}`;
+  const cached = projectStateCache.get(cacheKey);
+  const now = Date.now();
+  if (cached && (now - cached.builtAt) < PROJECT_STATE_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
   const parts: string[] = [];
 
   // File tree
@@ -429,7 +446,9 @@ export function gatherProjectState(cwd: string, settings: ContextSettings): stri
     // no package.json or invalid JSON
   }
 
-  return parts.join('\n\n');
+  const value = parts.join('\n\n');
+  projectStateCache.set(cacheKey, { builtAt: now, value });
+  return value;
 }
 
 function findReadme(cwd: string): string | null {

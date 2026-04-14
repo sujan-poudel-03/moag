@@ -4,6 +4,7 @@
 import * as vscode from 'vscode';
 import { Task, TaskType, EngineId, FailurePolicy, TaskStatus } from '../models/types';
 import { generateId } from '../models/plan';
+import { designSystemCssTokens } from './design-system';
 
 /** Options passed to TaskEditorPanel.open() */
 export interface TaskEditorOptions {
@@ -167,28 +168,29 @@ export class TaskEditorPanel {
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <style>
+  ${designSystemCssTokens()}
   :root {
-    --bg: var(--vscode-editor-background);
-    --fg: var(--vscode-editor-foreground);
-    --input-bg: var(--vscode-input-background);
-    --input-fg: var(--vscode-input-foreground);
-    --input-border: var(--vscode-input-border, #3c3c3c);
-    --btn-bg: var(--vscode-button-background);
-    --btn-fg: var(--vscode-button-foreground);
-    --btn-hover: var(--vscode-button-hoverBackground);
-    --btn-secondary-bg: var(--vscode-button-secondaryBackground);
-    --btn-secondary-fg: var(--vscode-button-secondaryForeground);
-    --section-border: var(--vscode-panel-border, #3c3c3c);
-    --focus-border: var(--vscode-focusBorder);
-    --error: var(--vscode-errorForeground, #f44747);
-    --description: var(--vscode-descriptionForeground);
+    --bg: var(--ds-bg);
+    --fg: var(--ds-fg);
+    --input-bg: var(--ds-input-bg);
+    --input-fg: var(--ds-input-fg);
+    --input-border: var(--ds-input-border);
+    --btn-bg: var(--ds-btn-bg);
+    --btn-fg: var(--ds-btn-fg);
+    --btn-hover: var(--ds-btn-hover);
+    --btn-secondary-bg: var(--ds-btn-secondary-bg);
+    --btn-secondary-fg: var(--ds-btn-secondary-fg);
+    --section-border: var(--ds-border);
+    --focus-border: var(--ds-focus);
+    --error: var(--ds-error);
+    --description: var(--ds-muted);
   }
 
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    font-family: var(--vscode-font-family);
-    font-size: var(--vscode-font-size);
+    font-family: var(--ds-font-family);
+    font-size: var(--ds-font-size);
     color: var(--fg);
     background: var(--bg);
     padding: 0;

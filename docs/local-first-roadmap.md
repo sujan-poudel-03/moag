@@ -1,4 +1,4 @@
-# Local-First Product Roadmap
+do# Local-First Product Roadmap
 
 ## Positioning
 
@@ -13,7 +13,7 @@ Secondary user:
 This means the product should optimize for:
 - Reliable local execution
 - Safe automation around code, services, tests, and environments
-- Strong status reporting for both technical and non-technical review
+- Strong status reporting for both technical and nonwev-technical review
 
 It should not optimize for team collaboration first. Shared workflows can come later, after the local loop is strong.
 

@@ -11,6 +11,7 @@ import { RunSession, RunSessionStore } from '../models/run-session';
 import { getModelSpec, ModelSpec, getAllModelSpecs } from '../models/model-specs';
 import { getEngine } from '../adapters/index';
 import { generateId } from '../models/plan';
+import { designSystemCssTokens } from './design-system';
 
 /** Tracks open panels by threadId so clicking the same thread reuses its panel. */
 const openPanels = new Map<string, ExecutionDetailPanel>();
@@ -1021,13 +1022,14 @@ function buildErrorHtml(message: string): string {
 
 function sharedStyles(): string {
   return /* css */ `
+    ${designSystemCssTokens()}
     * { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      font-family: var(--vscode-font-family);
-      font-size: var(--vscode-font-size);
-      color: var(--vscode-editor-foreground);
-      background: var(--vscode-editor-background);
+      font-family: var(--ds-font-family);
+      font-size: var(--ds-font-size);
+      color: var(--ds-fg);
+      background: var(--ds-bg);
       padding: 0;
       display: flex;
       flex-direction: column;
@@ -1040,8 +1042,8 @@ function sharedStyles(): string {
       align-items: center;
       gap: 12px;
       padding: 8px 16px;
-      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
-      border-bottom: 1px solid var(--vscode-panel-border);
+      background: var(--ds-surface);
+      border-bottom: 1px solid var(--ds-border);
       flex-shrink: 0;
     }
     .nav-back {

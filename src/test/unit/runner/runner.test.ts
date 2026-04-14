@@ -660,6 +660,27 @@ describe('TaskRunner', () => {
     assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Skipped);
   });
 
+  it('should emit task-completed with Skipped status when skipIf matches', async () => {
+    const { runner } = buildRunner();
+    const completedTasks: Array<{ name: string; status: TaskStatus }> = [];
+    runner.on('task-completed', (task: { name: string; status: TaskStatus }) => {
+      completedTasks.push({ name: task.name, status: task.status });
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].id = 'task-1';
+    plan.playlists[0].tasks[0].status = TaskStatus.Completed;
+    plan.playlists[0].tasks[1].skipIf = { taskId: 'task-1', status: TaskStatus.Completed };
+
+    await runner.play(plan);
+
+    // Task 2 should appear in task-completed with Skipped status
+    const task2Event = completedTasks.find(t => t.name === 'Task 2');
+    assert.ok(task2Event, 'task-completed should fire for skipped task');
+    assert.equal(task2Event!.status, TaskStatus.Skipped);
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Skipped);
+  });
+
   it('should run task when skipIf condition does not match', async () => {
     const { runner } = buildRunner();
     const taskNames: string[] = [];
@@ -674,6 +695,24 @@ describe('TaskRunner', () => {
 
     // Both tasks should run since skipIf doesn't match
     assert.deepEqual(taskNames, ['Task 1', 'Task 2']);
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
+  });
+
+  it('should run task when skipIf status does not match completed task', async () => {
+    const { runner } = buildRunner();
+    const taskNames: string[] = [];
+    runner.on('task-started', (task: { name: string }) => taskNames.push(task.name));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].id = 'task-a';
+    plan.playlists[0].tasks[0].status = TaskStatus.Completed;
+    // skipIf checks for Failed, but task-a is Completed → condition does NOT match → task 2 runs
+    plan.playlists[0].tasks[1].skipIf = { taskId: 'task-a', status: TaskStatus.Failed };
+
+    await runner.play(plan);
+
+    // Task 1 already completed (skipped on resume), Task 2 should run normally
+    assert.deepEqual(taskNames, ['Task 2']);
     assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
   });
 
@@ -711,6 +750,24 @@ describe('TaskRunner', () => {
 
     assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
     assert.equal(plan.playlists[1].tasks[0].status, TaskStatus.Skipped);
+  });
+
+  it('should run task normally when skipIf condition is failed but task completed', async () => {
+    const { runner } = buildRunner();
+    const taskNames: string[] = [];
+    runner.on('task-started', (task: { name: string }) => taskNames.push(task.name));
+
+    const plan = makePlan();
+    const task1Id = plan.playlists[0].tasks[0].id;
+    plan.playlists[0].tasks[0].status = TaskStatus.Completed;
+    // skipIf checks for 'failed', but task 1 is 'completed' → no match → task 2 runs
+    plan.playlists[0].tasks[1].skipIf = { taskId: task1Id, status: TaskStatus.Failed };
+
+    await runner.play(plan);
+
+    // Task 1 already completed (skipped on resume), Task 2 should run and complete
+    assert.deepEqual(taskNames, ['Task 2']);
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
   });
 
   // ─── Plan Variables Tests ───

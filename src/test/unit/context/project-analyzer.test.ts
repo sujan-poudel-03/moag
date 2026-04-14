@@ -188,6 +188,18 @@ describe('project-analyzer', () => {
       assert.equal(result.framework, null);
       assert.equal(result.fileCount, 0);
     });
+
+    it('handles empty temp directory without crashing', () => {
+      const dir = path.join(os.tmpdir(), `moag-empty-test-${Math.random().toString(36).slice(2)}`);
+      fs.mkdirSync(dir);
+      try {
+        const result = analyzeProject(dir);
+        assert.equal(result.language, 'unknown');
+        assert.equal(result.hasTests, false);
+      } finally {
+        cleanup(dir);
+      }
+    });
   });
 
   describe('generateSuggestions', () => {
@@ -229,6 +241,28 @@ describe('project-analyzer', () => {
       } finally {
         cleanup(dir);
       }
+    });
+  });
+
+  describe('analyzeProject — real MOAG project (process.cwd())', () => {
+    it('detects TypeScript language', () => {
+      const result = analyzeProject(process.cwd());
+      assert.equal(result.language, 'typescript');
+    });
+
+    it('detects hasTests is true', () => {
+      const result = analyzeProject(process.cwd());
+      assert.equal(result.hasTests, true);
+    });
+
+    it('detects mocha test framework', () => {
+      const result = analyzeProject(process.cwd());
+      assert.equal(result.testFramework, 'mocha');
+    });
+
+    it('detects npm as package manager', () => {
+      const result = analyzeProject(process.cwd());
+      assert.equal(result.packageManager, 'npm');
     });
   });
 
@@ -280,6 +314,27 @@ describe('project-analyzer', () => {
       assert.ok(text.includes('Add a LICENSE file'));
       // No framework line when null
       assert.ok(!text.includes('Framework:'));
+    });
+
+    it('formats python/django project with pytest', () => {
+      const analysis: ProjectAnalysis = {
+        framework: 'django',
+        language: 'python',
+        packageManager: 'pip',
+        hasTests: true,
+        testFramework: 'pytest',
+        hasLinter: false,
+        hasCI: false,
+        hasDocs: false,
+        missingFiles: [],
+        suggestedImprovements: [],
+        fileCount: 10,
+        topLevelDirs: ['app'],
+      };
+      const text = formatAnalysis(analysis);
+      assert.ok(text.includes('Language: python'));
+      assert.ok(text.includes('Framework: django'));
+      assert.ok(text.includes('Has tests: true'));
     });
 
     it('omits framework line when null', () => {

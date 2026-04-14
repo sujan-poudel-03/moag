@@ -15,7 +15,7 @@ const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '4';
+const HTML_VERSION = '6';
 
 export class DashboardPanel {
   public static currentPanel: DashboardPanel | undefined;
@@ -238,10 +238,10 @@ export class DashboardPanel {
   ): void {
     // Send stderr/stdout snippet so the dashboard can show WHY a task failed
     const stderrSnippet = result.stderr
-      ? result.stderr.substring(0, 2000)
+      ? result.stderr.substring(0, 8000)
       : '';
     const stdoutTail = result.stdout
-      ? result.stdout.substring(Math.max(0, result.stdout.length - 1000))
+      ? result.stdout.substring(Math.max(0, result.stdout.length - 3000))
       : '';
 
     this.postMessageWithRetries({
@@ -433,6 +433,25 @@ export class DashboardPanel {
         }
         break;
       }
+      case 'retryTaskWithNote': {
+        const taskId = msg.taskId as string | undefined;
+        if (taskId) {
+          const plan = this.getPlan();
+          if (plan) {
+            for (let pi = 0; pi < plan.playlists.length; pi++) {
+              for (let ti = 0; ti < plan.playlists[pi].tasks.length; ti++) {
+                if (plan.playlists[pi].tasks[ti].id === taskId) {
+                  vscode.commands.executeCommand('agentTaskPlayer.retryTaskWithNote', {
+                    kind: 'task', playlistIndex: pi, taskIndex: ti, label: plan.playlists[pi].tasks[ti].name,
+                  });
+                  return;
+                }
+              }
+            }
+          }
+        }
+        break;
+      }
       case 'open-diff': {
         const diffTaskId = msg.taskId as string | undefined;
         if (diffTaskId) {
@@ -539,17 +558,23 @@ export class DashboardPanel {
     * { box-sizing: border-box; margin: 0; padding: 0; }
     [hidden] { display: none !important; }
 
+    html, body {
+      height: 100vh;
+      width: 100%;
+      max-height: 100vh;
+      max-width: 100%;
+      overflow: hidden;
+      min-height: 0;
+    }
+
     body {
       font-family: var(--ds-font-family);
       font-size: var(--ds-font-size);
       color: var(--fg);
       background: var(--bg);
-      height: 100vh;
-      width: 100vw;
-      max-width: 100vw;
       display: flex;
       flex-direction: column;
-      overflow: hidden;
+      min-height: 0;
     }
 
     /* ─── Scrollbar ─── */
@@ -616,7 +641,7 @@ export class DashboardPanel {
     .icon-btn.primary:disabled { background: var(--button-bg); opacity: 0.4; }
 
     /* ─── Zone Layout ─── */
-    .main-zone {
+    .main-zone, .main-content {
       flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
       display: flex; flex-direction: column;
     }
@@ -931,7 +956,7 @@ export class DashboardPanel {
 
     /* ─── Section Toggle ─── */
     .section-toggle {
-      display: flex; align-items: center; gap: 0;
+      display: flex; align-items: center; gap: 4px;
       width: 100%; height: 22px; line-height: 22px;
       padding: 0; border: none; background: none;
       cursor: pointer; user-select: none; color: var(--fg);
@@ -1024,7 +1049,7 @@ export class DashboardPanel {
     .task-list { padding: 0; }
     .task-row {
       display: flex; align-items: center; gap: 8px;
-      height: 24px; line-height: 24px; padding: 0 8px 0 40px;
+      height: 24px; line-height: 24px; padding: 0 8px 0 36px;
       font-size: 11px;
     }
     .task-row:hover { background: var(--hover-bg); }
@@ -1042,6 +1067,23 @@ export class DashboardPanel {
     .task-duration {
       font-size: 10px; color: var(--dimmed); flex-shrink: 0;
     }
+    .task-runtime-badge {
+      font-size: 9px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      border-radius: 999px;
+      padding: 1px 6px;
+      flex-shrink: 0;
+    }
+    .task-runtime-badge.running {
+      background: rgba(76,175,80,0.2);
+      color: var(--success);
+    }
+    .task-runtime-badge.queued {
+      background: rgba(0,122,204,0.2);
+      color: var(--focus-border);
+    }
     .task-edit-btn {
       height: 18px; min-width: 18px; padding: 0 4px;
       border: 1px solid transparent; border-radius: 3px;
@@ -1052,7 +1094,7 @@ export class DashboardPanel {
     .task-row:hover .task-edit-btn { opacity: 1; }
     .task-edit-btn:hover { border-color: var(--border); color: var(--fg); background: var(--hover-bg); }
     .tree-add-btn {
-      width: calc(100% - 40px); margin: 2px 8px 4px 32px;
+      width: calc(100% - 36px); margin: 2px 8px 4px 28px;
       height: 22px; line-height: 20px; border: 1px dashed var(--border);
       border-radius: 4px; background: transparent; color: var(--dimmed);
       font-size: 11px; text-align: left; padding: 0 8px; cursor: pointer;
@@ -1087,9 +1129,9 @@ export class DashboardPanel {
     <button class="plan-name" id="plan-name" onclick="vscode.postMessage({type:'switch-plan'})">MOAG</button>
     <span id="runner-status" class="status-badge status-idle">Idle</span>
     <div class="transport">
-      <button id="btn-play" class="icon-btn primary" title="Play">&#9654;</button>
-      <button id="btn-pause" class="icon-btn" title="Pause">&#10074;&#10074;</button>
-      <button id="btn-stop" class="icon-btn" title="Stop">&#9632;</button>
+      <button id="btn-play" class="icon-btn primary" title="Play">▶</button>
+      <button id="btn-pause" class="icon-btn" title="Pause">⏸</button>
+      <button id="btn-stop" class="icon-btn" title="Stop">■</button>
     </div>
   </div>
 
@@ -1107,7 +1149,7 @@ export class DashboardPanel {
   <div class="eta-display" id="eta-display" style="display:none;"></div>
 
   <!-- Main scrollable zone -->
-  <div class="main-content" id="main-content">
+  <div class="main-zone" id="main-content">
 
     <!-- STATE 1: Empty state (no plan) -->
     <div class="state-empty" id="state-empty">
@@ -1229,6 +1271,7 @@ export class DashboardPanel {
       promptEngineEl.addEventListener('change', function() {
         selectedPromptEngineId = promptEngineEl.value;
         renderPromptComposerState();
+        renderEngineStatus();
       });
     }
     var heroInput = document.getElementById('hero-input');
@@ -1367,6 +1410,51 @@ export class DashboardPanel {
       return null;
     }
 
+    function getExecutionPointers(plan) {
+      if (!plan || !Array.isArray(plan.playlists)) {
+        return { runningTaskId: null, queuedTaskId: null };
+      }
+      var linear = [];
+      plan.playlists.forEach(function(pl) {
+        (pl.tasks || []).forEach(function(t) { linear.push(t); });
+      });
+      if (linear.length === 0) {
+        return { runningTaskId: null, queuedTaskId: null };
+      }
+
+      var runningIdx = -1;
+      for (var i = 0; i < linear.length; i++) {
+        if (String(linear[i].status || '').toLowerCase() === 'running') {
+          runningIdx = i;
+          break;
+        }
+      }
+
+      var queuedIdx = -1;
+      if (runningIdx >= 0) {
+        for (var j = runningIdx + 1; j < linear.length; j++) {
+          var s = String(linear[j].status || '').toLowerCase();
+          if (!s || s === 'pending' || s === 'queued' || s === 'todo') {
+            queuedIdx = j;
+            break;
+          }
+        }
+      } else {
+        for (var k = 0; k < linear.length; k++) {
+          var firstPending = String(linear[k].status || '').toLowerCase();
+          if (!firstPending || firstPending === 'pending' || firstPending === 'queued' || firstPending === 'todo') {
+            queuedIdx = k;
+            break;
+          }
+        }
+      }
+
+      return {
+        runningTaskId: runningIdx >= 0 ? linear[runningIdx].id : null,
+        queuedTaskId: queuedIdx >= 0 ? linear[queuedIdx].id : null,
+      };
+    }
+
     function autoResizePromptInput() {
       if (!promptInputEl) { return; }
       promptInputEl.style.height = 'auto';
@@ -1383,6 +1471,7 @@ export class DashboardPanel {
     function syncPromptEngineOptions(engines, preferredId) {
       if (!promptEngineEl) {
         promptEngines = Array.isArray(engines) ? engines : [];
+        renderEngineStatus();
         return;
       }
       promptEngines = Array.isArray(engines) ? engines : [];
@@ -1414,6 +1503,20 @@ export class DashboardPanel {
       }
 
       renderPromptComposerState();
+      renderEngineStatus();
+    }
+
+    function renderEngineStatus() {
+      var el = document.getElementById('engine-status');
+      if (!el) { return; }
+      if (!promptEngines || promptEngines.length === 0) {
+        el.innerHTML = '<span style="color:var(--dimmed)">No supported engines detected.</span>';
+        return;
+      }
+      var selected = promptEngines.find(function(engine) { return engine.id === selectedPromptEngineId; }) || promptEngines[0];
+      var otherEngines = promptEngines.filter(function(engine) { return engine.id !== selected.id; }).map(function(engine) { return engine.label; });
+      var extra = otherEngines.length > 0 ? ' <span style="color:var(--dimmed)">(also available: ' + escHtml(otherEngines.join(', ')) + ')</span>' : '';
+      el.innerHTML = '<span>Engine: <strong>' + escHtml(selected.label) + '</strong></span>' + extra;
     }
 
     function submitPromptFromComposer() {
@@ -1891,14 +1994,14 @@ export class DashboardPanel {
         errLine.className = 'ct-error-line';
         const stderr = msg.stderr || (state.output || '');
         const errPreview = stderr.split('\\n').filter(function(l) { return l.trim(); }).slice(-2).join(' | ').substring(0, 120);
-        errLine.textContent = blocked ? 'blocked' : (errPreview || 'exit ' + msg.exitCode);
+        errLine.textContent = blocked ? ('blocked' + (errPreview ? ': ' + errPreview : '')) : (errPreview || 'exit ' + msg.exitCode);
         errLine.title = stderr.split('\\n').filter(function(l) { return l.trim(); }).slice(-5).join('\\n');
         card.appendChild(errLine);
 
         const rawStderr = (msg.stderr || '').trim();
         const rawStdout = (msg.stdoutTail || state.output || '').trim();
         const errorSource = rawStderr || rawStdout;
-        if (errorSource && !blocked) {
+        if (errorSource) {
           const errorLines = errorSource.split('\\n').filter(function(l) { return l.trim(); }).slice(-5)
             .map(function(l) { return l.length > 200 ? l.substring(0, 200) + '...' : l; });
           if (errorLines.length > 0) {
@@ -1914,6 +2017,12 @@ export class DashboardPanel {
             card.appendChild(errDetails);
           }
         }
+        const actionRow = document.createElement('div');
+        actionRow.className = 'diff-actions';
+        actionRow.innerHTML =
+          '<button type="button" onclick="event.stopPropagation(); vscode.postMessage({type:\\x27retryTask\\x27, taskId:\\x27' + taskId + '\\x27})">Retry</button>' +
+          '<button type="button" onclick="event.stopPropagation(); vscode.postMessage({type:\\x27retryTaskWithNote\\x27, taskId:\\x27' + taskId + '\\x27})">Retry with Note</button>';
+        card.appendChild(actionRow);
         card.classList.add('expanded');
       }
 
@@ -2207,6 +2316,7 @@ export class DashboardPanel {
     function renderPlan(plan) {
       const section = document.getElementById('plan-section');
       const planName = document.getElementById('plan-name');
+      var pointers = getExecutionPointers(plan);
 
       if (!plan || !plan.playlists || plan.playlists.length === 0) {
         section.innerHTML = '<div class="plan-placeholder">No plan loaded \\u2014 use the sidebar to create one.</div>';
@@ -2244,17 +2354,25 @@ export class DashboardPanel {
           '<span class="section-toggle-icon">\\u25BC</span>' +
           '<span class="section-toggle-label">' +
             '<span class="playlist-name">' + escHtml(pl.name || 'Playlist') + '</span>' +
-            '<span class="engine-badge engine-' + escHtml(engineId) + '">' + escHtml(pl.engine || 'custom') + '</span>' +
           '</span>' +
+          '<span class="engine-badge engine-' + escHtml(engineId) + '">' + escHtml(pl.engine || 'custom') + '</span>' +
           '<span class="playlist-progress">' + doneCount + '/' + tasks.length + '</span>' +
         '</button>';
         html += '<div class="section-body task-list' + (playlistCollapsed ? ' collapsed' : '') + '" id="body-' + playlistSectionId + '">';
 
         tasks.forEach(function(task, taskIndex) {
           var duration = getTaskDurationLabel(task);
+          var isRunning = pointers.runningTaskId && task.id === pointers.runningTaskId;
+          var isQueued = pointers.queuedTaskId && task.id === pointers.queuedTaskId;
+          var runtimeBadge = isRunning
+            ? '<span class="task-runtime-badge running">RUNNING</span>'
+            : isQueued
+              ? '<span class="task-runtime-badge queued">QUEUED NEXT</span>'
+              : '';
           html += '<div class="task-row">' +
             '<span class="task-status-dot ' + escHtml(String(task.status || 'pending').toLowerCase()) + '"></span>' +
             '<span class="task-name">' + escHtml(task.name) + '</span>' +
+            runtimeBadge +
             '<span class="task-duration">' + escHtml(duration) + '</span>' +
             '<button class="task-edit-btn" onclick="event.stopPropagation();vscode.postMessage({type:\\'editTask\\',playlistIndex:' + playlistIndex + ',taskIndex:' + taskIndex + '})" title="Edit task">Edit</button>' +
           '</div>';

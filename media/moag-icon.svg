@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none">
+  <!-- Outer orbit ring — represents orchestration/loop -->
+  <circle cx="12" cy="12" r="10" stroke="#C5C5C5" stroke-width="1.5" stroke-dasharray="4 2" fill="none"/>
+  <!-- Inner solid circle — the hub -->
+  <circle cx="12" cy="12" r="7" stroke="#C5C5C5" stroke-width="1.5" fill="none"/>
+  <!-- Play triangle — the action -->
+  <polygon points="10,8 10,16 17,12" fill="#C5C5C5"/>
+  <!-- Agent dots on orbit — represents multiple agents -->
+  <circle cx="12" cy="2" r="1.5" fill="#C5C5C5"/>
+  <circle cx="21" cy="15.5" r="1.5" fill="#C5C5C5"/>
+  <circle cx="3" cy="15.5" r="1.5" fill="#C5C5C5"/>
+</svg>

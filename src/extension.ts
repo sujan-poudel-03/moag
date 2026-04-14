@@ -3,6 +3,8 @@
 
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
+import * as os from 'os';
 import { Plan, RunnerState, EngineId, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task } from './models/types';
 import { loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
 import { registerAllEngines, checkEngineAvailability, getEngine } from './adapters/index';
@@ -16,8 +18,14 @@ import { HistoryTreeProvider } from './ui/history-tree';
 import { DashboardPanel } from './ui/dashboard-panel';
 import { ExecutionDetailPanel } from './ui/execution-detail-panel';
 import { TaskEditorPanel } from './ui/task-editor-panel';
-import { PromptInputViewProvider } from './ui/prompt-input-view';
-import { detectAndConfigureEngines, redetectEngines } from './engine-detection';
+import {
+  PromptEngineOption,
+  PromptInputViewProvider,
+  PromptSidebarListItem,
+  PromptSidebarChatMessage,
+  PromptSidebarPlanGroup,
+} from './ui/prompt-input-view';
+import { detectAndConfigureEngines, detectEngines, redetectEngines } from './engine-detection';
 import { analyzeProject, formatAnalysis } from './context/project-analyzer';
 import { RunSessionStore, RunSession } from './models/run-session';
 import * as UserMsg from './utils/user-messages';
@@ -30,16 +38,24 @@ import { PromptLibraryStore } from './templates/prompt-library';
 
 let currentPlan: Plan | null = null;
 let currentPlanPath: string | null = null;
+let planDirty = false;
 let runner: TaskRunner;
 let historyStore: HistoryStore;
 let planTree: PlanTreeProvider;
-let planView: vscode.TreeView<PlanTreeItem>;
+let planView: vscode.TreeView<PlanTreeItem> | undefined;
 let historyTree: HistoryTreeProvider;
 let templateStore: TemplateStore;
 let promptLibraryStore: PromptLibraryStore;
 let runSessionStore: RunSessionStore;
 let sessionsTree: SessionsTreeProvider;
 let planFileWatcher: vscode.FileSystemWatcher | null = null;
+let temporaryPlanState: { plan: Plan | null; planPath: string | null; planDirty: boolean } | null = null;
+let engineStatusBarItem: vscode.StatusBarItem | null = null;
+let extensionContext: vscode.ExtensionContext | null = null;
+let detectedPromptEngines: EngineId[] = [];
+let promptViewProvider: PromptInputViewProvider | null = null;
+let currentSidebarThreadId: string | null = null;
+let pendingSidebarTurn: { prompt: string; engine: EngineId; startedAt: string; threadId: string; turnIndex: number } | null = null;
 
 // ─── Watch mode state ───
 let watchModeActive = false;
@@ -57,15 +73,28 @@ let executionStartTime = 0;
 let progressResolve: (() => void) | null = null;
 let progressReport: vscode.Progress<{ message?: string; increment?: number }> | null = null;
 
+const NO_ENGINES_PROMPT_KEY = 'agentTaskPlayer.noEnginesPromptShown';
+const RECENT_PLANS_KEY = 'moag.recentPlans';
+const CLAUDE_INSTALL_URL = 'https://www.npmjs.com/package/@anthropic-ai/claude-code';
+const CODEX_INSTALL_URL = 'https://www.npmjs.com/package/@openai/codex';
+
+interface TaskLocation {
+  playlistIndex: number;
+  taskIndex: number;
+}
+
+interface RecentPlan {
+  name: string;
+  path: string;
+  openedAt: number;
+}
+
 function startProgressNotification(): void {
   if (progressResolve) { return; } // already running
   vscode.window.withProgress(
-    { location: vscode.ProgressLocation.Notification, title: 'MOAG', cancellable: true },
-    (progress, token) => {
+    { location: vscode.ProgressLocation.Window, title: 'MOAG' },
+    (progress) => {
       progressReport = progress;
-      token.onCancellationRequested(() => {
-        runner.stop();
-      });
       return new Promise<void>((resolve) => {
         progressResolve = resolve;
       });
@@ -85,6 +114,541 @@ function endProgressNotification(): void {
   }
 }
 
+function getEngineDisplayName(id: EngineId): string {
+  try {
+    return getEngine(id).displayName;
+  } catch {
+    return id;
+  }
+}
+
+function updateEngineStatusBarVisibility(): void {
+  if (!engineStatusBarItem) {
+    return;
+  }
+  engineStatusBarItem.show();
+}
+
+function updateEngineStatusBar(available: EngineId[]): void {
+  if (!engineStatusBarItem) {
+    return;
+  }
+
+  const names = available.map(getEngineDisplayName);
+  engineStatusBarItem.text = available.length > 0
+    ? `$(check) ${available.length} engine${available.length === 1 ? '' : 's'}`
+    : '$(warning) No engines';
+  engineStatusBarItem.tooltip = available.length > 0
+    ? `Detected engines:\n${names.join('\n')}`
+    : 'No supported AI engines detected.\nClick to rescan.';
+  updateEngineStatusBarVisibility();
+}
+
+function getPromptEngineOptions(available: EngineId[]): PromptEngineOption[] {
+  return available.map((id) => ({
+    id,
+    label: getEngineDisplayName(id),
+  }));
+}
+
+function getPreferredPromptEngine(available: EngineId[]): EngineId | undefined {
+  const configuredEngine = vscode.workspace.getConfiguration('agentTaskPlayer')
+    .get<EngineId>('defaultEngine', 'claude' as EngineId);
+
+  if (available.includes(configuredEngine)) {
+    return configuredEngine;
+  }
+
+  return available[0];
+}
+
+function syncPromptProviderEngines(
+  promptProvider: PromptInputViewProvider,
+  available: EngineId[],
+): void {
+  detectedPromptEngines = [...available];
+  promptProvider.setEngines(
+    getPromptEngineOptions(available),
+    getPreferredPromptEngine(available),
+  );
+  DashboardPanel.currentPanel?.update();
+}
+
+function formatSessionAge(iso: string): string {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  const mins = Math.max(0, Math.floor(diffMs / 60000));
+  if (mins < 1) { return 'just now'; }
+  if (mins < 60) { return `${mins}m ago`; }
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) { return `${hrs}h ago`; }
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+function getPromptSidebarSessions(): PromptSidebarListItem[] {
+  const threadHeads = historyStore.getThreadHeads().slice(0, 30);
+  if (threadHeads.length > 0) {
+    return threadHeads.map((entry) => ({
+      id: entry.threadId ?? entry.id,
+      kind: 'thread',
+      title: entry.taskName,
+      subtitle: `${getEngineDisplayName(entry.engine)}  -  ${formatSessionAge(entry.startedAt)}`,
+    }));
+  }
+
+  return runSessionStore.getAll().slice(0, 30).map((session) => ({
+    id: session.id,
+    kind: 'run',
+    title: session.planName,
+    subtitle: `${session.status}  -  ${formatSessionAge(session.startedAt)}`,
+  }));
+}
+
+function getPromptSidebarPlanItems(): PromptSidebarListItem[] {
+  const plan = getActivePlan();
+  if (!plan) {
+    return [];
+  }
+
+  return plan.playlists
+    .flatMap((playlist) => (playlist.tasks || []).map((task) => ({
+      id: task.id,
+      kind: 'plan' as const,
+      title: task.name,
+      subtitle: `${playlist.name}  -  ${task.status ?? 'pending'}`,
+    })))
+    .slice(0, 200);
+}
+
+function getPromptSidebarHistoryItems(): PromptSidebarListItem[] {
+  return historyStore.getAll().slice(0, 200).map((entry) => {
+    const planName = entry.runId ? (runSessionStore.get(entry.runId)?.planName ?? 'Ad hoc') : 'Ad hoc';
+    const playlistName = entry.playlistName || 'Unassigned';
+    return {
+      id: entry.threadId ?? entry.id,
+      kind: 'history',
+      title: entry.taskName,
+      subtitle: `${planName} / ${playlistName}  -  ${getEngineDisplayName(entry.engine)}  -  ${formatSessionAge(entry.startedAt)}`,
+      status: entry.status,
+      planName,
+      playlistName,
+    };
+  });
+}
+
+function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
+  const plan = getActivePlan();
+  if (!plan) {
+    return [];
+  }
+
+  const getTaskFailureReason = (task: Task): string | undefined => {
+    if (task.status !== TaskStatus.Failed && task.status !== TaskStatus.Blocked) {
+      return undefined;
+    }
+    const entries = historyStore.getForTask(task.id);
+    const latest = entries[0];
+    if (!latest) {
+      return undefined;
+    }
+    const merged = [latest.result.stderr, latest.result.stdout].filter(Boolean).join('\n');
+    const firstLine = merged
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .find(line => line.length > 0);
+    return firstLine ? firstLine.substring(0, 160) : undefined;
+  };
+
+  return plan.playlists.map((playlist, index) => {
+    const tasks = playlist.tasks || [];
+    const total = tasks.length;
+    const done = tasks.filter((task) =>
+      task.status === TaskStatus.Completed
+      || task.status === TaskStatus.Failed
+      || task.status === TaskStatus.Blocked
+      || task.status === TaskStatus.Skipped).length;
+    const running = tasks.some((task) => task.status === TaskStatus.Running);
+    const failed = tasks.some((task) => task.status === TaskStatus.Failed || task.status === TaskStatus.Blocked);
+    const status = running
+      ? 'running'
+      : failed
+        ? 'failed'
+        : total > 0 && done === total
+          ? 'completed'
+          : 'pending';
+
+    return {
+      id: playlist.id ?? `playlist-${index}`,
+      name: playlist.name || `Playlist ${index + 1}`,
+      playlistStatus: status,
+      progress: { done, total },
+      tasks: tasks.map((task) => ({
+        id: task.id,
+        name: task.name,
+        status: task.status ?? 'pending',
+        failureReason: getTaskFailureReason(task),
+      })),
+    };
+  });
+}
+
+function syncPromptProviderSidebar(promptProvider: PromptInputViewProvider): void {
+  const chatState = getPromptSidebarChatState();
+  const context = getPromptSidebarActiveContext();
+  promptProvider.setSidebarState(
+    getPromptSidebarSessions(),
+    getPromptSidebarPlanItems(),
+    getPromptSidebarHistoryItems(),
+    chatState.title,
+    chatState.messages,
+    chatState.threadId,
+    runner.state,
+    getPromptSidebarPlanGroups(),
+    context.planName,
+    context.playlistName,
+  );
+}
+
+function getPromptSidebarActiveContext(): { planName: string; playlistName: string } {
+  const plan = getActivePlan();
+  if (!plan) {
+    return { planName: 'Ad hoc', playlistName: 'Quick Prompt' };
+  }
+
+  const runningPlaylist = plan.playlists.find((playlist) => (playlist.tasks || [])
+    .some((task) => task.status === TaskStatus.Running));
+  if (runningPlaylist) {
+    return {
+      planName: plan.name || 'Untitled Plan',
+      playlistName: runningPlaylist.name || 'Playlist',
+    };
+  }
+
+  const nextPlaylist = plan.playlists.find((playlist) => (playlist.tasks || [])
+    .some((task) => task.status !== TaskStatus.Completed));
+  if (nextPlaylist) {
+    return {
+      planName: plan.name || 'Untitled Plan',
+      playlistName: nextPlaylist.name || 'Playlist',
+    };
+  }
+
+  return {
+    planName: plan.name || 'Untitled Plan',
+    playlistName: plan.playlists[0]?.name || 'Playlist',
+  };
+}
+
+function getAssistantText(entry: HistoryEntry): string {
+  const getOutputPreview = (text: string | undefined): string => {
+    const raw = (text || '').trim();
+    if (!raw) {
+      return '';
+    }
+    const lines = raw.split(/\r?\n/).map((line) => line.trimEnd());
+    const nonEmpty = lines.filter((line) => line.trim().length > 0);
+    if (nonEmpty.length === 0) {
+      return '';
+    }
+    const preview = nonEmpty.slice(-24).join('\n').trim();
+    return preview.length > 2200 ? `${preview.slice(0, 2200)}...` : preview;
+  };
+
+  const summary = entry.result.summary?.trim();
+  const genericSummary = summary
+    ? /^(agent|command|check|service)\s+task\s+(passed|failed)|^command completed successfully\.?$|^task finished\.?$/i.test(summary)
+    : false;
+  if (summary && !genericSummary) {
+    return summary;
+  }
+
+  const changedCount = (entry.changedFiles ?? []).length;
+  if (entry.status === TaskStatus.Completed) {
+    if (changedCount > 0) {
+      return changedCount === 1
+        ? 'Done. Updated 1 file successfully.'
+        : `Done. Updated ${changedCount} files successfully.`;
+    }
+    const answerLikeOutput = getOutputPreview(entry.result.stdout);
+    if (answerLikeOutput) {
+      return answerLikeOutput;
+    }
+    return 'Done. No file changes were needed.';
+  }
+
+  const stdout = getOutputPreview(entry.result.stdout);
+  if (stdout) {
+    return stdout;
+  }
+
+  const stderr = getOutputPreview(entry.result.stderr);
+  if (stderr) {
+    return stderr;
+  }
+
+  return 'Run failed. Open Dashboard for details.';
+}
+
+function getUserChatText(rawPrompt: string, fallbackTaskName?: string): string {
+  const prompt = (rawPrompt || '').trim();
+  if (!prompt) {
+    return '';
+  }
+
+  // The runner injects context/rules/snippets before the actual task prompt.
+  // Keep only the user-authored segment.
+  if (/\[CONTEXT START\]/i.test(prompt) || /\[EXECUTION RULES\]/i.test(prompt) || /\[PROMPT SNIPPETS\]/i.test(prompt)) {
+    let body = prompt;
+
+    const sectionEnds = [
+      body.lastIndexOf('[CONTEXT END]'),
+      body.lastIndexOf('[/EXECUTION RULES]'),
+      body.lastIndexOf('[/PROMPT SNIPPETS]'),
+    ].filter((idx) => idx >= 0);
+
+    if (sectionEnds.length > 0) {
+      const lastEnd = Math.max(...sectionEnds);
+      const nextBreak = body.indexOf('\n', lastEnd);
+      body = nextBreak >= 0 ? body.slice(nextBreak + 1).trim() : body.slice(lastEnd + 1).trim();
+    }
+
+    body = body
+      .split(/\n\nExecution contract:\n/i)[0]
+      .split(/\n\nContext files:\n/i)[0]
+      .trim();
+
+    if (body) {
+      return body.length > 1200 ? `${body.slice(0, 1200)}...` : body;
+    }
+  }
+
+  if (fallbackTaskName && fallbackTaskName.trim()) {
+    return fallbackTaskName.trim();
+  }
+
+  return prompt.length > 1200 ? `${prompt.slice(0, 1200)}...` : prompt;
+}
+
+function getPromptSidebarChatState(): { title: string; messages: PromptSidebarChatMessage[]; threadId: string } {
+  const heads = historyStore.getThreadHeads();
+
+  if (pendingSidebarTurn) {
+    const pending = pendingSidebarTurn;
+    const pendingThread = historyStore.getThread(pending.threadId);
+    const hasNewResult = pendingThread.some((entry) => (entry.turnIndex ?? 0) >= pending.turnIndex);
+    if (!hasNewResult) {
+      const pendingPrompt = getUserChatText(pending.prompt, getPromptTaskName(pending.prompt));
+      const messages: PromptSidebarChatMessage[] = [];
+      const title = pendingThread[0]?.taskName || getPromptTaskName(pending.prompt);
+
+      // Keep prior turns visible so chat remains a continuous conversation.
+      for (const entry of pendingThread) {
+        const prompt = getUserChatText(entry.prompt ?? '', entry.taskName);
+        if (prompt) {
+          messages.push({
+            id: `${entry.id}-user`,
+            role: 'user',
+            author: 'You',
+            text: prompt,
+          });
+        }
+        messages.push({
+          id: `${entry.id}-assistant`,
+          role: 'assistant',
+          author: getEngineDisplayName(entry.engine),
+          text: getAssistantText(entry),
+          status: (entry.status as PromptSidebarChatMessage['status']) ?? undefined,
+          changedFilesCount: (entry.changedFiles ?? []).length,
+          durationMs: entry.result.durationMs,
+          verificationPassed: entry.verification?.passed,
+          exitCode: entry.result.exitCode,
+        });
+      }
+
+      if (pendingThread.length === 0 && pendingPrompt) {
+        messages.push({
+          id: `pending-user-${pending.turnIndex}`,
+          role: 'user',
+          author: 'You',
+          text: pendingPrompt,
+        });
+        messages.push({
+          id: `pending-assistant-${pending.turnIndex}`,
+          role: 'assistant',
+          author: getEngineDisplayName(pending.engine),
+          text: 'Running this request...',
+          status: 'running',
+        });
+      }
+
+      return {
+        title,
+        threadId: pending.threadId,
+        messages,
+      };
+    }
+
+    const resolvedThreadId = pending.threadId;
+    pendingSidebarTurn = null;
+    currentSidebarThreadId = resolvedThreadId;
+  }
+
+  if (heads.length === 0) {
+    currentSidebarThreadId = null;
+    return { title: 'New Chat', messages: [], threadId: '' };
+  }
+
+  if (!currentSidebarThreadId || !heads.some((head) => (head.threadId ?? head.id) === currentSidebarThreadId)) {
+    currentSidebarThreadId = heads[0].threadId ?? heads[0].id;
+  }
+
+  const thread = currentSidebarThreadId ? historyStore.getThread(currentSidebarThreadId) : [];
+  if (thread.length === 0) {
+    return { title: 'New Chat', messages: [], threadId: '' };
+  }
+
+  const title = thread[0].taskName || 'Chat';
+  const messages: PromptSidebarChatMessage[] = [];
+  for (const entry of thread) {
+    const prompt = getUserChatText(entry.prompt ?? '', entry.taskName);
+    if (prompt) {
+      messages.push({
+        id: `${entry.id}-user`,
+        role: 'user',
+        author: 'You',
+        text: prompt,
+      });
+    }
+    messages.push({
+      id: `${entry.id}-assistant`,
+      role: 'assistant',
+      author: getEngineDisplayName(entry.engine),
+      text: getAssistantText(entry),
+      status: (entry.status as PromptSidebarChatMessage['status']) ?? undefined,
+      changedFilesCount: (entry.changedFiles ?? []).length,
+      durationMs: entry.result.durationMs,
+      verificationPassed: entry.verification?.passed,
+      exitCode: entry.result.exitCode,
+    });
+  }
+
+  return { title, messages, threadId: currentSidebarThreadId ?? '' };
+}
+
+async function promptToInstallEngineOnce(
+  context: vscode.ExtensionContext,
+  available: EngineId[],
+): Promise<void> {
+  if (available.length > 0) {
+    return;
+  }
+
+  const alreadyShown = context.globalState.get<boolean>(NO_ENGINES_PROMPT_KEY, false);
+  if (alreadyShown) {
+    return;
+  }
+
+  await context.globalState.update(NO_ENGINES_PROMPT_KEY, true);
+
+  const choice = await vscode.window.showInformationMessage(
+    'MOAG: No AI engines found. Install one to get started.',
+    'Install Claude',
+    'Install Codex',
+  );
+
+  if (choice === 'Install Claude') {
+    void vscode.env.openExternal(vscode.Uri.parse(CLAUDE_INSTALL_URL));
+  } else if (choice === 'Install Codex') {
+    void vscode.env.openExternal(vscode.Uri.parse(CODEX_INSTALL_URL));
+  }
+}
+
+function isDashboardVisible(): boolean {
+  return Boolean(
+    (DashboardPanel.currentPanel as unknown as { _panel?: { visible?: boolean } } | undefined)?._panel?.visible,
+  );
+}
+
+function shouldShowTaskNotifications(): boolean {
+  return vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('showTaskNotifications', true)
+    && !isDashboardVisible();
+}
+
+function isTaskLocation(value: unknown): value is TaskLocation {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+
+  const candidate = value as TaskLocation;
+  return typeof candidate.playlistIndex === 'number' && typeof candidate.taskIndex === 'number';
+}
+
+function isEngineId(value: string | undefined): value is EngineId {
+  return value === 'claude'
+    || value === 'codex'
+    || value === 'gemini'
+    || value === 'ollama'
+    || value === 'custom';
+}
+
+function findTaskLocation(taskId: string): TaskLocation | null {
+  const plan = getActivePlan();
+  if (!plan) {
+    return null;
+  }
+
+  for (let playlistIndex = 0; playlistIndex < plan.playlists.length; playlistIndex++) {
+    const taskIndex = plan.playlists[playlistIndex].tasks.findIndex(task => task.id === taskId);
+    if (taskIndex >= 0) {
+      return { playlistIndex, taskIndex };
+    }
+  }
+
+  return null;
+}
+
+function notifyTaskCompleted(task: Task): void {
+  if (task.status !== TaskStatus.Completed || !shouldShowTaskNotifications()) {
+    return;
+  }
+
+  void vscode.window.showInformationMessage(
+    `Task "${task.name}" completed`,
+    'View Dashboard',
+    'View Changes',
+  ).then(action => {
+    if (action === 'View Dashboard') {
+      void vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+    } else if (action === 'View Changes') {
+      void vscode.commands.executeCommand('agentTaskPlayer.exportResults');
+    }
+  });
+}
+
+function notifyTaskFailed(task: Task): void {
+  if (!shouldShowTaskNotifications()) {
+    return;
+  }
+
+  void vscode.window.showWarningMessage(
+    `Task "${task.name}" failed`,
+    'View Dashboard',
+    'Retry',
+  ).then(action => {
+    if (action === 'View Dashboard') {
+      void vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+      return;
+    }
+
+    if (action === 'Retry') {
+      const location = findTaskLocation(task.id);
+      if (location) {
+        void vscode.commands.executeCommand('agentTaskPlayer.retryTask', location);
+      }
+    }
+  });
+}
+
 // ─── Pause state persistence ───
 const PAUSE_STATE_KEY = 'agentTaskPlayer.pauseState';
 
@@ -93,31 +657,63 @@ interface PersistentPauseState {
   taskStatuses: Record<string, string>;
   /** Path to the plan file that was running */
   planPath: string | null;
+  /** Signature of task statuses at the moment pause state was captured */
+  planStatusSignature?: string;
+}
+
+function normalizePersistedTaskStatus(status: TaskStatus): TaskStatus {
+  return status === TaskStatus.Running ? TaskStatus.Pending : status;
+}
+
+function isRestorableTaskStatus(status: string | undefined): status is TaskStatus {
+  return status === TaskStatus.Completed
+    || status === TaskStatus.Failed
+    || status === TaskStatus.Blocked
+    || status === TaskStatus.Skipped;
+}
+
+function buildPlanStatusSignature(plan: Plan): string {
+  const parts: string[] = [];
+  for (const pl of plan.playlists) {
+    for (const t of pl.tasks) {
+      parts.push(`${t.id}:${String(t.status || TaskStatus.Pending).toLowerCase()}`);
+    }
+  }
+  parts.sort();
+  return parts.join('|');
 }
 
 /** Save current task statuses to workspace state (called on pause/stop) */
 function savePauseState(ctx: vscode.ExtensionContext): void {
-  if (!currentPlan) { return; }
+  if (!currentPlan || !currentPlanPath) { return; }
   const taskStatuses: Record<string, string> = {};
   for (const pl of currentPlan.playlists) {
     for (const t of pl.tasks) {
-      taskStatuses[t.id] = t.status;
+      taskStatuses[t.id] = normalizePersistedTaskStatus(t.status);
     }
   }
-  const state: PersistentPauseState = { taskStatuses, planPath: currentPlanPath };
+  const state: PersistentPauseState = {
+    taskStatuses,
+    planPath: currentPlanPath,
+    planStatusSignature: buildPlanStatusSignature(currentPlan),
+  };
   ctx.workspaceState.update(PAUSE_STATE_KEY, state);
 }
 
 /** Restore task statuses from workspace state (called on activation) */
 function restorePauseState(ctx: vscode.ExtensionContext): void {
   const state = ctx.workspaceState.get<PersistentPauseState>(PAUSE_STATE_KEY);
-  if (!state || !currentPlan || state.planPath !== currentPlanPath) { return; }
+  if (!state || !currentPlan || !currentPlanPath || state.planPath !== currentPlanPath) { return; }
+  if (state.planStatusSignature && state.planStatusSignature !== buildPlanStatusSignature(currentPlan)) {
+    return;
+  }
 
   let restored = false;
   for (const pl of currentPlan.playlists) {
     for (const t of pl.tasks) {
-      if (state.taskStatuses[t.id] && state.taskStatuses[t.id] !== 'pending') {
-        t.status = state.taskStatuses[t.id] as import('./models/types').TaskStatus;
+      const savedStatus = state.taskStatuses[t.id];
+      if (isRestorableTaskStatus(savedStatus)) {
+        t.status = savedStatus;
         restored = true;
       }
     }
@@ -131,6 +727,29 @@ function restorePauseState(ctx: vscode.ExtensionContext): void {
 /** Clear saved pause state */
 function clearPauseState(ctx: vscode.ExtensionContext): void {
   ctx.workspaceState.update(PAUSE_STATE_KEY, undefined);
+}
+
+function addRecentPlan(name: string, planPath: string): void {
+  if (!extensionContext) {
+    return;
+  }
+
+  const resolvedPath = path.resolve(planPath);
+  const normalizedPath = normalizeFilePath(resolvedPath);
+  const recent = extensionContext.workspaceState.get<RecentPlan[]>(RECENT_PLANS_KEY, []);
+  const filtered = recent.filter(entry => normalizeFilePath(entry.path) !== normalizedPath);
+
+  filtered.unshift({
+    name,
+    path: resolvedPath,
+    openedAt: Date.now(),
+  });
+
+  void extensionContext.workspaceState.update(RECENT_PLANS_KEY, filtered.slice(0, 5));
+}
+
+function getRecentPlans(): RecentPlan[] {
+  return extensionContext?.workspaceState.get<RecentPlan[]>(RECENT_PLANS_KEY, []) ?? [];
 }
 
 /**
@@ -150,7 +769,67 @@ function getActivePlan(): Plan | null {
   return treePlan;
 }
 
+function setVisiblePlan(
+  plan: Plan | null,
+  planPath: string | null,
+  refreshDashboard = true,
+): void {
+  currentPlan = plan;
+  currentPlanPath = planPath;
+  planDirty = false;
+  if (plan && planPath) {
+    addRecentPlan(plan.name, planPath);
+  }
+  planTree.setPlan(plan);
+  if (planView) {
+    planView.message = undefined;
+  }
+  if (promptViewProvider) {
+    syncPromptProviderSidebar(promptViewProvider);
+  }
+  if (refreshDashboard) {
+    DashboardPanel.currentPanel?.update();
+  }
+}
+
+function activateTemporaryPlan(plan: Plan): void {
+  temporaryPlanState = { plan: getActivePlan(), planPath: currentPlanPath, planDirty };
+  setVisiblePlan(plan, null);
+}
+
+function restoreTemporaryPlan(refreshDashboard = true): void {
+  if (!temporaryPlanState) {
+    return;
+  }
+
+  const { plan, planPath, planDirty: previousPlanDirty } = temporaryPlanState;
+  temporaryPlanState = null;
+  setVisiblePlan(plan, planPath, refreshDashboard);
+  planDirty = previousPlanDirty;
+}
+
+function normalizeFilePath(filePath: string): string {
+  const resolved = path.resolve(filePath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function getSuggestedPlanFileName(planName: string): string {
+  const slug = planName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .substring(0, 50);
+  return `${slug || 'my-plan'}.json`;
+}
+
+function isDefaultPlanPath(planPath: string | null): boolean {
+  const defaultPath = getMoagPlanPath();
+  return Boolean(planPath && defaultPath && normalizeFilePath(planPath) === normalizeFilePath(defaultPath));
+}
+
 export function activate(context: vscode.ExtensionContext): void {
+  extensionContext = context;
+
   // Register all engine adapters
   registerAllEngines();
 
@@ -174,75 +853,68 @@ export function activate(context: vscode.ExtensionContext): void {
   planTree = new PlanTreeProvider();
   historyTree = new HistoryTreeProvider(historyStore);
 
-  // Register tree views
-  planView = vscode.window.createTreeView('agentTaskPlayer.planView', {
-    treeDataProvider: planTree,
-    showCollapseAll: true,
-    dragAndDropController: planTree,
-    canSelectMany: true,
-  });
-  const histView = vscode.window.createTreeView('agentTaskPlayer.historyView', {
-    treeDataProvider: historyTree,
-  });
-
-  // Initialize sessions tree
+  // Keep the sessions provider alive for commands/detail panels, but don't
+  // create a separate sidebar view now that sessions live behind History.
   sessionsTree = new SessionsTreeProvider(historyStore, runSessionStore);
-  const sessView = vscode.window.createTreeView('agentTaskPlayer.sessionsView', {
-    treeDataProvider: sessionsTree,
-    showCollapseAll: true,
-  });
-  context.subscriptions.push(planView, histView, sessView);
 
   // Register prompt input webview in sidebar
   const promptProvider = new PromptInputViewProvider(
     context.extensionUri,
-    async (prompt: string) => {
-      const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-      if (!workspaceFolder) {
-        UserMsg.showError(UserMsg.noWorkspace());
-        return;
+    async ({ prompt, engineId, imageData }) => {
+      let finalPrompt = prompt;
+      if (imageData) {
+        const match = imageData.match(/^data:(image\/[\w+]+);base64,(.+)$/s);
+        if (match) {
+          const ext = match[1].split('/')[1].split('+')[0];
+          const tmpFile = path.join(os.tmpdir(), `moag-img-${Date.now()}.${ext}`);
+          fs.writeFileSync(tmpFile, Buffer.from(match[2], 'base64'));
+          finalPrompt = `${prompt}\n\n[Attached image: ${tmpFile}]`;
+        }
       }
-
-      // Auto-create a plan if none loaded
-      if (!currentPlan) {
-        const planName = prompt.substring(0, 60).trim();
-        currentPlan = createEmptyPlan(planName);
-        currentPlan.description = prompt;
-        currentPlanPath = getNewPlanSavePath() || path.join(
-          workspaceFolder.uri.fsPath,
-          `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`,
-        );
+      return runPromptSubmission(finalPrompt, isEngineId(engineId) ? engineId : undefined);
+    },
+    (id, kind) => {
+      if (kind === 'thread' || kind === 'history') {
+        const head = historyStore.getThreadHeads().find((entry) => (entry.threadId ?? entry.id) === id);
+        if (head) {
+          currentSidebarThreadId = head.threadId ?? head.id;
+          syncPromptProviderSidebar(promptProvider);
+          cmdOpenThread(head);
+          return;
+        }
+      } else if (kind === 'run') {
+        const session = runSessionStore.get(id);
+        if (session) {
+          const runEntries = historyStore.getForRun(session.id);
+          if (runEntries.length > 0) {
+            currentSidebarThreadId = runEntries[0].threadId ?? runEntries[0].id;
+            syncPromptProviderSidebar(promptProvider);
+          }
+          cmdOpenSession(session);
+          return;
+        }
+      } else if (kind === 'plan') {
+        const location = findTaskLocation(id);
+        if (location) {
+          cmdEditTask(location);
+          return;
+        }
       }
-
-      // Ensure at least one playlist exists
-      if (currentPlan.playlists.length === 0) {
-        currentPlan.playlists.push(createPlaylist('Tasks'));
-      }
-
-      // Create and add the task
-      const taskName = prompt.length > 60 ? prompt.substring(0, 57) + '...' : prompt;
-      const task = createTask(taskName, prompt);
-      currentPlan.playlists[0].tasks.push(task);
-      saveAndRefresh();
-
-      // Find the indices for the new task
-      const playlistIndex = 0;
-      const taskIndex = currentPlan.playlists[0].tasks.length - 1;
-
-      // Pre-flight engine check
-      if (!await preflightEngineCheck(currentPlan, playlistIndex, taskIndex)) {
-        return;
-      }
-
-      // Run the task immediately — auto-open dashboard
-      vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
-      runner.playTask(currentPlan, playlistIndex, taskIndex).catch(err => {
-        vscode.window.showErrorMessage(`Task failed: ${err instanceof Error ? err.message : String(err)}`);
-      });
+      cmdShowHistory();
     },
   );
+  promptViewProvider = promptProvider;
+  syncPromptProviderEngines(
+    promptProvider,
+    context.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []),
+  );
+  syncPromptProviderSidebar(promptProvider);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(PromptInputViewProvider.viewType, promptProvider),
+  );
+  context.subscriptions.push(
+    historyStore.onDidChange(() => syncPromptProviderSidebar(promptProvider)),
+    runSessionStore.onDidChange(() => syncPromptProviderSidebar(promptProvider)),
   );
 
   // Save plan when tree items are reordered via drag-and-drop
@@ -253,6 +925,9 @@ export function activate(context: vscode.ExtensionContext): void {
   runner.on('state-changed', (state) => {
     planTree.setRunnerState(state);
     DashboardPanel.currentPanel?.update();
+    if (promptViewProvider) {
+      syncPromptProviderSidebar(promptViewProvider);
+    }
     updateStatusBar(state);
     // Persist task progress when pausing or stopping
     if (state === RunnerState.Paused || state === RunnerState.Stopping) {
@@ -267,6 +942,9 @@ export function activate(context: vscode.ExtensionContext): void {
   runner.on('task-started', (task, playlist, fullPrompt) => {
     executionTasksCompleted++; // tracks current task number (1-based)
     planTree.refresh();
+    if (promptViewProvider) {
+      syncPromptProviderSidebar(promptViewProvider);
+    }
 
     // Create run session on first task
     if (executionTasksCompleted === 1 && runner.currentRunId) {
@@ -289,8 +967,6 @@ export function activate(context: vscode.ExtensionContext): void {
       });
     }
 
-    // Auto-open the Dashboard so users can see live output during execution
-    ensureDashboardOpen();
     DashboardPanel.currentPanel?.update();
     DashboardPanel.currentPanel?.startTaskCard(task, playlist, fullPrompt);
 
@@ -360,6 +1036,7 @@ export function activate(context: vscode.ExtensionContext): void {
         });
       }
     }
+    notifyTaskCompleted(task);
   });
 
   runner.on('task-failed', (task, result) => {
@@ -389,6 +1066,7 @@ export function activate(context: vscode.ExtensionContext): void {
     }
     const shortErr = result.stderr.split('\n').filter(l => l.trim()).slice(0, 1).join('').substring(0, 80);
     vscode.window.setStatusBarMessage(`$(warning) Task "${task.name}" failed: ${shortErr || 'exit ' + result.exitCode}`, 5000);
+    notifyTaskFailed(task);
   });
 
   runner.on('playlist-completed', (_playlist) => {
@@ -397,7 +1075,9 @@ export function activate(context: vscode.ExtensionContext): void {
 
   runner.on('all-completed', () => {
     endProgressNotification();
-    clearPauseState(context);
+    if (!temporaryPlanState) {
+      clearPauseState(context);
+    }
     // Finalize run session
     if (runner.currentRunId) {
       const session = runSessionStore.get(runner.currentRunId);
@@ -450,7 +1130,12 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // ─── Status bar ───
 
-  const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  engineStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
+  engineStatusBarItem.command = 'agentTaskPlayer.detectEngines';
+  context.subscriptions.push(engineStatusBarItem);
+  updateEngineStatusBar(context.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []));
+
+  const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 98);
   statusBarItem.command = 'agentTaskPlayer.showDashboard';
   statusBarItem.text = '$(rocket) ATP: Idle';
   statusBarItem.show();
@@ -471,10 +1156,13 @@ export function activate(context: vscode.ExtensionContext): void {
   // Register all commands — using registerCommand with individual calls
   // to avoid strict type issues with the variadic handler signatures
   context.subscriptions.push(
+    vscode.commands.registerCommand('agentTaskPlayer.runPrompt', cmdRunPrompt),
     vscode.commands.registerCommand('agentTaskPlayer.play', cmdPlay),
     vscode.commands.registerCommand('agentTaskPlayer.pause', cmdPause),
     vscode.commands.registerCommand('agentTaskPlayer.stop', cmdStop),
     vscode.commands.registerCommand('agentTaskPlayer.openPlan', cmdOpenPlan),
+    vscode.commands.registerCommand('agentTaskPlayer.switchPlan', cmdSwitchPlan),
+    vscode.commands.registerCommand('agentTaskPlayer.savePlanAs', cmdSavePlanAs),
     vscode.commands.registerCommand('agentTaskPlayer.newPlan', cmdNewPlan),
     vscode.commands.registerCommand('agentTaskPlayer.addPlaylist', cmdAddPlaylist),
     vscode.commands.registerCommand('agentTaskPlayer.addTask', cmdAddTask),
@@ -500,7 +1188,12 @@ export function activate(context: vscode.ExtensionContext): void {
         false,
       );
     }),
-    vscode.commands.registerCommand('agentTaskPlayer.detectEngines', () => redetectEngines(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.showChangelog', () => cmdShowChangelog(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.detectEngines', async () => {
+      const result = await redetectEngines(context);
+      updateEngineStatusBar(result.available);
+      syncPromptProviderEngines(promptProvider, result.available);
+    }),
     vscode.commands.registerCommand('agentTaskPlayer.loadExamplePlan', cmdLoadExamplePlan),
     vscode.commands.registerCommand('agentTaskPlayer.showThreadList', cmdShowThreadList),
     vscode.commands.registerCommand('agentTaskPlayer.runPlanFile', cmdRunPlanFile),
@@ -537,6 +1230,12 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.switchProfile', cmdSwitchProfile),
     vscode.commands.registerCommand('agentTaskPlayer.watchMode', cmdToggleWatchMode),
     vscode.commands.registerCommand('agentTaskPlayer.managePromptSnippets', cmdManagePromptSnippets),
+    vscode.commands.registerCommand('agentTaskPlayer.toggleFullAuto', async () => {
+      const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+      const current = cfg.get<boolean>('fullAuto', false);
+      await cfg.update('fullAuto', !current, vscode.ConfigurationTarget.Workspace);
+      vscode.window.showInformationMessage(`Full Auto mode: ${!current ? 'ON — write → test → fix loop active' : 'OFF'}`);
+    }),
   );
 
   // Show walkthrough on first activation — always, regardless of existing plans
@@ -550,21 +1249,42 @@ export function activate(context: vscode.ExtensionContext): void {
     context.globalState.update('agentTaskPlayer.hasSeenWalkthrough', true);
   }
 
+  // Show "What's New" notification when the extension updates to a new version
+  const currentVersion = vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON?.version as string | undefined;
+  const lastSeenVersion = context.globalState.get<string>('agentTaskPlayer.lastSeenVersion');
+  if (currentVersion && lastSeenVersion && lastSeenVersion !== currentVersion) {
+    vscode.window.showInformationMessage(
+      `MOAG updated to v${currentVersion}`,
+      "What's New",
+    ).then(choice => {
+      if (choice === "What's New") {
+        cmdShowChangelog(context);
+      }
+    });
+  }
+  if (currentVersion) {
+    context.globalState.update('agentTaskPlayer.lastSeenVersion', currentVersion);
+  }
+
   // Auto-detect installed engines on first launch (non-blocking)
-  detectAndConfigureEngines(context);
+  void detectAndConfigureEngines(context)
+    .then(async (result) => {
+      updateEngineStatusBar(result.available);
+      syncPromptProviderEngines(promptProvider, result.available);
+      await promptToInstallEngineOnce(context, result.available);
+    })
+    .catch(() => undefined);
 
   // Auto-load plan if one exists in workspace, then restore pause state
   autoLoadPlan().then(() => restorePauseState(context));
 
   // Watch for plan file changes — auto-reload on external edits
-  planFileWatcher = vscode.workspace.createFileSystemWatcher('**/{.moag/plan.json,*.agent-plan.json}');
+  planFileWatcher = vscode.workspace.createFileSystemWatcher('**/{.moag/*.json,*.agent-plan.json}');
   planFileWatcher.onDidChange((uri) => {
-    if (currentPlanPath && uri.fsPath === currentPlanPath && runner.state === RunnerState.Idle) {
+    if (currentPlanPath && normalizeFilePath(uri.fsPath) === normalizeFilePath(currentPlanPath) && runner.state === RunnerState.Idle) {
       try {
-        currentPlan = loadPlan(currentPlanPath);
-        planTree.setPlan(currentPlan);
-        planView.message = truncateDescription(currentPlan?.description);
-        DashboardPanel.currentPanel?.update();
+        const plan = loadPlan(currentPlanPath);
+        setVisiblePlan(plan, currentPlanPath);
       } catch {
         // ignore reload errors
       }
@@ -629,6 +1349,8 @@ async function createPRFromRun(): Promise<void> {
 }
 
 export function deactivate(): void {
+  extensionContext = null;
+  promptViewProvider = null;
   runner?.stop();
   runner?.stopAllServices();
   if (planFileWatcher) {
@@ -638,16 +1360,6 @@ export function deactivate(): void {
   disableWatchMode();
 }
 
-// ─── Helper: truncate sidebar description ───
-
-function truncateDescription(desc?: string): string | undefined {
-  if (!desc) { return undefined; }
-  // Cap at 150 chars for sidebar display
-  const cleaned = desc.replace(/\s+/g, ' ').trim();
-  if (cleaned.length <= 150) { return cleaned; }
-  return cleaned.substring(0, 147) + '...';
-}
-
 // ─── Helper: save & refresh ───
 
 function saveAndRefresh(): void {
@@ -655,9 +1367,37 @@ function saveAndRefresh(): void {
   if (plan && currentPlanPath) {
     savePlan(plan, currentPlanPath);
   }
+  planDirty = Boolean(plan && isDefaultPlanPath(currentPlanPath));
   planTree.setPlan(plan);
-  planView.message = truncateDescription(plan?.description);
+  if (planView) {
+    planView.message = undefined;
+  }
+  if (promptViewProvider) {
+    syncPromptProviderSidebar(promptViewProvider);
+  }
   DashboardPanel.currentPanel?.update();
+}
+
+async function promptSaveBeforeNew(): Promise<boolean> {
+  const plan = getActivePlan();
+  if (!plan || !planDirty || !isDefaultPlanPath(currentPlanPath)) {
+    return true;
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `Plan "${plan.name}" has unsaved changes in the default location. Save it with a name before creating a new plan?`,
+    'Save As...',
+    'Discard',
+    'Cancel',
+  );
+  if (!choice || choice === 'Cancel') {
+    return false;
+  }
+  if (choice === 'Save As...') {
+    const saved = await cmdSavePlanAs();
+    return saved && !isDefaultPlanPath(currentPlanPath);
+  }
+  return true;
 }
 
 function formatTaskList(values?: string[]): string {
@@ -718,7 +1458,8 @@ function getTaskType(task: Task): TaskType {
 // ─── .moag/ directory management ───
 
 const MOAG_DIR = '.moag';
-const MOAG_PLAN_FILE = 'plan.json';
+const MOAG_PLAN_FILE = '.agent-plan.json';
+const MOAG_FALLBACK_PLAN_FILE = 'plan.json';
 
 /** Get the .moag/ directory path for the current workspace */
 function getMoagDir(): string | null {
@@ -727,11 +1468,16 @@ function getMoagDir(): string | null {
   return path.join(workspaceFolder.uri.fsPath, MOAG_DIR);
 }
 
-/** Get the canonical plan path: .moag/plan.json */
+/** Get preferred plan path: .moag/.agent-plan.json (fallback .moag/plan.json) */
 function getMoagPlanPath(): string | null {
   const dir = getMoagDir();
   if (!dir) { return null; }
-  return path.join(dir, MOAG_PLAN_FILE);
+  const fs = require('fs') as typeof import('fs');
+  const canonical = path.join(dir, MOAG_PLAN_FILE);
+  if (fs.existsSync(canonical)) {
+    return canonical;
+  }
+  return path.join(dir, MOAG_FALLBACK_PLAN_FILE);
 }
 
 /** Ensure .moag/ directory exists */
@@ -740,7 +1486,11 @@ function ensureMoagDir(): string | null {
   if (!dir) { return null; }
   const fs = require('fs') as typeof import('fs');
   if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {
+      return null; // read-only FS or permission denied
+    }
   }
   // Add .moag/ to .gitignore if not already there
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
@@ -759,20 +1509,38 @@ function ensureMoagDir(): string | null {
   return dir;
 }
 
-/** Resolve the plan path: prefer .moag/plan.json, auto-migrate any legacy *.agent-plan.json */
+/** Resolve the plan path: prefer .moag/.agent-plan.json, then .moag/plan.json */
 async function resolvePlanPath(): Promise<string | null> {
   const fs = require('fs') as typeof import('fs');
+  const moagDir = getMoagDir();
+  const canonicalMoagPath = moagDir ? path.join(moagDir, MOAG_PLAN_FILE) : null;
+  const fallbackMoagPath = moagDir ? path.join(moagDir, MOAG_FALLBACK_PLAN_FILE) : null;
   const moagPath = getMoagPlanPath();
 
-  // 1. If .moag/plan.json exists, use it
-  if (moagPath && fs.existsSync(moagPath)) {
+  // 1. If .moag/.agent-plan.json exists, use it
+  if (canonicalMoagPath && fs.existsSync(canonicalMoagPath)) {
     // Still check for stray legacy files and clean them up
     migrateLegacyPlans();
-    return moagPath;
+    return canonicalMoagPath;
   }
 
-  // 2. Find any legacy *.agent-plan.json files and auto-migrate the first one
-  const files = await vscode.workspace.findFiles('*.agent-plan.json', '**/node_modules/**', 10);
+  // 2. If .moag/plan.json exists, use it
+  if (fallbackMoagPath && fs.existsSync(fallbackMoagPath)) {
+    migrateLegacyPlans();
+    return fallbackMoagPath;
+  }
+
+  // 3. Find any legacy *.agent-plan.json files and auto-migrate the first one
+  let files: vscode.Uri[];
+  try {
+    const findPromise = vscode.workspace.findFiles('*.agent-plan.json', '**/node_modules/**', 10);
+    const timeoutPromise = new Promise<vscode.Uri[]>((_, reject) =>
+      setTimeout(() => reject(new Error('findFiles timeout')), 1000),
+    );
+    files = await Promise.race([findPromise, timeoutPromise]);
+  } catch {
+    return null; // timed out or errored — huge workspace, bail gracefully
+  }
   if (files.length === 0) {
     return null;
   }
@@ -816,7 +1584,16 @@ function migrateLegacyPlans(): void {
     for (const entry of entries) {
       if (entry.isFile() && entry.name.endsWith('.agent-plan.json')) {
         const src = path.join(workspaceRoot, entry.name);
-        const dest = path.join(moagDir, entry.name);
+        let dest = path.join(moagDir, entry.name);
+        // If destination already exists, use a numbered suffix
+        if (fs.existsSync(dest)) {
+          const base = entry.name.replace(/\.agent-plan\.json$/, '');
+          let counter = 2;
+          while (fs.existsSync(path.join(moagDir, `${base}-${counter}.agent-plan.json`))) {
+            counter++;
+          }
+          dest = path.join(moagDir, `${base}-${counter}.agent-plan.json`);
+        }
         try {
           fs.renameSync(src, dest);
         } catch { /* ignore */ }
@@ -837,12 +1614,16 @@ async function autoLoadPlan(): Promise<void> {
   const planPath = await resolvePlanPath();
   if (!planPath) { return; }
 
+  // If the plan file was deleted externally, reset and bail
+  const fs = require('fs') as typeof import('fs');
+  if (!fs.existsSync(planPath)) {
+    setVisiblePlan(null, null);
+    return;
+  }
+
   try {
-    currentPlanPath = planPath;
-    currentPlan = loadPlan(currentPlanPath);
-    planTree.setPlan(currentPlan);
-    planView.message = truncateDescription(currentPlan?.description);
-    DashboardPanel.currentPanel?.update();
+    const plan = loadPlan(planPath);
+    setVisiblePlan(plan, planPath);
   } catch {
     // Silently ignore corrupt plan files on startup
   }
@@ -966,6 +1747,214 @@ async function preflightEngineCheck(
 
 // ─── Command handlers ───
 
+function getPromptTaskName(prompt: string): string {
+  const normalized = prompt.replace(/\s+/g, ' ').trim();
+  return normalized.length > 60 ? normalized.substring(0, 57) + '...' : normalized;
+}
+
+function initializeSingleTaskExecution(): void {
+  executionTaskCount = 1;
+  executionTasksCompleted = 0;
+  executionTasksFailed = 0;
+  executionStartTime = Date.now();
+}
+
+function initializeMultiTaskExecution(taskCount: number): void {
+  executionTaskCount = Math.max(taskCount, 0);
+  executionTasksCompleted = 0;
+  executionTasksFailed = 0;
+  executionStartTime = Date.now();
+}
+
+function createPromptPlan(prompt: string, engineId: EngineId, threadId: string, turnIndex: number): Plan {
+  const taskName = getPromptTaskName(prompt);
+  const tempPlan = createEmptyPlan(`Run: ${taskName}`);
+  tempPlan.description = prompt;
+  tempPlan.defaultEngine = engineId;
+  tempPlan.playlists = [createPlaylist('Run Prompt', engineId)];
+  const task = createTask(taskName, prompt, engineId) as Task & { _threadId?: string; _turnIndex?: number };
+  task._threadId = threadId;
+  task._turnIndex = turnIndex;
+  tempPlan.playlists[0].tasks.push(task);
+  return tempPlan;
+}
+
+async function showNoPromptEngineMessage(): Promise<void> {
+  const action = await vscode.window.showWarningMessage(
+    'No available AI engine was detected. Install or configure one to run prompts.',
+    'Detect Engines',
+    'Open Settings',
+  );
+  if (action === 'Detect Engines') {
+    vscode.commands.executeCommand('agentTaskPlayer.detectEngines');
+  } else if (action === 'Open Settings') {
+    vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer.engines');
+  }
+}
+
+async function resolveRunPromptEngine(): Promise<EngineId | null> {
+  const configuredEngine = vscode.workspace.getConfiguration('agentTaskPlayer')
+    .get<EngineId>('defaultEngine', 'claude' as EngineId);
+  const configuredAvailability = await checkEngineAvailability([configuredEngine]);
+  if (configuredAvailability.get(configuredEngine)?.available) {
+    return configuredEngine;
+  }
+
+  const detected = await detectEngines();
+  if (detected.autoSelected) {
+    return detected.autoSelected;
+  }
+
+  const customEngine = 'custom' as EngineId;
+  if (configuredEngine !== customEngine) {
+    const customAvailability = await checkEngineAvailability([customEngine]);
+    if (customAvailability.get(customEngine)?.available) {
+      return customEngine;
+    }
+  }
+
+  return null;
+}
+
+async function runPromptSubmission(
+  prompt: string,
+  selectedEngineId?: EngineId,
+): Promise<boolean> {
+  if (!vscode.workspace.workspaceFolders?.[0]) {
+    UserMsg.showError(UserMsg.noWorkspace());
+    return false;
+  }
+
+  if (runner.state !== RunnerState.Idle) {
+    vscode.window.showWarningMessage('Runner is already active. Stop it first.');
+    return false;
+  }
+
+  const engineId = selectedEngineId ?? await resolveRunPromptEngine();
+  if (!engineId) {
+    await showNoPromptEngineMessage();
+    return false;
+  }
+
+  // Keep sidebar prompts in one continuous chat thread unless user switches threads.
+  const sidebarThreadId = currentSidebarThreadId ?? generateId();
+  const nextTurnIndex = historyStore.getThread(sidebarThreadId).length;
+  currentSidebarThreadId = sidebarThreadId;
+  pendingSidebarTurn = {
+    prompt,
+    engine: engineId,
+    startedAt: new Date().toISOString(),
+    threadId: sidebarThreadId,
+    turnIndex: nextTurnIndex,
+  };
+  if (promptViewProvider) {
+    syncPromptProviderSidebar(promptViewProvider);
+  }
+
+  const promptPlan = createPromptPlan(prompt, engineId, sidebarThreadId, nextTurnIndex);
+  if (!await preflightEngineCheck(promptPlan, 0, 0)) {
+    pendingSidebarTurn = null;
+    if (promptViewProvider) {
+      syncPromptProviderSidebar(promptViewProvider);
+    }
+    return false;
+  }
+
+  const activePlan = getActivePlan();
+  if (!activePlan) {
+    runner.resetPlan(promptPlan);
+    initializeSingleTaskExecution();
+    activateTemporaryPlan(promptPlan);
+    DashboardPanel.currentPanel?.clearTimeline();
+    startProgressNotification();
+
+    try {
+      await runner.play(promptPlan);
+      return true;
+    } catch (err) {
+      pendingSidebarTurn = null;
+      if (promptViewProvider) {
+        syncPromptProviderSidebar(promptViewProvider);
+      }
+      UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
+      return false;
+    } finally {
+      restoreTemporaryPlan(false);
+    }
+  }
+
+  if (activePlan.playlists.length === 0) {
+    activePlan.playlists.push(createPlaylist('Tasks'));
+  }
+
+  const targetPlaylist = activePlan.playlists[0];
+  const task = createTask(getPromptTaskName(prompt), prompt, engineId) as Task & { _threadId?: string; _turnIndex?: number };
+  task._threadId = sidebarThreadId;
+  task._turnIndex = nextTurnIndex;
+  targetPlaylist.tasks.push(task);
+  saveAndRefresh();
+
+  const singleTaskPlan: Plan = {
+    ...activePlan,
+    playlists: [
+      {
+        ...targetPlaylist,
+        tasks: [task],
+      },
+    ],
+  };
+
+  runner.resetPlan(singleTaskPlan);
+  initializeSingleTaskExecution();
+  DashboardPanel.currentPanel?.clearTimeline();
+  startProgressNotification();
+
+  try {
+    await runner.play(singleTaskPlan);
+    return true;
+  } catch (err) {
+    pendingSidebarTurn = null;
+    if (promptViewProvider) {
+      syncPromptProviderSidebar(promptViewProvider);
+    }
+    UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
+    return false;
+  }
+}
+
+async function generatePlanFromDashboardPrompt(prompt: string): Promise<boolean> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) {
+    UserMsg.showError(UserMsg.noWorkspace());
+    return false;
+  }
+
+  if (!prompt.trim()) {
+    vscode.window.showWarningMessage('Describe the plan first.');
+    return false;
+  }
+
+  if (!await promptSaveBeforeNew()) {
+    return false;
+  }
+
+  return createPlanFromIdea(prompt, workspaceFolder);
+}
+
+async function cmdRunPrompt(): Promise<void> {
+  const input = await vscode.window.showInputBox({
+    placeHolder: 'Describe what you want the AI to do...',
+    prompt: 'Run a single prompt with the best available engine',
+    ignoreFocusOut: true,
+  });
+  const prompt = input?.trim();
+  if (!prompt) {
+    return;
+  }
+
+  await runPromptSubmission(prompt);
+}
+
 async function cmdPlay(): Promise<void> {
   if (!currentPlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
@@ -1015,10 +2004,7 @@ async function cmdPlay(): Promise<void> {
   }
 
   // Initialize progress counters
-  executionTaskCount = currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
-  executionTasksCompleted = 0;
-  executionTasksFailed = 0;
-  executionStartTime = Date.now();
+  initializeMultiTaskExecution(currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0));
 
   saveAndRefresh();
   startProgressNotification();
@@ -1047,21 +2033,338 @@ async function cmdOpenPlan(): Promise<void> {
   if (!uris || uris.length === 0) { return; }
 
   try {
-    currentPlanPath = uris[0].fsPath;
-    currentPlan = loadPlan(currentPlanPath);
-    planTree.setPlan(currentPlan);
-    planView.message = truncateDescription(currentPlan?.description);
-    DashboardPanel.currentPanel?.update();
-    vscode.window.showInformationMessage(`Loaded plan: ${currentPlan.name}`);
+    const planPath = uris[0].fsPath;
+    const plan = loadPlan(planPath);
+    setVisiblePlan(plan, planPath);
+    vscode.window.showInformationMessage(`Loaded plan: ${plan.name}`);
   } catch (err) {
     UserMsg.showError(UserMsg.planLoadError(err instanceof Error ? err.message : String(err)));
   }
+}
+
+async function cmdSwitchPlan(): Promise<void> {
+  if (runner.state !== RunnerState.Idle) {
+    vscode.window.showWarningMessage('Stop the runner before switching plans.');
+    return;
+  }
+
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  const moagDir = getMoagDir();
+  if (!workspaceFolder || !moagDir) {
+    vscode.window.showWarningMessage('No workspace open');
+    return;
+  }
+
+  const fs = require('fs') as typeof import('fs');
+  const wsRoot = workspaceFolder.uri.fsPath;
+
+  interface PlanQuickPickItem extends vscode.QuickPickItem {
+    path?: string;
+  }
+
+  const activePath = currentPlanPath ? normalizeFilePath(currentPlanPath) : null;
+  const seenPaths = new Set<string>();
+  const fileItems: PlanQuickPickItem[] = [];
+
+  const addPlanItem = (fullPath: string, fallbackName: string, description?: string): void => {
+    const normalizedPath = normalizeFilePath(fullPath);
+    if (seenPaths.has(normalizedPath) || !fs.existsSync(fullPath)) {
+      return;
+    }
+
+    try {
+      const raw = fs.readFileSync(fullPath, 'utf-8');
+      const plan = loadPlanFromJson(raw);
+      const isCurrent = activePath !== null && normalizedPath === activePath;
+      fileItems.push({
+        label: `${isCurrent ? '$(check)' : '$(file)'} ${plan.name || fallbackName}`,
+        description: isCurrent ? '(active)' : (description ?? path.relative(wsRoot, fullPath)),
+        detail: plan.description ? plan.description.substring(0, 100) : undefined,
+        path: fullPath,
+      });
+      seenPaths.add(normalizedPath);
+    } catch {
+      // Skip invalid or non-plan JSON files.
+    }
+  };
+
+  if (fs.existsSync(moagDir)) {
+    const moagEntries = fs.readdirSync(moagDir, { withFileTypes: true });
+    for (const entry of moagEntries) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) {
+        continue;
+      }
+      addPlanItem(path.join(moagDir, entry.name), entry.name);
+    }
+  }
+
+  const rootEntries = fs.readdirSync(wsRoot, { withFileTypes: true });
+  for (const entry of rootEntries) {
+    if (!entry.isFile() || !entry.name.endsWith('.agent-plan.json')) {
+      continue;
+    }
+    addPlanItem(path.join(wsRoot, entry.name), entry.name, entry.name);
+  }
+
+  fileItems.sort((a, b) => {
+    if (a.description === '(active)' && b.description !== '(active)') {
+      return -1;
+    }
+    if (b.description === '(active)' && a.description !== '(active)') {
+      return 1;
+    }
+    return a.label.localeCompare(b.label);
+  });
+
+  const recentItems: PlanQuickPickItem[] = getRecentPlans()
+    .filter(recent => {
+      const normalizedPath = normalizeFilePath(recent.path);
+      return !seenPaths.has(normalizedPath) && fs.existsSync(recent.path);
+    })
+    .map(recent => ({
+      label: `$(history) ${recent.name}`,
+      description: `(recent) ${path.relative(wsRoot, recent.path)}`,
+      path: recent.path,
+    }));
+
+  if (fileItems.length === 0 && recentItems.length === 0) {
+    vscode.window.showInformationMessage('No plan files found. Create one first.');
+    return;
+  }
+
+  const items: PlanQuickPickItem[] = [...fileItems];
+  if (recentItems.length > 0) {
+    items.push({
+      label: 'Recent Plans',
+      kind: vscode.QuickPickItemKind.Separator,
+    });
+    items.push(...recentItems);
+  }
+
+  items.push({
+    label: '$(add) Create New Plan',
+    description: '',
+    path: '__new__',
+  });
+
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: 'Select a plan to load',
+    matchOnDescription: true,
+    matchOnDetail: true,
+  });
+  if (!picked) {
+    return;
+  }
+
+  if (picked.path === '__new__') {
+    void vscode.commands.executeCommand('agentTaskPlayer.newPlan');
+    return;
+  }
+  if (!picked.path) {
+    return;
+  }
+
+  try {
+    const plan = loadPlan(picked.path);
+    setVisiblePlan(plan, picked.path);
+    vscode.window.showInformationMessage(`Loaded plan: ${plan.name}`);
+  } catch (err) {
+    UserMsg.showError(UserMsg.planLoadError(err instanceof Error ? err.message : String(err)));
+  }
+}
+
+async function cmdSavePlanAs(): Promise<boolean> {
+  const plan = getActivePlan();
+  if (!plan) {
+    vscode.window.showWarningMessage('No plan loaded.');
+    return false;
+  }
+
+  const filenameInput = await vscode.window.showInputBox({
+    prompt: 'Save plan as (will be saved to .moag/ directory)',
+    value: getSuggestedPlanFileName(plan.name),
+    validateInput: (value) => {
+      const trimmed = value.trim();
+      if (!trimmed) {
+        return 'Filename required';
+      }
+      if (trimmed.toLowerCase() === MOAG_PLAN_FILE.toLowerCase()) {
+        return 'Use a name other than plan.json';
+      }
+      if (!trimmed.endsWith('.json')) {
+        return 'Must end with .json';
+      }
+      if (/[<>:"/\\|?*]/.test(trimmed)) {
+        return 'Invalid characters in filename';
+      }
+      return null;
+    },
+  });
+  if (!filenameInput) {
+    return false;
+  }
+
+  const moagDir = ensureMoagDir();
+  if (!moagDir) {
+    vscode.window.showWarningMessage('Cannot create .moag/ directory.');
+    return false;
+  }
+
+  const fs = require('fs') as typeof import('fs');
+  const filename = filenameInput.trim();
+  const newPath = path.join(moagDir, filename);
+  const nextPath = normalizeFilePath(newPath);
+  const activePath = currentPlanPath ? normalizeFilePath(currentPlanPath) : null;
+
+  if (fs.existsSync(newPath) && nextPath !== activePath) {
+    const overwrite = await vscode.window.showWarningMessage(
+      `"${filename}" already exists. Overwrite?`,
+      'Overwrite',
+      'Cancel',
+    );
+    if (overwrite !== 'Overwrite') {
+      return false;
+    }
+  }
+
+  try {
+    savePlan(plan, newPath);
+    setVisiblePlan(plan, newPath);
+    planDirty = isDefaultPlanPath(newPath);
+    vscode.window.showInformationMessage(`Plan saved as: ${filename}`);
+    return true;
+  } catch (err) {
+    vscode.window.showErrorMessage(`Failed to save plan: ${err instanceof Error ? err.message : String(err)}`);
+    return false;
+  }
+}
+
+async function createPlanFromIdea(
+  rawIdea: string,
+  workspaceFolder: vscode.WorkspaceFolder,
+): Promise<boolean> {
+  const trimmedIdea = rawIdea.trim();
+  if (!trimmedIdea) {
+    vscode.window.showWarningMessage('No description provided — plan creation cancelled.');
+    return false;
+  }
+
+  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
+  const isLargeSpec = trimmedIdea.length > 500 || trimmedIdea.split('\n').length > 20;
+
+  let planName = trimmedIdea.substring(0, 60).replace(/\n.*/s, '').trim();
+  let playlists: Array<{ name: string; engine?: string; tasks: Array<{ name: string; prompt: string }> }> = [];
+
+  const cwd = workspaceFolder.uri.fsPath;
+  const projectAnalysis = analyzeProject(cwd);
+  const projectContext = formatAnalysis(projectAnalysis);
+
+  try {
+    const engine = getEngine(defaultEngine);
+    const prompt = isLargeSpec ? PLAN_GENERATION_PROMPT_LARGE : PLAN_GENERATION_PROMPT;
+
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: 'Generating plan...' },
+      async (_progress, token) => {
+        const abortController = new AbortController();
+        token.onCancellationRequested(() => abortController.abort());
+
+        const result = await engine.runTask({
+          prompt: prompt + '\n\nProject context:\n' + projectContext + '\n\nUser description:\n' + trimmedIdea,
+          cwd,
+          signal: abortController.signal,
+        });
+
+        if (result.exitCode === 0 && result.stdout.trim()) {
+          const parsed = parsePlanResponse(result.stdout);
+          if (parsed) {
+            planName = parsed.name;
+            if (parsed.playlists && parsed.playlists.length > 0) {
+              playlists = parsed.playlists;
+            } else if (parsed.tasks && parsed.tasks.length > 0) {
+              playlists = [{ name: 'Tasks', tasks: parsed.tasks }];
+            }
+          }
+        }
+      },
+    );
+  } catch {
+    // Engine not available or failed — fall back to a single task plan
+  }
+
+  if (playlists.length === 0) {
+    playlists = [{ name: 'Tasks', tasks: [{ name: planName, prompt: trimmedIdea }] }];
+  }
+
+  const totalGeneratedTasks = playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
+  if (totalGeneratedTasks > 1) {
+    const reviewItems: (vscode.QuickPickItem & { plIdx: number; tIdx: number })[] = [];
+    for (let pi = 0; pi < playlists.length; pi++) {
+      const pl = playlists[pi];
+      for (let ti = 0; ti < pl.tasks.length; ti++) {
+        const t = pl.tasks[ti];
+        const promptPreview = t.prompt.length > 80 ? t.prompt.substring(0, 77) + '...' : t.prompt;
+        reviewItems.push({
+          label: t.name,
+          description: playlists.length > 1 ? pl.name : undefined,
+          detail: promptPreview,
+          picked: true,
+          plIdx: pi,
+          tIdx: ti,
+        });
+      }
+    }
+
+    const selected = await vscode.window.showQuickPick(reviewItems, {
+      canPickMany: true,
+      placeHolder: `Review ${totalGeneratedTasks} generated tasks — uncheck to remove`,
+      title: `Plan: ${planName}`,
+    });
+
+    if (!selected) {
+      return false;
+    }
+
+    const kept = new Set(selected.map(s => `${s.plIdx}-${s.tIdx}`));
+    for (let pi = playlists.length - 1; pi >= 0; pi--) {
+      playlists[pi].tasks = playlists[pi].tasks.filter((_, ti) => kept.has(`${pi}-${ti}`));
+      if (playlists[pi].tasks.length === 0) {
+        playlists.splice(pi, 1);
+      }
+    }
+
+    if (playlists.length === 0) {
+      vscode.window.showWarningMessage('All tasks were removed — plan creation cancelled.');
+      return false;
+    }
+  }
+
+  currentPlan = createEmptyPlan(planName);
+  currentPlan.description = trimmedIdea.length > 500 ? trimmedIdea.substring(0, 500) + '...' : trimmedIdea;
+  currentPlan.playlists = playlists.map(pl => {
+    const playlist = createPlaylist(pl.name, pl.engine as EngineId | undefined);
+    for (const t of pl.tasks) {
+      playlist.tasks.push(createTask(t.name, t.prompt));
+    }
+    return playlist;
+  });
+
+  const totalTasks = currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
+  currentPlanPath = getNewPlanSavePath() || path.join(workspaceFolder.uri.fsPath, `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`);
+  saveAndRefresh();
+  vscode.window.showInformationMessage(
+    `Plan "${planName}" created — ${currentPlan.playlists.length} playlist${currentPlan.playlists.length > 1 ? 's' : ''}, ${totalTasks} task${totalTasks > 1 ? 's' : ''}.`,
+  );
+  return true;
 }
 
 async function cmdNewPlan(): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
     UserMsg.showError(UserMsg.noWorkspace());
+    return;
+  }
+  if (!await promptSaveBeforeNew()) {
     return;
   }
 
@@ -1121,116 +2424,7 @@ async function cmdNewPlan(): Promise<void> {
     }
   }
 
-  // Use the AI engine to convert the raw idea into a structured plan
-  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
-  const isLargeSpec = rawIdea.length > 500 || rawIdea.split('\n').length > 20;
-
-  let planName = rawIdea.substring(0, 60).replace(/\n.*/s, '').trim();
-  let playlists: Array<{ name: string; engine?: string; tasks: Array<{ name: string; prompt: string }> }> = [];
-
-  // Analyze project to give AI better context
-  const cwd = workspaceFolder.uri.fsPath;
-  const projectAnalysis = analyzeProject(cwd);
-  const projectContext = formatAnalysis(projectAnalysis);
-
-  try {
-    const engine = getEngine(defaultEngine);
-    const prompt = isLargeSpec ? PLAN_GENERATION_PROMPT_LARGE : PLAN_GENERATION_PROMPT;
-
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'Generating plan from your description...', cancellable: true },
-      async (_progress, token) => {
-        const abortController = new AbortController();
-        token.onCancellationRequested(() => abortController.abort());
-
-        const result = await engine.runTask({
-          prompt: prompt + '\n\nProject context:\n' + projectContext + '\n\nUser description:\n' + rawIdea,
-          cwd,
-          signal: abortController.signal,
-        });
-
-        if (result.exitCode === 0 && result.stdout.trim()) {
-          const parsed = parsePlanResponse(result.stdout);
-          if (parsed) {
-            planName = parsed.name;
-            if (parsed.playlists && parsed.playlists.length > 0) {
-              playlists = parsed.playlists;
-            } else if (parsed.tasks && parsed.tasks.length > 0) {
-              playlists = [{ name: 'Tasks', tasks: parsed.tasks }];
-            }
-          }
-        }
-      },
-    );
-  } catch {
-    // Engine not available or failed — fall back to manual
-  }
-
-  // Fallback: if AI didn't produce anything, create a single task
-  if (playlists.length === 0) {
-    playlists = [{ name: 'Tasks', tasks: [{ name: planName, prompt: rawIdea }] }];
-  }
-
-  // ─── Plan Review: let the user deselect tasks before saving ───
-  const totalGeneratedTasks = playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
-  if (totalGeneratedTasks > 1) {
-    const reviewItems: (vscode.QuickPickItem & { plIdx: number; tIdx: number })[] = [];
-    for (let pi = 0; pi < playlists.length; pi++) {
-      const pl = playlists[pi];
-      for (let ti = 0; ti < pl.tasks.length; ti++) {
-        const t = pl.tasks[ti];
-        const promptPreview = t.prompt.length > 80 ? t.prompt.substring(0, 77) + '...' : t.prompt;
-        reviewItems.push({
-          label: t.name,
-          description: playlists.length > 1 ? pl.name : undefined,
-          detail: promptPreview,
-          picked: true,
-          plIdx: pi,
-          tIdx: ti,
-        });
-      }
-    }
-
-    const selected = await vscode.window.showQuickPick(reviewItems, {
-      canPickMany: true,
-      placeHolder: `Review ${totalGeneratedTasks} generated tasks — uncheck to remove`,
-      title: `Plan: ${planName}`,
-    });
-
-    if (!selected) { return; } // user cancelled
-
-    // Rebuild playlists keeping only selected tasks
-    const kept = new Set(selected.map(s => `${s.plIdx}-${s.tIdx}`));
-    for (let pi = playlists.length - 1; pi >= 0; pi--) {
-      playlists[pi].tasks = playlists[pi].tasks.filter((_, ti) => kept.has(`${pi}-${ti}`));
-      if (playlists[pi].tasks.length === 0) {
-        playlists.splice(pi, 1);
-      }
-    }
-
-    if (playlists.length === 0) {
-      vscode.window.showWarningMessage('All tasks were removed — plan creation cancelled.');
-      return;
-    }
-  }
-
-  // Build the plan with proper multi-playlist structure
-  currentPlan = createEmptyPlan(planName);
-  currentPlan.description = rawIdea.length > 500 ? rawIdea.substring(0, 500) + '...' : rawIdea;
-  currentPlan.playlists = playlists.map(pl => {
-    const playlist = createPlaylist(pl.name, pl.engine as EngineId | undefined);
-    for (const t of pl.tasks) {
-      playlist.tasks.push(createTask(t.name, t.prompt));
-    }
-    return playlist;
-  });
-
-  const totalTasks = currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
-  currentPlanPath = getNewPlanSavePath() || path.join(workspaceFolder.uri.fsPath, `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`);
-  saveAndRefresh();
-  vscode.window.showInformationMessage(
-    `Plan "${planName}" created — ${currentPlan.playlists.length} playlist${currentPlan.playlists.length > 1 ? 's' : ''}, ${totalTasks} task${totalTasks > 1 ? 's' : ''}.`,
-  );
+  await createPlanFromIdea(rawIdea, workspaceFolder);
 }
 
 async function cmdLoadExamplePlan(): Promise<void> {
@@ -1280,6 +2474,9 @@ async function cmdNewPlanFromTemplate(): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) {
     UserMsg.showError(UserMsg.noWorkspace());
+    return;
+  }
+  if (!await promptSaveBeforeNew()) {
     return;
   }
 
@@ -1711,6 +2908,9 @@ async function cmdSmartNewPlan(): Promise<void> {
     UserMsg.showError(UserMsg.noWorkspace());
     return;
   }
+  if (!await promptSaveBeforeNew()) {
+    return;
+  }
 
   const cwd = workspaceFolder.uri.fsPath;
   const analysis = analyzeProject(cwd);
@@ -1729,7 +2929,7 @@ async function cmdSmartNewPlan(): Promise<void> {
   try {
     const engine = getEngine(defaultEngine);
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'Scanning project and generating plan...', cancellable: true },
+      { location: vscode.ProgressLocation.Window, title: 'Scanning project...' },
       async (_progress, token) => {
         const abortController = new AbortController();
         token.onCancellationRequested(() => abortController.abort());
@@ -1903,7 +3103,7 @@ async function cmdPlanFromGitHubIssue(): Promise<void> {
   try {
     const engine = getEngine(defaultEngine);
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Generating plan from issue #${issueNumber}...`, cancellable: true },
+      { location: vscode.ProgressLocation.Window, title: `Loading issue #${issueNumber}...` },
       async (_progress, token) => {
         const abortController = new AbortController();
         token.onCancellationRequested(() => abortController.abort());
@@ -1958,7 +3158,7 @@ async function cmdSplitTask(item?: PlanTreeItem): Promise<void> {
   try {
     const engine = getEngine(defaultEngine);
     await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: `Splitting "${task.name}"...`, cancellable: true },
+      { location: vscode.ProgressLocation.Window, title: `Splitting task...` },
       async (_progress, token) => {
         const abortController = new AbortController();
         token.onCancellationRequested(() => abortController.abort());
@@ -2151,14 +3351,28 @@ async function cmdClearAllTasks(): Promise<void> {
   );
 }
 
-async function cmdRetryTask(item?: PlanTreeItem): Promise<void> {
-  if (!currentPlan || !item || item.kind !== 'task' || item.taskIndex === undefined) { return; }
+async function cmdRetryTask(item?: PlanTreeItem | TaskLocation): Promise<void> {
+  if (!currentPlan) { return; }
+
+  let playlistIndex: number;
+  let taskIndex: number;
+
+  if (item instanceof PlanTreeItem && item.kind === 'task' && item.taskIndex !== undefined) {
+    playlistIndex = item.playlistIndex;
+    taskIndex = item.taskIndex;
+  } else if (isTaskLocation(item)) {
+    playlistIndex = item.playlistIndex;
+    taskIndex = item.taskIndex;
+  } else {
+    return;
+  }
+
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy. Stop it first before retrying.');
     return;
   }
 
-  const task = currentPlan.playlists[item.playlistIndex]?.tasks[item.taskIndex];
+  const task = currentPlan.playlists[playlistIndex]?.tasks[taskIndex];
   if (!task) { return; }
   if (task.status !== TaskStatus.Failed && task.status !== TaskStatus.Blocked) {
     vscode.window.showInformationMessage('Only failed or blocked tasks can be retried.');
@@ -2169,24 +3383,37 @@ async function cmdRetryTask(item?: PlanTreeItem): Promise<void> {
   task.status = TaskStatus.Pending;
   saveAndRefresh();
 
-  if (!await preflightEngineCheck(currentPlan, item.playlistIndex, item.taskIndex)) {
+  if (!await preflightEngineCheck(currentPlan, playlistIndex, taskIndex)) {
     return;
   }
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
-  runner.playTask(currentPlan, item.playlistIndex, item.taskIndex).catch(err => {
+  initializeSingleTaskExecution();
+  runner.playTask(currentPlan, playlistIndex, taskIndex).catch(err => {
     UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
   });
 }
 
-async function cmdRetryTaskWithNote(item?: PlanTreeItem): Promise<void> {
-  if (!currentPlan || !item || item.kind !== 'task' || item.taskIndex === undefined) { return; }
+async function cmdRetryTaskWithNote(item?: PlanTreeItem | TaskLocation): Promise<void> {
+  if (!currentPlan) { return; }
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy. Stop it first before retrying.');
     return;
   }
 
-  const task = currentPlan.playlists[item.playlistIndex]?.tasks[item.taskIndex];
+  let playlistIndex: number;
+  let taskIndex: number;
+  if (item instanceof PlanTreeItem && item.kind === 'task' && item.taskIndex !== undefined) {
+    playlistIndex = item.playlistIndex;
+    taskIndex = item.taskIndex;
+  } else if (isTaskLocation(item)) {
+    playlistIndex = item.playlistIndex;
+    taskIndex = item.taskIndex;
+  } else {
+    return;
+  }
+
+  const task = currentPlan.playlists[playlistIndex]?.tasks[taskIndex];
   if (!task) { return; }
   if (task.status !== TaskStatus.Failed && task.status !== TaskStatus.Blocked) {
     vscode.window.showInformationMessage('Only failed or blocked tasks can be retried with a note.');
@@ -2209,12 +3436,13 @@ async function cmdRetryTaskWithNote(item?: PlanTreeItem): Promise<void> {
   task.status = TaskStatus.Pending;
   saveAndRefresh();
 
-  if (!await preflightEngineCheck(currentPlan, item.playlistIndex, item.taskIndex)) {
+  if (!await preflightEngineCheck(currentPlan, playlistIndex, taskIndex)) {
     return;
   }
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
-  runner.playTask(currentPlan, item.playlistIndex, item.taskIndex).catch(err => {
+  initializeSingleTaskExecution();
+  runner.playTask(currentPlan, playlistIndex, taskIndex).catch(err => {
     UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
   });
 }
@@ -2265,13 +3493,26 @@ function cmdShowDashboard(): void {
 
 /** Open the Dashboard panel if it isn't already open */
 function ensureDashboardOpen(): void {
-  DashboardPanel.createOrShow(
+  const panel = DashboardPanel.createOrShow(
     vscode.Uri.file(''),
     runner,
     historyStore,
     () => getActivePlan(),
     () => saveAndRefresh(),
+    () => getPromptEngineOptions(detectedPromptEngines),
+    () => getPreferredPromptEngine(detectedPromptEngines),
+    async (prompt: string, engineId?: string) => {
+      return runPromptSubmission(prompt, isEngineId(engineId) ? engineId : undefined);
+    },
+    async (prompt: string) => {
+      return generatePlanFromDashboardPrompt(prompt);
+    },
   );
+  // Force a delayed update to ensure the webview receives the plan
+  // even if the webview-ready handshake is slow
+  for (const delay of [200, 600, 1500]) {
+    setTimeout(() => panel.update(), delay);
+  }
 }
 
 function cmdClearHistory(): void {
@@ -2335,6 +3576,7 @@ async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
   saveAndRefresh();
   DashboardPanel.currentPanel?.clearTimeline();
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+  initializeMultiTaskExecution(playlist.tasks.length);
   runner.playPlaylist(currentPlan, item.playlistIndex).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
@@ -2348,6 +3590,7 @@ async function cmdPlayTask(item?: PlanTreeItem): Promise<void> {
   }
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+  initializeSingleTaskExecution();
   runner.playTask(currentPlan, item.playlistIndex, item.taskIndex).catch(err => {
     vscode.window.showErrorMessage(`Task failed: ${err instanceof Error ? err.message : String(err)}`);
   });
@@ -2390,6 +3633,47 @@ async function cmdRunSelected(item?: PlanTreeItem, selectedItems?: PlanTreeItem[
 
   if (taskList.length === 0) { return; }
 
+  const selectedEngines = new Set<EngineId>();
+  for (const { playlistIndex, taskIndex } of taskList) {
+    const playlist = currentPlan.playlists[playlistIndex];
+    const task = playlist?.tasks[taskIndex];
+    if (!playlist || !task || getTaskType(task) !== 'agent') {
+      continue;
+    }
+    selectedEngines.add(task.engine ?? playlist.engine ?? currentPlan.defaultEngine);
+  }
+  if (selectedEngines.size > 0) {
+    const availability = await checkEngineAvailability([...selectedEngines]);
+    const missing: Array<{ command: string; displayName: string }> = [];
+    for (const [, info] of availability) {
+      if (!info.available) {
+        missing.push({ command: info.command, displayName: info.displayName });
+      }
+    }
+    if (missing.length > 0) {
+      const engineList = missing
+        .map(m => m.command
+          ? `"${m.displayName}" (command: ${m.command})`
+          : `"${m.displayName}" (not configured)`)
+        .join(', ');
+      const msg = missing.length === 1
+        ? `Engine ${engineList} was not found on your system.`
+        : `Engines ${engineList} were not found on your system.`;
+      const action = await vscode.window.showWarningMessage(
+        msg,
+        'Run Anyway',
+        'Open Settings',
+      );
+      if (action === 'Open Settings') {
+        void vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer.engines');
+        return;
+      }
+      if (action !== 'Run Anyway') {
+        return;
+      }
+    }
+  }
+
   // Reset selected tasks to pending
   for (const { playlistIndex, taskIndex } of taskList) {
     const task = currentPlan.playlists[playlistIndex]?.tasks[taskIndex];
@@ -2399,6 +3683,7 @@ async function cmdRunSelected(item?: PlanTreeItem, selectedItems?: PlanTreeItem[
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   DashboardPanel.currentPanel?.clearTimeline();
+  initializeMultiTaskExecution(taskList.length);
   runner.playTasks(currentPlan, taskList).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
@@ -2522,22 +3807,25 @@ async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
   }
 
   try {
-    currentPlanPath = planPath;
-    currentPlan = loadPlan(planPath);
-    planTree.setPlan(currentPlan);
-    planView.message = truncateDescription(currentPlan?.description);
+    const plan = loadPlan(planPath);
+    setVisiblePlan(plan, planPath);
   } catch (err) {
     UserMsg.showError(UserMsg.planLoadError(err instanceof Error ? err.message : String(err)));
     return;
   }
 
+  const plan = getActivePlan();
+  if (!plan) {
+    return;
+  }
+
   // Pre-flight
-  if (!await preflightEngineCheck(currentPlan)) {
+  if (!await preflightEngineCheck(plan)) {
     return;
   }
 
   // Check if the plan file has tasks with existing progress (completed/failed)
-  const hasProgress = currentPlan.playlists.some(pl =>
+  const hasProgress = plan.playlists.some(pl =>
     pl.tasks.some(t => t.status !== TaskStatus.Pending),
   );
   if (hasProgress) {
@@ -2550,29 +3838,26 @@ async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
     );
     if (!action) { return; }
     if (action.value === 'restart') {
-      runner.resetPlan(currentPlan);
+      runner.resetPlan(plan);
       DashboardPanel.currentPanel?.clearTimeline();
     }
   } else {
-    runner.resetPlan(currentPlan);
+    runner.resetPlan(plan);
     DashboardPanel.currentPanel?.clearTimeline();
   }
 
   // Initialize progress counters
-  executionTaskCount = currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
-  executionTasksCompleted = 0;
-  executionTasksFailed = 0;
-  executionStartTime = Date.now();
+  initializeMultiTaskExecution(plan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0));
 
   saveAndRefresh();
 
   vscode.window.setStatusBarMessage(
-    `$(rocket) Running plan "${currentPlan.name}" (${executionTaskCount} tasks)...`,
+    `$(rocket) Running plan "${plan.name}" (${executionTaskCount} tasks)...`,
     5000,
   );
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
-  runner.play(currentPlan).catch(err => {
+  runner.play(plan).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
 }
@@ -2708,7 +3993,7 @@ async function cmdImportPlanFromUrl(): Promise<void> {
 
   try {
     jsonText = await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Notification, title: 'Fetching plan from URL...', cancellable: false },
+      { location: vscode.ProgressLocation.Window, title: 'Fetching plan...' },
       async () => {
         // Detect GitHub Gist URL: gist.github.com/<user>/<id> or gist.github.com/<id>
         const gistMatch = trimmedUrl.match(/gist\.github\.com\/(?:[^/]+\/)?([a-f0-9]+)/i);
@@ -3692,4 +4977,69 @@ async function cmdManagePromptSnippets(): Promise<void> {
 
   const count = selected.length;
   vscode.window.showInformationMessage(`${count} snippet${count !== 1 ? 's' : ''} will auto-inject into task prompts.`);
+}
+
+async function cmdShowChangelog(context: vscode.ExtensionContext): Promise<void> {
+  const changelogPath = vscode.Uri.joinPath(context.extensionUri, 'CHANGELOG.md');
+  let markdown = '';
+  try {
+    const bytes = await vscode.workspace.fs.readFile(changelogPath);
+    markdown = Buffer.from(bytes).toString('utf8');
+  } catch {
+    vscode.window.showErrorMessage('Could not read CHANGELOG.md.');
+    return;
+  }
+
+  const panel = vscode.window.createWebviewPanel(
+    'moagChangelog',
+    "What's New — MOAG",
+    vscode.ViewColumn.One,
+    { enableScripts: false, retainContextWhenHidden: false },
+  );
+
+  // Convert markdown headings/lists to basic HTML
+  function mdToHtml(md: string): string {
+    return md
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/^## \[(.+?)\] - (.+)$/gm, '<h2>$1 <span class="date">$2</span></h2>')
+      .replace(/^### (.+)$/gm, '<h3>$1</h3>')
+      .replace(/^## (.+)$/gm, '<h2>$1</h2>')
+      .replace(/^# (.+)$/gm, '<h1>$1</h1>')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/^- (.+)$/gm, '<li>$1</li>')
+      .replace(/(<li>.*<\/li>\n?)+/g, (m) => `<ul>${m}</ul>`)
+      .replace(/\n{2,}/g, '</p><p>')
+      .replace(/^(?!<[hul])/gm, '')
+      .trim();
+  }
+
+  const currentVersion = context.extension?.packageJSON?.version as string | undefined;
+  const html = mdToHtml(markdown);
+
+  panel.webview.html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';">
+<title>What's New — MOAG</title>
+<style>
+  body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 24px 32px; max-width: 860px; margin: 0 auto; }
+  h1 { color: var(--vscode-textLink-foreground); font-size: 1.6em; margin-bottom: 4px; }
+  h2 { color: var(--vscode-textLink-foreground); font-size: 1.25em; border-bottom: 1px solid var(--vscode-panel-border); padding-bottom: 4px; margin-top: 28px; }
+  h3 { color: var(--vscode-descriptionForeground); font-size: 1em; margin: 16px 0 6px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .date { font-weight: normal; font-size: 0.8em; color: var(--vscode-descriptionForeground); margin-left: 8px; }
+  ul { margin: 4px 0 12px; padding-left: 20px; }
+  li { margin: 3px 0; line-height: 1.5; }
+  code { background: var(--vscode-textCodeBlock-background); padding: 1px 5px; border-radius: 3px; font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
+  strong { color: var(--vscode-foreground); }
+  .badge { display: inline-block; background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); border-radius: 10px; padding: 2px 10px; font-size: 0.75em; font-weight: bold; margin-left: 8px; vertical-align: middle; }
+</style>
+</head>
+<body>
+<h1>MOAG — What's New ${currentVersion ? `<span class="badge">v${currentVersion}</span>` : ''}</h1>
+${html}
+</body>
+</html>`;
 }

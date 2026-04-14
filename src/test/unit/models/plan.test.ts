@@ -239,4 +239,31 @@ describe('loadPlan / savePlan round-trip', () => {
     const t = loaded.playlists[0].tasks[0];
     assert.deepEqual(t.skipIf, { taskId: 'dep-1', status: TaskStatus.Completed });
   });
+
+  it('should preserve variables through hydrate/dehydrate', () => {
+    const plan = createEmptyPlan('Variables Hydrate Test');
+    plan.variables = { env: 'staging', version: '2.0' };
+    plan.playlists[0].tasks.push(createTask('Deploy', 'Deploy to {{env}} v{{version}}'));
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+
+    assert.deepEqual(loaded.variables, { env: 'staging', version: '2.0' });
+    assert.equal(loaded.playlists[0].tasks[0].prompt, 'Deploy to {{env}} v{{version}}');
+  });
+
+  it('should preserve skipIf through hydrate/dehydrate', () => {
+    const plan = createEmptyPlan('SkipIf Hydrate Test');
+    const task = createTask('Guarded', 'Run only if abc not done');
+    task.skipIf = { taskId: 'abc', status: TaskStatus.Completed };
+    plan.playlists[0].tasks.push(task);
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+    const t = loaded.playlists[0].tasks[0];
+
+    assert.deepEqual(t.skipIf, { taskId: 'abc', status: TaskStatus.Completed });
+    assert.equal(t.skipIf!.taskId, 'abc');
+    assert.equal(t.skipIf!.status, TaskStatus.Completed);
+  });
 });

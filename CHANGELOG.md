@@ -1,58 +1,59 @@
 # Changelog
 
-## [1.0.0] - 2026-03-20
+## [1.0.0] - 2026-03-24
 
-### The Workflow Revolution
+### Workflow
+- Task Editor webview form for streamlined task creation
+- Quick Add Task (Ctrl+Shift+T) — add tasks without leaving the keyboard
+- Add Task from Editor Selection — highlight code, create a task
+- Duplicate Task — clone any task with one click
+- Split Task — AI decomposes large prompts into focused steps
+- Plan Review picker — review and edit AI-generated plans before execution
 
-#### Workflow
-- **Task Editor Form** — single webview replaces the multi-dialog creation chain
-- **Quick Add Task** (Ctrl+Shift+T) — add tasks without leaving the keyboard
-- **Add Task from Editor Selection** — highlight code and create a task from it
-- **Duplicate Task** — clone any task with one click
-- **Split Task** — AI decomposes large prompts into focused steps
-- **Plan Review Picker** — review and edit AI-generated plans before execution
-- **Plan Templates** — 12 pre-built plans across 4 categories (scaffold, test, refactor, docs)
-- **New Plan from Template** — create a plan from any built-in template via the command palette
-- **Plan Variables** — `{{varName}}` substitution across task prompts
-- **Conditional Tasks** — `skipIf` lets tasks evaluate whether to run
-- **Output Chaining** — previous task output feeds into the next task (on by default)
-- **Share Plan as Gist** — export any plan as a GitHub Gist
-- **Import Plan from URL** — load plans from gists, raw GitHub URLs, or any JSON endpoint
+### Smart Features
+- AI Auto-Fix — analyzes failures and retries with a targeted repair prompt
+- Smart Plan — scans your project and generates a structured improvement plan
+- skipIf conditions — conditional task execution based on expressions
+- Plan Variables — `{{varName}}` substitution across task prompts
+- Output Chaining — previous task output feeds into the next task
+- Prompt Rules — auto-injects best practices and constraints into every prompt
+- Prompt Snippets — reusable prompt fragments with auto-inject support
+- Relevant File Detection — auto-detects and includes referenced files as context
 
-#### Smart Features
-- **AI Auto-Fix** — automatically analyzes failures and retries with a targeted repair prompt
-- **Project Analyzer** — detects project framework, language, gaps, and suggests improvements
-- **Smart New Plan** — scans your project and auto-generates a structured improvement plan
-- **Execution Rules Injection** — auto-injects best practices and constraints into every prompt
-- **Smart Context Files** — auto-detects and includes referenced files as context
-- **Prompt Snippet Library** — reusable prompt fragments with auto-inject support
+### Multi-Agent
+- Peer Review task type — a different engine reviews changes after each task
+- Consensus Mode — run the same task on multiple engines, first success wins
+- Add Review Step command — insert a review task after any existing task
 
-#### Dashboard
-- **Inline Diff Viewer** — syntax-highlighted file diffs inside task cards
-- **Progress Bar & ETA** — track execution progress with time estimates
-- **Auto-fix Badge** — recovered tasks show a badge indicating AI auto-fix was used
+### Auto-Test
+- Auto-test after tasks — automatically runs your test suite after each task completes
+- Full Auto mode — write → test → fix loop until tests pass
 
-#### GitHub Integration
-- **Plan from GitHub Issue** — turn any GitHub issue into a runnable plan
-- **Create PR** — open a pull request directly from the completion notification
-- **Review All Changes** — inspect all file changes from a completed run
+### GitHub
+- Plan from Issue — turn any GitHub issue into a runnable plan
+- Create PR — open a pull request from the completion notification
+- Share as Gist — export any plan as a GitHub Gist
+- Import from URL — load plans from gists, raw URLs, or any JSON endpoint
 
-#### Multi-Agent
-- **Peer Review Task Type** — a different engine reviews code changes after each task
-- **Add Review Step** — insert a review task after any existing task with one command
-- **Consensus Mode** — run the same task on multiple engines, first success wins
+### Dashboard
+- Inline Diff Viewer — syntax-highlighted file diffs inside task cards
+- Progress Bar & ETA — track execution progress with time estimates
+- Auto-fix Badge — recovered tasks show a visual indicator
 
-#### Configuration
-- **Execution Profiles** — Fast, Balanced, Quality, and Budget presets control retries, review, and context depth
-- **Watch Mode** — automatically re-runs tasks when watched files change
+### Templates
+- 12 built-in plan templates across Scaffold, Improve, Fix, and Automate categories
 
-#### Sidebar & Tree UX
-- **Playlist Progress Counters** — see "3/5 done" at a glance on each playlist
-- **Colored Status Icons** — green, red, blue, and gray icons for task states
-- **Rich Markdown Tooltips** — hover any task for full details
-- **Better Task Descriptions** — status, type, verify command, and dependencies shown inline
-- **Truncated Plan Descriptions** — long descriptions trimmed to 150 characters in the tree
-- **Taller Prompt Input** — auto-growing text area with tips for new users
+### Config
+- Execution Profiles — Fast, Balanced, Quality, and Budget presets
+- Watch Mode — re-runs tasks when watched files change
+- .moag/ directory — dedicated project directory with auto-migration from legacy files
+
+### UX
+- Truncated descriptions — long plan descriptions trimmed in the tree view
+- Playlist progress counters — see "3/5 done" at a glance
+- Colored status icons — green, red, blue, and gray for task states
+- Rich markdown tooltips — hover any task for full details
+- Custom activity bar icon
 
 ## [0.8.0] - 2026-03-17
 

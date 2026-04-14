@@ -18,7 +18,7 @@ export function generateId(): string {
 
 /** Convert a persisted plan file into the runtime Plan model (adds status fields) */
 export function hydratePlan(file: PlanFile): Plan {
-  return {
+  const plan: Plan = {
     version: file.version,
     name: file.name,
     description: file.description,
@@ -27,11 +27,31 @@ export function hydratePlan(file: PlanFile): Plan {
     variables: file.variables,
     playlists: file.playlists.map(hydratePlaylist),
   };
+  // Ensure all task/playlist IDs are unique; fix duplicates or missing IDs
+  ensureUniqueIds(plan);
+  return plan;
+}
+
+/** Assign missing IDs and deduplicate any collisions across all tasks and playlists */
+function ensureUniqueIds(plan: Plan): void {
+  const seen = new Set<string>();
+  for (const pl of plan.playlists) {
+    if (!pl.id || seen.has(pl.id)) {
+      pl.id = generateId();
+    }
+    seen.add(pl.id);
+    for (const task of pl.tasks) {
+      if (!task.id || seen.has(task.id)) {
+        task.id = generateId();
+      }
+      seen.add(task.id);
+    }
+  }
 }
 
 function hydratePlaylist(p: PlanFilePlaylist): Playlist {
   return {
-    id: p.id,
+    id: p.id || generateId(),
     name: p.name,
     engine: p.engine,
     autoplay: p.autoplay ?? true,
@@ -43,7 +63,7 @@ function hydratePlaylist(p: PlanFilePlaylist): Playlist {
 
 function hydrateTask(t: PlanFileTask): Task {
   return {
-    id: t.id,
+    id: t.id || generateId(),
     name: t.name,
     prompt: t.prompt,
     type: t.type ?? 'agent',
