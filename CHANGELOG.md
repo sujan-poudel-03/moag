@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.9.0] - 2026-04-16
+## [0.9.3] - 2026-04-16
 
 ### Live Sandbox & Screenshot Context
 - **Project auto-detection** (`src/sandbox/project-detector.ts`) — identifies web (Next, Vite, CRA, Angular, Nuxt, SvelteKit, Vue), mobile (React Native, Expo, Flutter, Android), and desktop (Electron, Tauri) from `package.json`, `pubspec.yaml`, or `gradlew`
@@ -10,6 +10,8 @@
 - New commands: `agentTaskPlayer.launchSandbox`, `agentTaskPlayer.stopSandbox`, `agentTaskPlayer.takeScreenshot`
 - `TaskRunner.queueScreenshots()` — injects screenshot paths into `buildContext()` via new `pendingScreenshots` option (priority 0, ahead of plan overview)
 - 34 new unit tests in `src/test/unit/sandbox/` covering framework detection, lifecycle, URL parsing, and tool selection per project type
+
+## [0.9.0] - 2026-03-XX
 
 ### Validation Engine
 - New `validate` task type — unified entrypoint for cross-platform quality gates
