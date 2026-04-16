@@ -5,6 +5,21 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Plan, Playlist, Task, TaskStatus, HistoryEntry } from '../models/types';
 import { HistoryStore } from '../history/store';
+import { semanticSearch, formatSpans, SemanticSpan } from './semantic-provider';
+
+/** Telemetry record for context budget usage — populated by buildContext */
+export interface ContextBudgetUsage {
+  /** Chars consumed by all context sections combined */
+  totalCharsUsed: number;
+  /** Max chars allowed (from settings) */
+  totalCharsBudget: number;
+  /** How many sections were dropped to stay within budget */
+  sectionsDropped: number;
+  /** Whether semantic retrieval was used for any section */
+  usedSemanticRetrieval: boolean;
+  /** Number of high-confidence semantic spans returned */
+  semanticSpansReturned: number;
+}
 
 /** Toggles and limits for context injection */
 export interface ContextSettings {
@@ -31,6 +46,15 @@ export interface ContextOptions {
   cwd: string;
   historyStore: HistoryStore;
   settings: ContextSettings;
+  /** If provided, budget usage telemetry is written here after buildContext returns */
+  budgetUsage?: ContextBudgetUsage;
+  /**
+   * Paths to screenshots captured via the sandbox panel.
+   * When provided, they are appended as a high-priority context section so
+   * the agent can see what the running app looks like before acting.
+   * The caller is responsible for clearing this queue after passing it in.
+   */
+  pendingScreenshots?: string[];
 }
 
 /** Read context settings from VS Code configuration */
@@ -61,6 +85,15 @@ interface Section {
 
 /**
  * Build a context string to prepend to the task prompt.
+ *
+ * Retrieval cascade (highest priority first):
+ * 1. Plan overview + progress (always cheap, text-only)
+ * 2. rg/glob-based changed-files + relevant-files discovery
+ * 3. Semantic span retrieval (when provider is registered and confident)
+ * 4. Project state / README (optional, lowest priority)
+ *
+ * Budget telemetry is written to options.budgetUsage when provided.
+ *
  * Returns empty string if context is disabled or produces no content.
  */
 export function buildContext(options: ContextOptions): string {
@@ -70,6 +103,15 @@ export function buildContext(options: ContextOptions): string {
   }
 
   const sections: Section[] = [];
+  let usedSemanticRetrieval = false;
+  let semanticSpansReturned = 0;
+
+  if (options.pendingScreenshots && options.pendingScreenshots.length > 0) {
+    const body = options.pendingScreenshots
+      .map((p, i) => `Screenshot ${i + 1}: ${p}`)
+      .join('\n');
+    sections.push({ priority: 0, header: '=== SANDBOX SCREENSHOTS ===', body });
+  }
 
   if (settings.planOverview) {
     const body = gatherPlanOverview(options.plan, options.playlist, options.task);
@@ -114,17 +156,88 @@ export function buildContext(options: ContextOptions): string {
   }
 
   if (sections.length === 0) {
+    // Write zero telemetry and return early
+    if (options.budgetUsage) {
+      Object.assign(options.budgetUsage, {
+        totalCharsUsed: 0,
+        totalCharsBudget: settings.maxContextChars,
+        sectionsDropped: 0,
+        usedSemanticRetrieval: false,
+        semanticSpansReturned: 0,
+      } satisfies ContextBudgetUsage);
+    }
     return '';
   }
 
+  const beforeTrim = sections.length;
   const trimmed = applyBudget(sections, settings.maxContextChars);
+  const sectionsDropped = beforeTrim - trimmed.length;
+
   if (trimmed.length === 0) {
+    if (options.budgetUsage) {
+      Object.assign(options.budgetUsage, {
+        totalCharsUsed: 0,
+        totalCharsBudget: settings.maxContextChars,
+        sectionsDropped,
+        usedSemanticRetrieval,
+        semanticSpansReturned,
+      } satisfies ContextBudgetUsage);
+    }
     return '';
+  }
+
+  // Write budget telemetry
+  const totalCharsUsed = trimmed.reduce(
+    (sum, s) => sum + s.header.length + 1 + s.body.length + 2,
+    0,
+  );
+
+  if (options.budgetUsage) {
+    Object.assign(options.budgetUsage, {
+      totalCharsUsed,
+      totalCharsBudget: settings.maxContextChars,
+      sectionsDropped,
+      usedSemanticRetrieval,
+      semanticSpansReturned,
+    } satisfies ContextBudgetUsage);
   }
 
   const inner = trimmed.map(s => `${s.header}\n${s.body}`).join('\n\n');
   return `[CONTEXT START]\n${inner}\n[CONTEXT END]`;
 }
+
+/**
+ * Run the full retrieval cascade for a task prompt and return ranked spans.
+ *
+ * Stages:
+ * 1. Semantic provider (fast, high-quality when available)
+ * 2. rg/glob scan of files referenced in the prompt
+ *
+ * Returns semantic spans when the provider fires with high confidence;
+ * otherwise returns an empty array so callers fall back to whole-file retrieval.
+ */
+export async function runRetrievalCascade(
+  task: Task,
+  cwd: string,
+  budget: number,
+): Promise<{ spans: SemanticSpan[]; usedSemantic: boolean }> {
+  // Stage 1 — semantic provider
+  const spans = await semanticSearch({
+    query: task.prompt,
+    cwd,
+    maxSpans: 20,
+    fileGlob: '*.ts',
+  });
+
+  if (spans.length > 0) {
+    return { spans, usedSemantic: true };
+  }
+
+  // Stage 2 — no high-confidence semantic results → callers use rg/glob (gatherRelevantFiles)
+  return { spans: [], usedSemantic: false };
+}
+
+export { formatSpans };
 
 // ─── Section builders ───
 

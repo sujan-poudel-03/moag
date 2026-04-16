@@ -1,10 +1,62 @@
 // ─── Execution Profiles ───
 // Predefined configurations for trading off speed, quality, and cost.
 
-import { EngineId } from './types';
+import { EngineId, ValidationProfile, ValidationTarget } from './types';
 
 export type ProfileName = 'auto' | 'fast' | 'balanced' | 'quality' | 'budget';
 export type ModelPreset = 'fast' | 'balanced' | 'deep';
+
+// ─── CI Validation Profile Presets ───
+
+/**
+ * Describes which stages run and which targets are included for a given
+ * validation depth profile (quick / pr / full).
+ */
+export interface ValidationProfileConfig {
+  /** Human-readable label */
+  label: string;
+  description: string;
+  /** Targets validated in this profile */
+  targets: Array<ValidationTarget | 'all'>;
+  /** Stages enabled by target (undefined = all stages) */
+  stages: Array<'lint' | 'unit' | 'integration' | 'e2e'>;
+  /** Suggested max wall-clock time for CI pipeline budget enforcement */
+  maxWallClockMs: number;
+  /** Number of parallel target runners allowed */
+  parallelTargets: number;
+}
+
+export const VALIDATION_PROFILE_CONFIGS: Record<ValidationProfile, ValidationProfileConfig> = {
+  quick: {
+    label: 'Quick',
+    description: 'Lint + unit tests only — fast local feedback loop',
+    targets: ['all'],
+    stages: ['lint', 'unit'],
+    maxWallClockMs: 3 * 60 * 1000,   // 3 min
+    parallelTargets: 1,
+  },
+  pr: {
+    label: 'PR Gate',
+    description: 'Lint + unit + integration + e2e — runs on every pull request',
+    targets: ['all'],
+    stages: ['lint', 'unit', 'integration', 'e2e'],
+    maxWallClockMs: 15 * 60 * 1000,  // 15 min
+    parallelTargets: 2,
+  },
+  full: {
+    label: 'Full',
+    description: 'All stages across all available targets — nightly validation',
+    targets: ['all'],
+    stages: ['lint', 'unit', 'integration', 'e2e'],
+    maxWallClockMs: 60 * 60 * 1000,  // 60 min
+    parallelTargets: 3,
+  },
+};
+
+/** Resolve a ValidationProfile to its config. Falls back to 'quick' for unknown values. */
+export function resolveValidationProfile(profile: string): ValidationProfileConfig {
+  return VALIDATION_PROFILE_CONFIGS[profile as ValidationProfile] ?? VALIDATION_PROFILE_CONFIGS.quick;
+}
 
 export interface ProfileConfig {
   preferredEngine: EngineId;

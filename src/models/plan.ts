@@ -5,7 +5,177 @@ import * as path from 'path';
 import {
   Plan, PlanFile, PlanFilePlaylist, PlanFileTask,
   Playlist, Task, TaskStatus, EngineId,
+  ContextBudget, ValidationProfile, ValidationSettings, ValidationTarget,
 } from './types';
+
+const DEFAULT_VALIDATION_TARGETS: ValidationTarget[] = ['all'];
+const DEFAULT_VALIDATION_PROFILE: ValidationProfile = 'quick';
+const DEFAULT_CONTEXT_BUDGET: ContextBudget = {
+  discoveryTokens: 12_000,
+  analysisTokens: 24_000,
+  fixTokens: 16_000,
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function parseValidationTargets(
+  rawTargets: unknown,
+  fieldPath: string,
+  sourceName: string,
+): ValidationTarget[] {
+  if (!Array.isArray(rawTargets) || rawTargets.length === 0) {
+    throw new Error(`"${sourceName}" has invalid "${fieldPath}" — expected a non-empty array.`);
+  }
+
+  const unique = new Set<ValidationTarget>();
+  for (const value of rawTargets) {
+    if (value !== 'web' && value !== 'mobile' && value !== 'desktop' && value !== 'all') {
+      throw new Error(`"${sourceName}" has invalid "${fieldPath}" value "${String(value)}".`);
+    }
+    unique.add(value);
+  }
+
+  if (unique.has('all')) {
+    return ['all'];
+  }
+  return [...unique];
+}
+
+function parseValidationProfile(
+  rawProfile: unknown,
+  fieldPath: string,
+  sourceName: string,
+): ValidationProfile {
+  if (rawProfile !== 'quick' && rawProfile !== 'pr' && rawProfile !== 'full') {
+    throw new Error(
+      `"${sourceName}" has invalid "${fieldPath}" value "${String(rawProfile)}" (expected quick/pr/full).`,
+    );
+  }
+  return rawProfile;
+}
+
+function parseBudgetTokenValue(rawValue: unknown, fieldPath: string, sourceName: string): number {
+  if (typeof rawValue !== 'number' || !Number.isInteger(rawValue) || rawValue <= 0) {
+    throw new Error(`"${sourceName}" has invalid "${fieldPath}" — expected a positive integer.`);
+  }
+  return rawValue;
+}
+
+function normalizePlanValidation(raw: unknown, sourceName: string): ValidationSettings {
+  if (raw === undefined) {
+    return {
+      targets: [...DEFAULT_VALIDATION_TARGETS],
+      profile: DEFAULT_VALIDATION_PROFILE,
+      contextBudget: { ...DEFAULT_CONTEXT_BUDGET },
+    };
+  }
+  if (!isRecord(raw)) {
+    throw new Error(`"${sourceName}" has invalid "validation" — expected an object.`);
+  }
+
+  const targets = raw.targets === undefined
+    ? [...DEFAULT_VALIDATION_TARGETS]
+    : parseValidationTargets(raw.targets, 'validation.targets', sourceName);
+
+  const profile = raw.profile === undefined
+    ? DEFAULT_VALIDATION_PROFILE
+    : parseValidationProfile(raw.profile, 'validation.profile', sourceName);
+
+  let contextBudget = { ...DEFAULT_CONTEXT_BUDGET };
+  if (raw.contextBudget !== undefined) {
+    if (!isRecord(raw.contextBudget)) {
+      throw new Error(`"${sourceName}" has invalid "validation.contextBudget" — expected an object.`);
+    }
+    const budget = raw.contextBudget;
+    if (budget.discoveryTokens !== undefined) {
+      contextBudget.discoveryTokens = parseBudgetTokenValue(
+        budget.discoveryTokens,
+        'validation.contextBudget.discoveryTokens',
+        sourceName,
+      );
+    }
+    if (budget.analysisTokens !== undefined) {
+      contextBudget.analysisTokens = parseBudgetTokenValue(
+        budget.analysisTokens,
+        'validation.contextBudget.analysisTokens',
+        sourceName,
+      );
+    }
+    if (budget.fixTokens !== undefined) {
+      contextBudget.fixTokens = parseBudgetTokenValue(
+        budget.fixTokens,
+        'validation.contextBudget.fixTokens',
+        sourceName,
+      );
+    }
+  }
+
+  return { targets, profile, contextBudget };
+}
+
+function normalizeTaskValidation(raw: unknown, sourceName: string, taskId: string): Task['validation'] {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!isRecord(raw)) {
+    throw new Error(`"${sourceName}" has invalid "tasks[].validation" for task "${taskId}" — expected an object.`);
+  }
+
+  const validation: NonNullable<Task['validation']> = {};
+  if (raw.targets !== undefined) {
+    validation.targets = parseValidationTargets(raw.targets, 'tasks[].validation.targets', sourceName);
+  }
+  if (raw.profile !== undefined) {
+    validation.profile = parseValidationProfile(raw.profile, 'tasks[].validation.profile', sourceName);
+  }
+  if (raw.contextBudget !== undefined) {
+    if (!isRecord(raw.contextBudget)) {
+      throw new Error(
+        `"${sourceName}" has invalid "tasks[].validation.contextBudget" for task "${taskId}" — expected an object.`,
+      );
+    }
+    const budget: NonNullable<NonNullable<Task['validation']>['contextBudget']> = {};
+    if (raw.contextBudget.discoveryTokens !== undefined) {
+      budget.discoveryTokens = parseBudgetTokenValue(
+        raw.contextBudget.discoveryTokens,
+        'tasks[].validation.contextBudget.discoveryTokens',
+        sourceName,
+      );
+    }
+    if (raw.contextBudget.analysisTokens !== undefined) {
+      budget.analysisTokens = parseBudgetTokenValue(
+        raw.contextBudget.analysisTokens,
+        'tasks[].validation.contextBudget.analysisTokens',
+        sourceName,
+      );
+    }
+    if (raw.contextBudget.fixTokens !== undefined) {
+      budget.fixTokens = parseBudgetTokenValue(
+        raw.contextBudget.fixTokens,
+        'tasks[].validation.contextBudget.fixTokens',
+        sourceName,
+      );
+    }
+    if (Object.keys(budget).length > 0) {
+      validation.contextBudget = budget;
+    }
+  }
+
+  return Object.keys(validation).length > 0 ? validation : undefined;
+}
+
+function isDefaultValidationSettings(settings: ValidationSettings): boolean {
+  return (
+    settings.profile === DEFAULT_VALIDATION_PROFILE &&
+    settings.targets.length === 1 &&
+    settings.targets[0] === 'all' &&
+    settings.contextBudget.discoveryTokens === DEFAULT_CONTEXT_BUDGET.discoveryTokens &&
+    settings.contextBudget.analysisTokens === DEFAULT_CONTEXT_BUDGET.analysisTokens &&
+    settings.contextBudget.fixTokens === DEFAULT_CONTEXT_BUDGET.fixTokens
+  );
+}
 
 /** Generate a short random id using crypto when available */
 export function generateId(): string {
@@ -17,7 +187,7 @@ export function generateId(): string {
 }
 
 /** Convert a persisted plan file into the runtime Plan model (adds status fields) */
-export function hydratePlan(file: PlanFile): Plan {
+export function hydratePlan(file: PlanFile, sourceName = 'plan'): Plan {
   const plan: Plan = {
     version: file.version,
     name: file.name,
@@ -25,7 +195,8 @@ export function hydratePlan(file: PlanFile): Plan {
     defaultEngine: file.defaultEngine,
     fallbackEngine: file.fallbackEngine,
     variables: file.variables,
-    playlists: file.playlists.map(hydratePlaylist),
+    validation: normalizePlanValidation(file.validation, sourceName),
+    playlists: file.playlists.map(p => hydratePlaylist(p, sourceName)),
   };
   // Ensure all task/playlist IDs are unique; fix duplicates or missing IDs
   ensureUniqueIds(plan);
@@ -49,7 +220,7 @@ function ensureUniqueIds(plan: Plan): void {
   }
 }
 
-function hydratePlaylist(p: PlanFilePlaylist): Playlist {
+function hydratePlaylist(p: PlanFilePlaylist, sourceName: string): Playlist {
   return {
     id: p.id || generateId(),
     name: p.name,
@@ -57,11 +228,11 @@ function hydratePlaylist(p: PlanFilePlaylist): Playlist {
     autoplay: p.autoplay ?? true,
     autoplayDelay: p.autoplayDelay,
     parallel: p.parallel,
-    tasks: p.tasks.map(hydrateTask),
+    tasks: p.tasks.map(t => hydrateTask(t, sourceName)),
   };
 }
 
-function hydrateTask(t: PlanFileTask): Task {
+function hydrateTask(t: PlanFileTask, sourceName: string): Task {
   return {
     id: t.id || generateId(),
     name: t.name,
@@ -85,6 +256,7 @@ function hydrateTask(t: PlanFileTask): Task {
     dependsOn: t.dependsOn,
     skipIf: t.skipIf ? { taskId: t.skipIf.taskId, status: t.skipIf.status as TaskStatus } : undefined,
     consensus: t.consensus,
+    validation: normalizeTaskValidation(t.validation, sourceName, t.id || t.name || '<unknown-task>'),
     status: (t.status as TaskStatus) || TaskStatus.Pending,
   };
 }
@@ -98,6 +270,13 @@ export function dehydratePlan(plan: Plan): PlanFile {
     defaultEngine: plan.defaultEngine,
     playlists: plan.playlists.map(dehydratePlaylist),
   };
+  if (!isDefaultValidationSettings(plan.validation)) {
+    result.validation = {
+      targets: plan.validation.targets,
+      profile: plan.validation.profile,
+      contextBudget: { ...plan.validation.contextBudget },
+    };
+  }
   if (plan.fallbackEngine) {
     result.fallbackEngine = plan.fallbackEngine;
   }
@@ -144,6 +323,13 @@ function dehydrateTask(t: Task): PlanFileTask {
     skipIf: t.skipIf ? { taskId: t.skipIf.taskId, status: t.skipIf.status } : undefined,
     consensus: t.consensus,
   };
+  if (t.validation && Object.keys(t.validation).length > 0) {
+    result.validation = {
+      targets: t.validation.targets,
+      profile: t.validation.profile,
+      contextBudget: t.validation.contextBudget,
+    };
+  }
   // Only persist non-pending statuses to keep plan files clean
   if (t.status && t.status !== TaskStatus.Pending) {
     result.status = t.status;
@@ -186,7 +372,7 @@ export function loadPlan(filePath: string): Plan {
     throw new Error(`"${fileName}" is missing the required "name" field.`);
   }
 
-  return hydratePlan(file);
+  return hydratePlan(file, fileName);
 }
 
 /** Save a plan to a JSON file */
@@ -206,6 +392,7 @@ export function createEmptyPlan(name: string): Plan {
     version: '1.0',
     name,
     defaultEngine: 'claude' as EngineId,
+    validation: normalizePlanValidation(undefined, 'plan'),
     playlists: [createPlaylist('Tasks')],
   };
 }

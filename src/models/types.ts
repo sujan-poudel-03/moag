@@ -4,7 +4,34 @@
 export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom';
 
 /** Supported task execution modes */
-export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review';
+export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review' | 'validate';
+
+/** Supported validation targets for cross-platform checks */
+export type ValidationTarget = 'web' | 'mobile' | 'desktop' | 'all';
+
+/** Supported validation depth profiles */
+export type ValidationProfile = 'quick' | 'pr' | 'full';
+
+/** Token budgets for context discovery/analysis/fix phases */
+export interface ContextBudget {
+  discoveryTokens: number;
+  analysisTokens: number;
+  fixTokens: number;
+}
+
+/** Plan-level validation defaults and context limits */
+export interface ValidationSettings {
+  targets: ValidationTarget[];
+  profile: ValidationProfile;
+  contextBudget: ContextBudget;
+}
+
+/** Task-level validation override knobs */
+export interface TaskValidationSettings {
+  targets?: ValidationTarget[];
+  profile?: ValidationProfile;
+  contextBudget?: Partial<ContextBudget>;
+}
 
 /** How the runner should react when a task fails */
 export type FailurePolicy = 'stop' | 'continue' | 'mark-blocked';
@@ -71,6 +98,8 @@ export interface Task {
   skipIf?: { taskId: string; status: TaskStatus };
   /** Consensus mode: run the same task on multiple engines, pick the best result */
   consensus?: { engines: EngineId[]; strategy: 'first-pass' | 'best-diff' };
+  /** Optional validation target/profile/budget overrides for validate tasks */
+  validation?: TaskValidationSettings;
   /** Runtime status (not persisted in the plan file) */
   status: TaskStatus;
 }
@@ -102,6 +131,8 @@ export interface Plan {
   fallbackEngine?: EngineId;
   /** User-defined variables for template substitution in prompts */
   variables?: Record<string, string>;
+  /** Validation defaults (targets/profile/budget) used by validation-aware tasks */
+  validation: ValidationSettings;
   playlists: Playlist[];
 }
 
@@ -143,9 +174,24 @@ export interface VerificationResult {
 
 /** Artifact evidence recorded for a task run */
 export interface TaskArtifact {
+  /** File path or logical target name */
   target: string;
   exists: boolean;
   resolvedPath?: string;
+  /** Validation target platform that produced this artifact */
+  validationTarget?: 'web' | 'mobile' | 'desktop';
+  /** Which stage produced this artifact */
+  stage?: 'lint' | 'unit' | 'integration' | 'e2e';
+  /** Screenshot file paths captured during this stage */
+  screenshots?: string[];
+  /** Trace file paths (e.g. Playwright .zip traces) */
+  traces?: string[];
+  /** Log file paths captured during execution */
+  logs?: string[];
+  /** Short failure summary for quick diagnosis */
+  failureSummary?: string;
+  /** Whether this artifact came from a flaky test run (passed after retry) */
+  flaky?: boolean;
 }
 
 /** A single entry in the execution history log */
@@ -184,6 +230,26 @@ export interface HistoryEntry {
   modelReason?: string;
   /** Whether this task was auto-fixed after initial failure */
   autoFixed?: boolean;
+  /** Per-target pass/fail/skip breakdown for validate tasks */
+  validationTargetResults?: Array<{
+    target: 'web' | 'mobile' | 'desktop';
+    /** 'pass' | 'fail' | 'skip' */
+    status: 'pass' | 'fail' | 'skip';
+    stagesPassed: number;
+    stagesFailed: number;
+    durationMs: number;
+    summary: string;
+  }>;
+  /** Total flaky detections across all validation targets in this run */
+  flakyCount?: number;
+  /** Context budget usage for this task execution */
+  contextBudgetUsage?: {
+    totalCharsUsed: number;
+    totalCharsBudget: number;
+    sectionsDropped: number;
+    usedSemanticRetrieval: boolean;
+    semanticSpansReturned: number;
+  };
 }
 
 /** Serializable plan file format (status fields stripped) */
@@ -196,6 +262,12 @@ export interface PlanFile {
   fallbackEngine?: EngineId;
   /** User-defined variables for template substitution in prompts */
   variables?: Record<string, string>;
+  /** Optional plan-level validation defaults */
+  validation?: {
+    targets?: ValidationTarget[];
+    profile?: ValidationProfile;
+    contextBudget?: Partial<ContextBudget>;
+  };
   playlists: PlanFilePlaylist[];
 }
 
@@ -234,6 +306,8 @@ export interface PlanFileTask {
   skipIf?: { taskId: string; status: string };
   /** Consensus mode: run the same task on multiple engines, pick the best result */
   consensus?: { engines: EngineId[]; strategy: 'first-pass' | 'best-diff' };
+  /** Optional validation target/profile/budget overrides */
+  validation?: TaskValidationSettings;
   /** Persisted execution status (omitted or 'pending' means not yet run) */
   status?: string;
 }

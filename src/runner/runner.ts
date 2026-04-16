@@ -24,6 +24,7 @@ import { generateId } from '../models/plan';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
 import { resolveProfile, ProfileName, ProfileConfig } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
+import { getValidationAdapters, validationResultToEngineResult } from '../adapters/validation/index';
 import { HistoryStore } from '../history/store';
 import { buildContext, getContextSettings } from '../context/context-builder';
 import { analyzeProject } from '../context/project-analyzer';
@@ -88,11 +89,20 @@ export class TaskRunner {
   private _autoFixedTasks = new Set<string>();
 
   private _promptLibrary: PromptLibraryStore | null = null;
+  private _pendingScreenshots: string[] = [];
 
   constructor(private readonly historyStore: HistoryStore) {}
 
   setPromptLibrary(store: PromptLibraryStore): void {
     this._promptLibrary = store;
+  }
+
+  /**
+   * Queue screenshot paths to be injected into the next task's context.
+   * Paths are consumed (cleared) after the first task that uses them.
+   */
+  queueScreenshots(paths: string[]): void {
+    this._pendingScreenshots = [...this._pendingScreenshots, ...paths];
   }
 
   get currentRunId(): string | null {
@@ -139,6 +149,10 @@ export class TaskRunner {
     this._totalCostUsd = 0;
     this._budgetExceededEmitted = false;
     this._autoFixedTasks.clear();
+  }
+
+  private isFailSafeMode(): boolean {
+    return vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('failSafeMode', false);
   }
 
   private trackTaskCost(result: EngineResult): void {
@@ -310,11 +324,13 @@ export class TaskRunner {
 
   private async runLoop(): Promise<void> {
     const plan = this._plan!;
+    const failSafe = this.isFailSafeMode();
     const concurrentPlaylists = vscode.workspace.getConfiguration('agentTaskPlayer')
       .get<number>('parallelPlaylists', 1);
+    const effectiveConcurrentPlaylists = failSafe ? 1 : concurrentPlaylists;
 
-    if (concurrentPlaylists > 1 && plan.playlists.length > 1) {
-      await this.runPlaylistsConcurrently(plan, concurrentPlaylists);
+    if (effectiveConcurrentPlaylists > 1 && plan.playlists.length > 1) {
+      await this.runPlaylistsConcurrently(plan, effectiveConcurrentPlaylists);
     } else {
       await this.runPlaylistsSequentially(plan);
     }
@@ -330,12 +346,13 @@ export class TaskRunner {
     for (let pi = resumePlaylistIndex; pi < plan.playlists.length; pi++) {
       const playlist = plan.playlists[pi];
       this._currentPlaylistIndex = pi;
+      const failSafe = this.isFailSafeMode();
 
       if (this.state === RunnerState.Stopping) {
         return;
       }
 
-      if (playlist.parallel) {
+      if (playlist.parallel && !failSafe) {
         await this.runPlaylistParallel(playlist, plan);
       } else {
         // Only resume mid-playlist for the first playlist we enter; all others start from 0
@@ -359,7 +376,7 @@ export class TaskRunner {
           nextIndex++;
           running++;
 
-          const runPlaylist = playlist.parallel
+          const runPlaylist = (playlist.parallel && !this.isFailSafeMode())
             ? this.runPlaylistParallel(playlist, plan)
             : this.runPlaylistSequential(playlist, plan, 0);
 
@@ -501,7 +518,8 @@ export class TaskRunner {
   }
 
   private async executeTaskWithRetry(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
-    const fullAuto = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('fullAuto', false);
+    const failSafe = this.isFailSafeMode();
+    const fullAuto = !failSafe && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('fullAuto', false);
     const effectiveMaxAttempts = fullAuto ? Math.max((task.retryCount ?? 0) + 1, 4) : (task.retryCount ?? 0) + 1;
 
     if (fullAuto) {
@@ -521,7 +539,7 @@ export class TaskRunner {
     }
 
     // Auto-fix: if task still failed and auto-fix is enabled (or fullAuto), attempt AI-driven repair
-    const autoFixEnabled = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
+    const autoFixEnabled = !failSafe && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
     if (task.status !== TaskStatus.Completed && this.getTaskType(task) === 'agent' && (autoFixEnabled || fullAuto)) {
       await this.autoFixTask(task, playlist, plan);
     }
@@ -736,6 +754,7 @@ export class TaskRunner {
         runId: this._currentRunId || undefined,
         modelId: (task as Task & { _modelId?: string })._modelId,
         modelReason: (task as Task & { _modelReason?: string })._modelReason,
+        validationTargetResults: (task as Task & { _validationTargetResults?: HistoryEntry['validationTargetResults'] })._validationTargetResults,
       };
       this.historyStore.add(entry);
       this.trackTaskCost(result);
@@ -834,6 +853,8 @@ export class TaskRunner {
         return this.runCheckTask(task, cwd, signal);
       case 'review':
         return this.runReviewTask(task, engineId, cwd, signal, plan, fallbackEngine);
+      case 'validate':
+        return this.runValidateTask(task, cwd, signal, plan);
       default:
         return { stdout: '', stderr: `Unsupported task type "${taskType}"`, exitCode: 1, durationMs: 0 };
     }
@@ -972,6 +993,86 @@ export class TaskRunner {
     }
 
     return this.runAgentTask(task, reviewEngine, cwd, reviewPrompt, signal, fallbackEngine);
+  }
+
+  private async runValidateTask(
+    task: Task,
+    cwd: string,
+    signal: AbortSignal,
+    plan: Plan,
+  ): Promise<EngineResult> {
+    // Resolve effective targets: task-level override → plan-level default → 'all'
+    const rawTargets: Array<import('../models/types').ValidationTarget | 'all'> =
+      (task.validation?.targets ?? plan.validation?.targets ?? ['all']) as Array<import('../models/types').ValidationTarget | 'all'>;
+
+    const profile: 'quick' | 'pr' | 'full' =
+      (task.validation?.profile ?? plan.validation?.profile ?? 'quick') as 'quick' | 'pr' | 'full';
+
+    const adapters = getValidationAdapters(rawTargets);
+    if (adapters.length === 0) {
+      return {
+        stdout: '',
+        stderr: `No validation adapters matched targets: ${rawTargets.join(', ')}`,
+        exitCode: 1,
+        durationMs: 0,
+        summary: 'Validation configuration error.',
+      };
+    }
+
+    this.emit('task-output', task, `\n[validate] Profile: ${profile}  Targets: ${rawTargets.join(', ')}\n`, 'stdout');
+
+    const results: import('../adapters/validation/types').ValidationResult[] = [];
+    const runStartedAt = Date.now();
+
+    for (const adapter of adapters) {
+      if (signal.aborted) { break; }
+
+      const available = await adapter.isAvailable(cwd);
+      if (!available) {
+        const reason = await adapter.unavailableReason(cwd);
+        this.emit('task-output', task, `\n[validate:${adapter.target}] SKIPPED — ${reason}\n`, 'stderr');
+        results.push({
+          target: adapter.target,
+          available: false,
+          skipReason: reason,
+          stages: [],
+          exitCode: 0,
+          durationMs: 0,
+          output: '',
+          summary: 'skipped',
+        });
+        continue;
+      }
+
+      this.emit('task-output', task, `\n[validate:${adapter.target}] Starting ${profile} validation...\n`, 'stdout');
+      const result = await adapter.run({
+        cwd,
+        profile,
+        signal,
+        env: task.env,
+        onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
+      });
+      results.push(result);
+
+      const icon = result.exitCode === 0 ? '✓' : '✗';
+      this.emit('task-output', task, `\n[validate:${adapter.target}] ${icon} ${result.summary}\n`, result.exitCode === 0 ? 'stdout' : 'stderr');
+    }
+
+    const engineResult = validationResultToEngineResult(results);
+    engineResult.durationMs = Date.now() - runStartedAt;
+
+    // Stash per-target breakdown on the task for history entry enrichment
+    (task as Task & { _validationTargetResults?: HistoryEntry['validationTargetResults'] })._validationTargetResults =
+      results.map(r => ({
+        target: r.target,
+        status: !r.available ? 'skip' : r.exitCode === 0 ? 'pass' : 'fail',
+        stagesPassed: r.stages.filter(s => s.passed).length,
+        stagesFailed: r.stages.filter(s => !s.passed).length,
+        durationMs: r.durationMs,
+        summary: r.summary,
+      })) as HistoryEntry['validationTargetResults'];
+
+    return engineResult;
   }
 
   private async runConsensusTask(
@@ -1440,7 +1541,12 @@ export class TaskRunner {
     const settings = getContextSettings();
     let prompt = '';
     if (settings.enabled) {
-      const ctx = buildContext({ plan, playlist, task, cwd, historyStore: this.historyStore, settings });
+      const pendingScreenshots = this._pendingScreenshots.length > 0
+        ? [...this._pendingScreenshots]
+        : undefined;
+      // Consume the queue — screenshots attach to the first task after capture
+      this._pendingScreenshots = [];
+      const ctx = buildContext({ plan, playlist, task, cwd, historyStore: this.historyStore, settings, pendingScreenshots });
       if (ctx) {
         prompt += ctx + '\n\n';
       }

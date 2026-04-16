@@ -43,6 +43,14 @@ function makeEntry(overrides: Partial<HistoryEntry> = {}): HistoryEntry {
 }
 
 describe('HistoryStore', () => {
+  beforeEach(() => {
+    vscodeMock.clearMockConfig();
+  });
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+  });
+
   it('should start empty when no stored data', () => {
     const memento = createMemento();
     const store = new HistoryStore(memento);
@@ -148,5 +156,56 @@ describe('HistoryStore', () => {
     const all = store.getAll();
     assert.equal(all[0].id, 'third');
     assert.equal(all[2].id, 'first');
+  });
+
+  it('should truncate prompt and large outputs before persisting', () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      maxStoredPromptChars: 20,
+      maxStoredOutputChars: 25,
+      maxStoredCodeChangesChars: 15,
+      maxStoredVerificationChars: 18,
+    });
+
+    const memento = createMemento();
+    const store = new HistoryStore(memento);
+    store.add(makeEntry({
+      prompt: 'x'.repeat(100),
+      result: { stdout: 'a'.repeat(100), stderr: 'b'.repeat(100), exitCode: 0, durationMs: 5 },
+      codeChanges: 'c'.repeat(100),
+      verification: { command: 'npm test', exitCode: 1, output: 'd'.repeat(100), durationMs: 2, passed: false },
+    }));
+
+    const persisted = (memento._store['agentTaskPlayer.history'] as HistoryEntry[])[0];
+    assert.ok(persisted.prompt.length < 60, 'prompt should be truncated');
+    assert.ok(persisted.result.stdout.length < 70, 'stdout should be truncated');
+    assert.ok(persisted.result.stderr.length < 70, 'stderr should be truncated');
+    assert.ok((persisted.codeChanges || '').length < 60, 'code changes should be truncated');
+    assert.ok((persisted.verification?.output || '').length < 70, 'verification output should be truncated');
+  });
+
+  it('should trim oldest entries when serialized history exceeds byte budget', () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      maxHistoryStorageBytes: 1800,
+      maxStoredOutputChars: 200,
+      maxStoredPromptChars: 200,
+      maxStoredCodeChangesChars: 200,
+      maxStoredVerificationChars: 200,
+    });
+
+    const memento = createMemento();
+    const store = new HistoryStore(memento);
+
+    for (let i = 0; i < 25; i++) {
+      store.add(makeEntry({
+        id: `heavy-${i}`,
+        prompt: `prompt-${i}-` + 'p'.repeat(120),
+        result: { stdout: 'o'.repeat(120), stderr: 'e'.repeat(120), exitCode: 0, durationMs: 5 },
+      }));
+    }
+
+    const persisted = memento._store['agentTaskPlayer.history'] as HistoryEntry[];
+    const bytes = Buffer.byteLength(JSON.stringify(persisted), 'utf8');
+    assert.ok(bytes <= 1800, `serialized bytes should stay under budget, got ${bytes}`);
+    assert.ok(persisted.length < 25, 'oldest entries should be dropped to satisfy byte budget');
   });
 });

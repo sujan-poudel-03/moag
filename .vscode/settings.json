@@ -1,3 +1,16 @@
 {
-    "agentTaskPlayer.fullAuto": false
+  "agentTaskPlayer.fullAuto": false,
+  "agentTaskPlayer.parallelPlaylists": 1,
+  "agentTaskPlayer.failSafeMode": true,
+  "agentTaskPlayer.autoFix": false,
+  "agentTaskPlayer.taskTimeoutMs": 240000,
+  "agentTaskPlayer.engines.codex.autoApprove": false,
+  "agentTaskPlayer.maxHistoryEntries": 60,
+  "agentTaskPlayer.maxHistoryStorageBytes": 1200000,
+  "agentTaskPlayer.maxRunSessionStorageBytes": 400000,
+  "agentTaskPlayer.context.allPriorOutputs": false,
+  "agentTaskPlayer.context.maxPriorTasks": 2,
+  "agentTaskPlayer.context.maxOutputPerTask": 800,
+  "agentTaskPlayer.context.maxContextChars": 8000,
+  "agentTaskPlayer.context.maxFileContextChars": 4000
 }

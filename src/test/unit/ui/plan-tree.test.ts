@@ -21,6 +21,11 @@ describe('PlanTreeProvider', () => {
       name: 'UX Redesign',
       description: 'This should not appear in the plan tree rows.',
       defaultEngine: 'gemini',
+      validation: {
+        targets: ['all'],
+        profile: 'quick',
+        contextBudget: { discoveryTokens: 12000, analysisTokens: 24000, fixTokens: 16000 },
+      },
       playlists: [
         {
           id: 'playlist-1',
@@ -81,6 +86,11 @@ describe('PlanTreeProvider', () => {
       version: '1.0',
       name: 'Execution',
       defaultEngine: 'claude',
+      validation: {
+        targets: ['all'],
+        profile: 'quick',
+        contextBudget: { discoveryTokens: 12000, analysisTokens: 24000, fixTokens: 16000 },
+      },
       playlists: [
         {
           id: 'playlist-1',

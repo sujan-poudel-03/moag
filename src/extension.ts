@@ -33,6 +33,8 @@ import { SessionsTreeProvider, SessionsTreeItem } from './ui/sessions-tree';
 import { BUILT_IN_PLAN_TEMPLATES, PlanTemplate } from './templates/built-in-plans';
 import { PROFILE_META, ProfileName } from './models/execution-profiles';
 import { PromptLibraryStore } from './templates/prompt-library';
+import { SandboxManager } from './sandbox/sandbox-manager';
+import { captureScreenshot } from './sandbox/screenshot';
 
 // ─── Shared state ───
 
@@ -56,6 +58,13 @@ let detectedPromptEngines: EngineId[] = [];
 let promptViewProvider: PromptInputViewProvider | null = null;
 let currentSidebarThreadId: string | null = null;
 let pendingSidebarTurn: { prompt: string; engine: EngineId; startedAt: string; threadId: string; turnIndex: number } | null = null;
+let promptSidebarSyncTimer: ReturnType<typeof setTimeout> | null = null;
+let dashboardUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ─── Sandbox state ───
+let sandboxManager: SandboxManager | null = null;
+/** Screenshot paths captured via the sandbox panel, cleared after injected into a task's context */
+let pendingScreenshotPaths: string[] = [];
 
 // ─── Watch mode state ───
 let watchModeActive = false;
@@ -171,7 +180,7 @@ function syncPromptProviderEngines(
     getPromptEngineOptions(available),
     getPreferredPromptEngine(available),
   );
-  DashboardPanel.currentPanel?.update();
+  scheduleDashboardUpdate();
 }
 
 function formatSessionAge(iso: string): string {
@@ -217,11 +226,11 @@ function getPromptSidebarPlanItems(): PromptSidebarListItem[] {
       title: task.name,
       subtitle: `${playlist.name}  -  ${task.status ?? 'pending'}`,
     })))
-    .slice(0, 200);
+    .slice(0, 80);
 }
 
 function getPromptSidebarHistoryItems(): PromptSidebarListItem[] {
-  return historyStore.getAll().slice(0, 200).map((entry) => {
+  return historyStore.getAll().slice(0, 80).map((entry) => {
     const planName = entry.runId ? (runSessionStore.get(entry.runId)?.planName ?? 'Ad hoc') : 'Ad hoc';
     const playlistName = entry.playlistName || 'Unassigned';
     return {
@@ -307,6 +316,31 @@ function syncPromptProviderSidebar(promptProvider: PromptInputViewProvider): voi
     context.planName,
     context.playlistName,
   );
+}
+
+function schedulePromptProviderSidebarSync(delayMs = 120): void {
+  if (!promptViewProvider) {
+    return;
+  }
+  if (promptSidebarSyncTimer) {
+    clearTimeout(promptSidebarSyncTimer);
+  }
+  promptSidebarSyncTimer = setTimeout(() => {
+    promptSidebarSyncTimer = null;
+    if (promptViewProvider) {
+      syncPromptProviderSidebar(promptViewProvider);
+    }
+  }, delayMs);
+}
+
+function scheduleDashboardUpdate(delayMs = 120): void {
+  if (dashboardUpdateTimer) {
+    clearTimeout(dashboardUpdateTimer);
+  }
+  dashboardUpdateTimer = setTimeout(() => {
+    dashboardUpdateTimer = null;
+    DashboardPanel.currentPanel?.update();
+  }, delayMs);
 }
 
 function getPromptSidebarActiveContext(): { planName: string; playlistName: string } {
@@ -720,7 +754,7 @@ function restorePauseState(ctx: vscode.ExtensionContext): void {
   }
   if (restored) {
     planTree.setPlan(currentPlan);
-    DashboardPanel.currentPanel?.update();
+    scheduleDashboardUpdate();
   }
 }
 
@@ -785,10 +819,10 @@ function setVisiblePlan(
     planView.message = undefined;
   }
   if (promptViewProvider) {
-    syncPromptProviderSidebar(promptViewProvider);
+    schedulePromptProviderSidebarSync();
   }
   if (refreshDashboard) {
-    DashboardPanel.currentPanel?.update();
+    scheduleDashboardUpdate();
   }
 }
 
@@ -878,7 +912,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const head = historyStore.getThreadHeads().find((entry) => (entry.threadId ?? entry.id) === id);
         if (head) {
           currentSidebarThreadId = head.threadId ?? head.id;
-          syncPromptProviderSidebar(promptProvider);
+          schedulePromptProviderSidebarSync();
           cmdOpenThread(head);
           return;
         }
@@ -888,7 +922,7 @@ export function activate(context: vscode.ExtensionContext): void {
           const runEntries = historyStore.getForRun(session.id);
           if (runEntries.length > 0) {
             currentSidebarThreadId = runEntries[0].threadId ?? runEntries[0].id;
-            syncPromptProviderSidebar(promptProvider);
+            schedulePromptProviderSidebarSync();
           }
           cmdOpenSession(session);
           return;
@@ -908,25 +942,36 @@ export function activate(context: vscode.ExtensionContext): void {
     promptProvider,
     context.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []),
   );
-  syncPromptProviderSidebar(promptProvider);
+  schedulePromptProviderSidebarSync(0);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(PromptInputViewProvider.viewType, promptProvider),
   );
   context.subscriptions.push(
-    historyStore.onDidChange(() => syncPromptProviderSidebar(promptProvider)),
-    runSessionStore.onDidChange(() => syncPromptProviderSidebar(promptProvider)),
+    historyStore.onDidChange(() => schedulePromptProviderSidebarSync()),
+    runSessionStore.onDidChange(() => schedulePromptProviderSidebarSync()),
   );
 
   // Save plan when tree items are reordered via drag-and-drop
   planTree.onDidReorder(() => saveAndRefresh());
 
+  // ─── Sandbox manager ───
+  sandboxManager = new SandboxManager();
+
+  sandboxManager.on('state-changed', (state) => {
+    DashboardPanel.currentPanel?.postSandboxState(state);
+  });
+
+  sandboxManager.on('output', (text: string) => {
+    DashboardPanel.currentPanel?.appendSandboxOutput(text);
+  });
+
   // ─── Wire runner events to UI ───
 
   runner.on('state-changed', (state) => {
     planTree.setRunnerState(state);
-    DashboardPanel.currentPanel?.update();
+    scheduleDashboardUpdate();
     if (promptViewProvider) {
-      syncPromptProviderSidebar(promptViewProvider);
+      schedulePromptProviderSidebarSync();
     }
     updateStatusBar(state);
     // Persist task progress when pausing or stopping
@@ -943,7 +988,7 @@ export function activate(context: vscode.ExtensionContext): void {
     executionTasksCompleted++; // tracks current task number (1-based)
     planTree.refresh();
     if (promptViewProvider) {
-      syncPromptProviderSidebar(promptViewProvider);
+      schedulePromptProviderSidebarSync();
     }
 
     // Create run session on first task
@@ -967,7 +1012,7 @@ export function activate(context: vscode.ExtensionContext): void {
       });
     }
 
-    DashboardPanel.currentPanel?.update();
+    scheduleDashboardUpdate();
     DashboardPanel.currentPanel?.startTaskCard(task, playlist, fullPrompt);
 
     // Show real progress in status bar and notification
@@ -1020,9 +1065,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const entry = entries[0];
     DashboardPanel.currentPanel?.completeTaskCard(
       task, entry?.result ?? _result, entry?.changedFiles, entry?.codeChanges, entry?.verification, entry?.artifacts,
-      entry?.autoFixed,
+      entry?.autoFixed, entry?.validationTargetResults,
     );
-    DashboardPanel.currentPanel?.update();
+    scheduleDashboardUpdate();
     // Update run session stats
     if (runner.currentRunId) {
       const session = runSessionStore.get(runner.currentRunId);
@@ -1047,9 +1092,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const entry = entries[0];
     DashboardPanel.currentPanel?.completeTaskCard(
       task, entry?.result ?? result, entry?.changedFiles, entry?.codeChanges, entry?.verification, entry?.artifacts,
-      entry?.autoFixed,
+      entry?.autoFixed, entry?.validationTargetResults,
     );
-    DashboardPanel.currentPanel?.update();
+    scheduleDashboardUpdate();
     // Update run session stats
     if (runner.currentRunId) {
       const session = runSessionStore.get(runner.currentRunId);
@@ -1236,6 +1281,60 @@ export function activate(context: vscode.ExtensionContext): void {
       await cfg.update('fullAuto', !current, vscode.ConfigurationTarget.Workspace);
       vscode.window.showInformationMessage(`Full Auto mode: ${!current ? 'ON — write → test → fix loop active' : 'OFF'}`);
     }),
+
+    // ─── Sandbox commands ───
+    vscode.commands.registerCommand('agentTaskPlayer.launchSandbox', async () => {
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!cwd) {
+        vscode.window.showWarningMessage('Open a workspace folder before launching the sandbox.');
+        return;
+      }
+      ensureDashboardOpen();
+      await sandboxManager!.launch(cwd);
+    }),
+
+    vscode.commands.registerCommand('agentTaskPlayer.stopSandbox', () => {
+      sandboxManager?.stop();
+    }),
+
+    vscode.commands.registerCommand('agentTaskPlayer.takeScreenshot', async () => {
+      const state = sandboxManager?.state;
+      if (!state || state.status !== 'running') {
+        vscode.window.showWarningMessage('Launch the sandbox first before taking a screenshot.');
+        return;
+      }
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!cwd) { return; }
+
+      vscode.window.withProgress(
+        { location: vscode.ProgressLocation.Window, title: 'MOAG: capturing screenshot…' },
+        async () => {
+          const screenshotPath = await captureScreenshot({
+            projectType: state.projectInfo?.type ?? 'web',
+            url: state.url,
+            cwd,
+          });
+
+          if (screenshotPath) {
+            sandboxManager!.setLastScreenshotPath(screenshotPath);
+            runner.queueScreenshots([screenshotPath]);
+            vscode.window.showInformationMessage(
+              `Screenshot captured — will be attached to the next agent task.`,
+              'View',
+            ).then(choice => {
+              if (choice === 'View') {
+                vscode.commands.executeCommand('vscode.open', vscode.Uri.file(screenshotPath));
+              }
+            });
+          } else {
+            vscode.window.showWarningMessage(
+              'Screenshot failed. For web: install Playwright (npm i -D @playwright/test). ' +
+              'For mobile: ensure adb (Android) or xcrun (iOS) is accessible.',
+            );
+          }
+        },
+      );
+    }),
   );
 
   // Show walkthrough on first activation — always, regardless of existing plans
@@ -1353,6 +1452,7 @@ export function deactivate(): void {
   promptViewProvider = null;
   runner?.stop();
   runner?.stopAllServices();
+  sandboxManager?.stop();
   if (planFileWatcher) {
     planFileWatcher.dispose();
     planFileWatcher = null;
@@ -1373,9 +1473,9 @@ function saveAndRefresh(): void {
     planView.message = undefined;
   }
   if (promptViewProvider) {
-    syncPromptProviderSidebar(promptViewProvider);
+    schedulePromptProviderSidebarSync();
   }
-  DashboardPanel.currentPanel?.update();
+  scheduleDashboardUpdate();
 }
 
 async function promptSaveBeforeNew(): Promise<boolean> {
@@ -1848,14 +1948,14 @@ async function runPromptSubmission(
     turnIndex: nextTurnIndex,
   };
   if (promptViewProvider) {
-    syncPromptProviderSidebar(promptViewProvider);
+    schedulePromptProviderSidebarSync();
   }
 
   const promptPlan = createPromptPlan(prompt, engineId, sidebarThreadId, nextTurnIndex);
   if (!await preflightEngineCheck(promptPlan, 0, 0)) {
     pendingSidebarTurn = null;
     if (promptViewProvider) {
-      syncPromptProviderSidebar(promptViewProvider);
+      schedulePromptProviderSidebarSync();
     }
     return false;
   }
@@ -1874,7 +1974,7 @@ async function runPromptSubmission(
     } catch (err) {
       pendingSidebarTurn = null;
       if (promptViewProvider) {
-        syncPromptProviderSidebar(promptViewProvider);
+        schedulePromptProviderSidebarSync();
       }
       UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
       return false;
@@ -1915,7 +2015,7 @@ async function runPromptSubmission(
   } catch (err) {
     pendingSidebarTurn = null;
     if (promptViewProvider) {
-      syncPromptProviderSidebar(promptViewProvider);
+      schedulePromptProviderSidebarSync();
     }
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
     return false;
@@ -1956,14 +2056,15 @@ async function cmdRunPrompt(): Promise<void> {
 }
 
 async function cmdPlay(): Promise<void> {
-  if (!currentPlan) {
+  const activePlan = getActivePlan();
+  if (!activePlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
     return;
   }
 
   // Resume from pause — don't reset anything
   if (runner.state === RunnerState.Paused) {
-    runner.play(currentPlan);
+    runner.play(activePlan);
     return;
   }
 
@@ -1973,7 +2074,7 @@ async function cmdPlay(): Promise<void> {
   }
 
   // Check if there are already completed/failed tasks (partial run)
-  const hasProgress = currentPlan.playlists.some(pl =>
+  const hasProgress = activePlan.playlists.some(pl =>
     pl.tasks.some(t => t.status !== TaskStatus.Pending),
   );
 
@@ -1988,29 +2089,29 @@ async function cmdPlay(): Promise<void> {
     if (!action) { return; }
 
     if (action.value === 'restart') {
-      runner.resetPlan(currentPlan);
+      runner.resetPlan(activePlan);
       DashboardPanel.currentPanel?.clearTimeline();
     }
     // For resume: leave task statuses as-is — the runner skips completed tasks
   } else {
     // Fresh start
-    runner.resetPlan(currentPlan);
+    runner.resetPlan(activePlan);
     DashboardPanel.currentPanel?.clearTimeline();
   }
 
   // Pre-flight engine check — verify the first pending task's engine is installed
-  if (!await checkFirstPendingEngine(currentPlan)) {
+  if (!await checkFirstPendingEngine(activePlan)) {
     return;
   }
 
   // Initialize progress counters
-  initializeMultiTaskExecution(currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0));
+  initializeMultiTaskExecution(activePlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0));
 
   saveAndRefresh();
   startProgressNotification();
   // Auto-open the dashboard so the user sees live output
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
-  runner.play(currentPlan).catch(err => {
+  runner.play(activePlan).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
 }
@@ -3543,19 +3644,47 @@ async function cmdSwitchEngine(): Promise<void> {
     savePlan(currentPlan, currentPlanPath);
   }
   planTree.refresh();
-  DashboardPanel.currentPanel?.update();
+  scheduleDashboardUpdate();
   vscode.window.showInformationMessage(`Engine switched to ${pick.label.replace(' (current)', '')}.`);
 }
 
-async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
-  if (!currentPlan || !item || item.kind !== 'playlist') { return; }
+function isPlaylistLikeItem(item: unknown): item is { kind?: string; playlistIndex: number } {
+  if (!item || typeof item !== 'object') { return false; }
+  const candidate = item as { playlistIndex?: unknown };
+  return typeof candidate.playlistIndex === 'number';
+}
 
-  if (!await preflightEngineCheck(currentPlan, item.playlistIndex)) {
+function isTaskLikeItem(item: unknown): item is { kind?: string; playlistIndex: number; taskIndex: number } {
+  if (!item || typeof item !== 'object') { return false; }
+  const candidate = item as { playlistIndex?: unknown; taskIndex?: unknown };
+  return typeof candidate.playlistIndex === 'number' && typeof candidate.taskIndex === 'number';
+}
+
+async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIndex: number }): Promise<void> {
+  const activePlan = getActivePlan();
+  if (!activePlan) {
+    vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
+    return;
+  }
+  if (!item || !isPlaylistLikeItem(item)) {
+    vscode.window.showWarningMessage('Could not run playlist: invalid selection payload.');
+    return;
+  }
+  if (item.kind && item.kind !== 'playlist') {
+    vscode.window.showWarningMessage('Could not run playlist: selected item is not a playlist.');
+    return;
+  }
+  if (item.playlistIndex < 0 || item.playlistIndex >= activePlan.playlists.length) {
+    vscode.window.showWarningMessage('Could not run playlist: playlist index is out of range.');
+    return;
+  }
+
+  if (!await preflightEngineCheck(activePlan, item.playlistIndex)) {
     return;
   }
 
   // Only reset tasks in this specific playlist, not the entire plan
-  const playlist = currentPlan.playlists[item.playlistIndex];
+  const playlist = activePlan.playlists[item.playlistIndex];
   const hasProgress = playlist.tasks.some(t => t.status !== TaskStatus.Pending);
   if (hasProgress) {
     const action = await vscode.window.showQuickPick(
@@ -3577,21 +3706,41 @@ async function cmdPlayPlaylist(item?: PlanTreeItem): Promise<void> {
   DashboardPanel.currentPanel?.clearTimeline();
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   initializeMultiTaskExecution(playlist.tasks.length);
-  runner.playPlaylist(currentPlan, item.playlistIndex).catch(err => {
+  runner.playPlaylist(activePlan, item.playlistIndex).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
 }
 
-async function cmdPlayTask(item?: PlanTreeItem): Promise<void> {
-  if (!currentPlan || !item || item.kind !== 'task' || item.taskIndex === undefined) { return; }
+async function cmdPlayTask(item?: PlanTreeItem | { kind?: string; playlistIndex: number; taskIndex: number }): Promise<void> {
+  const activePlan = getActivePlan();
+  if (!activePlan) {
+    vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
+    return;
+  }
+  if (!item || !isTaskLikeItem(item)) {
+    vscode.window.showWarningMessage('Could not run task: invalid selection payload.');
+    return;
+  }
+  if (item.kind && item.kind !== 'task') {
+    vscode.window.showWarningMessage('Could not run task: selected item is not a task.');
+    return;
+  }
+  if (item.playlistIndex < 0 || item.playlistIndex >= activePlan.playlists.length) {
+    vscode.window.showWarningMessage('Could not run task: playlist index is out of range.');
+    return;
+  }
+  if (item.taskIndex < 0 || item.taskIndex >= activePlan.playlists[item.playlistIndex].tasks.length) {
+    vscode.window.showWarningMessage('Could not run task: task index is out of range.');
+    return;
+  }
 
-  if (!await preflightEngineCheck(currentPlan, item.playlistIndex, item.taskIndex)) {
+  if (!await preflightEngineCheck(activePlan, item.playlistIndex, item.taskIndex)) {
     return;
   }
 
   vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   initializeSingleTaskExecution();
-  runner.playTask(currentPlan, item.playlistIndex, item.taskIndex).catch(err => {
+  runner.playTask(activePlan, item.playlistIndex, item.taskIndex).catch(err => {
     vscode.window.showErrorMessage(`Task failed: ${err instanceof Error ? err.message : String(err)}`);
   });
 }

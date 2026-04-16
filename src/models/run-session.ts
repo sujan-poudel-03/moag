@@ -1,7 +1,7 @@
 // ─── Run session store — tracks plan execution runs using VS Code memento API ───
 
 import * as vscode from 'vscode';
-import { EngineId } from './types';
+import { ContextBudget, EngineId, ValidationProfile, ValidationTarget } from './types';
 
 export interface RunSession {
   id: string;
@@ -16,11 +16,16 @@ export interface RunSession {
   totalTokensIn: number;
   totalTokensOut: number;
   totalCost: number;
+  validationProfile?: ValidationProfile;
+  validationTargets?: ValidationTarget[];
+  contextBudget?: ContextBudget;
+  contextTokensUsed?: Partial<ContextBudget>;
   status: 'running' | 'completed' | 'failed' | 'stopped';
 }
 
 const STORAGE_KEY = 'agentTaskPlayer.runSessions';
 const MAX_SESSIONS = 50;
+const MAX_PLAN_NAME_CHARS = 160;
 
 export class RunSessionStore {
   private _sessions: RunSession[] = [];
@@ -28,13 +33,18 @@ export class RunSessionStore {
   readonly onDidChange = this._onDidChange.event;
 
   constructor(private readonly storage: vscode.Memento) {
-    this._sessions = storage.get<RunSession[]>(STORAGE_KEY, []);
+    this._sessions = storage.get<RunSession[]>(STORAGE_KEY, [])
+      .map((session) => this.sanitizeSession(session));
+    this.trim();
+    this.trimByStorageBytes();
+    this.persist();
   }
 
   /** Create a new run session */
   create(session: RunSession): void {
-    this._sessions.push(session);
+    this._sessions.push(this.sanitizeSession(session));
     this.trim();
+    this.trimByStorageBytes();
     this.persist();
     this._onDidChange.fire();
   }
@@ -43,7 +53,8 @@ export class RunSessionStore {
   update(id: string, partial: Partial<RunSession>): void {
     const idx = this._sessions.findIndex(s => s.id === id);
     if (idx === -1) { return; }
-    this._sessions[idx] = { ...this._sessions[idx], ...partial };
+    this._sessions[idx] = this.sanitizeSession({ ...this._sessions[idx], ...partial });
+    this.trimByStorageBytes();
     this.persist();
     this._onDidChange.fire();
   }
@@ -79,7 +90,41 @@ export class RunSessionStore {
     }
   }
 
+  private trimByStorageBytes(): void {
+    const maxBytes = this.getMaxSessionStorageBytes();
+    while (this._sessions.length > 0 && this.getSerializedBytes(this._sessions) > maxBytes) {
+      this._sessions.shift();
+    }
+  }
+
+  private getSerializedBytes(entries: RunSession[]): number {
+    try {
+      return Buffer.byteLength(JSON.stringify(entries), 'utf8');
+    } catch {
+      return Number.MAX_SAFE_INTEGER;
+    }
+  }
+
+  private getMaxSessionStorageBytes(): number {
+    return vscode.workspace.getConfiguration('agentTaskPlayer')
+      .get<number>('maxRunSessionStorageBytes', 800_000);
+  }
+
+  private sanitizeSession(session: RunSession): RunSession {
+    const safePlanName = (session.planName || '').slice(0, MAX_PLAN_NAME_CHARS);
+    return {
+      ...session,
+      planName: safePlanName || 'Untitled',
+      engines: Array.isArray(session.engines) ? session.engines.slice(0, 8) : [],
+      validationTargets: session.validationTargets?.slice(0, 4),
+    };
+  }
+
   private persist(): void {
-    this.storage.update(STORAGE_KEY, this._sessions);
+    void Promise.resolve(this.storage.update(STORAGE_KEY, this._sessions)).catch(() => {
+      // Fallback path under storage pressure.
+      this._sessions = this._sessions.slice(-10);
+      void this.storage.update(STORAGE_KEY, this._sessions);
+    });
   }
 }

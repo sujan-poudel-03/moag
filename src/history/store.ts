@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 import { HistoryEntry } from '../models/types';
 
 const HISTORY_KEY = 'agentTaskPlayer.history';
+const TRUNCATED_SUFFIX = '\n...[truncated for storage]';
 
 export class HistoryStore {
   private _entries: HistoryEntry[] = [];
@@ -11,7 +12,11 @@ export class HistoryStore {
   readonly onDidChange = this._onDidChange.event;
 
   constructor(private readonly storage: vscode.Memento) {
-    this._entries = storage.get<HistoryEntry[]>(HISTORY_KEY, []);
+    this._entries = storage.get<HistoryEntry[]>(HISTORY_KEY, [])
+      .map((entry) => this.sanitizeEntry(entry));
+    this.trim();
+    this.trimByStorageBytes();
+    this.persist();
   }
 
   /** Get all history entries (newest first) */
@@ -31,44 +36,9 @@ export class HistoryStore {
 
   /** Add a new history entry (truncates large outputs before persisting) */
   add(entry: HistoryEntry): void {
-    // Cap stdout/stderr to prevent memento overflow (~100KB max per entry)
-    const MAX_STORED_OUTPUT = 100_000;
-    if (entry.result.stdout && entry.result.stdout.length > MAX_STORED_OUTPUT) {
-      entry = {
-        ...entry,
-        result: {
-          ...entry.result,
-          stdout: entry.result.stdout.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
-        },
-      };
-    }
-    if (entry.result.stderr && entry.result.stderr.length > MAX_STORED_OUTPUT) {
-      entry = {
-        ...entry,
-        result: {
-          ...entry.result,
-          stderr: entry.result.stderr.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
-        },
-      };
-    }
-    // Cap code changes too
-    if (entry.codeChanges && entry.codeChanges.length > MAX_STORED_OUTPUT) {
-      entry = {
-        ...entry,
-        codeChanges: entry.codeChanges.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
-      };
-    }
-    if (entry.verification?.output && entry.verification.output.length > MAX_STORED_OUTPUT) {
-      entry = {
-        ...entry,
-        verification: {
-          ...entry.verification,
-          output: entry.verification.output.slice(0, MAX_STORED_OUTPUT) + '\n...[truncated for storage]',
-        },
-      };
-    }
-    this._entries.push(entry);
+    this._entries.push(this.sanitizeEntry(entry));
     this.trim();
+    this.trimByStorageBytes();
     this.persist();
     this._onDidChange.fire();
   }
@@ -122,7 +92,85 @@ export class HistoryStore {
     }
   }
 
+  /**
+   * Keep persisted history safely below VS Code memento limits.
+   * Drops oldest entries until serialized payload fits configured budget.
+   */
+  private trimByStorageBytes(): void {
+    const maxBytes = this.getMaxHistoryStorageBytes();
+    while (this._entries.length > 0 && this.getSerializedBytes(this._entries) > maxBytes) {
+      this._entries.shift();
+    }
+  }
+
+  private getSerializedBytes(entries: HistoryEntry[]): number {
+    try {
+      return Buffer.byteLength(JSON.stringify(entries), 'utf8');
+    } catch {
+      return Number.MAX_SAFE_INTEGER;
+    }
+  }
+
+  private getMaxHistoryStorageBytes(): number {
+    return vscode.workspace.getConfiguration('agentTaskPlayer')
+      .get<number>('maxHistoryStorageBytes', 3_000_000);
+  }
+
+  private sanitizeEntry(entry: HistoryEntry): HistoryEntry {
+    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const maxOutputChars = cfg.get<number>('maxStoredOutputChars', 12_000);
+    const maxPromptChars = cfg.get<number>('maxStoredPromptChars', 6_000);
+    const maxCodeChangesChars = cfg.get<number>('maxStoredCodeChangesChars', 12_000);
+    const maxVerificationChars = cfg.get<number>('maxStoredVerificationChars', 12_000);
+    const maxChangedFiles = cfg.get<number>('maxStoredChangedFiles', 300);
+    const maxArtifacts = cfg.get<number>('maxStoredArtifacts', 150);
+
+    const changedFiles = entry.changedFiles
+      ? entry.changedFiles.slice(0, maxChangedFiles).map((f) => this.clampText(f, 260))
+      : undefined;
+    const artifacts = entry.artifacts
+      ? entry.artifacts.slice(0, maxArtifacts)
+      : undefined;
+
+    return {
+      ...entry,
+      prompt: this.clampText(entry.prompt, maxPromptChars),
+      result: {
+        ...entry.result,
+        stdout: this.clampText(entry.result.stdout, maxOutputChars),
+        stderr: this.clampText(entry.result.stderr, maxOutputChars),
+      },
+      codeChanges: this.clampOptionalText(entry.codeChanges, maxCodeChangesChars),
+      verification: entry.verification
+        ? {
+          ...entry.verification,
+          output: this.clampText(entry.verification.output, maxVerificationChars),
+        }
+        : undefined,
+      changedFiles,
+      artifacts,
+    };
+  }
+
+  private clampOptionalText(value: string | undefined, maxChars: number): string | undefined {
+    if (typeof value !== 'string') {
+      return value;
+    }
+    return this.clampText(value, maxChars);
+  }
+
+  private clampText(value: string, maxChars: number): string {
+    if (value.length <= maxChars) {
+      return value;
+    }
+    return value.slice(0, maxChars) + TRUNCATED_SUFFIX;
+  }
+
   private persist(): void {
-    this.storage.update(HISTORY_KEY, this._entries);
+    void Promise.resolve(this.storage.update(HISTORY_KEY, this._entries)).catch(() => {
+      // Fallback path when storage is under pressure: keep fewer recent entries and retry once.
+      this._entries = this._entries.slice(-20);
+      void this.storage.update(HISTORY_KEY, this._entries);
+    });
   }
 }

@@ -437,6 +437,24 @@
         "title": "Toggle Full Auto",
         "category": "MOAG",
         "icon": "$(zap)"
+      },
+      {
+        "command": "agentTaskPlayer.launchSandbox",
+        "title": "Launch Sandbox (Browser / Emulator Preview)",
+        "category": "MOAG",
+        "icon": "$(browser)"
+      },
+      {
+        "command": "agentTaskPlayer.stopSandbox",
+        "title": "Stop Sandbox",
+        "category": "MOAG",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "agentTaskPlayer.takeScreenshot",
+        "title": "Take Sandbox Screenshot (attaches to next task)",
+        "category": "MOAG",
+        "icon": "$(device-camera)"
       }
     ],
     "viewsContainers": {
@@ -846,6 +864,23 @@
           "default": 200,
           "minimum": 10,
           "description": "Maximum number of history entries to keep."
+        },
+        "agentTaskPlayer.maxHistoryStorageBytes": {
+          "type": "number",
+          "default": 3000000,
+          "minimum": 200000,
+          "description": "Maximum serialized history storage size in bytes. Oldest entries are trimmed when exceeded."
+        },
+        "agentTaskPlayer.maxRunSessionStorageBytes": {
+          "type": "number",
+          "default": 800000,
+          "minimum": 200000,
+          "description": "Maximum serialized run session storage size in bytes. Oldest sessions are trimmed when exceeded."
+        },
+        "agentTaskPlayer.failSafeMode": {
+          "type": "boolean",
+          "default": false,
+          "description": "Stability-first mode for low-memory environments. Forces sequential execution and disables auto-fix/full-auto retries."
         },
         "agentTaskPlayer.executionProfile": {
           "type": "string",

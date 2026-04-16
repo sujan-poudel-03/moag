@@ -7,6 +7,7 @@ import { Plan, Task, Playlist, EngineResult, VerificationResult, TaskArtifact } 
 import { HistoryStore } from '../history/store';
 import { TaskRunner } from '../runner/runner';
 import { designSystemCssTokens } from './design-system';
+import { SandboxState } from '../sandbox/sandbox-manager';
 
 // Diagnostic output channel for debugging dashboard issues
 const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
@@ -15,7 +16,7 @@ const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '6';
+const HTML_VERSION = '7';
 
 export class DashboardPanel {
   public static currentPanel: DashboardPanel | undefined;
@@ -26,6 +27,7 @@ export class DashboardPanel {
   private _webviewReadyFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private _disposed = false;
   private _webviewReady = false;
+  private _sandboxState: SandboxState | null = null;
 
   private constructor(
     panel: vscode.WebviewPanel,
@@ -85,6 +87,10 @@ export class DashboardPanel {
     }
     outputChannel.appendLine('[createOrShow] creating new panel');
 
+    // Allow loading local files (screenshots) from any workspace folder
+    const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+    const localRoots = workspaceFolders.map(f => f.uri);
+
     const panel = vscode.window.createWebviewPanel(
       'agentTaskPlayerDashboard',
       'MOAG',
@@ -92,6 +98,7 @@ export class DashboardPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
+        localResourceRoots: localRoots,
       },
     );
 
@@ -166,7 +173,28 @@ export class DashboardPanel {
       services: this.runner.getRunningServices(),
       promptEngines: this.getPromptEngines(),
       selectedPromptEngineId: this.getSelectedPromptEngineId(),
+      sandboxState: this._sandboxState,
     }, this._webviewReady ? [0] : [0, 200, 600]);
+  }
+
+  /**
+   * Called by extension.ts whenever the sandbox state changes.
+   * Converts the screenshot path to a webview URI before posting so the
+   * <img> tag can load the local file.
+   */
+  public postSandboxState(state: SandboxState): void {
+    this._sandboxState = state;
+    const serializable = { ...state };
+    if (state.lastScreenshotPath) {
+      try {
+        serializable.lastScreenshotPath = this._panel.webview
+          .asWebviewUri(vscode.Uri.file(state.lastScreenshotPath))
+          .toString();
+      } catch {
+        // keep raw path as fallback
+      }
+    }
+    this.safePostMessage({ type: 'sandbox-state', sandboxState: serializable });
   }
 
   /** Clear the live output panel (alias for clearTimeline) */
@@ -235,6 +263,7 @@ export class DashboardPanel {
     verification?: VerificationResult,
     artifacts?: TaskArtifact[],
     autoFixed?: boolean,
+    validationTargetResults?: import('../models/types').HistoryEntry['validationTargetResults'],
   ): void {
     // Send stderr/stdout snippet so the dashboard can show WHY a task failed
     const stderrSnippet = result.stderr
@@ -260,6 +289,7 @@ export class DashboardPanel {
       verification,
       artifacts,
       autoFixed: autoFixed || false,
+      validationTargetResults: validationTargetResults ?? null,
     });
   }
 
@@ -493,7 +523,28 @@ export class DashboardPanel {
       case 'open-settings':
         vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer');
         break;
+      case 'sandbox-launch':
+        vscode.commands.executeCommand('agentTaskPlayer.launchSandbox');
+        break;
+      case 'sandbox-stop':
+        vscode.commands.executeCommand('agentTaskPlayer.stopSandbox');
+        break;
+      case 'sandbox-screenshot':
+        vscode.commands.executeCommand('agentTaskPlayer.takeScreenshot');
+        break;
+      case 'sandbox-open-browser': {
+        const url = typeof msg.url === 'string' ? msg.url : null;
+        if (url) {
+          vscode.commands.executeCommand('simpleBrowser.api.open', url);
+        }
+        break;
+      }
     }
+  }
+
+  /** Stream sandbox dev-server output to the dashboard terminal pane */
+  public appendSandboxOutput(text: string): void {
+    this.safePostMessage({ type: 'sandbox-output', text });
   }
 
   private dispose(): void {
@@ -1121,6 +1172,44 @@ export class DashboardPanel {
     .history-run-status.pass { background: rgba(76,175,80,0.15); color: var(--success); }
     .history-run-status.fail { background: rgba(244,71,71,0.15); color: var(--error); }
 
+    /* ─── Sandbox Panel ─── */
+    .sandbox-section { border-top: 1px solid var(--border); flex-shrink: 0; }
+    .sandbox-content { padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
+    .sandbox-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .sandbox-framework { font-size: 11px; font-weight: 600; }
+    .sandbox-url { font-size: 11px; color: var(--dimmed); text-decoration: none; }
+    .sandbox-url:hover { color: var(--fg); text-decoration: underline; cursor: pointer; }
+    .sandbox-status-dot {
+      width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0;
+      background: var(--dimmed);
+    }
+    .sandbox-status-dot.running { background: var(--success); box-shadow: 0 0 4px var(--success); }
+    .sandbox-status-dot.starting { background: var(--warning); animation: pulse 1.2s ease-in-out infinite; }
+    .sandbox-status-dot.error { background: var(--error); }
+    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+    .sandbox-status-label { font-size: 10px; color: var(--dimmed); }
+    .sandbox-btn {
+      font-size: 11px; padding: 3px 10px; border: none; border-radius: 3px; cursor: pointer;
+      background: var(--button-bg); color: var(--button-fg); font-family: var(--vscode-font-family);
+      white-space: nowrap;
+    }
+    .sandbox-btn:hover { background: var(--button-hover); }
+    .sandbox-btn:disabled { opacity: 0.4; cursor: default; }
+    .sandbox-btn.primary { background: var(--focus-border); color: #fff; }
+    .sandbox-btn.primary:hover { opacity: 0.85; }
+    .sandbox-screenshot-thumb {
+      max-width: 100%; max-height: 180px; border-radius: 4px;
+      border: 1px solid var(--border); cursor: pointer;
+      object-fit: contain; display: block;
+    }
+    .sandbox-screenshot-label { font-size: 10px; color: var(--dimmed); margin-bottom: 3px; }
+    .sandbox-output {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 10px; line-height: 1.4; color: var(--terminal-fg);
+      background: var(--terminal-bg); padding: 6px 8px; border-radius: 3px;
+      max-height: 80px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
+    }
+
   </style>
 </head>
 <body>
@@ -1196,6 +1285,43 @@ export class DashboardPanel {
 
     <!-- STATE 2+4: History section -->
     <div id="info-panel" style="display:none;"></div>
+
+    <!-- Sandbox Panel — always shown when a workspace is open -->
+    <div class="sandbox-section" id="sandbox-section">
+      <button class="section-toggle" data-section="sandbox" onclick="toggleSection('sandbox')">
+        <span class="section-toggle-icon">&#x25BC;</span>
+        <span class="section-toggle-label">Sandbox</span>
+        <span class="section-toggle-count" id="sandbox-status-badge"></span>
+      </button>
+      <div class="section-body collapsed" id="body-sandbox">
+        <div class="sandbox-content">
+          <div class="sandbox-row" id="sandbox-info-row">
+            <span class="sandbox-status-dot" id="sandbox-dot"></span>
+            <span class="sandbox-status-label" id="sandbox-status-label">Not started</span>
+            <span class="sandbox-framework" id="sandbox-framework"></span>
+            <a class="sandbox-url" id="sandbox-url" style="display:none;"
+               onclick="vscode.postMessage({type:'sandbox-open-browser',url:this.dataset.url})"
+               title="Open in VS Code Simple Browser"></a>
+          </div>
+          <div class="sandbox-row" id="sandbox-action-row">
+            <button class="sandbox-btn primary" id="sandbox-btn-launch"
+                    onclick="vscode.postMessage({type:'sandbox-launch'})">Launch Sandbox</button>
+            <button class="sandbox-btn" id="sandbox-btn-stop" style="display:none;"
+                    onclick="vscode.postMessage({type:'sandbox-stop'})">Stop</button>
+            <button class="sandbox-btn" id="sandbox-btn-screenshot"
+                    onclick="vscode.postMessage({type:'sandbox-screenshot'})"
+                    title="Capture screenshot and attach to next agent task">Screenshot</button>
+          </div>
+          <div id="sandbox-output-wrap" style="display:none;">
+            <div class="sandbox-output" id="sandbox-output"></div>
+          </div>
+          <div id="sandbox-screenshot-wrap" style="display:none;">
+            <div class="sandbox-screenshot-label">Last screenshot (attached to next task)</div>
+            <img class="sandbox-screenshot-thumb" id="sandbox-screenshot-img" src="" alt="screenshot" />
+          </div>
+        </div>
+      </div>
+    </div>
 
   </div>
 
@@ -1726,8 +1852,77 @@ export class DashboardPanel {
           }
           break;
         }
+        case 'sandbox-state':
+          renderSandboxPanel(msg.sandboxState);
+          break;
+        case 'sandbox-output': {
+          var sbOut = document.getElementById('sandbox-output');
+          var sbWrap = document.getElementById('sandbox-output-wrap');
+          if (sbOut && sbWrap) {
+            sbWrap.style.display = 'block';
+            sbOut.textContent = (sbOut.textContent + msg.text).slice(-2000);
+            sbOut.scrollTop = sbOut.scrollHeight;
+          }
+          break;
+        }
+      }
+      // Also handle sandboxState in update messages
+      if (msg.type === 'update' && msg.sandboxState) {
+        renderSandboxPanel(msg.sandboxState);
       }
     });
+
+    // ─── Sandbox Panel ───
+
+    function renderSandboxPanel(state) {
+      if (!state) { return; }
+      var dot = document.getElementById('sandbox-dot');
+      var label = document.getElementById('sandbox-status-label');
+      var badge = document.getElementById('sandbox-status-badge');
+      var framework = document.getElementById('sandbox-framework');
+      var urlEl = document.getElementById('sandbox-url');
+      var btnLaunch = document.getElementById('sandbox-btn-launch');
+      var btnStop = document.getElementById('sandbox-btn-stop');
+      var screenshotWrap = document.getElementById('sandbox-screenshot-wrap');
+      var screenshotImg = document.getElementById('sandbox-screenshot-img');
+
+      if (!dot) { return; }
+
+      // Status dot
+      dot.className = 'sandbox-status-dot ' + (state.status || 'stopped');
+
+      // Status label
+      var labelMap = { stopped: 'Stopped', starting: 'Starting...', running: 'Running', error: 'Error' };
+      label.textContent = state.error || labelMap[state.status] || state.status;
+      badge.textContent = state.status === 'running' ? '●' : '';
+
+      // Framework label
+      if (state.projectInfo) {
+        framework.textContent = state.projectInfo.framework || '';
+      }
+
+      // URL link
+      if (state.url) {
+        urlEl.textContent = state.url;
+        urlEl.dataset.url = state.url;
+        urlEl.style.display = 'inline';
+        urlEl.title = 'Open in VS Code Simple Browser: ' + state.url;
+      } else {
+        urlEl.style.display = 'none';
+      }
+
+      // Buttons
+      var running = state.status === 'running' || state.status === 'starting';
+      btnLaunch.style.display = running ? 'none' : 'inline-block';
+      btnStop.style.display = running ? 'inline-block' : 'none';
+
+      // Screenshot
+      if (state.lastScreenshotPath) {
+        screenshotImg.src = state.lastScreenshotPath;
+        screenshotImg.alt = 'Last screenshot';
+        screenshotWrap.style.display = 'block';
+      }
+    }
 
     // ─── Execution Logic ───
 
@@ -1808,7 +2003,7 @@ export class DashboardPanel {
         output: '', engine: msg.engine || '', taskType: msg.taskType || 'agent',
         command: msg.command || '', playlistName: msg.playlistName || '',
         durationMs: 0, exitCode: null, status: 'running',
-        changedFiles: null, codeChanges: null, verification: null, artifacts: null, summary: '',
+        changedFiles: null, codeChanges: null, verification: null, artifacts: null, validationTargetResults: null, summary: '',
       };
       document.getElementById('active-task-name').textContent = msg.taskName;
       document.getElementById('active-task-context').textContent = msg.playlistName || '';
@@ -1896,6 +2091,7 @@ export class DashboardPanel {
         state.summary = msg.summary || '';
         state.verification = msg.verification || null;
         state.artifacts = msg.artifacts || null;
+        state.validationTargetResults = msg.validationTargetResults || null;
       }
       const passed = msg.status === 'completed';
       const blocked = msg.status === 'blocked';
@@ -2078,6 +2274,25 @@ export class DashboardPanel {
         artifactsSection.innerHTML = '<summary>Artifacts (' + state.artifacts.length + ')</summary>' +
           '<ul>' + state.artifacts.map(function(a) { return '<li>' + escHtml(a.target) + ' - ' + (a.exists ? 'present' : 'missing') + '</li>'; }).join('') + '</ul>';
         detail.appendChild(artifactsSection);
+      }
+      if (msg.validationTargetResults && msg.validationTargetResults.length > 0) {
+        const valSection = document.createElement('details');
+        valSection.className = 'ct-detail-section';
+        valSection.open = true;
+        const statusIcon = function(s) { return s === 'pass' ? '\\u2713' : s === 'skip' ? '\\u25CB' : '\\u2717'; };
+        const statusClass = function(s) { return s === 'pass' ? 'val-pass' : s === 'skip' ? 'val-skip' : 'val-fail'; };
+        const rows = msg.validationTargetResults.map(function(r) {
+          return '<tr class="' + statusClass(r.status) + '">' +
+            '<td>' + statusIcon(r.status) + ' ' + escHtml(r.target) + '</td>' +
+            '<td>' + escHtml(r.summary) + '</td>' +
+            '<td>' + r.stagesPassed + '/' + (r.stagesPassed + r.stagesFailed) + ' stages</td>' +
+            '<td>' + formatDuration(r.durationMs) + '</td>' +
+            '</tr>';
+        }).join('');
+        valSection.innerHTML = '<summary>Validation Targets (' + msg.validationTargetResults.length + ')</summary>' +
+          '<table class="val-target-table"><thead><tr><th>Target</th><th>Summary</th><th>Stages</th><th>Duration</th></tr></thead>' +
+          '<tbody>' + rows + '</tbody></table>';
+        detail.appendChild(valSection);
       }
       if (msg.codeChanges) {
         const diffSection = document.createElement('details');
@@ -2279,7 +2494,7 @@ export class DashboardPanel {
       updateTimers();
     }
 
-    const collapsedSections = { info: true };
+    const collapsedSections = { info: true, sandbox: true };
 
     function toggleSection(sectionId) {
       collapsedSections[sectionId] = !collapsedSections[sectionId];
@@ -2459,11 +2674,15 @@ export class DashboardPanel {
 
     function renderEngineStatus() {
       var el = document.getElementById('engine-status');
-      if (!el) return;
-      // Engine detection happens on the extension side.
-      // For now show a placeholder that the extension will update.
-      el.innerHTML = '<span style="color:var(--dimmed)">Detecting engines...</span>';
-      vscode.postMessage({ type: 'detect-engines' });
+      if (!el) { return; }
+      if (!promptEngines || promptEngines.length === 0) {
+        el.innerHTML = '<span style="color:var(--dimmed)">No supported engines detected.</span>';
+        return;
+      }
+      var selected = promptEngines.find(function(engine) { return engine.id === selectedPromptEngineId; }) || promptEngines[0];
+      var otherEngines = promptEngines.filter(function(engine) { return engine.id !== selected.id; }).map(function(engine) { return engine.label; });
+      var extra = otherEngines.length > 0 ? ' <span style="color:var(--dimmed)">(also available: ' + escHtml(otherEngines.join(', ')) + ')</span>' : '';
+      el.innerHTML = '<span>Engine: <strong>' + escHtml(selected.label) + '</strong></span>' + extra;
     }
 
     // ─── Init ───

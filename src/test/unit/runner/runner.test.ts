@@ -558,6 +558,29 @@ describe('TaskRunner', () => {
     assert.equal(runner.state, RunnerState.Idle);
   });
 
+  it('should force sequential execution in fail-safe mode even when playlist.parallel is true', async () => {
+    const { runner } = buildRunner();
+    let inFlight = 0;
+    let maxInFlight = 0;
+    engineRunStub.callsFake(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise(r => setTimeout(r, 30));
+      inFlight--;
+      return mockEngineResult;
+    });
+
+    vscodeMock.setMockConfig('agentTaskPlayer', { failSafeMode: true });
+
+    const plan = makePlan();
+    plan.playlists[0].parallel = true;
+
+    await runner.play(plan);
+
+    assert.equal(maxInFlight, 1, 'fail-safe mode must prevent concurrent task execution');
+    vscodeMock.clearMockConfig();
+  });
+
   it('should skip completed tasks on resume', async () => {
     const { runner } = buildRunner();
     const taskNames: string[] = [];
@@ -895,6 +918,27 @@ describe('TaskRunner', () => {
     assert.equal(engineRunStub.callCount, 1);
     assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
 
+    vscodeMock.clearMockConfig();
+  });
+
+  it('should skip auto-fix when fail-safe mode is enabled', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask = sinon.stub().returns([{
+      result: { stderr: 'error', stdout: '' },
+      changedFiles: [],
+    }]);
+
+    vscodeMock.setMockConfig('agentTaskPlayer', { failSafeMode: true, autoFix: true });
+    engineRunStub.resolves({ ...mockEngineResult, exitCode: 1 });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].autoplayDelay = 0;
+
+    await runner.play(plan);
+
+    assert.equal(engineRunStub.callCount, 1);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
     vscodeMock.clearMockConfig();
   });
 

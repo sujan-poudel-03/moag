@@ -46,7 +46,12 @@ describe('RunSessionStore', () => {
   let store: InstanceType<typeof RunSessionStore>;
 
   beforeEach(() => {
+    vscodeMock.clearMockConfig();
     store = new RunSessionStore(createMemento());
+  });
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
   });
 
   it('should start empty', () => {
@@ -165,5 +170,25 @@ describe('RunSessionStore', () => {
     store.create(makeSession({ id: 's2', engines: ['claude', 'codex', 'gemini'] }));
     const session = store.get('s2')!;
     assert.deepEqual(session.engines, ['claude', 'codex', 'gemini']);
+  });
+
+  it('should trim oldest sessions when serialized sessions exceed byte budget', () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      maxRunSessionStorageBytes: 1500,
+    });
+    const memento = createMemento();
+    const sizedStore = new RunSessionStore(memento);
+
+    for (let i = 0; i < 30; i++) {
+      sizedStore.create(makeSession({
+        id: `heavy-${i}`,
+        planName: `Very long plan name ${i} ` + 'x'.repeat(300),
+      }));
+    }
+
+    const persisted = memento._store['agentTaskPlayer.runSessions'] as RunSession[];
+    const bytes = Buffer.byteLength(JSON.stringify(persisted), 'utf8');
+    assert.ok(bytes <= 1500, `serialized bytes should stay under budget, got ${bytes}`);
+    assert.ok(persisted.length < 30, 'old sessions should be dropped to satisfy byte budget');
   });
 });

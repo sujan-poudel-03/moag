@@ -31,6 +31,13 @@ describe('createEmptyPlan', () => {
     assert.equal(plan.playlists.length, 1);
     assert.equal(plan.playlists[0].name, 'Tasks');
     assert.deepEqual(plan.playlists[0].tasks, []);
+    assert.deepEqual(plan.validation.targets, ['all']);
+    assert.equal(plan.validation.profile, 'quick');
+    assert.deepEqual(plan.validation.contextBudget, {
+      discoveryTokens: 12000,
+      analysisTokens: 24000,
+      fixTokens: 16000,
+    });
   });
 });
 
@@ -86,6 +93,15 @@ describe('loadPlan / savePlan round-trip', () => {
   it('should save and reload a plan preserving all fields', () => {
     const plan = createEmptyPlan('Round Trip');
     plan.description = 'A test plan';
+    plan.validation = {
+      targets: ['web', 'mobile'],
+      profile: 'pr',
+      contextBudget: {
+        discoveryTokens: 9000,
+        analysisTokens: 18000,
+        fixTokens: 12000,
+      },
+    };
     // Use the default playlist that createEmptyPlan provides
     const pl = plan.playlists[0];
     pl.name = 'Phase 1';
@@ -109,6 +125,11 @@ describe('loadPlan / savePlan round-trip', () => {
     task.startupTimeoutMs = 45000;
     task.retryCount = 2;
     task.dependsOn = ['other-task'];
+    task.validation = {
+      targets: ['desktop'],
+      profile: 'full',
+      contextBudget: { fixTokens: 22000 },
+    };
     pl.tasks.push(task);
 
     savePlan(plan, tmpFile);
@@ -123,6 +144,13 @@ describe('loadPlan / savePlan round-trip', () => {
     assert.equal(loaded.playlists[0].autoplayDelay, 500);
     assert.equal(loaded.playlists[0].parallel, true);
     assert.equal(loaded.playlists[0].tasks.length, 1);
+    assert.deepEqual(loaded.validation.targets, ['web', 'mobile']);
+    assert.equal(loaded.validation.profile, 'pr');
+    assert.deepEqual(loaded.validation.contextBudget, {
+      discoveryTokens: 9000,
+      analysisTokens: 18000,
+      fixTokens: 12000,
+    });
 
     const t = loaded.playlists[0].tasks[0];
     assert.equal(t.name, 'Task 1');
@@ -144,6 +172,11 @@ describe('loadPlan / savePlan round-trip', () => {
     assert.equal(t.startupTimeoutMs, 45000);
     assert.equal(t.retryCount, 2);
     assert.deepEqual(t.dependsOn, ['other-task']);
+    assert.deepEqual(t.validation, {
+      targets: ['desktop'],
+      profile: 'full',
+      contextBudget: { fixTokens: 22000 },
+    });
     // Status should be hydrated back to Pending
     assert.equal(t.status, TaskStatus.Pending);
   });
@@ -265,5 +298,132 @@ describe('loadPlan / savePlan round-trip', () => {
     assert.deepEqual(t.skipIf, { taskId: 'abc', status: TaskStatus.Completed });
     assert.equal(t.skipIf!.taskId, 'abc');
     assert.equal(t.skipIf!.status, TaskStatus.Completed);
+  });
+
+  it('should default validation settings when omitted in file', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Legacy Plan',
+      defaultEngine: 'claude',
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{
+          id: 't-1',
+          name: 'Legacy Task',
+          prompt: 'Do something',
+        }],
+      }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    const loaded = loadPlan(tmpFile);
+
+    assert.deepEqual(loaded.validation.targets, ['all']);
+    assert.equal(loaded.validation.profile, 'quick');
+    assert.deepEqual(loaded.validation.contextBudget, {
+      discoveryTokens: 12000,
+      analysisTokens: 24000,
+      fixTokens: 16000,
+    });
+  });
+
+  it('should throw when plan validation profile is invalid', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Bad Profile',
+      defaultEngine: 'claude',
+      validation: {
+        profile: 'bad-profile' as any,
+      },
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{
+          id: 't-1',
+          name: 'Task',
+          prompt: 'Prompt',
+        }],
+      }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /validation\.profile/i);
+  });
+
+  it('should throw when validation targets contain unsupported values', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Bad Targets',
+      defaultEngine: 'claude',
+      validation: {
+        targets: ['web', 'tv' as any],
+      },
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{
+          id: 't-1',
+          name: 'Task',
+          prompt: 'Prompt',
+        }],
+      }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /validation\.targets/i);
+  });
+
+  it('should throw when context budget values are not positive integers', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Bad Budget',
+      defaultEngine: 'claude',
+      validation: {
+        contextBudget: {
+          discoveryTokens: -1,
+        },
+      },
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{
+          id: 't-1',
+          name: 'Task',
+          prompt: 'Prompt',
+        }],
+      }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /discoveryTokens/i);
+  });
+
+  it('should throw when task-level validation override is invalid', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Bad Task Validation',
+      defaultEngine: 'claude',
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{
+          id: 't-1',
+          name: 'Task',
+          prompt: 'Prompt',
+          validation: {
+            profile: 'invalid' as any,
+          },
+        }],
+      }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /tasks\[\]\.validation\.profile/i);
   });
 });

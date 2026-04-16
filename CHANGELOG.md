@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.9.0] - 2026-04-16
+
+### Live Sandbox & Screenshot Context
+- **Project auto-detection** (`src/sandbox/project-detector.ts`) — identifies web (Next, Vite, CRA, Angular, Nuxt, SvelteKit, Vue), mobile (React Native, Expo, Flutter, Android), and desktop (Electron, Tauri) from `package.json`, `pubspec.yaml`, or `gradlew`
+- **Sandbox lifecycle manager** (`src/sandbox/sandbox-manager.ts`) — spawns the detected dev server / emulator, parses stdout for the live URL (Vite `Local:`, Next `ready on`, etc.), falls back to port polling, emits `state-changed` and `output` events
+- **Sandbox panel in the dashboard** — collapsible section with project badge, animated status dot, clickable URL (opens in VS Code Simple Browser), `[Launch] / [Stop] / [Screenshot]` buttons, live dev-server output tail, inline screenshot thumbnail
+- **Screenshot → agent context loop** — `[Screenshot]` captures via `playwright screenshot` (web), `adb exec-out screencap` (Android), or `xcrun simctl io booted screenshot` (iOS); saves to `.moag/screenshots/`; path is queued into the next agent task's context so the agent literally sees the UI before its next change
+- New commands: `agentTaskPlayer.launchSandbox`, `agentTaskPlayer.stopSandbox`, `agentTaskPlayer.takeScreenshot`
+- `TaskRunner.queueScreenshots()` — injects screenshot paths into `buildContext()` via new `pendingScreenshots` option (priority 0, ahead of plan overview)
+- 34 new unit tests in `src/test/unit/sandbox/` covering framework detection, lifecycle, URL parsing, and tool selection per project type
+
+### Validation Engine
+- New `validate` task type — unified entrypoint for cross-platform quality gates
+- **Web adapter** — auto-detects Playwright or Cypress config; runs lint → unit → integration → e2e based on profile
+- **Mobile adapter** — supports Detox, Appium, and Expo; checks for connected Android device or booted iOS simulator; skips gracefully when unavailable with actionable guidance
+- **Desktop adapter** — supports Electron+Playwright, Spectron, and WinAppDriver; normalizes result output
+- Adapters are skipped (not failed) when tooling is absent, with descriptive skip reasons
+- Targets: `web`, `mobile`, `desktop`, `all` (expands to all available adapters)
+
+### CI Profiles (quick / pr / full)
+- Three validation depth profiles: `quick` (lint+unit, 3 min), `pr` (all stages, 15 min), `full` (all stages + all targets, 60 min)
+- `ValidationProfileConfig` type in `execution-profiles.ts` with `resolveValidationProfile()` helper
+- Plan-level and task-level `validation` override fields (`targets`, `profile`, `contextBudget`)
+- See `docs/ci-validation-guide.md` for GitHub Actions examples and sample CI plan files
+
+### Context Intelligence
+- **Semantic provider interface** (`src/context/semantic-provider.ts`) — pluggable local semantic search backend
+- `semanticSearch()` with automatic fallback: when no provider is registered or confidence is below 0.45, falls back to deterministic rg/glob retrieval
+- `runRetrievalCascade()` helper for retrieval cascade orchestration
+- `ContextBudgetUsage` telemetry emitted by `buildContext()` — tracks chars used, sections dropped, and whether semantic retrieval fired
+- `budgetUsage` out-parameter on `ContextOptions` for callers that need telemetry
+- `formatSpans()` utility to render semantic spans as fenced code blocks within a char budget
+
+### Evidence and Observability
+- Expanded `TaskArtifact` schema: `validationTarget`, `stage`, `screenshots`, `traces`, `logs`, `failureSummary`, `flaky`
+- `HistoryEntry.validationTargetResults` — per-target pass/fail/skip breakdown with stage counts and duration
+- `HistoryEntry.flakyCount` — total flaky detections across targets in a single run
+- `HistoryEntry.contextBudgetUsage` — context budget telemetry per task execution
+- Dashboard **Validation Targets** table — collapsible section showing target × stage pass/fail/skip, duration, and summary
+- `completeTaskCard()` now accepts and forwards `validationTargetResults` to the dashboard webview
+
+### Schema
+- `ValidationTarget`, `ValidationProfile`, `ContextBudget`, `ValidationSettings`, `TaskValidationSettings` types in `types.ts`
+- `Plan.validation` and `Task.validation` — plan-level defaults and task-level overrides (backward-compatible; defaults to `quick` profile with `all` targets)
+- `RunSession` — `validationProfile`, `validationTargets`, `contextBudget`, `contextTokensUsed` fields
+
+### Documentation
+- `docs/ci-validation-guide.md` — full CI/CD integration guide with GitHub Actions YAML, artifact retention, flaky test handling, and failure policy recommendations
+
+### Migration Notes
+- Existing plans without a `validation` field continue to work unchanged (defaults to `quick`/`all`).
+- Existing tasks without `type: "validate"` run exactly as before.
+- The `validate` task type is opt-in — no behavior changes for `agent`, `command`, `service`, `check`, or `review` tasks.
+
 ## [1.0.0] - 2026-03-24
 
 ### Workflow
