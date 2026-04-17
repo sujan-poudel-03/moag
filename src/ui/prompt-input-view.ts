@@ -1695,7 +1695,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div class="composer-meta">
       <button class="composer-meta-btn" id="attachBtn" type="button" title="Attach file or image">
-        <svg viewBox="0 0 16 16"><path d="M8 1v10M4 7l4 4 4-4M2 13h12"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5.5l-6.4 6.4a3.2 3.2 0 01-4.5-4.5L9.5 1a2.1 2.1 0 013 3L6.1 10.4a1.1 1.1 0 01-1.5-1.5L10 3.5"/></svg>
       </button>
       <div class="composer-meta-sep"></div>
       <select id="engine"></select>
