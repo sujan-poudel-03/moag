@@ -1145,8 +1145,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
 
     /* ─── Sidebar Sandbox ─── */
-    .sidebar-sandbox { display: none; border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15)); margin-top: 6px; padding-top: 2px; }
-    .sidebar-sandbox.active { display: block; }
+    .sidebar-sandbox { border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15)); margin-top: 6px; padding-top: 2px; }
     .sidebar-sandbox-toggle {
       display: flex; align-items: center; gap: 4px; width: 100%;
       border: none; background: none; cursor: pointer; user-select: none;
@@ -3065,8 +3064,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     });
 
     function renderSidebarSandbox(state) {
-      if (!state) { sbSectionEl.classList.remove('active'); return; }
-      sbSectionEl.classList.add('active');
+      if (!state) { return; }
       sbDotEl.className = 'sidebar-sandbox-dot ' + (state.status || 'stopped');
       var labels = { stopped: 'Stopped', starting: 'Starting...', running: 'Running', error: 'Error' };
       sbStatusEl.textContent = state.error || labels[state.status] || state.status;
