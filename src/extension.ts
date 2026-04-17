@@ -959,6 +959,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   sandboxManager.on('state-changed', (state) => {
     DashboardPanel.currentPanel?.postSandboxState(state);
+    promptViewProvider?.postSandboxState(state);
   });
 
   sandboxManager.on('output', (text: string) => {

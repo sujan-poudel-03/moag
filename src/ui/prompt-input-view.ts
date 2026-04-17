@@ -62,6 +62,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
   private _planGroups: PromptSidebarPlanGroup[] = [];
   private _activePlanName = '';
   private _activePlaylistName = '';
+  private _sandboxState: unknown = null;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
@@ -230,6 +231,26 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           this.setBusy(false);
         }
       }
+
+      if (message.type === 'launchSandbox') {
+        void vscode.commands.executeCommand('agentTaskPlayer.launchSandbox');
+        return;
+      }
+      if (message.type === 'stopSandbox') {
+        void vscode.commands.executeCommand('agentTaskPlayer.stopSandbox');
+        return;
+      }
+      if (message.type === 'takeScreenshot') {
+        void vscode.commands.executeCommand('agentTaskPlayer.takeScreenshot');
+        return;
+      }
+      if (message.type === 'openSandboxBrowser') {
+        const url = typeof message.url === 'string' ? message.url : '';
+        if (url) {
+          void vscode.commands.executeCommand('simpleBrowser.api.open', url);
+        }
+        return;
+      }
     });
   }
 
@@ -287,7 +308,14 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     runnerState: this._runnerState,
     activePlanName: this._activePlanName,
     activePlaylistName: this._activePlaylistName,
+    sandboxState: this._sandboxState,
   });
+  }
+
+  /** Push sandbox state to the sidebar webview */
+  postSandboxState(state: unknown): void {
+    this._sandboxState = state;
+    this._view?.webview.postMessage({ type: 'sandbox-state', sandboxState: state });
   }
 
   private _getHtml(): string {
@@ -1115,6 +1143,55 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       border-color: var(--vscode-focusBorder);
       background: rgba(0,122,204,0.12);
     }
+
+    /* ─── Sidebar Sandbox ─── */
+    .sidebar-sandbox { display: none; border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15)); margin-top: 6px; padding-top: 2px; }
+    .sidebar-sandbox.active { display: block; }
+    .sidebar-sandbox-toggle {
+      display: flex; align-items: center; gap: 4px; width: 100%;
+      border: none; background: none; cursor: pointer; user-select: none;
+      color: var(--vscode-foreground); padding: 4px 0; font-size: 11px;
+    }
+    .sidebar-sandbox-toggle:hover { opacity: 0.8; }
+    .sidebar-sandbox-icon { font-size: 10px; width: 14px; text-align: center; transition: transform 0.1s; }
+    .sidebar-sandbox-toggle.collapsed .sidebar-sandbox-icon { transform: rotate(-90deg); }
+    .sidebar-sandbox-label { font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; }
+    .sidebar-sandbox-badge {
+      font-size: 9px; margin-left: auto; padding: 1px 6px;
+      border-radius: 999px; border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+      color: var(--vscode-descriptionForeground);
+    }
+    .sidebar-sandbox-badge.running { border-color: rgba(76,175,80,0.5); color: #4caf50; background: rgba(76,175,80,0.1); }
+    .sidebar-sandbox-badge.starting { border-color: rgba(204,167,0,0.5); color: #cca700; background: rgba(204,167,0,0.1); }
+    .sidebar-sandbox-body { padding: 6px 0; }
+    .sidebar-sandbox-body.collapsed { display: none; }
+    .sidebar-sandbox-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; flex-wrap: wrap; }
+    .sidebar-sandbox-dot { width: 6px; height: 6px; border-radius: 50%; background: rgba(128,128,128,0.4); flex-shrink: 0; }
+    .sidebar-sandbox-dot.running { background: #4caf50; }
+    .sidebar-sandbox-dot.starting { background: #cca700; animation: sbPulse 1.2s ease-in-out infinite; }
+    .sidebar-sandbox-dot.error { background: #f44747; }
+    @keyframes sbPulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+    .sidebar-sandbox-status { font-size: 10px; color: var(--vscode-descriptionForeground); }
+    .sidebar-sandbox-framework { font-size: 10px; font-weight: 600; }
+    .sidebar-sandbox-url {
+      font-size: 10px; color: var(--vscode-textLink-foreground, #3794ff);
+      text-decoration: none; cursor: pointer;
+    }
+    .sidebar-sandbox-url:hover { text-decoration: underline; }
+    .sidebar-sandbox-actions { display: flex; gap: 4px; padding: 4px 0; }
+    .sb-btn {
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+      background: transparent; color: var(--vscode-descriptionForeground);
+      border-radius: 999px; padding: 2px 8px; font-size: 9px;
+      cursor: pointer; text-transform: uppercase;
+    }
+    .sb-btn:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
+    .sb-btn.primary {
+      background: var(--vscode-button-background); color: var(--vscode-button-foreground);
+      border-color: transparent;
+    }
+    .sb-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
+
     .thread-chip {
       border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
       background: transparent;
@@ -1397,6 +1474,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       font-size: 11px;
       line-height: 1;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
     }
     .send:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
     .send:disabled { opacity: 0.45; cursor: not-allowed; }
@@ -1542,6 +1622,31 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div id="planListHeading" class="plan-list-heading"><input id="planListSelectModeCb" type="checkbox" aria-label="Enable selection mode"><span>All Tasks</span><button id="planHeadingCollapseBtn" class="plan-tool-btn" type="button" title="Collapse All" aria-label="Collapse All">Collapse All</button></div>
     <div id="planList" class="list"></div>
+
+    <!-- Sidebar Sandbox -->
+    <div id="sidebarSandbox" class="sidebar-sandbox">
+      <button class="sidebar-sandbox-toggle collapsed" id="sbToggle" type="button">
+        <span class="sidebar-sandbox-icon">&#x25BC;</span>
+        <span class="sidebar-sandbox-label">Sandbox</span>
+        <span class="sidebar-sandbox-badge" id="sbBadge"></span>
+      </button>
+      <div class="sidebar-sandbox-body collapsed" id="sbBody">
+        <div class="sidebar-sandbox-row">
+          <span class="sidebar-sandbox-dot" id="sbDot"></span>
+          <span class="sidebar-sandbox-status" id="sbStatus">Not started</span>
+          <span class="sidebar-sandbox-framework" id="sbFramework"></span>
+        </div>
+        <div class="sidebar-sandbox-row">
+          <a class="sidebar-sandbox-url" id="sbUrl" style="display:none;"></a>
+        </div>
+        <div class="sidebar-sandbox-actions">
+          <button class="sb-btn primary" id="sbLaunch" type="button">Launch</button>
+          <button class="sb-btn" id="sbStop" type="button" style="display:none;">Stop</button>
+          <button class="sb-btn" id="sbScreenshot" type="button">Screenshot</button>
+        </div>
+      </div>
+    </div>
+
     <div id="historyTools" class="history-tools">
       <span class="tool-label">View</span>
       <select id="historyViewMode" class="tool-select">
@@ -1585,7 +1690,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       </div>
       <div class="textarea-row">
         <textarea id="prompt" placeholder="Describe what to build" rows="2"></textarea>
-        <button id="send" class="send" type="button" title="Run (Ctrl+Enter)">&#8593;</button>
+        <button id="send" class="send" type="button" title="Run (Ctrl+Enter)"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M2.5 2L14 8l-11.5 6V9.5L9 8 2.5 6.5V2z"/></svg></button>
       </div>
     </div>
     <div class="composer-meta">
@@ -2932,6 +3037,54 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     });
     engineEl.addEventListener('change', () => renderContextBar());
 
+    // ─── Sidebar Sandbox ───
+    const sbSectionEl = document.getElementById('sidebarSandbox');
+    const sbToggleEl = document.getElementById('sbToggle');
+    const sbBodyEl = document.getElementById('sbBody');
+    const sbDotEl = document.getElementById('sbDot');
+    const sbStatusEl = document.getElementById('sbStatus');
+    const sbFrameworkEl = document.getElementById('sbFramework');
+    const sbUrlEl = document.getElementById('sbUrl');
+    const sbBadgeEl = document.getElementById('sbBadge');
+    const sbLaunchEl = document.getElementById('sbLaunch');
+    const sbStopEl = document.getElementById('sbStop');
+    const sbScreenshotEl = document.getElementById('sbScreenshot');
+    let sbCollapsed = true;
+
+    sbToggleEl.addEventListener('click', () => {
+      sbCollapsed = !sbCollapsed;
+      sbToggleEl.classList.toggle('collapsed', sbCollapsed);
+      sbBodyEl.classList.toggle('collapsed', sbCollapsed);
+    });
+    sbLaunchEl.addEventListener('click', () => vscode.postMessage({ type: 'launchSandbox' }));
+    sbStopEl.addEventListener('click', () => vscode.postMessage({ type: 'stopSandbox' }));
+    sbScreenshotEl.addEventListener('click', () => vscode.postMessage({ type: 'takeScreenshot' }));
+    sbUrlEl.addEventListener('click', () => {
+      const url = sbUrlEl.dataset.url;
+      if (url) { vscode.postMessage({ type: 'openSandboxBrowser', url: url }); }
+    });
+
+    function renderSidebarSandbox(state) {
+      if (!state) { sbSectionEl.classList.remove('active'); return; }
+      sbSectionEl.classList.add('active');
+      sbDotEl.className = 'sidebar-sandbox-dot ' + (state.status || 'stopped');
+      var labels = { stopped: 'Stopped', starting: 'Starting...', running: 'Running', error: 'Error' };
+      sbStatusEl.textContent = state.error || labels[state.status] || state.status;
+      sbFrameworkEl.textContent = state.projectInfo ? state.projectInfo.framework : '';
+      if (state.url) {
+        sbUrlEl.textContent = state.url;
+        sbUrlEl.dataset.url = state.url;
+        sbUrlEl.style.display = 'inline';
+      } else {
+        sbUrlEl.style.display = 'none';
+      }
+      var active = state.status === 'running' || state.status === 'starting';
+      sbLaunchEl.style.display = active ? 'none' : 'inline-block';
+      sbStopEl.style.display = active ? 'inline-block' : 'none';
+      sbBadgeEl.textContent = active ? (state.status === 'running' ? 'Running' : 'Starting') : '';
+      sbBadgeEl.className = 'sidebar-sandbox-badge ' + (active ? state.status : '');
+    }
+
     window.addEventListener('message', (event) => {
       const msg = event.data;
       if (msg.type === 'setBusy') {
@@ -2988,6 +3141,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         setActiveTab(activeTab);
         engineEl.disabled = busy || engineEl.options.length === 0 || engineEl.value === '';
         updateActionState();
+        if (msg.sandboxState) { renderSidebarSandbox(msg.sandboxState); }
+      } else if (msg.type === 'sandbox-state') {
+        renderSidebarSandbox(msg.sandboxState);
       }
     });
 
