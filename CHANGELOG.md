@@ -1,15 +1,24 @@
 # Changelog
 
-## [0.9.3] - 2026-04-16
+## [0.9.4] - 2026-04-20
 
-### Live Sandbox & Screenshot Context
-- **Project auto-detection** (`src/sandbox/project-detector.ts`) — identifies web (Next, Vite, CRA, Angular, Nuxt, SvelteKit, Vue), mobile (React Native, Expo, Flutter, Android), and desktop (Electron, Tauri) from `package.json`, `pubspec.yaml`, or `gradlew`
-- **Sandbox lifecycle manager** (`src/sandbox/sandbox-manager.ts`) — spawns the detected dev server / emulator, parses stdout for the live URL (Vite `Local:`, Next `ready on`, etc.), falls back to port polling, emits `state-changed` and `output` events
-- **Sandbox panel in the dashboard** — collapsible section with project badge, animated status dot, clickable URL (opens in VS Code Simple Browser), `[Launch] / [Stop] / [Screenshot]` buttons, live dev-server output tail, inline screenshot thumbnail
-- **Screenshot → agent context loop** — `[Screenshot]` captures via `playwright screenshot` (web), `adb exec-out screencap` (Android), or `xcrun simctl io booted screenshot` (iOS); saves to `.moag/screenshots/`; path is queued into the next agent task's context so the agent literally sees the UI before its next change
-- New commands: `agentTaskPlayer.launchSandbox`, `agentTaskPlayer.stopSandbox`, `agentTaskPlayer.takeScreenshot`
-- `TaskRunner.queueScreenshots()` — injects screenshot paths into `buildContext()` via new `pendingScreenshots` option (priority 0, ahead of plan overview)
-- 34 new unit tests in `src/test/unit/sandbox/` covering framework detection, lifecycle, URL parsing, and tool selection per project type
+### GitHub Copilot Engine
+- **New engine: GitHub Copilot** — uses VS Code's `vscode.lm` API to route tasks through any Copilot-available model (GPT-4o, Claude, etc.); streams output in real-time; requires GitHub Copilot extension installed and signed in
+- Select `copilot` as the engine in any plan task or as the global default
+
+### Smarter Verification (False-Failure Prevention)
+- **Pre-flight baseline check** — MOAG runs `verifyCommand` on clean state before the agent starts; if verify was already failing before the task ran, the task is not blamed — shown as "Pre-existing failures — not caused by this task" with a yellow badge
+- **Scoped verify** (`"scopedVerify": true` on any task) — runs `git diff --name-only HEAD` after the agent, then automatically narrows `tsc --noEmit` and `eslint` to only the files the task touched; pre-existing lint/type errors in unrelated files no longer fail your task
+- **Env file inheritance** (`"inheritEnvFiles": [".env.test", ".env.local"]`) — MOAG reads the specified files from workspace root and injects their vars into the agent's process env; stops integration test timeouts caused by missing `.env.test` in agent worktrees
+- **Full verify output in UI** — failed task cards now show the complete verification stderr in a collapsible `<details>` block (up to 8 000 chars); no more truncated `[Verification command failed (e…]`
+- **Retry with failure context** — on retry, the agent receives `[RETRY CONTEXT — previous attempt failed]` with the last stderr and verify output prepended; the agent now knows what to fix instead of re-running blind
+- **Command task silent-success** — `type: "command"` and `type: "check"` tasks succeed on exit code 0, regardless of stdout content
+
+### Extended Thinking (Claude)
+- New setting `agentTaskPlayer.engines.claude.extendedThinking` — when enabled, prepends a step-by-step thinking directive to every Claude task prompt for deeper reasoning on complex tasks
+
+### Session Cost Display
+- Running session cost appears as a `$0.04` chip in the composer context bar, accumulating across all tasks; resets at the start of each new run
 
 ## [0.9.0] - 2026-03-XX
 
