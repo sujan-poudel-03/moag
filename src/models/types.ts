@@ -1,7 +1,7 @@
 // ─── Core data models for Agent Task Player ───
 
 /** Supported agent engine identifiers */
-export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom';
+export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom' | 'copilot';
 
 /** Supported task execution modes */
 export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review' | 'validate';
@@ -70,6 +70,10 @@ export interface Task {
   cwd?: string;
   /** Environment variable overrides for local execution */
   env?: Record<string, string>;
+  /** Env files to inherit (e.g. [".env.test", ".env.local"]) — merged before task.env */
+  inheritEnvFiles?: string[];
+  /** When true, scope the verifyCommand to only files changed by this task */
+  scopedVerify?: boolean;
   /** File references to include as context */
   files?: string[];
   /** Success criteria shown in the dashboard and checked by the operator */
@@ -170,6 +174,10 @@ export interface VerificationResult {
   output: string;
   durationMs: number;
   passed: boolean;
+  /** True when this was the baseline (pre-agent) verification run */
+  baselinePassed?: boolean;
+  /** True when the baseline was already broken before the agent ran — task is not at fault */
+  baselineBroken?: boolean;
 }
 
 /** Artifact evidence recorded for a task run */
@@ -182,6 +190,10 @@ export interface TaskArtifact {
   validationTarget?: 'web' | 'mobile' | 'desktop';
   /** Which stage produced this artifact */
   stage?: 'lint' | 'unit' | 'integration' | 'e2e';
+  /** Outcome of this stage — 'pass', 'fail', or 'skip' */
+  stageStatus?: 'pass' | 'fail' | 'skip';
+  /** Stage execution duration in milliseconds */
+  durationMs?: number;
   /** Screenshot file paths captured during this stage */
   screenshots?: string[];
   /** Trace file paths (e.g. Playwright .zip traces) */
@@ -290,6 +302,8 @@ export interface PlanFileTask {
   command?: string;
   cwd?: string;
   env?: Record<string, string>;
+  inheritEnvFiles?: string[];
+  scopedVerify?: boolean;
   files?: string[];
   acceptanceCriteria?: string[];
   verifyCommand?: string;

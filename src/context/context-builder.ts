@@ -55,6 +55,13 @@ export interface ContextOptions {
    * The caller is responsible for clearing this queue after passing it in.
    */
   pendingScreenshots?: string[];
+  /**
+   * Pre-fetched ranked code spans from runRetrievalCascade.
+   * When provided, emitted as a high-priority section instead of whole-file retrieval.
+   */
+  retrievedSpans?: SemanticSpan[];
+  /** True when retrievedSpans were produced by the semantic provider (not just rg/hint). */
+  retrievedSpansUsedSemantic?: boolean;
 }
 
 /** Read context settings from VS Code configuration */
@@ -103,8 +110,8 @@ export function buildContext(options: ContextOptions): string {
   }
 
   const sections: Section[] = [];
-  let usedSemanticRetrieval = false;
-  let semanticSpansReturned = 0;
+  let usedSemanticRetrieval = options.retrievedSpansUsedSemantic ?? false;
+  let semanticSpansReturned = options.retrievedSpans?.length ?? 0;
 
   if (options.pendingScreenshots && options.pendingScreenshots.length > 0) {
     const body = options.pendingScreenshots
@@ -134,7 +141,14 @@ export function buildContext(options: ContextOptions): string {
     }
   }
 
-  if (settings.relevantFiles) {
+  // Ranked spans from retrieval cascade — preferred over whole-file content
+  if (options.retrievedSpans && options.retrievedSpans.length > 0) {
+    const spanBudget = Math.floor(settings.maxFileContextChars * 0.8);
+    const body = formatSpans(options.retrievedSpans, spanBudget);
+    if (body) {
+      sections.push({ priority: 3.3, header: '=== RELEVANT CODE SPANS ===', body });
+    }
+  } else if (settings.relevantFiles) {
     const body = gatherRelevantFiles(options.task, options.cwd, settings);
     if (body) {
       sections.push({ priority: 3.5, header: '=== RELEVANT FILES ===', body });
@@ -209,35 +223,329 @@ export function buildContext(options: ContextOptions): string {
 /**
  * Run the full retrieval cascade for a task prompt and return ranked spans.
  *
- * Stages:
- * 1. Semantic provider (fast, high-quality when available)
- * 2. rg/glob scan of files referenced in the prompt
+ * Stages (highest priority first):
+ * 1. Symbol/project hints — camelCase/PascalCase identifiers extracted from prompt,
+ *    scanned in-process across up to 30 source files (confidence 0.6)
+ * 2. rg/glob keyword search — broader token extraction (ALL_CAPS, snake_case, plain
+ *    identifiers) scanned across up to 50 files; replaces overlapping hint spans
+ *    in the same files (confidence 0.65)
+ * 3. Semantic provider — when a provider is registered and returns confident results,
+ *    its spans replace deterministic spans for covered files (highest quality)
  *
- * Returns semantic spans when the provider fires with high confidence;
- * otherwise returns an empty array so callers fall back to whole-file retrieval.
+ * Returns `{ spans, usedSemantic }`. Callers pass `spans` to `buildContext` via
+ * `ContextOptions.retrievedSpans`; when spans is empty, `buildContext` falls back
+ * to whole-file `gatherRelevantFiles`.
  */
 export async function runRetrievalCascade(
   task: Task,
   cwd: string,
   budget: number,
 ): Promise<{ spans: SemanticSpan[]; usedSemantic: boolean }> {
-  // Stage 1 — semantic provider
-  const spans = await semanticSearch({
+  // Stage 1 — symbol/project hint spans (camelCase/PascalCase, confidence 0.6)
+  const hintSpans = gatherSymbolHintSpans(task.prompt, cwd, budget);
+
+  // Stage 2 — rg/glob keyword spans (broader coverage, confidence 0.65)
+  // Overlapping hint spans in the same files are replaced by the higher-confidence rg spans
+  const rgSpans = gatherRgGlobSpans(task.prompt, cwd, budget);
+  const deterministicSpans = mergeSpans(hintSpans, rgSpans);
+
+  // Stage 3 — semantic provider (async, optional, highest quality)
+  const semanticSpans = await semanticSearch({
     query: task.prompt,
     cwd,
     maxSpans: 20,
     fileGlob: '*.ts',
   });
 
-  if (spans.length > 0) {
-    return { spans, usedSemantic: true };
+  if (semanticSpans.length > 0) {
+    // Semantic spans take priority; keep deterministic extras for uncovered files
+    const coveredFiles = new Set(semanticSpans.map(s => s.filePath));
+    const extras = deterministicSpans.filter(s => !coveredFiles.has(s.filePath));
+    return { spans: [...semanticSpans, ...extras], usedSemantic: true };
   }
 
-  // Stage 2 — no high-confidence semantic results → callers use rg/glob (gatherRelevantFiles)
-  return { spans: [], usedSemantic: false };
+  // No semantic results — return deterministic (rg + hint) spans
+  return { spans: deterministicSpans, usedSemantic: false };
 }
 
 export { formatSpans };
+
+// ─── Symbol hint retrieval ───
+
+/** Matches camelCase and PascalCase identifiers (4+ chars) */
+const SYMBOL_HINT_PATTERN = /\b([A-Z][a-zA-Z0-9]{3,}|[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]{2,})\b/g;
+
+/** Matches any identifier-like token of 4+ chars (captures ALL_CAPS, snake_case, plain words) */
+const KEYWORD_PATTERN = /\b([a-zA-Z_][a-zA-Z0-9_]{3,})\b/g;
+
+/** Lines of surrounding context to include around a symbol match */
+const SPAN_CONTEXT_LINES = 3;
+
+/** Max source files to scan during hint extraction */
+const MAX_HINT_SCAN_FILES = 30;
+
+/** Max source files to scan during rg/glob keyword extraction */
+const MAX_RG_SCAN_FILES = 50;
+
+/** Max file size to scan for symbol hints (50 KB) */
+const MAX_HINT_FILE_BYTES = 50 * 1024;
+
+/** Common English words that are never useful code search terms */
+const STOP_WORDS = new Set([
+  'that', 'this', 'with', 'from', 'have', 'will', 'your', 'what', 'when', 'then',
+  'they', 'them', 'into', 'just', 'also', 'some', 'each', 'like', 'over', 'where',
+  'been', 'were', 'there', 'their', 'would', 'could', 'should', 'which', 'about',
+  'after', 'before', 'because', 'through', 'make', 'more', 'only', 'both', 'used',
+]);
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Extract symbol identifiers from a prompt, find their occurrences in source
+ * files (with surrounding context), and return as SemanticSpan[].
+ *
+ * Files are scanned in priority order: prompt-referenced files first, then
+ * src/ directory files up to MAX_HINT_SCAN_FILES.
+ */
+export function gatherSymbolHintSpans(prompt: string, cwd: string, budget: number): SemanticSpan[] {
+  const symbols = new Set<string>();
+  const symPattern = new RegExp(SYMBOL_HINT_PATTERN.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = symPattern.exec(prompt)) !== null) {
+    symbols.add(m[1]);
+  }
+  if (symbols.size === 0) { return []; }
+
+  const candidateFiles = collectCandidateFiles(cwd, prompt);
+  const spans: SemanticSpan[] = [];
+  let totalChars = 0;
+
+  for (const relPath of candidateFiles) {
+    if (totalChars >= budget) { break; }
+    const fullPath = path.join(cwd, relPath);
+
+    let content: string;
+    try {
+      const stat = fs.statSync(fullPath);
+      if (!stat.isFile() || stat.size > MAX_HINT_FILE_BYTES) { continue; }
+      content = fs.readFileSync(fullPath, 'utf-8');
+    } catch { continue; }
+
+    const lines = content.split('\n');
+    const matchedLineSet = new Set<number>();
+
+    for (const sym of symbols) {
+      const re = new RegExp(`\\b${escapeRegex(sym)}\\b`);
+      for (let i = 0; i < lines.length; i++) {
+        if (re.test(lines[i])) {
+          const lo = Math.max(0, i - SPAN_CONTEXT_LINES);
+          const hi = Math.min(lines.length - 1, i + SPAN_CONTEXT_LINES);
+          for (let j = lo; j <= hi; j++) { matchedLineSet.add(j); }
+        }
+      }
+    }
+    if (matchedLineSet.size === 0) { continue; }
+
+    // Group consecutive matched line indices into contiguous ranges
+    const sorted = [...matchedLineSet].sort((a, b) => a - b);
+    const groups: [number, number][] = [];
+    let rangeStart = sorted[0];
+    let rangeEnd = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i] <= rangeEnd + 1) {
+        rangeEnd = sorted[i];
+      } else {
+        groups.push([rangeStart, rangeEnd]);
+        rangeStart = rangeEnd = sorted[i];
+      }
+    }
+    groups.push([rangeStart, rangeEnd]);
+
+    for (const [lo, hi] of groups) {
+      const spanContent = lines.slice(lo, hi + 1).join('\n');
+      if (totalChars + spanContent.length > budget) { break; }
+      spans.push({
+        filePath: relPath,
+        startLine: lo + 1,  // 1-indexed
+        endLine: hi + 1,
+        content: spanContent,
+        confidence: 0.6,    // deterministic, moderate confidence
+      });
+      totalChars += spanContent.length;
+    }
+  }
+
+  return spans;
+}
+
+/**
+ * Return source files to scan: prompt-referenced files first, then `src/` files.
+ * Normalizes separators and ensures all paths are relative to cwd.
+ */
+function collectCandidateFiles(cwd: string, prompt: string, maxFiles = MAX_HINT_SCAN_FILES): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+
+  // 1. Files explicitly mentioned in the prompt
+  const promptPattern = new RegExp(PATH_PATTERN.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = promptPattern.exec(prompt)) !== null) {
+    const normalized = m[1].replace(/\\/g, '/');
+    if (!seen.has(normalized)) {
+      seen.add(normalized);
+      const full = path.join(cwd, normalized);
+      try { if (fs.statSync(full).isFile()) { out.push(normalized); } } catch { /* not a file */ }
+    }
+  }
+
+  // 2. Source files from src/ up to the remaining limit
+  const counter = { remaining: maxFiles - out.length };
+  const srcDir = path.join(cwd, 'src');
+  collectSourceFilesRecursive(srcDir, cwd, seen, out, counter);
+
+  return out;
+}
+
+function collectSourceFilesRecursive(
+  dir: string,
+  cwd: string,
+  seen: Set<string>,
+  out: string[],
+  counter: { remaining: number },
+): void {
+  if (counter.remaining <= 0) { return; }
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+
+  for (const entry of entries) {
+    if (counter.remaining <= 0) { break; }
+    if (IGNORED_DIRS.has(entry.name) || entry.isSymbolicLink()) { continue; }
+    const fullPath = path.join(dir, entry.name);
+    const relPath = path.relative(cwd, fullPath).replace(/\\/g, '/');
+    if (entry.isDirectory()) {
+      collectSourceFilesRecursive(fullPath, cwd, seen, out, counter);
+    } else if (entry.isFile() && PATH_EXTENSIONS.test(entry.name) && !seen.has(relPath)) {
+      seen.add(relPath);
+      out.push(relPath);
+      counter.remaining--;
+    }
+  }
+}
+
+/**
+ * Extract broad keywords from a prompt and scan source files for matching spans.
+ *
+ * This is the rg/glob stage — covers identifiers the camelCase/PascalCase symbol
+ * hint stage misses: ALL_CAPS constants, snake_case names, and short identifiers.
+ * Returns spans with confidence 0.65 (higher than hint spans at 0.6).
+ */
+export function gatherRgGlobSpans(prompt: string, cwd: string, budget: number): SemanticSpan[] {
+  const keywords = new Set<string>();
+  const kwPattern = new RegExp(KEYWORD_PATTERN.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = kwPattern.exec(prompt)) !== null) {
+    const word = m[1];
+    if (!STOP_WORDS.has(word.toLowerCase())) {
+      keywords.add(word);
+    }
+  }
+  if (keywords.size === 0) { return []; }
+
+  const candidateFiles = collectCandidateFiles(cwd, prompt, MAX_RG_SCAN_FILES);
+  const spans: SemanticSpan[] = [];
+  let totalChars = 0;
+
+  for (const relPath of candidateFiles) {
+    if (totalChars >= budget) { break; }
+    const fullPath = path.join(cwd, relPath);
+
+    let content: string;
+    try {
+      const stat = fs.statSync(fullPath);
+      if (!stat.isFile() || stat.size > MAX_HINT_FILE_BYTES) { continue; }
+      content = fs.readFileSync(fullPath, 'utf-8');
+    } catch { continue; }
+
+    const lines = content.split('\n');
+    const matchedLineSet = new Set<number>();
+
+    for (const kw of keywords) {
+      const re = new RegExp(`\\b${escapeRegex(kw)}\\b`);
+      for (let i = 0; i < lines.length; i++) {
+        if (re.test(lines[i])) {
+          const lo = Math.max(0, i - SPAN_CONTEXT_LINES);
+          const hi = Math.min(lines.length - 1, i + SPAN_CONTEXT_LINES);
+          for (let j = lo; j <= hi; j++) { matchedLineSet.add(j); }
+        }
+      }
+    }
+    if (matchedLineSet.size === 0) { continue; }
+
+    const sorted = [...matchedLineSet].sort((a, b) => a - b);
+    const groups: [number, number][] = [];
+    let rangeStart = sorted[0];
+    let rangeEnd = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i] <= rangeEnd + 1) {
+        rangeEnd = sorted[i];
+      } else {
+        groups.push([rangeStart, rangeEnd]);
+        rangeStart = rangeEnd = sorted[i];
+      }
+    }
+    groups.push([rangeStart, rangeEnd]);
+
+    for (const [lo, hi] of groups) {
+      const spanContent = lines.slice(lo, hi + 1).join('\n');
+      if (totalChars + spanContent.length > budget) { break; }
+      spans.push({
+        filePath: relPath,
+        startLine: lo + 1,
+        endLine: hi + 1,
+        content: spanContent,
+        confidence: 0.65,
+      });
+      totalChars += spanContent.length;
+    }
+  }
+
+  return spans;
+}
+
+/**
+ * Merge two span arrays. `higher` spans (higher confidence) replace overlapping
+ * `lower` spans in the same file. Non-overlapping lower spans are kept as extras.
+ */
+export function mergeSpans(lower: SemanticSpan[], higher: SemanticSpan[]): SemanticSpan[] {
+  if (higher.length === 0) { return lower; }
+  if (lower.length === 0) { return higher; }
+
+  const higherByFile = new Map<string, SemanticSpan[]>();
+  for (const s of higher) {
+    const arr = higherByFile.get(s.filePath) ?? [];
+    arr.push(s);
+    higherByFile.set(s.filePath, arr);
+  }
+
+  const extras: SemanticSpan[] = [];
+  for (const ls of lower) {
+    const higherInFile = higherByFile.get(ls.filePath);
+    if (!higherInFile) {
+      extras.push(ls);
+      continue;
+    }
+    const overlaps = higherInFile.some(
+      hs => ls.startLine <= hs.endLine && ls.endLine >= hs.startLine,
+    );
+    if (!overlaps) {
+      extras.push(ls);
+    }
+  }
+
+  return [...higher, ...extras];
+}
 
 // ─── Section builders ───
 

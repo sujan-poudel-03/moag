@@ -9,6 +9,7 @@ import {
   ValidationRunOptions,
   ValidationStageResult,
 } from './types';
+import { resolveValidationProfile } from '../../models/execution-profiles';
 
 type MobileTool = 'detox' | 'appium' | 'expo';
 
@@ -83,11 +84,13 @@ export class MobileValidator implements ValidationAdapter {
     const stages: ValidationStageResult[] = [];
     const startedAt = Date.now();
 
-    // Unit tests always run
-    stages.push(await this.runStage('unit', this.unitCommand(cwd, tool), cwd, env, signal, onOutput));
+    const { stages: enabledStages } = resolveValidationProfile(profile);
 
-    // E2e runs for pr and full profiles
-    if ((profile === 'pr' || profile === 'full') && !signal.aborted) {
+    if (enabledStages.includes('unit')) {
+      stages.push(await this.runStage('unit', this.unitCommand(cwd, tool), cwd, env, signal, onOutput));
+    }
+
+    if (enabledStages.includes('e2e') && !signal.aborted) {
       stages.push(await this.runStage('e2e', this.e2eCommand(cwd, tool), cwd, env, signal, onOutput));
     }
 

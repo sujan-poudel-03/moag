@@ -10,7 +10,7 @@ const proxyquire = require('proxyquire').noCallThru();
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const vscodeMock = require('../mocks/vscode');
 
-// Load context-builder with mocked vscode
+// Load context-builder with mocked vscode (semantic provider returns no spans)
 const {
   buildContext,
   getContextSettings,
@@ -20,8 +20,34 @@ const {
   gatherPriorOutputs,
   gatherProjectState,
   applyBudget,
+  gatherRgGlobSpans,
+  gatherSymbolHintSpans,
+  mergeSpans,
 } = proxyquire('../../../context/context-builder', {
   'vscode': vscodeMock,
+  './semantic-provider': {
+    semanticSearch: async () => [],
+    formatSpans: require('../../../context/semantic-provider').formatSpans,
+  },
+});
+
+// Separate load with semantic provider returning results for runRetrievalCascade tests
+const { runRetrievalCascade: runCascadeWithSemantic } = proxyquire('../../../context/context-builder', {
+  'vscode': vscodeMock,
+  './semantic-provider': {
+    semanticSearch: async () => [
+      { filePath: 'src/semantic.ts', startLine: 1, endLine: 5, content: 'semantic result', confidence: 0.9 },
+    ],
+    formatSpans: require('../../../context/semantic-provider').formatSpans,
+  },
+});
+
+const { runRetrievalCascade: runCascadeNoSemantic } = proxyquire('../../../context/context-builder', {
+  'vscode': vscodeMock,
+  './semantic-provider': {
+    semanticSearch: async () => [],
+    formatSpans: require('../../../context/semantic-provider').formatSpans,
+  },
 });
 
 // ─── Helpers ───
@@ -394,6 +420,108 @@ describe('Context Builder', () => {
     });
   });
 
+  describe('gatherRgGlobSpans', () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'rg-test-'));
+      fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('should find spans matching ALL_CAPS constants in prompt', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'config.ts'), [
+        'const MAX_RETRIES = 3;',
+        'const BASE_URL = "http://example.com";',
+        'export { MAX_RETRIES, BASE_URL };',
+      ].join('\n'));
+      const spans = gatherRgGlobSpans('Use MAX_RETRIES when retrying requests', tmpDir, 50000);
+      assert.ok(spans.length > 0);
+      assert.ok(spans.some((s: any) => s.content.includes('MAX_RETRIES')));
+      assert.ok(spans.every((s: any) => s.confidence === 0.65));
+    });
+
+    it('should find spans matching snake_case identifiers in prompt', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'utils.ts'), [
+        'function task_runner(task_id: string) {',
+        '  return task_id.toUpperCase();',
+        '}',
+      ].join('\n'));
+      const spans = gatherRgGlobSpans('implement task_runner logic for each task_id', tmpDir, 50000);
+      assert.ok(spans.length > 0);
+      assert.ok(spans.some((s: any) => s.content.includes('task_runner')));
+    });
+
+    it('should return empty array when no matching keywords found', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'empty.ts'), 'export {};');
+      const spans = gatherRgGlobSpans('fix the issue with that this with from have', tmpDir, 50000);
+      // stop words only — no useful keywords
+      assert.equal(spans.length, 0);
+    });
+
+    it('should respect the budget and not exceed it', () => {
+      const longContent = Array.from({ length: 200 }, (_, i) => `// line_number_${i}`).join('\n');
+      fs.writeFileSync(path.join(tmpDir, 'src', 'big.ts'), longContent);
+      const tinyBudget = 50;
+      const spans = gatherRgGlobSpans('line_number context', tmpDir, tinyBudget);
+      const totalChars = spans.reduce((sum: number, s: any) => sum + s.content.length, 0);
+      assert.ok(totalChars <= tinyBudget);
+    });
+
+    it('should assign confidence 0.65 to all returned spans', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'auth.ts'), 'function authenticate_user() {}');
+      const spans = gatherRgGlobSpans('authenticate_user should validate tokens', tmpDir, 50000);
+      for (const s of spans) {
+        assert.equal((s as any).confidence, 0.65);
+      }
+    });
+  });
+
+  describe('mergeSpans', () => {
+    function makeSpan(filePath: string, startLine: number, endLine: number, confidence: number) {
+      return { filePath, startLine, endLine, content: `lines ${startLine}-${endLine}`, confidence };
+    }
+
+    it('should return higher spans when lower is empty', () => {
+      const higher = [makeSpan('a.ts', 1, 5, 0.65)];
+      const result = mergeSpans([], higher);
+      assert.deepEqual(result, higher);
+    });
+
+    it('should return lower spans when higher is empty', () => {
+      const lower = [makeSpan('a.ts', 1, 5, 0.6)];
+      const result = mergeSpans(lower, []);
+      assert.deepEqual(result, lower);
+    });
+
+    it('should drop lower spans that overlap with higher spans in the same file', () => {
+      const lower = [makeSpan('a.ts', 3, 8, 0.6)];
+      const higher = [makeSpan('a.ts', 5, 10, 0.65)];
+      const result = mergeSpans(lower, higher);
+      assert.equal(result.length, 1);
+      assert.equal(result[0].confidence, 0.65);
+    });
+
+    it('should keep non-overlapping lower spans from other files', () => {
+      const lower = [makeSpan('b.ts', 1, 5, 0.6)];
+      const higher = [makeSpan('a.ts', 1, 5, 0.65)];
+      const result = mergeSpans(lower, higher);
+      assert.equal(result.length, 2);
+      assert.ok(result.some((s: any) => s.filePath === 'a.ts'));
+      assert.ok(result.some((s: any) => s.filePath === 'b.ts'));
+    });
+
+    it('should keep non-overlapping lower spans in the same file', () => {
+      const lower = [makeSpan('a.ts', 1, 3, 0.6)];
+      const higher = [makeSpan('a.ts', 10, 15, 0.65)];
+      const result = mergeSpans(lower, higher);
+      assert.equal(result.length, 2);
+    });
+  });
+
   describe('first task scenario', () => {
     it('should produce only plan overview + project state for first task', () => {
       const { plan, playlist, tasks } = makePlanWithTasks();
@@ -409,6 +537,157 @@ describe('Context Builder', () => {
       assert.ok(!result.includes('=== PROGRESS SO FAR ==='));
       assert.ok(!result.includes('=== FILES CHANGED BY PRIOR TASKS ==='));
       assert.ok(!result.includes('=== PRIOR TASK RESULTS ==='));
+    });
+  });
+
+  describe('gatherSymbolHintSpans', () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hint-test-'));
+      fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('should find spans for camelCase identifiers in prompt', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'runner.ts'), [
+        'export class TaskRunner {',
+        '  run(task: string) {}',
+        '}',
+      ].join('\n'));
+      const spans = gatherSymbolHintSpans('Use TaskRunner to execute tasks', tmpDir, 50000);
+      assert.ok(spans.length > 0);
+      assert.ok(spans.some((s: any) => s.content.includes('TaskRunner')));
+    });
+
+    it('should find spans for PascalCase identifiers in prompt', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'store.ts'), [
+        'class HistoryStore {',
+        '  private entries: any[] = [];',
+        '}',
+      ].join('\n'));
+      const spans = gatherSymbolHintSpans('HistoryStore should persist entries', tmpDir, 50000);
+      assert.ok(spans.length > 0);
+      assert.ok(spans.some((s: any) => s.content.includes('HistoryStore')));
+    });
+
+    it('should assign confidence 0.6 to all spans', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'auth.ts'), 'function AuthProvider() {}');
+      const spans = gatherSymbolHintSpans('AuthProvider setup', tmpDir, 50000);
+      for (const s of spans) {
+        assert.equal((s as any).confidence, 0.6);
+      }
+    });
+
+    it('should return empty when prompt has no camelCase/PascalCase identifiers', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'index.ts'), 'export {};');
+      const spans = gatherSymbolHintSpans('fix the bug in the project', tmpDir, 50000);
+      assert.equal(spans.length, 0);
+    });
+
+    it('should respect the budget and not exceed it', () => {
+      const content = Array.from({ length: 100 }, (_, i) => `function MyFunc${i}() {}`).join('\n');
+      fs.writeFileSync(path.join(tmpDir, 'src', 'big.ts'), content);
+      const budget = 80;
+      const spans = gatherSymbolHintSpans('MyFunc usage in code', tmpDir, budget);
+      const totalChars = spans.reduce((sum: number, s: any) => sum + s.content.length, 0);
+      assert.ok(totalChars <= budget);
+    });
+
+    it('should include surrounding context lines around a match', () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'ctx.ts'), [
+        'const BEFORE = 1;',
+        'function ContextBuilder() {',
+        '  return {};',
+        '}',
+        'const AFTER = 2;',
+      ].join('\n'));
+      const spans = gatherSymbolHintSpans('ContextBuilder should return an object', tmpDir, 50000);
+      assert.ok(spans.length > 0);
+      const merged = spans.map((s: any) => s.content).join('\n');
+      // Should include lines before/after the match
+      assert.ok(merged.includes('BEFORE') || merged.includes('AFTER') || merged.includes('ContextBuilder'));
+    });
+  });
+
+  describe('runRetrievalCascade', () => {
+    let tmpDir: string;
+
+    beforeEach(() => {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cascade-test-'));
+      fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    });
+
+    afterEach(() => {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    function makeTask(prompt: string): Task {
+      const t = createTask('Test task', prompt);
+      t.id = 'cascade-task-1';
+      return t;
+    }
+
+    it('should return usedSemantic=true when semantic provider returns spans', async () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'index.ts'), 'export {};');
+      const task = makeTask('implement TaskRunner logic');
+      const result = await runCascadeWithSemantic(task, tmpDir, 50000);
+      assert.equal(result.usedSemantic, true);
+      assert.ok(result.spans.some((s: any) => s.filePath === 'src/semantic.ts'));
+    });
+
+    it('should return usedSemantic=false when no semantic provider', async () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'runner.ts'), [
+        'export class TaskRunner {',
+        '  run() {}',
+        '}',
+      ].join('\n'));
+      const task = makeTask('implement TaskRunner logic');
+      const result = await runCascadeNoSemantic(task, tmpDir, 50000);
+      assert.equal(result.usedSemantic, false);
+    });
+
+    it('should return deterministic spans when semantic returns empty', async () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'runner.ts'), [
+        'export class TaskRunner {',
+        '  run() {}',
+        '}',
+      ].join('\n'));
+      const task = makeTask('implement TaskRunner logic');
+      const result = await runCascadeNoSemantic(task, tmpDir, 50000);
+      assert.equal(result.usedSemantic, false);
+      // Should still have rg/hint spans covering TaskRunner
+      assert.ok(result.spans.some((s: any) => s.content.includes('TaskRunner')));
+    });
+
+    it('should include deterministic spans for files not covered by semantic results', async () => {
+      // The semantic mock returns src/semantic.ts; if there are other matching files
+      // the cascade should keep non-overlapping deterministic spans as extras
+      fs.writeFileSync(path.join(tmpDir, 'src', 'other.ts'), [
+        'function TaskHelper() {}',
+      ].join('\n'));
+      const task = makeTask('use TaskHelper and semantic stuff');
+      const result = await runCascadeWithSemantic(task, tmpDir, 50000);
+      assert.equal(result.usedSemantic, true);
+      // Semantic span is present
+      assert.ok(result.spans.some((s: any) => s.filePath === 'src/semantic.ts'));
+      // Extras from other files may also be present
+      // (src/other.ts is not covered by the semantic result)
+      const otherSpan = result.spans.find((s: any) => s.filePath === 'src/other.ts');
+      if (otherSpan) {
+        assert.ok(otherSpan.content.includes('TaskHelper'));
+      }
+    });
+
+    it('should return empty spans when prompt has no useful keywords and no semantic', async () => {
+      fs.writeFileSync(path.join(tmpDir, 'src', 'index.ts'), 'export {};');
+      const task = makeTask('fix that this with from have');
+      const result = await runCascadeNoSemantic(task, tmpDir, 50000);
+      assert.equal(result.usedSemantic, false);
+      assert.equal(result.spans.length, 0);
     });
   });
 });

@@ -21,6 +21,14 @@ export class ClaudeAdapter implements EngineAdapter {
     const extraArgs = config.get<string[]>('args', ['-p']);
 
     const autoApprove = config.get<boolean>('autoApprove', true);
+    const extendedThinking = config.get<boolean>('extendedThinking', false);
+
+    if (extendedThinking) {
+      options = {
+        ...options,
+        prompt: `[EXTENDED THINKING ENABLED: Work through this problem systematically with deep analysis before producing your solution. Consider edge cases, alternative approaches, and potential issues.]\n\n${options.prompt}`,
+      };
+    }
 
     const result = await runCli(
       {

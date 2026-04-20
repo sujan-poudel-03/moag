@@ -16,7 +16,7 @@ const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '7';
+const HTML_VERSION = '9';
 
 export class DashboardPanel {
   public static currentPanel: DashboardPanel | undefined;
@@ -639,12 +639,14 @@ export class DashboardPanel {
       display: flex;
       align-items: center;
       gap: 8px;
-      padding: 6px 12px;
+      padding: 0 12px;
       background: var(--sidebar-bg);
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
-      min-height: 48px;
-      flex-wrap: wrap;
+      height: 44px;
+      min-height: 44px;
+      max-height: 44px;
+      flex-wrap: nowrap;
     }
     .plan-name {
       font-weight: 600;
@@ -692,187 +694,30 @@ export class DashboardPanel {
     .icon-btn.primary:disabled { background: var(--button-bg); opacity: 0.4; }
 
     /* ─── Zone Layout ─── */
-    .main-zone, .main-content {
+    .main-zone {
       flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
       display: flex; flex-direction: column;
     }
-    /* ─── Compact Chat Composer ─── */
-    .prompt-composer {
-      padding: 8px 10px 10px;
-      border-top: 1px solid var(--border);
-      flex-shrink: 0;
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-      background: var(--sidebar-bg);
-    }
-    .composer-actions {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 5px;
-    }
-    .composer-action-btn {
-      display: inline-flex;
-      align-items: center;
-      height: 22px;
-      padding: 0 8px;
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: rgba(128,128,128,0.06);
-      color: var(--dimmed);
-      font-family: var(--vscode-font-family);
-      font-size: 11px;
-      cursor: pointer;
-    }
-    .composer-action-btn:hover:not(:disabled) { background: var(--hover-bg); color: var(--fg); }
-    .composer-action-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .composer-input-wrap {
-      position: relative;
-      display: flex;
-      border: 1px solid var(--vscode-input-border, var(--border));
-      border-radius: 8px;
-      background: var(--vscode-input-background);
+    body[data-dashboard-state="executing"] .main-zone {
       overflow: hidden;
     }
-    .composer-input-wrap:focus-within { border-color: var(--focus-border); }
-    .prompt-textarea {
-      flex: 1;
-      min-height: 54px;
-      max-height: 160px;
-      resize: none;
-      padding: 8px 10px;
-      border: none;
-      background: transparent;
-      color: var(--vscode-input-foreground);
-      font-family: var(--vscode-font-family);
-      font-size: 12px;
-      line-height: 1.5;
-      outline: none;
-      overflow-y: auto;
-    }
-    .prompt-textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
-    .prompt-textarea:disabled { opacity: 0.6; cursor: not-allowed; }
-    .composer-send-btn {
-      align-self: flex-end;
-      width: 30px;
-      height: 30px;
-      margin: 6px 6px 6px 0;
-      border: none;
-      border-radius: 6px;
-      background: var(--button-bg);
-      color: var(--button-fg);
-      font-size: 14px;
-      cursor: pointer;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      flex-shrink: 0;
-    }
-    .composer-send-btn:hover:not(:disabled) { background: var(--button-hover); }
-    .composer-send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-    .composer-footer {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .prompt-select {
-      height: 22px;
-      padding: 0 6px;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: var(--vscode-dropdown-background, var(--vscode-input-background));
-      color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
-      font-family: var(--vscode-font-family);
-      font-size: 11px;
-      outline: none;
-    }
-    .prompt-select:disabled { opacity: 0.6; cursor: not-allowed; }
-    .composer-context-pill {
-      font-size: 10px;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-      color: var(--dimmed);
-      background: rgba(128,128,128,0.1);
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      padding: 1px 7px;
-      white-space: nowrap;
-    }
-    .composer-note { font-size: 10px; color: var(--dimmed); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .composer-chars { font-size: 10px; color: var(--dimmed); white-space: nowrap; flex-shrink: 0; }
-
-    /* ─── State 1: Empty ─── */
-    .state-empty { padding: 24px 12px; }
-    .hero-input-wrap { margin-bottom: 20px; }
-    .hero-input {
-      width: 100%;
-      padding: 12px 14px;
-      font-size: 15px;
-      font-family: var(--vscode-font-family);
-      background: var(--bg);
-      color: var(--fg);
-      border: 2px solid var(--focus-border);
-      border-radius: 6px;
-      outline: none;
-      box-sizing: border-box;
-    }
-    .hero-input:focus { border-color: var(--button-bg); }
-    .hero-input::placeholder { color: var(--dimmed); }
-    .secondary-actions { display: flex; flex-direction: column; gap: 8px; padding: 0 20px; }
-    .or-divider { text-align: center; color: var(--dimmed); font-size: 13px; margin: 4px 0; }
-    .action-btn {
-      width: 100%; padding: 10px 16px; border: 1px solid var(--border); border-radius: 6px;
-      font-size: 14px; cursor: pointer; text-align: center;
-      background: transparent; color: var(--fg);
-    }
-    .action-btn:hover { background: var(--hover-bg); }
-    .action-primary { border-color: var(--button-bg); background: rgba(0,122,204,0.08); }
-    .action-secondary { border-color: var(--border); }
-    .action-tertiary { border-color: var(--border); color: var(--dimmed); }
-    .engine-status { padding: 16px 20px; font-size: 12px; color: var(--dimmed); }
-
     /* ─── Progress Section ─── */
-    .run-intro {
-      display: flex;
-      flex-direction: column;
-      justify-content: center;
-      gap: 10px;
-      min-height: 180px;
-      margin: auto 16px;
-      padding: 22px 20px;
-      border: 1px dashed rgba(128,128,128,0.35);
-      border-radius: 14px;
-      background:
-        radial-gradient(circle at top left, rgba(0,122,204,0.12), transparent 45%),
-        linear-gradient(180deg, rgba(128,128,128,0.04), rgba(128,128,128,0.02)),
-        var(--sidebar-bg);
-    }
-    .run-intro-title {
-      font-size: 20px;
-      font-weight: 700;
-      line-height: 1.2;
-    }
-    .run-intro-copy {
-      font-size: 12px;
-      color: var(--dimmed);
-      line-height: 1.5;
-      max-width: 520px;
-    }
-
     .progress-section {
-      padding: 6px 12px;
+      padding: 4px 12px 0;
       border-bottom: 1px solid var(--border);
       flex-shrink: 0;
+      height: 30px;
+      min-height: 30px;
+      max-height: 30px;
     }
-    .progress-track { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 4px; }
+    .progress-track { height: 3px; background: var(--border); border-radius: 2px; overflow: hidden; margin-bottom: 4px; }
     .progress-fill { height: 100%; background: var(--success); border-radius: 2px; transition: width 0.4s ease; width: 0%; }
     .progress-fill.has-errors {
       background: linear-gradient(90deg, var(--success) 0%, var(--success) var(--pass-pct), var(--error) var(--pass-pct), var(--error) 100%);
     }
-    .stats-row { display: flex; justify-content: space-between; font-size: 12px; color: var(--dimmed); margin-bottom: 4px; }
+    .stats-row { display: flex; justify-content: space-between; font-size: 11px; color: var(--dimmed); margin-bottom: 0; line-height: 20px; }
     .minimap { display: flex; flex-wrap: wrap; gap: 2px; max-height: 22px; overflow: hidden; }
+    body[data-dashboard-state="executing"] .minimap { display: none; }
     .minimap .dot {
       width: 6px; height: 6px; border-radius: 1px;
     }
@@ -918,16 +763,23 @@ export class DashboardPanel {
     .tile-status.pending { background: var(--badge-bg); color: var(--badge-fg); }
     .tile-fraction { font-size: 10px; color: var(--dimmed); }
 
-    /* ─── Active Task Card ─── */
-    .active-task-card {
-      display: none; flex-direction: column; flex-grow: 1;
-      margin: 8px; border: 1px solid var(--focus-border);
-      border-radius: 6px; overflow: hidden; min-height: 200px;
+    /* ─── Active Task Terminal ─── */
+    .active-task {
+      display: none;
+      flex-direction: column;
+      flex-grow: 1;
+      margin: 0 6px;
+      border: 1px solid var(--focus-border);
+      border-radius: 4px;
+      overflow: hidden;
+      min-height: 0;
     }
-    .active-task-card.visible { display: flex; }
+    .active-task.visible {
+      display: flex;
+    }
     .active-task-header {
       display: flex; align-items: center; gap: 8px;
-      min-height: 32px; padding: 0 10px;
+      min-height: 32px; height: 32px; max-height: 32px; padding: 0 10px;
       background: rgba(0,122,204,0.04);
       border-bottom: 1px solid var(--border); flex-shrink: 0;
     }
@@ -944,15 +796,6 @@ export class DashboardPanel {
       flex: 1; font-weight: 600; font-size: 12px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .active-task-context {
-      max-width: 42%;
-      font-size: 10px;
-      color: var(--dimmed);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      flex-shrink: 0;
-    }
     .engine-badge {
       font-size: 9px; font-weight: 700; text-transform: uppercase;
       padding: 1px 5px; border-radius: 3px; letter-spacing: 0.4px; flex-shrink: 0;
@@ -962,11 +805,6 @@ export class DashboardPanel {
     .engine-gemini { background: #4285f422; color: #4285f4; }
     .engine-ollama { background: #9c27b022; color: #9c27b0; }
     .engine-custom { background: rgba(128,128,128,0.15); color: var(--dimmed); }
-    .autofix-badge {
-      display: inline-block; font-size: 9px; font-weight: 600;
-      padding: 1px 6px; border-radius: 3px; margin-left: 6px;
-      background: rgba(56,132,244,0.15); color: #3884f4; vertical-align: middle;
-    }
     .active-timer {
       font-size: 11px; font-family: var(--vscode-editor-font-family, monospace);
       color: var(--dimmed); flex-shrink: 0;
@@ -980,19 +818,63 @@ export class DashboardPanel {
       word-break: break-all; word-wrap: break-word; line-height: 1.4;
     }
     .active-task-output {
-      flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
-      padding: 8px 10px; background: var(--terminal-bg); color: var(--terminal-fg);
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      overflow-x: hidden;
+      padding: 8px 10px;
+      background: var(--terminal-bg);
+      color: var(--terminal-fg);
       font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 12px; white-space: pre-wrap; word-break: break-all; line-height: 1.5;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-all;
+      line-height: 1.5;
     }
     .active-output-empty { color: var(--dimmed); font-style: italic; }
+
+    /* ─── Idle Plan Summary ─── */
+    .plan-summary {
+      margin: 12px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--sidebar-bg);
+    }
+    .plan-summary-name { font-size: 16px; font-weight: 600; margin-bottom: 4px; }
+    .plan-summary-desc {
+      font-size: 12px;
+      color: var(--dimmed);
+      margin-bottom: 12px;
+      max-height: 36px;
+      overflow: hidden;
+    }
+    .plan-summary-playlists { font-size: 12px; margin-bottom: 12px; }
+    .plan-summary-pl { padding: 3px 0; display: flex; justify-content: space-between; gap: 8px; }
+    .plan-summary-total { font-size: 12px; color: var(--dimmed); margin-bottom: 12px; }
+    .plan-summary-play {
+      width: 100%; padding: 8px; border: none; border-radius: 4px;
+      background: var(--button-bg); color: var(--button-fg);
+      font-size: 13px; font-weight: 600; cursor: pointer;
+      font-family: var(--vscode-font-family);
+    }
+    .plan-summary-play:hover { background: var(--button-hover); }
+    .no-plan-message {
+      margin: 12px;
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--sidebar-bg);
+      font-size: 12px;
+      color: var(--dimmed);
+    }
 
     /* ─── Result Banner ─── */
     .result-banner {
       margin: 8px; padding: 10px 14px; border-radius: 6px;
-      border-left: 3px solid var(--success); background: rgba(76,175,80,0.06); flex-shrink: 0;
+      border-left: 3px solid var(--success); background: rgba(76,175,80,0.10); flex-shrink: 0;
     }
-    .result-banner.result-warning { border-left-color: var(--error); background: rgba(244,71,71,0.06); }
+    .result-banner.result-warning { border-left-color: var(--warning); background: rgba(229,160,0,0.12); }
     .result-banner-header { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
     .result-banner-copy { flex: 1; min-width: 0; }
     .result-banner-title { font-weight: 600; font-size: 12px; margin-bottom: 2px; }
@@ -1021,11 +903,22 @@ export class DashboardPanel {
     .section-body.collapsed { display: none; }
 
     /* ─── Completed Task Cards ─── */
+    .completed-section { padding: 0 0 8px; }
+    .completed-section-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin: 0 8px; height: 24px;
+    }
+    .completed-show-all {
+      font-size: 11px; color: var(--focus-border);
+      border: none; background: none; cursor: pointer; padding: 0 8px;
+      font-family: var(--vscode-font-family);
+    }
+    .completed-show-all:hover { text-decoration: underline; }
     .completed-task { border-left: 2px solid transparent; margin: 0 8px 2px; border-radius: 3px; }
     .completed-task.failed-task { border-left-color: var(--error); }
     .completed-task-row {
       display: flex; align-items: center; gap: 8px;
-      padding: 5px 8px; cursor: pointer; border-radius: 3px;
+      min-height: 28px; height: 28px; padding: 0 8px; cursor: pointer; border-radius: 3px;
     }
     .completed-task-row:hover { background: var(--hover-bg); }
     .ct-icon {
@@ -1042,135 +935,18 @@ export class DashboardPanel {
       font-size: 11px; color: var(--error); padding: 2px 8px 4px 32px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
-    .ct-error-output {
-      margin: 4px 8px 4px 32px; border: 1px solid rgba(244,71,71,0.3);
-      border-radius: 3px; font-size: 10px;
-    }
-    .ct-error-output summary {
-      padding: 3px 8px; cursor: pointer; font-weight: 600;
-      color: var(--error); background: rgba(244,71,71,0.06);
-    }
-    .ct-error-output pre {
-      padding: 6px 8px; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
-      font-family: var(--vscode-editor-font-family, monospace); max-height: 150px; overflow-y: auto;
-    }
     .ct-detail { display: none; padding: 4px 8px 8px 32px; }
     .completed-task.expanded .ct-detail { display: block; }
     .ct-detail-output {
       font-size: 10px; padding: 4px 6px; border-radius: 3px;
-      margin-bottom: 4px; max-height: 120px; overflow-y: auto;
+      margin-bottom: 4px; max-height: 160px; overflow-y: auto;
     }
-    .ct-detail-section { font-size: 11px; margin-top: 6px; }
-    .ct-detail-section summary { cursor: pointer; font-weight: 600; padding: 2px 0; }
-    .ct-detail-section ul { padding-left: 16px; margin-top: 4px; }
-    .ct-detail-section li { margin: 2px 0; font-size: 10px; }
 
     /* ─── Diff Viewer ─── */
-    .diff-section { margin-top: 8px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
-    .diff-section summary { padding: 6px 10px; cursor: pointer; font-size: 11px; font-weight: 600; background: rgba(128,128,128,0.08); user-select: none; }
-    .diff-section summary:hover { background: rgba(128,128,128,0.14); }
-    .diff-view { font-family: var(--vscode-editor-font-family, monospace); font-size: 11px; line-height: 1.5; overflow-x: auto; padding: 8px; margin: 0; white-space: pre; }
     .diff-add { background: rgba(78,201,176,0.15); color: inherit; }
     .diff-remove { background: rgba(244,71,71,0.15); color: inherit; }
     .diff-hunk { color: var(--dimmed); font-style: italic; }
     .diff-header { font-weight: 700; color: var(--fg); }
-    .diff-file-summary { font-size: 10px; color: var(--dimmed); padding: 4px 10px; border-bottom: 1px solid var(--border); }
-    .diff-actions { display: flex; gap: 6px; padding: 4px 10px; border-top: 1px solid var(--border); }
-    .diff-actions button { font-size: 10px; padding: 2px 8px; background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); border: none; border-radius: 2px; cursor: pointer; }
-    .diff-actions button:hover { opacity: 0.85; }
-
-    /* ─── Plan Tab Tree View ─── */
-    .plan-section { padding: 8px 0; flex: 1; }
-    .plan-placeholder { padding: 20px 16px; color: var(--dimmed); font-size: 12px; text-align: center; }
-    .playlist-block { margin-top: 2px; }
-    .playlist-toggle { padding-left: 16px; }
-    .playlist-toggle .section-toggle-label {
-      display: flex; align-items: center; gap: 6px;
-      font-size: 11px; font-weight: 600; text-transform: none; letter-spacing: 0;
-      min-width: 0;
-    }
-    .playlist-name {
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      min-width: 0; flex: 1;
-    }
-    .playlist-progress {
-      font-size: 10px; color: var(--dimmed); flex-shrink: 0;
-      padding-right: 8px;
-    }
-    .task-list { padding: 0; }
-    .task-row {
-      display: flex; align-items: center; gap: 8px;
-      height: 24px; line-height: 24px; padding: 0 8px 0 36px;
-      font-size: 11px;
-    }
-    .task-row:hover { background: var(--hover-bg); }
-    .task-status-dot {
-      width: 10px; height: 10px; border-radius: 50%;
-      flex-shrink: 0; background: rgba(128,128,128,0.4);
-    }
-    .task-status-dot.completed { background: var(--success); }
-    .task-status-dot.failed, .task-status-dot.blocked { background: var(--error); }
-    .task-status-dot.running { background: var(--success); animation: dot-pulse 1s ease-in-out infinite; }
-    .task-status-dot.skipped { background: rgba(128,128,128,0.2); }
-    .task-name {
-      flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
-    .task-duration {
-      font-size: 10px; color: var(--dimmed); flex-shrink: 0;
-    }
-    .task-runtime-badge {
-      font-size: 9px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.3px;
-      border-radius: 999px;
-      padding: 1px 6px;
-      flex-shrink: 0;
-    }
-    .task-runtime-badge.running {
-      background: rgba(76,175,80,0.2);
-      color: var(--success);
-    }
-    .task-runtime-badge.queued {
-      background: rgba(0,122,204,0.2);
-      color: var(--focus-border);
-    }
-    .task-edit-btn {
-      height: 18px; min-width: 18px; padding: 0 4px;
-      border: 1px solid transparent; border-radius: 3px;
-      background: transparent; color: var(--dimmed); font-size: 10px;
-      cursor: pointer; opacity: 0; transition: opacity 0.1s;
-      flex-shrink: 0;
-    }
-    .task-row:hover .task-edit-btn { opacity: 1; }
-    .task-edit-btn:hover { border-color: var(--border); color: var(--fg); background: var(--hover-bg); }
-    .tree-add-btn {
-      width: calc(100% - 36px); margin: 2px 8px 4px 28px;
-      height: 22px; line-height: 20px; border: 1px dashed var(--border);
-      border-radius: 4px; background: transparent; color: var(--dimmed);
-      font-size: 11px; text-align: left; padding: 0 8px; cursor: pointer;
-    }
-    .tree-add-btn:hover { background: var(--hover-bg); color: var(--fg); }
-    .tree-add-playlist-btn {
-      width: calc(100% - 16px); margin: 6px 8px 0;
-      height: 22px; line-height: 20px; border: 1px dashed var(--border);
-      border-radius: 4px; background: transparent; color: var(--dimmed);
-      font-size: 11px; text-align: left; padding: 0 8px; cursor: pointer;
-    }
-    .tree-add-playlist-btn:hover { background: var(--hover-bg); color: var(--fg); }
-
-    /* ─── History Section ─── */
-    .history-section { border-top: 1px solid var(--border); flex-shrink: 0; padding-top: 2px; }
-    .history-entry {
-      display: flex; align-items: center; gap: 8px; padding: 5px 12px;
-      font-size: 11px; border-bottom: 1px solid rgba(128,128,128,0.06);
-    }
-    .history-entry:hover { background: var(--hover-bg); }
-    .history-run-label { font-weight: 600; flex: 1; }
-    .history-run-meta { color: var(--dimmed); font-size: 10px; }
-    .history-run-status { font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 3px; }
-    .history-run-status.pass { background: rgba(76,175,80,0.15); color: var(--success); }
-    .history-run-status.fail { background: rgba(244,71,71,0.15); color: var(--error); }
 
     /* ─── Sandbox Panel ─── */
     .sandbox-section { border-top: 1px solid var(--border); flex-shrink: 0; }
@@ -1209,6 +985,21 @@ export class DashboardPanel {
       background: var(--terminal-bg); padding: 6px 8px; border-radius: 3px;
       max-height: 80px; overflow-y: auto; white-space: pre-wrap; word-break: break-all;
     }
+    .status-bar {
+      height: 28px;
+      min-height: 28px;
+      max-height: 28px;
+      padding: 0 10px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--dimmed);
+      background: var(--sidebar-bg);
+      flex-shrink: 0;
+    }
+    .status-bar .spacer { flex: 1; min-width: 0; }
 
   </style>
 </head>
@@ -1224,8 +1015,8 @@ export class DashboardPanel {
     </div>
   </div>
 
-  <!-- F. Progress Section (hidden until plan loaded) -->
-  <div class="progress-section" id="progress-section" style="display:none;">
+  <!-- Dashboard State Sections -->
+  <div class="progress-section" id="progress-section" hidden>
     <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
     <div class="stats-row">
       <span id="stats-tasks">0/0 tasks (0 failed)</span>
@@ -1234,57 +1025,52 @@ export class DashboardPanel {
     <div class="minimap" id="minimap"></div>
   </div>
 
-  <!-- ETA display -->
-  <div class="eta-display" id="eta-display" style="display:none;"></div>
-
   <!-- Main scrollable zone -->
   <div class="main-zone" id="main-content">
 
-    <!-- STATE 1: Empty state (no plan) -->
-    <div class="state-empty" id="state-empty">
-      <div class="hero-input-wrap">
-        <input type="text" class="hero-input" id="hero-input" placeholder="What do you want to build?" />
-      </div>
-      <div class="secondary-actions">
-        <span class="or-divider">or</span>
-        <button class="action-btn action-primary" onclick="vscode.postMessage({type:'smart-plan'})">Smart Plan (auto-detect project)</button>
-        <button class="action-btn action-secondary" onclick="vscode.postMessage({type:'new-plan-template'})">Browse 12 Templates</button>
-        <button class="action-btn action-tertiary" onclick="vscode.postMessage({type:'open-plan'})">Open Plan File</button>
-      </div>
-      <div class="engine-status" id="engine-status"></div>
-    </div>
-
-    <!-- STATE 3: Active task panel (execution) -->
-    <div class="active-task" id="active-task">
+    <!-- EXECUTING: Active task terminal -->
+    <div class="active-task" id="active-task" hidden>
       <div class="active-task-header">
         <div class="active-dot"></div>
         <span class="active-task-name" id="active-task-name"></span>
-        <span class="active-task-context" id="active-task-context"></span>
         <span class="engine-badge" id="active-engine"></span>
         <span class="active-timer" id="active-timer">0s</span>
       </div>
       <div class="terminal-output active-task-output" id="active-output"></div>
-      <details class="active-task-details" id="active-details">
-        <summary>Details</summary>
-        <div id="active-contract-inline"></div>
-        <pre id="active-prompt"></pre>
-      </details>
     </div>
 
-    <!-- STATE 4: Result banner -->
-    <div class="result-banner" id="result-banner" style="display:none;"></div>
+    <!-- IDLE: Plan summary -->
+    <div class="plan-summary" id="plan-summary" hidden>
+      <div class="plan-summary-name" id="plan-summary-name"></div>
+      <div class="plan-summary-desc" id="plan-summary-desc" hidden></div>
+      <div class="plan-summary-playlists" id="plan-summary-playlists"></div>
+      <div class="plan-summary-total" id="plan-summary-total"></div>
+      <button class="plan-summary-play" id="plan-summary-play">▶ Play</button>
+    </div>
+    <div class="no-plan-message" id="no-plan-message" hidden>
+      No plan loaded. Use the sidebar to create a plan or run a prompt.
+    </div>
 
-    <!-- STATE 4: Error banner -->
+    <!-- IDLE + COMPLETE: Result banner -->
+    <div class="result-banner" id="result-banner" hidden>
+      <div class="result-banner-header">
+        <div class="result-banner-copy">
+          <div class="result-banner-title" id="result-banner-title"></div>
+          <div class="result-banner-meta" id="result-banner-meta"></div>
+        </div>
+        <div class="result-banner-actions">
+          <button class="result-banner-btn" id="result-banner-review">Review Changes</button>
+          <button class="result-banner-btn" id="result-banner-retry">Retry Failed</button>
+          <button class="result-banner-btn" id="result-banner-export">Export</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- IDLE + COMPLETE: Error banner -->
     <div class="error-banner" id="error-banner"></div>
 
-    <!-- STATE 4: Completed cards -->
-    <div class="completed-section" id="completed-section"></div>
-
-    <!-- STATE 2+4: Tasks section -->
-    <div class="plan-section" id="plan-section"></div>
-
-    <!-- STATE 2+4: History section -->
-    <div id="info-panel" style="display:none;"></div>
+    <!-- COMPLETE: Completed cards -->
+    <div class="completed-section" id="completed-section" hidden></div>
 
     <!-- Sandbox Panel — always shown when a workspace is open -->
     <div class="sandbox-section" id="sandbox-section">
@@ -1299,23 +1085,23 @@ export class DashboardPanel {
             <span class="sandbox-status-dot" id="sandbox-dot"></span>
             <span class="sandbox-status-label" id="sandbox-status-label">Not started</span>
             <span class="sandbox-framework" id="sandbox-framework"></span>
-            <a class="sandbox-url" id="sandbox-url" style="display:none;"
+            <a class="sandbox-url" id="sandbox-url" hidden
                onclick="vscode.postMessage({type:'sandbox-open-browser',url:this.dataset.url})"
                title="Open in VS Code Simple Browser"></a>
           </div>
           <div class="sandbox-row" id="sandbox-action-row">
             <button class="sandbox-btn primary" id="sandbox-btn-launch"
                     onclick="vscode.postMessage({type:'sandbox-launch'})">Launch Sandbox</button>
-            <button class="sandbox-btn" id="sandbox-btn-stop" style="display:none;"
+            <button class="sandbox-btn" id="sandbox-btn-stop" hidden
                     onclick="vscode.postMessage({type:'sandbox-stop'})">Stop</button>
             <button class="sandbox-btn" id="sandbox-btn-screenshot"
                     onclick="vscode.postMessage({type:'sandbox-screenshot'})"
                     title="Capture screenshot and attach to next agent task">Screenshot</button>
           </div>
-          <div id="sandbox-output-wrap" style="display:none;">
+          <div id="sandbox-output-wrap" hidden>
             <div class="sandbox-output" id="sandbox-output"></div>
           </div>
-          <div id="sandbox-screenshot-wrap" style="display:none;">
+          <div id="sandbox-screenshot-wrap" hidden>
             <div class="sandbox-screenshot-label">Last screenshot (attached to next task)</div>
             <img class="sandbox-screenshot-thumb" id="sandbox-screenshot-img" src="" alt="screenshot" />
           </div>
@@ -1346,6 +1132,9 @@ export class DashboardPanel {
     const cardState = {};
     let currentTaskId = null;
     let completedOrder = [];
+    let completedTasks = [];
+    const completedExpandedState = {};
+    let showAllCompletedCards = false;
     let totalTasks = 0;
     let completedCount = 0;
     let failedCount = 0;
@@ -1357,7 +1146,7 @@ export class DashboardPanel {
     let currentPlan = null;
     let currentServices = [];
     let lastPlanHash = '';
-    var dashboardState = 'empty'; // 'empty' | 'idle' | 'executing' | 'complete'
+    var dashboardState = 'idle'; // 'idle' | 'executing' | 'complete'
     let runnerState = 'idle';
     let promptBusy = false;
     let composerBusyAction = '';
@@ -1400,18 +1189,11 @@ export class DashboardPanel {
         renderEngineStatus();
       });
     }
-    var heroInput = document.getElementById('hero-input');
-    if (heroInput) {
-      heroInput.addEventListener('keydown', function(e) {
-        if (e.key === 'Enter' && heroInput.value.trim()) {
-          vscode.postMessage({ type: 'run-prompt', prompt: heroInput.value.trim() });
-          heroInput.value = '';
-        }
-      });
-    }
     document.getElementById('btn-play').onclick = () => vscode.postMessage({ type: 'play' });
     document.getElementById('btn-pause').onclick = () => vscode.postMessage({ type: 'pause' });
     document.getElementById('btn-stop').onclick = () => vscode.postMessage({ type: 'stop' });
+    var summaryPlayBtn = document.getElementById('plan-summary-play');
+    if (summaryPlayBtn) { summaryPlayBtn.onclick = () => vscode.postMessage({ type: 'play' }); }
     var resultBannerReview = document.getElementById('result-banner-review');
     if (resultBannerReview) { resultBannerReview.onclick = () => vscode.postMessage({ type: 'review-changes' }); }
     var resultBannerRetry = document.getElementById('result-banner-retry');
@@ -1421,50 +1203,66 @@ export class DashboardPanel {
 
     // ─── State Machine ───
     function setDashboardState(newState) {
-      if (newState === dashboardState) return;
+      if (newState !== 'idle' && newState !== 'executing' && newState !== 'complete') {
+        newState = 'idle';
+      }
       dashboardState = newState;
+      document.body.dataset.dashboardState = newState;
 
-      var stateEmpty = document.getElementById('state-empty');
       var progressSection = document.getElementById('progress-section');
       var activeTask = document.getElementById('active-task');
+      var planSummary = document.getElementById('plan-summary');
+      var noPlanMessage = document.getElementById('no-plan-message');
       var resultBanner = document.getElementById('result-banner');
       var completedSection = document.getElementById('completed-section');
-      var planSection = document.getElementById('plan-section');
-      var infoPanel = document.getElementById('info-panel');
+      var errorBanner = document.getElementById('error-banner');
+      var sandboxSection = document.getElementById('sandbox-section');
+      var hasResults = !!(resultBanner && resultBanner.dataset.hasResults === 'true');
+      var hasPlan = hasPlanLoaded();
 
-      // Hide everything first
-      stateEmpty.style.display = 'none';
-      progressSection.style.display = 'none';
-      activeTask.style.display = 'none';
-      if (resultBanner) resultBanner.style.display = 'none';
-      completedSection.style.display = 'none';
-      planSection.style.display = 'none';
-      infoPanel.style.display = 'none';
-      document.body.classList.remove('task-active');
+      // Hide all dashboard sections first.
+      if (progressSection) { progressSection.hidden = true; }
+      if (activeTask) {
+        activeTask.hidden = true;
+        activeTask.classList.remove('visible');
+      }
+      if (planSummary) { planSummary.hidden = true; }
+      if (noPlanMessage) { noPlanMessage.hidden = true; }
+      if (resultBanner) { resultBanner.hidden = true; }
+      if (completedSection) { completedSection.hidden = true; }
+      if (errorBanner) { errorBanner.hidden = true; }
+      if (sandboxSection) { sandboxSection.hidden = true; }
 
-      switch (newState) {
-        case 'empty':
-          stateEmpty.style.display = '';
-          break;
-        case 'idle':
-          progressSection.style.display = '';
-          planSection.style.display = '';
-          infoPanel.style.display = '';
-          // Ensure tasks expanded
-          if (collapsedSections['tasks']) toggleSection('tasks');
-          break;
-        case 'executing':
-          progressSection.style.display = '';
-          activeTask.style.display = 'flex';
-          document.body.classList.add('task-active');
-          break;
-        case 'complete':
-          progressSection.style.display = '';
-          if (resultBanner) resultBanner.style.display = '';
-          completedSection.style.display = '';
-          planSection.style.display = '';
-          infoPanel.style.display = '';
-          break;
+      if (newState === 'executing') {
+        if (progressSection) { progressSection.hidden = false; }
+        if (activeTask) {
+          activeTask.hidden = false;
+          activeTask.classList.add('visible');
+        }
+        return;
+      }
+
+      if (progressSection) { progressSection.hidden = false; }
+
+      if (newState === 'complete') {
+        if (completedSection) { completedSection.hidden = false; }
+        if (hasResults && resultBanner) { resultBanner.hidden = false; }
+        if (errorBanner && errorBanner.textContent && errorBanner.textContent.trim()) {
+          errorBanner.hidden = false;
+        }
+        return;
+      }
+
+      if (hasPlan) {
+        if (planSummary) { planSummary.hidden = false; }
+      } else {
+        if (noPlanMessage) { noPlanMessage.hidden = false; }
+      }
+      if (hasResults && resultBanner) {
+        resultBanner.hidden = false;
+      }
+      if (errorBanner && errorBanner.textContent && errorBanner.textContent.trim()) {
+        errorBanner.hidden = false;
       }
     }
 
@@ -1490,12 +1288,6 @@ export class DashboardPanel {
     function getPlanStats(plan) { return getTaskStats(getPlanTasks(plan)); }
     function hasPlanLoaded() { return !!(currentPlan && currentPlan.playlists && currentPlan.playlists.length > 0); }
     function hasTaskResults(stats) { return (stats.completed + stats.failed + stats.blocked + stats.skipped) > 0; }
-
-    function getNextTask(tasks) {
-      return tasks.find(function(t) { return t.status === 'running'; })
-        || tasks.find(function(t) { return !t.status || t.status === 'pending' || t.status === 'paused'; })
-        || null;
-    }
 
     function findRunningOrNextTask(plan) {
       if (!plan || !Array.isArray(plan.playlists)) {
@@ -1534,51 +1326,6 @@ export class DashboardPanel {
         }
       }
       return null;
-    }
-
-    function getExecutionPointers(plan) {
-      if (!plan || !Array.isArray(plan.playlists)) {
-        return { runningTaskId: null, queuedTaskId: null };
-      }
-      var linear = [];
-      plan.playlists.forEach(function(pl) {
-        (pl.tasks || []).forEach(function(t) { linear.push(t); });
-      });
-      if (linear.length === 0) {
-        return { runningTaskId: null, queuedTaskId: null };
-      }
-
-      var runningIdx = -1;
-      for (var i = 0; i < linear.length; i++) {
-        if (String(linear[i].status || '').toLowerCase() === 'running') {
-          runningIdx = i;
-          break;
-        }
-      }
-
-      var queuedIdx = -1;
-      if (runningIdx >= 0) {
-        for (var j = runningIdx + 1; j < linear.length; j++) {
-          var s = String(linear[j].status || '').toLowerCase();
-          if (!s || s === 'pending' || s === 'queued' || s === 'todo') {
-            queuedIdx = j;
-            break;
-          }
-        }
-      } else {
-        for (var k = 0; k < linear.length; k++) {
-          var firstPending = String(linear[k].status || '').toLowerCase();
-          if (!firstPending || firstPending === 'pending' || firstPending === 'queued' || firstPending === 'todo') {
-            queuedIdx = k;
-            break;
-          }
-        }
-      }
-
-      return {
-        runningTaskId: runningIdx >= 0 ? linear[runningIdx].id : null,
-        queuedTaskId: queuedIdx >= 0 ? linear[queuedIdx].id : null,
-      };
     }
 
     function autoResizePromptInput() {
@@ -1739,23 +1486,83 @@ export class DashboardPanel {
       const title = document.getElementById('result-banner-title');
       const meta = document.getElementById('result-banner-meta');
       const retryBtn = document.getElementById('result-banner-retry');
-      if (!currentPlan) { banner.hidden = true; return; }
+      if (!banner || !title || !meta || !retryBtn) { return; }
+      if (!currentPlan) {
+        banner.dataset.hasResults = 'false';
+        title.textContent = '';
+        meta.textContent = '';
+        retryBtn.disabled = true;
+        setDashboardState(dashboardState);
+        return;
+      }
       const stats = getPlanStats(currentPlan);
       const failures = stats.failed + stats.blocked;
       const hasResults = hasTaskResults(stats);
-      if (!hasResults) { banner.hidden = true; return; }
-      banner.hidden = false;
+      if (!hasResults) {
+        banner.dataset.hasResults = 'false';
+        title.textContent = '';
+        meta.textContent = '';
+        retryBtn.disabled = true;
+        setDashboardState(dashboardState);
+        return;
+      }
+      banner.dataset.hasResults = 'true';
       banner.className = 'result-banner' + (failures > 0 ? ' result-warning' : '');
       if (failures > 0) {
-        title.textContent = failures + ' task' + (failures !== 1 ? 's' : '') + ' failed';
-        meta.textContent = stats.completed + ' passed \u00B7 ' + failures + ' failed' +
-          (totalFilesChanged > 0 ? ' \u00B7 ' + totalFilesChanged + ' files changed' : '');
+        title.textContent = stats.completed + ' passed, ' + failures + ' failed \u2014 ' +
+          totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's' : '') + ' changed';
+        meta.textContent = runStartTime ? 'Run time: ' + formatDuration(Date.now() - runStartTime) : '';
       } else {
-        title.textContent = 'Run finished \u2013 ' + stats.completed + ' task' + (stats.completed !== 1 ? 's' : '') + ' completed';
-        meta.textContent = (totalFilesChanged > 0 ? totalFilesChanged + ' files changed' : 'No files changed') +
-          (runStartTime ? ' \u00B7 ' + formatDuration(Date.now() - runStartTime) : '');
+        title.textContent = 'All ' + stats.completed + ' tasks completed \u2014 ' +
+          totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's' : '') + ' changed';
+        meta.textContent = runStartTime ? 'Run time: ' + formatDuration(Date.now() - runStartTime) : '';
       }
       retryBtn.disabled = failures === 0;
+      setDashboardState(dashboardState);
+    }
+
+    function renderIdleOverview(plan) {
+      var summaryEl = document.getElementById('plan-summary');
+      var noPlanEl = document.getElementById('no-plan-message');
+      var nameEl = document.getElementById('plan-summary-name');
+      var descEl = document.getElementById('plan-summary-desc');
+      var playlistsEl = document.getElementById('plan-summary-playlists');
+      var totalEl = document.getElementById('plan-summary-total');
+      var playBtn = document.getElementById('plan-summary-play');
+      if (!summaryEl || !noPlanEl || !nameEl || !descEl || !playlistsEl || !totalEl || !playBtn) { return; }
+
+      if (!plan || !Array.isArray(plan.playlists) || plan.playlists.length === 0) {
+        summaryEl.hidden = true;
+        noPlanEl.hidden = false;
+        return;
+      }
+
+      summaryEl.hidden = false;
+      noPlanEl.hidden = true;
+
+      nameEl.textContent = plan.name || 'Untitled Plan';
+      var description = typeof plan.description === 'string' ? plan.description.trim() : '';
+      if (description) {
+        descEl.hidden = false;
+        descEl.textContent = description;
+      } else {
+        descEl.hidden = true;
+        descEl.textContent = '';
+      }
+
+      var totalTasksInPlan = 0;
+      playlistsEl.innerHTML = plan.playlists.map(function(pl, idx) {
+        var tasks = Array.isArray(pl.tasks) ? pl.tasks : [];
+        totalTasksInPlan += tasks.length;
+        var done = tasks.filter(function(t) {
+          var status = String(t && t.status || '').toLowerCase();
+          return status === 'completed' || status === 'failed' || status === 'blocked' || status === 'skipped';
+        }).length;
+        var playlistName = escHtml(pl.name || ('Playlist ' + (idx + 1)));
+        return '<div class="plan-summary-pl"><span>' + playlistName + '</span><span>' + done + '/' + tasks.length + ' done</span></div>';
+      }).join('');
+      totalEl.textContent = totalTasksInPlan + ' tasks across ' + plan.playlists.length + ' playlists';
+      playBtn.disabled = runnerState === 'playing';
     }
 
     // ─── Message Handler ───
@@ -1776,7 +1583,7 @@ export class DashboardPanel {
                   (pl.tasks||[]).map(function(t) { return [t.id||'',t.name||'',t.status||'pending'].join(':'); }).join(',')
                 ].join('|');
               }).join('||') : '';
-            var shouldRenderPlan = newHash !== lastPlanHash || !document.getElementById('plan-section').innerHTML.trim();
+            var shouldRenderPlan = newHash !== lastPlanHash;
             currentServices = msg.services || [];
             syncPromptEngineOptions(msg.promptEngines || [], msg.selectedPromptEngineId);
             if (shouldRenderPlan) {
@@ -1788,7 +1595,6 @@ export class DashboardPanel {
             syncActiveTaskFromPlan(planForRender);
             updateProgress();
             renderStatus(msg.runnerState);
-            renderHistory(msg.history || []);
           } catch(e) {
             console.error('[MOAG Dashboard] Update error:', e);
             const incomingPlan = msg.plan || null;
@@ -1859,7 +1665,7 @@ export class DashboardPanel {
           var sbOut = document.getElementById('sandbox-output');
           var sbWrap = document.getElementById('sandbox-output-wrap');
           if (sbOut && sbWrap) {
-            sbWrap.style.display = 'block';
+            sbWrap.hidden = false;
             sbOut.textContent = (sbOut.textContent + msg.text).slice(-2000);
             sbOut.scrollTop = sbOut.scrollHeight;
           }
@@ -1905,22 +1711,24 @@ export class DashboardPanel {
       if (state.url) {
         urlEl.textContent = state.url;
         urlEl.dataset.url = state.url;
-        urlEl.style.display = 'inline';
+        urlEl.hidden = false;
         urlEl.title = 'Open in VS Code Simple Browser: ' + state.url;
       } else {
-        urlEl.style.display = 'none';
+        urlEl.hidden = true;
       }
 
       // Buttons
       var running = state.status === 'running' || state.status === 'starting';
-      btnLaunch.style.display = running ? 'none' : 'inline-block';
-      btnStop.style.display = running ? 'inline-block' : 'none';
+      btnLaunch.hidden = running;
+      btnStop.hidden = !running;
 
       // Screenshot
       if (state.lastScreenshotPath) {
         screenshotImg.src = state.lastScreenshotPath;
         screenshotImg.alt = 'Last screenshot';
-        screenshotWrap.style.display = 'block';
+        screenshotWrap.hidden = false;
+      } else {
+        screenshotWrap.hidden = true;
       }
     }
 
@@ -1931,6 +1739,9 @@ export class DashboardPanel {
       Object.keys(taskStartTimes).forEach(function(k) { delete taskStartTimes[k]; });
       currentTaskId = null;
       completedOrder = [];
+      completedTasks = [];
+      Object.keys(completedExpandedState).forEach(function(k) { delete completedExpandedState[k]; });
+      showAllCompletedCards = false;
       completedCount = 0;
       failedCount = 0;
       blockedCount = 0;
@@ -1939,24 +1750,16 @@ export class DashboardPanel {
       taskStartTime = null;
       stopTimer();
       document.getElementById('active-task-name').textContent = '';
-      document.getElementById('active-task-context').textContent = '';
       document.getElementById('active-output').textContent = '';
       document.getElementById('active-engine').textContent = '';
       document.getElementById('active-engine').className = 'engine-badge engine-custom';
       document.getElementById('active-timer').textContent = '0s';
-      document.getElementById('completed-section').innerHTML = '';
-      document.getElementById('completed-section').hidden = true;
-      const activeCard = document.getElementById('active-task');
-      activeCard.hidden = true;
-      activeCard.className = 'active-task-card';
+      renderCompletedCards();
       updateProgress();
       renderResultBanner();
       updateStatusSummary('Ready');
-      if (!currentPlan || !currentPlan.playlists || currentPlan.playlists.length === 0) {
-        setDashboardState('empty');
-      } else {
-        setDashboardState('idle');
-      }
+      updateStatusRight('');
+      setDashboardState('idle');
     }
 
     function getActiveRuntimeLabel(task) {
@@ -1988,6 +1791,10 @@ export class DashboardPanel {
       var el = document.getElementById('status-summary');
       if (el) { el.textContent = text || 'Ready'; }
     }
+    function updateStatusRight(text) {
+      var el = document.getElementById('status-right');
+      if (el) { el.textContent = text || ''; }
+    }
 
     function clearActiveOutputPlaceholder() {
       const hint = document.querySelector('#active-output .active-output-empty');
@@ -2006,16 +1813,12 @@ export class DashboardPanel {
         changedFiles: null, codeChanges: null, verification: null, artifacts: null, validationTargetResults: null, summary: '',
       };
       document.getElementById('active-task-name').textContent = msg.taskName;
-      document.getElementById('active-task-context').textContent = msg.playlistName || '';
       const engineEl = document.getElementById('active-engine');
       engineEl.textContent = getActiveRuntimeLabel(msg);
       engineEl.className = 'engine-badge engine-' + (msg.engine || 'custom');
       document.getElementById('active-timer').textContent = '0s';
       showActiveOutputPlaceholder('Waiting for terminal output...');
-      const activeCard = document.getElementById('active-task');
-      activeCard.hidden = false;
-      activeCard.className = 'active-task-card visible';
-      updateStatusSummary('Running: ' + (msg.playlistName || 'Playlist') + ' -> ' + msg.taskName);
+      updateStatusSummary('Running: ' + msg.taskName);
       setDashboardState('executing');
     }
 
@@ -2032,15 +1835,10 @@ export class DashboardPanel {
         return;
       }
 
-      const activeCard = document.getElementById('active-task');
       const taskName = candidate.task.name || 'Untitled task';
       const playlistName = candidate.playlistName || 'Playlist';
-      const contextText = candidate.phase === 'queued'
-        ? (playlistName + ' (queued next)')
-        : playlistName;
 
       document.getElementById('active-task-name').textContent = taskName;
-      document.getElementById('active-task-context').textContent = contextText;
 
       const engineEl = document.getElementById('active-engine');
       const engineId = candidate.task.engine || (candidate.playlist && candidate.playlist.engine) || 'custom';
@@ -2056,9 +1854,7 @@ export class DashboardPanel {
         showActiveOutputPlaceholder('Waiting for terminal output...');
       }
 
-      activeCard.hidden = false;
-      activeCard.className = 'active-task-card visible';
-      updateStatusSummary('Running: ' + playlistName + ' -> ' + taskName);
+      updateStatusSummary('Running: ' + taskName);
       setDashboardState('executing');
     }
 
@@ -2115,215 +1911,119 @@ export class DashboardPanel {
       }
     }
 
-    function detectErrorReason(text) {
-      if (!text) { return null; }
-      if (/usage.?limit|rate.?limit|quota.?exceeded|too many requests/i.test(text)) {
-        var resetMatch = text.match(/try again at ([^.\\n]+)/i) || text.match(/reset[s]? (?:at|on) ([^.\\n]+)/i);
-        return '\\u26A0 Rate limit reached' + (resetMatch ? ' \\u2014 resets ' + resetMatch[1].trim() : '') + '. Switch engine or wait.';
+    function addCompletedCard(taskId, taskName, msg) {
+      var state = cardState[taskId] || {};
+      var failed = msg.status === 'failed' || msg.status === 'blocked';
+      if (typeof completedExpandedState[taskId] !== 'boolean') {
+        completedExpandedState[taskId] = failed;
       }
-      if (/authentication|auth.*fail|invalid.*key|unauthorized|403/i.test(text)) {
-        return '\\u26A0 Authentication failed \\u2014 check your API key or login.';
-      }
-      if (/not.?found|command.?not.?found|is not recognized|ENOENT/i.test(text)) {
-        return '\\u26A0 CLI not found \\u2014 is the engine installed and in PATH?';
-      }
-      if (/model.*not.*supported|model.*not.*found|invalid.*model/i.test(text)) {
-        return '\\u26A0 Model not available \\u2014 check engine settings or switch model.';
-      }
-      if (/ETIMEDOUT|ECONNREFUSED|network|socket hang up/i.test(text)) {
-        return '\\u26A0 Network error \\u2014 check your internet connection.';
-      }
-      return null;
+      completedTasks.push({
+        taskId: taskId,
+        taskName: taskName,
+        status: msg.status,
+        engine: state.engine || '',
+        durationMs: msg.durationMs || 0,
+        filesCount: Array.isArray(msg.changedFiles) ? msg.changedFiles.length : 0,
+        stderr: msg.stderr || '',
+        output: state.output || msg.stdoutTail || '',
+      });
+      renderCompletedCards();
     }
 
-    function addCompletedCard(taskId, taskName, msg) {
-      const section = document.getElementById('completed-section');
-      section.hidden = false;
-
-      if (completedOrder.length === 1) {
-        const header = document.createElement('button');
-        header.className = 'section-toggle';
-        header.dataset.section = 'completed';
-        header.onclick = function() { toggleSection('completed'); };
-        header.innerHTML = '<span class="section-toggle-icon">\\u25BC</span>' +
-          '<span class="section-toggle-label">Completed Tasks</span>' +
-          '<span class="section-toggle-count" id="completed-count">1</span>';
-        header.id = 'completed-label';
-        section.prepend(header);
-        const body = document.createElement('div');
-        body.id = 'body-completed';
-        body.className = 'section-body';
-        section.appendChild(body);
-      } else {
-        const countEl = document.getElementById('completed-count');
-        if (countEl) { countEl.textContent = completedOrder.length; }
+    function firstNonEmptyLine(text) {
+      if (!text) { return ''; }
+      var lines = String(text).split('\\n');
+      for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (line) { return line; }
       }
+      return '';
+    }
 
-      const state = cardState[taskId] || {};
-      const passed = msg.status === 'completed';
-      const skipped = msg.status === 'skipped';
-      const blocked = msg.status === 'blocked';
-      const durStr = formatDuration(msg.durationMs || 0);
-      const filesCount = (msg.changedFiles || []).length;
+    function getOutputTail(output, limit) {
+      if (!output) { return '(no output captured)'; }
+      var lines = String(output).split('\\n');
+      return lines.length > limit ? lines.slice(-limit).join('\\n') : lines.join('\\n');
+    }
 
-      const card = document.createElement('div');
-      card.className = 'completed-task' + (passed ? '' : skipped ? '' : ' failed-task');
-      card.dataset.taskId = taskId;
+    function renderCompletedCards() {
+      var section = document.getElementById('completed-section');
+      if (!section) { return; }
+      section.innerHTML = '';
+      if (completedTasks.length === 0) { return; }
 
-      const row = document.createElement('div');
-      row.className = 'completed-task-row';
-      var autoFixBadge = msg.autoFixed ? '<span class="autofix-badge">\\uD83D\\uDD27 Auto-fixed</span>' : '';
-      row.innerHTML =
-        '<span class="ct-icon ' + (passed ? 'pass' : skipped ? 'skip' : 'fail') + '">' +
-          (passed ? '\\u2713' : skipped ? '\\u2212' : blocked ? '!' : '\\u2717') +
-        '</span>' +
-        '<span class="ct-name">' + escHtml(taskName) + autoFixBadge + '</span>' +
-        '<span class="ct-stats">' +
-          (state.engine ? '<span class="engine-badge engine-' + state.engine + '">' + state.engine + '</span>' : '') +
-          '<span>' + durStr + '</span>' +
-          (filesCount > 0 ? '<span>' + filesCount + ' file' + (filesCount !== 1 ? 's' : '') + '</span>' : '') +
-        '</span>';
-      row.onclick = function() { card.classList.toggle('expanded'); };
+      var headerWrap = document.createElement('div');
+      headerWrap.className = 'completed-section-header';
+      var header = document.createElement('button');
+      header.className = 'section-toggle' + (collapsedSections.completed ? ' collapsed' : '');
+      header.dataset.section = 'completed';
+      header.onclick = function() { toggleSection('completed'); };
+      header.innerHTML = '<span class="section-toggle-icon">\\u25BC</span>' +
+        '<span class="section-toggle-label">Completed Tasks</span>' +
+        '<span class="section-toggle-count" id="completed-count">' + completedTasks.length + '</span>';
+      var showAllBtn = document.createElement('button');
+      showAllBtn.className = 'completed-show-all';
+      showAllBtn.hidden = completedTasks.length <= 10;
+      showAllBtn.textContent = showAllCompletedCards ? 'Show less' : ('Show all (' + completedTasks.length + ')');
+      showAllBtn.onclick = function() {
+        showAllCompletedCards = !showAllCompletedCards;
+        renderCompletedCards();
+      };
+      headerWrap.appendChild(header);
+      headerWrap.appendChild(showAllBtn);
+      section.appendChild(headerWrap);
 
-      if (!passed && !skipped) {
-        const errLine = document.createElement('div');
-        errLine.className = 'ct-error-line';
-        const stderr = msg.stderr || (state.output || '');
-        const errPreview = stderr.split('\\n').filter(function(l) { return l.trim(); }).slice(-2).join(' | ').substring(0, 120);
-        errLine.textContent = blocked ? ('blocked' + (errPreview ? ': ' + errPreview : '')) : (errPreview || 'exit ' + msg.exitCode);
-        errLine.title = stderr.split('\\n').filter(function(l) { return l.trim(); }).slice(-5).join('\\n');
-        card.appendChild(errLine);
+      var body = document.createElement('div');
+      body.id = 'body-completed';
+      body.className = 'section-body' + (collapsedSections.completed ? ' collapsed' : '');
+      section.appendChild(body);
 
-        const rawStderr = (msg.stderr || '').trim();
-        const rawStdout = (msg.stdoutTail || state.output || '').trim();
-        const errorSource = rawStderr || rawStdout;
-        if (errorSource) {
-          const errorLines = errorSource.split('\\n').filter(function(l) { return l.trim(); }).slice(-5)
-            .map(function(l) { return l.length > 200 ? l.substring(0, 200) + '...' : l; });
-          if (errorLines.length > 0) {
-            const errDetails = document.createElement('details');
-            errDetails.className = 'ct-error-output';
-            errDetails.open = true;
-            const errSummary = document.createElement('summary');
-            errSummary.textContent = 'Error Output (' + (rawStderr ? 'stderr' : 'stdout') + ')';
-            const errPre = document.createElement('pre');
-            errPre.textContent = errorLines.join('\\n');
-            errDetails.appendChild(errSummary);
-            errDetails.appendChild(errPre);
-            card.appendChild(errDetails);
-          }
+      var visibleCards = showAllCompletedCards ? completedTasks : completedTasks.slice(-10);
+      visibleCards.forEach(function(entry) {
+        var passed = entry.status === 'completed';
+        var skipped = entry.status === 'skipped';
+        var failed = entry.status === 'failed' || entry.status === 'blocked';
+        var card = document.createElement('div');
+        card.className = 'completed-task' + (failed ? ' failed-task' : '') +
+          (completedExpandedState[entry.taskId] ? ' expanded' : '');
+        card.dataset.taskId = entry.taskId;
+
+        var row = document.createElement('div');
+        row.className = 'completed-task-row';
+        row.innerHTML =
+          '<span class="ct-icon ' + (passed ? 'pass' : skipped ? 'skip' : 'fail') + '">' +
+          (passed ? '\\u2713' : skipped ? '\\u2212' : '\\u2717') +
+          '</span>' +
+          '<span class="ct-name">' + escHtml(entry.taskName) + '</span>' +
+          '<span class="ct-stats">' +
+          (entry.engine ? '<span class="engine-badge engine-' + escHtml(String(entry.engine).toLowerCase()) + '">' + escHtml(entry.engine) + '</span>' : '') +
+          '<span>' + formatDuration(entry.durationMs) + '</span>' +
+          '<span>' + entry.filesCount + ' file' + (entry.filesCount !== 1 ? 's' : '') + '</span>' +
+          '</span>';
+        row.onclick = function() {
+          completedExpandedState[entry.taskId] = !completedExpandedState[entry.taskId];
+          card.classList.toggle('expanded', completedExpandedState[entry.taskId]);
+        };
+        card.appendChild(row);
+
+        if (failed) {
+          var errLine = document.createElement('div');
+          errLine.className = 'ct-error-line';
+          var firstErrLine = firstNonEmptyLine(entry.stderr);
+          errLine.textContent = firstErrLine || 'Task failed without stderr output';
+          errLine.title = entry.stderr || '';
+          card.appendChild(errLine);
         }
-        const actionRow = document.createElement('div');
-        actionRow.className = 'diff-actions';
-        actionRow.innerHTML =
-          '<button type="button" onclick="event.stopPropagation(); vscode.postMessage({type:\\x27retryTask\\x27, taskId:\\x27' + taskId + '\\x27})">Retry</button>' +
-          '<button type="button" onclick="event.stopPropagation(); vscode.postMessage({type:\\x27retryTaskWithNote\\x27, taskId:\\x27' + taskId + '\\x27})">Retry with Note</button>';
-        card.appendChild(actionRow);
-        card.classList.add('expanded');
-      }
 
-      const detail = document.createElement('div');
-      detail.className = 'ct-detail';
-
-      if (state.summary) {
-        const summaryDiv = document.createElement('div');
-        summaryDiv.className = 'terminal-output ct-detail-output';
-        summaryDiv.textContent = state.summary;
-        detail.appendChild(summaryDiv);
-      }
-      if (state.command) {
-        const cmdDiv = document.createElement('div');
-        cmdDiv.className = 'terminal-output ct-detail-output';
-        cmdDiv.textContent = state.command;
-        detail.appendChild(cmdDiv);
-      }
-      if (state.verification) {
-        const verifyDiv = document.createElement('div');
-        verifyDiv.className = 'terminal-output ct-detail-output';
-        verifyDiv.textContent = 'Verify: ' + state.verification.command + ' -> ' +
-          (state.verification.passed ? 'passed' : 'failed') + ' (' + formatDuration(state.verification.durationMs || 0) + ')';
-        detail.appendChild(verifyDiv);
-      }
-      if (msg.stderr) {
-        const stderrDiv = document.createElement('div');
-        stderrDiv.className = 'terminal-output ct-detail-output';
-        stderrDiv.style.color = 'var(--error)';
-        stderrDiv.textContent = msg.stderr;
-        detail.appendChild(stderrDiv);
-      }
-      if (state.output) {
-        const lines = state.output.split('\\n');
-        const tail = lines.length > 100 ? lines.slice(-100).join('\\n') : state.output;
-        const outDiv = document.createElement('div');
-        outDiv.className = 'terminal-output ct-detail-output';
-        outDiv.textContent = tail;
-        detail.appendChild(outDiv);
-      }
-      if (msg.changedFiles && msg.changedFiles.length > 0) {
-        const filesSection = document.createElement('details');
-        filesSection.className = 'ct-detail-section';
-        filesSection.open = true;
-        filesSection.innerHTML = '<summary>Changed Files (' + msg.changedFiles.length + ')</summary>' +
-          '<ul>' + msg.changedFiles.map(function(f) { return '<li>' + escHtml(f) + '</li>'; }).join('') + '</ul>';
-        detail.appendChild(filesSection);
-      }
-      if (state.artifacts && state.artifacts.length > 0) {
-        const artifactsSection = document.createElement('details');
-        artifactsSection.className = 'ct-detail-section';
-        artifactsSection.open = !passed;
-        artifactsSection.innerHTML = '<summary>Artifacts (' + state.artifacts.length + ')</summary>' +
-          '<ul>' + state.artifacts.map(function(a) { return '<li>' + escHtml(a.target) + ' - ' + (a.exists ? 'present' : 'missing') + '</li>'; }).join('') + '</ul>';
-        detail.appendChild(artifactsSection);
-      }
-      if (msg.validationTargetResults && msg.validationTargetResults.length > 0) {
-        const valSection = document.createElement('details');
-        valSection.className = 'ct-detail-section';
-        valSection.open = true;
-        const statusIcon = function(s) { return s === 'pass' ? '\\u2713' : s === 'skip' ? '\\u25CB' : '\\u2717'; };
-        const statusClass = function(s) { return s === 'pass' ? 'val-pass' : s === 'skip' ? 'val-skip' : 'val-fail'; };
-        const rows = msg.validationTargetResults.map(function(r) {
-          return '<tr class="' + statusClass(r.status) + '">' +
-            '<td>' + statusIcon(r.status) + ' ' + escHtml(r.target) + '</td>' +
-            '<td>' + escHtml(r.summary) + '</td>' +
-            '<td>' + r.stagesPassed + '/' + (r.stagesPassed + r.stagesFailed) + ' stages</td>' +
-            '<td>' + formatDuration(r.durationMs) + '</td>' +
-            '</tr>';
-        }).join('');
-        valSection.innerHTML = '<summary>Validation Targets (' + msg.validationTargetResults.length + ')</summary>' +
-          '<table class="val-target-table"><thead><tr><th>Target</th><th>Summary</th><th>Stages</th><th>Duration</th></tr></thead>' +
-          '<tbody>' + rows + '</tbody></table>';
-        detail.appendChild(valSection);
-      }
-      if (msg.codeChanges) {
-        const diffSection = document.createElement('details');
-        diffSection.className = 'diff-section';
-        const diffText = msg.codeChanges.length > 8000 ? msg.codeChanges.substring(0, 8000) + '\\n... (truncated)' : msg.codeChanges;
-        var fileSummaries = [];
-        diffText.split('\\n').forEach(function(diffLine) {
-          if (!diffLine.startsWith('diff --git a/')) { return; }
-          var afterPrefix = diffLine.slice('diff --git a/'.length);
-          var sepIdx = afterPrefix.indexOf(' b/');
-          if (sepIdx !== -1) { fileSummaries.push(afterPrefix.slice(0, sepIdx)); }
-        });
-        var fileSummaryHtml = fileSummaries.length > 0
-          ? '<div class="diff-file-summary">' + fileSummaries.map(function(f) { return escHtml(f); }).join(' &middot; ') + '</div>'
-          : '';
-        diffSection.innerHTML =
-          '<summary>Changes (' + (msg.changedFiles || []).length + ' files)</summary>' +
-          fileSummaryHtml +
-          '<div class="diff-view">' + colorDiff(diffText) + '</div>' +
-          '<div class="diff-actions">' +
-            '<button onclick="navigator.clipboard.writeText(this.closest(\\'.diff-section\\').querySelector(\\'.diff-view\\').textContent)">Copy Diff</button>' +
-            '<button onclick="vscode.postMessage({type:\\x27open-diff\\x27, taskId:\\x27' + taskId + '\\x27})">Open in Editor</button>' +
-          '</div>';
-        detail.appendChild(diffSection);
-      }
-
-      card.appendChild(row);
-      card.appendChild(detail);
-      const body = document.getElementById('body-completed') || section;
-      body.appendChild(card);
-      card.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        var detail = document.createElement('div');
+        detail.className = 'ct-detail';
+        var outputDiv = document.createElement('pre');
+        outputDiv.className = 'terminal-output ct-detail-output';
+        outputDiv.textContent = getOutputTail(entry.output || entry.stderr, 50);
+        detail.appendChild(outputDiv);
+        card.appendChild(detail);
+        body.appendChild(card);
+      });
     }
 
     // ─── Progress + Stats ───
@@ -2348,7 +2048,6 @@ export class DashboardPanel {
 
     function updateProgress() {
       const fill = document.getElementById('progress-fill');
-      const progressSection = document.getElementById('progress-section');
       const tasks = currentPlan ? currentPlan.playlists.flatMap(function(pl) { return pl.tasks || []; }) : [];
       const passedTasks = tasks.filter(function(t) { return t.status === 'completed'; }).length;
       const failedTasks = tasks.filter(function(t) { return t.status === 'failed'; }).length;
@@ -2357,12 +2056,10 @@ export class DashboardPanel {
         tasks.filter(function(t) { return t.status === 'skipped'; }).length);
       const effectiveFailed = Math.max(failedCount, failedTasks);
 
-      progressSection.hidden = !hasPlanLoaded();
-
       if (totalTasks === 0) {
         fill.style.width = '0%';
         fill.classList.remove('has-errors');
-        document.getElementById('stats-tasks').textContent = '0/0 tasks (0 failed)';
+        document.getElementById('stats-tasks').textContent = '0/0';
         document.getElementById('stats-elapsed').textContent = '';
         return;
       }
@@ -2383,7 +2080,7 @@ export class DashboardPanel {
       const isExecuting = currentTaskId !== null;
       var failureCount = failedTasks + blockedTasks;
       if (isExecuting) {
-        document.getElementById('stats-tasks').textContent = effectiveCompleted + '/' + totalTasks + ' tasks (' + failureCount + ' failed)';
+        document.getElementById('stats-tasks').textContent = effectiveCompleted + '/' + totalTasks;
         document.getElementById('stats-elapsed').textContent = getExecutionEtaText(effectiveCompleted);
       } else {
         document.getElementById('stats-tasks').textContent = effectiveCompleted + '/' + totalTasks + ' tasks (' + failureCount + ' failed)';
@@ -2398,6 +2095,11 @@ export class DashboardPanel {
       updateProgress();
       if (taskStartTime && currentTaskId) {
         document.getElementById('active-timer').textContent = formatDuration(Date.now() - taskStartTime);
+      }
+      if (runStartTime && (runnerState === 'playing' || runnerState === 'paused' || runnerState === 'stopping')) {
+        updateStatusRight(formatDuration(Date.now() - runStartTime));
+      } else {
+        updateStatusRight('');
       }
     }
 
@@ -2423,6 +2125,7 @@ export class DashboardPanel {
 
     function renderPlaylistTiles(plan) {
       const container = document.getElementById('playlist-tiles');
+      if (!container) { return; }
       if (!plan || !plan.playlists || plan.playlists.length === 0) {
         container.hidden = true;
         container.innerHTML = '';
@@ -2442,7 +2145,7 @@ export class DashboardPanel {
         if (isActive) { classes.push('is-active'); }
         if ((stats.failed + stats.blocked) > 0) { classes.push('has-failure'); }
         if (statusKey === 'done') { classes.push('is-done'); }
-        return '<button class="' + classes.join(' ') + '" onclick="document.getElementById(\\x27plan-section\\x27).scrollIntoView({behavior:\\x27smooth\\x27})" title="' + escHtml(pl.name || 'Playlist') + '">' +
+        return '<button class="' + classes.join(' ') + '" onclick="vscode.postMessage({type:\\x27switch-plan\\x27})" title="' + escHtml(pl.name || 'Playlist') + '">' +
           '<span class="tile-name">' + escHtml(pl.name || 'Playlist') + '</span>' +
           '<span class="tile-meta">' +
             '<span class="tile-status ' + statusKey + '">' + statusKey + '</span>' +
@@ -2471,21 +2174,17 @@ export class DashboardPanel {
       if (state === 'playing') {
         syncActiveTaskFromPlan(currentPlan);
       }
-      if (state === 'idle' && completedCount > 0 && completedCount >= totalTasks) {
-        setDashboardState('complete');
-      } else if (state === 'idle' && currentPlan) {
-        setDashboardState('idle');
-      } else if (state === 'playing') {
+      if (state === 'playing') {
         setDashboardState('executing');
+      } else if (state === 'idle' && completedCount > 0 && completedCount >= totalTasks) {
+        setDashboardState('complete');
+      } else {
+        setDashboardState('idle');
       }
       if (state === 'idle') {
         updateStatusSummary('Ready');
+        updateStatusRight('');
         stopTimer();
-        if (currentTaskId === null) {
-          const activeCard = document.getElementById('active-task');
-          activeCard.hidden = true;
-          activeCard.className = 'active-task-card';
-        }
       } else if (state === 'paused') {
         updateStatusSummary('Paused');
       } else if (state === 'stopping') {
@@ -2494,7 +2193,7 @@ export class DashboardPanel {
       updateTimers();
     }
 
-    const collapsedSections = { info: true, sandbox: true };
+    const collapsedSections = { completed: false, sandbox: true };
 
     function toggleSection(sectionId) {
       collapsedSections[sectionId] = !collapsedSections[sectionId];
@@ -2508,148 +2207,25 @@ export class DashboardPanel {
 
     // ─── Plan Tab: Tree View ───
 
-    function getTaskDurationMs(task) {
-      var taskState = cardState[task.id];
-      if (taskState && typeof taskState.durationMs === 'number' && taskState.durationMs > 0) {
-        return taskState.durationMs;
-      }
-      if (typeof task.durationMs === 'number' && task.durationMs > 0) {
-        return task.durationMs;
-      }
-      return 0;
-    }
-
-    function getTaskDurationLabel(task) {
-      var status = String(task.status || '').toLowerCase();
-      if (status !== 'completed' && status !== 'failed' && status !== 'blocked' && status !== 'skipped') {
-        return '';
-      }
-      var ms = getTaskDurationMs(task);
-      return ms > 0 ? formatDuration(ms) : '';
-    }
-
     function renderPlan(plan) {
-      const section = document.getElementById('plan-section');
       const planName = document.getElementById('plan-name');
-      var pointers = getExecutionPointers(plan);
-
       if (!plan || !plan.playlists || plan.playlists.length === 0) {
-        section.innerHTML = '<div class="plan-placeholder">No plan loaded \\u2014 use the sidebar to create one.</div>';
-        planName.textContent = plan && plan.name ? plan.name : 'MOAG';
+        if (planName) { planName.textContent = plan && plan.name ? plan.name : 'MOAG'; }
         totalTasks = 0;
         renderPills(null);
-        setDashboardState('empty');
+        renderIdleOverview(null);
         renderPromptComposerState();
+        setDashboardState(runnerState === 'playing' ? 'executing' : 'idle');
         return;
       }
 
-      planName.textContent = plan.name || 'Untitled Plan';
+      if (planName) { planName.textContent = plan.name || 'Untitled Plan'; }
       let taskCount = 0;
       plan.playlists.forEach(function(pl) { taskCount += (pl.tasks || []).length; });
       totalTasks = taskCount;
-
-      var tasksCollapsed = !!collapsedSections.tasks;
-      var html = '<button class="section-toggle' + (tasksCollapsed ? ' collapsed' : '') + '" data-section="tasks" onclick="toggleSection(\\'tasks\\')">' +
-        '<span class="section-toggle-icon">\\u25BC</span>' +
-        '<span class="section-toggle-label">TASKS</span>' +
-        '<span class="section-toggle-count">' + taskCount + '</span>' +
-      '</button>';
-      html += '<div class="section-body' + (tasksCollapsed ? ' collapsed' : '') + '" id="body-tasks">';
-
-      plan.playlists.forEach(function(pl, playlistIndex) {
-        const tasks = pl.tasks || [];
-        const stats = getTaskStats(tasks);
-        const doneCount = stats.completed + stats.failed + stats.blocked + stats.skipped;
-        const playlistSectionId = 'playlist-' + playlistIndex;
-        const playlistCollapsed = !!collapsedSections[playlistSectionId];
-        const engineId = String(pl.engine || 'custom').toLowerCase();
-
-        html += '<div class="playlist-block">';
-        html += '<button class="section-toggle playlist-toggle' + (playlistCollapsed ? ' collapsed' : '') + '" data-section="' + playlistSectionId + '" onclick="toggleSection(\\'' + playlistSectionId + '\\')">' +
-          '<span class="section-toggle-icon">\\u25BC</span>' +
-          '<span class="section-toggle-label">' +
-            '<span class="playlist-name">' + escHtml(pl.name || 'Playlist') + '</span>' +
-          '</span>' +
-          '<span class="engine-badge engine-' + escHtml(engineId) + '">' + escHtml(pl.engine || 'custom') + '</span>' +
-          '<span class="playlist-progress">' + doneCount + '/' + tasks.length + '</span>' +
-        '</button>';
-        html += '<div class="section-body task-list' + (playlistCollapsed ? ' collapsed' : '') + '" id="body-' + playlistSectionId + '">';
-
-        tasks.forEach(function(task, taskIndex) {
-          var duration = getTaskDurationLabel(task);
-          var isRunning = pointers.runningTaskId && task.id === pointers.runningTaskId;
-          var isQueued = pointers.queuedTaskId && task.id === pointers.queuedTaskId;
-          var runtimeBadge = isRunning
-            ? '<span class="task-runtime-badge running">RUNNING</span>'
-            : isQueued
-              ? '<span class="task-runtime-badge queued">QUEUED NEXT</span>'
-              : '';
-          html += '<div class="task-row">' +
-            '<span class="task-status-dot ' + escHtml(String(task.status || 'pending').toLowerCase()) + '"></span>' +
-            '<span class="task-name">' + escHtml(task.name) + '</span>' +
-            runtimeBadge +
-            '<span class="task-duration">' + escHtml(duration) + '</span>' +
-            '<button class="task-edit-btn" onclick="event.stopPropagation();vscode.postMessage({type:\\'editTask\\',playlistIndex:' + playlistIndex + ',taskIndex:' + taskIndex + '})" title="Edit task">Edit</button>' +
-          '</div>';
-        });
-
-        html += '<button class="tree-add-btn" onclick="vscode.postMessage({type:\\'addTask\\',playlistIndex:' + playlistIndex + '})">+ Add task</button>';
-        html += '</div>';
-        html += '</div>';
-      });
-
-      html += '<button class="tree-add-playlist-btn" onclick="vscode.postMessage({type:\\'addPlaylist\\'})">+ Add playlist</button>';
-      html += '</div>';
-      section.innerHTML = html;
-      if (dashboardState === 'empty') {
-        setDashboardState('idle');
-      }
+      renderIdleOverview(plan);
+      setDashboardState(runnerState === 'playing' ? 'executing' : dashboardState);
       renderPromptComposerState();
-    }
-
-    // ─── History Section ───
-
-    function renderHistory(history) {
-      const section = document.getElementById('info-panel');
-      if (!section) { return; }
-      if (!history || history.length === 0) { section.innerHTML = ''; section.hidden = true; return; }
-      section.hidden = false;
-
-      // Group entries into runs (gap > 60s = new run)
-      var runs = [];
-      var currentRun = null;
-      history.forEach(function(entry) {
-        if (!currentRun || Math.abs((entry.startTime || 0) - (currentRun.time || 0)) > 60000) {
-          currentRun = { time: entry.startTime || 0, passed: 0, failed: 0, entries: [] };
-          runs.push(currentRun);
-        }
-        currentRun.entries.push(entry);
-        if (entry.status === 'completed') { currentRun.passed++; }
-        else if (entry.status !== 'skipped') { currentRun.failed++; }
-      });
-
-      var infoCollapsed = !!collapsedSections.info;
-      var html = '<div class="history-section">';
-      html += '<button class="section-toggle' + (infoCollapsed ? ' collapsed' : '') + '" data-section="info" onclick="toggleSection(\\'info\\')">' +
-        '<span class="section-toggle-icon">\\u25BC</span>' +
-        '<span class="section-toggle-label">HISTORY</span>' +
-        '<span class="section-toggle-count">' + runs.length + ' run' + (runs.length !== 1 ? 's' : '') + '</span>' +
-      '</button>' +
-      '<div class="section-body' + (infoCollapsed ? ' collapsed' : '') + '" id="body-info">';
-
-      runs.slice(0, 20).forEach(function(run, i) {
-        var dateStr = run.time ? new Date(run.time).toLocaleDateString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) : 'Unknown';
-        var statusCls = run.failed > 0 ? 'fail' : 'pass';
-        var statusText = run.failed > 0 ? (run.failed + ' failed') : 'All passed';
-        html += '<div class="history-entry">' +
-          '<span class="history-run-label">Run #' + (runs.length - i) + '</span>' +
-          '<span class="history-run-meta">' + dateStr + ' \u00B7 ' + run.entries.length + ' tasks</span>' +
-          '<span class="history-run-status ' + statusCls + '">' + statusText + '</span>' +
-        '</div>';
-      });
-
-      html += '</div></div>';
-      section.innerHTML = html;
     }
 
     // ─── Utilities ───
@@ -2658,31 +2234,6 @@ export class DashboardPanel {
       const div = document.createElement('div');
       div.textContent = s || '';
       return div.innerHTML;
-    }
-
-    function colorDiff(diff) {
-      return diff.split('\\n').map(function(line) {
-        const escaped = escHtml(line);
-        if (line.startsWith('diff --git')) return '<span class="diff-header">' + escaped + '</span>';
-        if (line.startsWith('+++') || line.startsWith('---')) return '<span class="diff-header">' + escaped + '</span>';
-        if (line.startsWith('@@')) return '<span class="diff-hunk">' + escaped + '</span>';
-        if (line.startsWith('+')) return '<span class="diff-add">' + escaped + '</span>';
-        if (line.startsWith('-')) return '<span class="diff-remove">' + escaped + '</span>';
-        return escaped;
-      }).join('\\n');
-    }
-
-    function renderEngineStatus() {
-      var el = document.getElementById('engine-status');
-      if (!el) { return; }
-      if (!promptEngines || promptEngines.length === 0) {
-        el.innerHTML = '<span style="color:var(--dimmed)">No supported engines detected.</span>';
-        return;
-      }
-      var selected = promptEngines.find(function(engine) { return engine.id === selectedPromptEngineId; }) || promptEngines[0];
-      var otherEngines = promptEngines.filter(function(engine) { return engine.id !== selected.id; }).map(function(engine) { return engine.label; });
-      var extra = otherEngines.length > 0 ? ' <span style="color:var(--dimmed)">(also available: ' + escHtml(otherEngines.join(', ')) + ')</span>' : '';
-      el.innerHTML = '<span>Engine: <strong>' + escHtml(selected.label) + '</strong></span>' + extra;
     }
 
     // ─── Init ───
@@ -2704,7 +2255,6 @@ export class DashboardPanel {
           renderPills(initState.plan);
           updateProgress();
           renderStatus(initState.runnerState || 'idle');
-          renderHistory(initState.history || []);
         } else {
           currentPlan = null;
           renderPlan(null);
@@ -2744,8 +2294,7 @@ export class DashboardPanel {
       const maxRetries = 10;
       const interval = setInterval(function() {
         retries++;
-        var planSection = document.getElementById('plan-section');
-        var hasRenderedPlan = !!(planSection && planSection.innerHTML.trim());
+        var hasRenderedPlan = !!currentPlan;
         if ((currentPlan && hasRenderedPlan) || retries >= maxRetries) {
           clearInterval(interval);
           if (currentPlan && !hasRenderedPlan) { vscode.postMessage({ type: 'refresh' }); }

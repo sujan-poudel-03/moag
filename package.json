@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
   "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
-  "version": "0.9.3",
+  "version": "0.9.4",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -44,7 +44,8 @@
     "llm",
     "ai-agent",
     "workflow",
-    "coding-assistant"
+    "coding-assistant",
+    "copilot"
   ],
   "activationEvents": [
     "onView:agentTaskPlayer.promptView",
@@ -101,12 +102,6 @@
         "title": "New Plan",
         "category": "MOAG",
         "icon": "$(new-file)"
-      },
-      {
-        "command": "agentTaskPlayer.loadExamplePlan",
-        "title": "Try Example Plan",
-        "category": "MOAG",
-        "icon": "$(beaker)"
       },
       {
         "command": "agentTaskPlayer.addPlaylist",
@@ -470,9 +465,21 @@
       "agentTaskPlayer": [
         {
           "id": "agentTaskPlayer.promptView",
-          "name": "CHAT",
+          "name": "PROMPT",
           "type": "webview",
           "visibility": "visible"
+        },
+        {
+          "id": "agentTaskPlayer.planView",
+          "name": "PLAN",
+          "type": "tree",
+          "visibility": "visible"
+        },
+        {
+          "id": "agentTaskPlayer.historyView",
+          "name": "HISTORY",
+          "type": "tree",
+          "visibility": "collapsed"
         }
       ]
     },
@@ -495,119 +502,14 @@
           "group": "navigation@1"
         },
         {
-          "command": "agentTaskPlayer.pause",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_run@0"
-        },
-        {
           "command": "agentTaskPlayer.stop",
           "when": "view == agentTaskPlayer.planView",
           "group": "navigation@2"
         },
         {
-          "command": "agentTaskPlayer.quickAddTask",
+          "command": "agentTaskPlayer.pause",
           "when": "view == agentTaskPlayer.planView",
-          "group": "0_add@0"
-        },
-        {
-          "command": "agentTaskPlayer.addTask",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "0_add@1"
-        },
-        {
-          "command": "agentTaskPlayer.newPlanFromTemplate",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@1"
-        },
-        {
-          "command": "agentTaskPlayer.smartNewPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@0"
-        },
-        {
-          "command": "agentTaskPlayer.newPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@2"
-        },
-        {
-          "command": "agentTaskPlayer.importPlanFromUrl",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "3_share@3"
-        },
-        {
-          "command": "agentTaskPlayer.planFromGitHubIssue",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "3_share@4"
-        },
-        {
-          "command": "agentTaskPlayer.openPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@3"
-        },
-        {
-          "command": "agentTaskPlayer.runPrompt",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "0_add@0"
-        },
-        {
-          "command": "agentTaskPlayer.savePlanAs",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "1_plan@5"
-        },
-        {
-          "command": "agentTaskPlayer.switchProfile",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_run@3"
-        },
-        {
-          "command": "agentTaskPlayer.watchMode",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_run@1"
-        },
-        {
-          "command": "agentTaskPlayer.toggleFullAuto",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_run@2"
-        },
-        {
-          "command": "agentTaskPlayer.addPlaylist",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "0_add@2"
-        },
-        {
-          "command": "agentTaskPlayer.exportPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "3_share@1"
-        },
-        {
-          "command": "agentTaskPlayer.importPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "3_share@2"
-        },
-        {
-          "command": "agentTaskPlayer.dryRun",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "4_danger@0"
-        },
-        {
-          "command": "agentTaskPlayer.sharePlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "3_share@0"
-        },
-        {
-          "command": "agentTaskPlayer.runPlanFile",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "2_run@0"
-        },
-        {
-          "command": "agentTaskPlayer.bulkDelete",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "4_danger@1"
-        },
-        {
-          "command": "agentTaskPlayer.clearAllTasks",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "4_danger@2"
+          "group": "run@0"
         },
         {
           "command": "agentTaskPlayer.clearHistory",
@@ -628,11 +530,6 @@
           "command": "agentTaskPlayer.exportResults",
           "when": "view == agentTaskPlayer.historyView",
           "group": "navigation@4"
-        },
-        {
-          "command": "agentTaskPlayer.showChangelog",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "5_help@1"
         }
       ],
       "view/item/context": [
@@ -753,7 +650,8 @@
             "claude",
             "gemini",
             "ollama",
-            "custom"
+            "custom",
+            "copilot"
           ],
           "description": "Default agent engine to use for tasks."
         },
@@ -765,7 +663,9 @@
         "agentTaskPlayer.engines.codex.args": {
           "type": "array",
           "default": [],
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Extra arguments for Codex CLI."
         },
         "agentTaskPlayer.engines.codex.autoApprove": {
@@ -780,8 +680,12 @@
         },
         "agentTaskPlayer.engines.claude.args": {
           "type": "array",
-          "default": ["-p"],
-          "items": { "type": "string" },
+          "default": [
+            "-p"
+          ],
+          "items": {
+            "type": "string"
+          },
           "description": "Extra arguments for Claude Code CLI."
         },
         "agentTaskPlayer.engines.claude.autoApprove": {
@@ -797,7 +701,9 @@
         "agentTaskPlayer.engines.gemini.args": {
           "type": "array",
           "default": [],
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Extra arguments for Gemini CLI."
         },
         "agentTaskPlayer.engines.ollama.command": {
@@ -818,7 +724,9 @@
         "agentTaskPlayer.engines.custom.args": {
           "type": "array",
           "default": [],
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "description": "Custom engine arguments. Use {prompt} as placeholder."
         },
         "agentTaskPlayer.fallbackEngine": {
@@ -830,7 +738,8 @@
             "claude",
             "gemini",
             "ollama",
-            "custom"
+            "custom",
+            "copilot"
           ],
           "description": "Backup engine to switch to when the primary engine hits a rate limit. Leave empty to disable auto-fallback."
         },
@@ -884,7 +793,13 @@
         },
         "agentTaskPlayer.executionProfile": {
           "type": "string",
-          "enum": ["auto", "fast", "balanced", "quality", "budget"],
+          "enum": [
+            "auto",
+            "fast",
+            "balanced",
+            "quality",
+            "budget"
+          ],
           "default": "auto",
           "enumDescriptions": [
             "Use default settings (balanced)",
@@ -922,7 +837,12 @@
         },
         "agentTaskPlayer.defaultReasoningPreset": {
           "type": "string",
-          "enum": ["auto", "fast", "balanced", "deep"],
+          "enum": [
+            "auto",
+            "fast",
+            "balanced",
+            "deep"
+          ],
           "default": "auto",
           "description": "Default reasoning preset for model selection. 'auto' analyzes task complexity to pick the best model."
         },
@@ -1011,6 +931,11 @@
           "minimum": 1,
           "maximum": 6,
           "description": "File tree scan depth for project state context."
+        },
+        "agentTaskPlayer.engines.claude.extendedThinking": {
+          "type": "boolean",
+          "default": false,
+          "description": "When enabled, instructs Claude to use extended step-by-step thinking for complex tasks. Increases token usage but improves output quality."
         }
       }
     },
@@ -1028,7 +953,9 @@
               "altText": "Terminal showing CLI install command",
               "markdown": "media/walkthrough-install.md"
             },
-            "completionEvents": ["onCommand:agentTaskPlayer.detectEngines"]
+            "completionEvents": [
+              "onCommand:agentTaskPlayer.detectEngines"
+            ]
           },
           {
             "id": "openPanel",
@@ -1038,7 +965,9 @@
               "altText": "MOAG panel in the activity bar",
               "markdown": "media/walkthrough-panel.md"
             },
-            "completionEvents": ["onView:agentTaskPlayer.planView"]
+            "completionEvents": [
+              "onView:agentTaskPlayer.planView"
+            ]
           },
           {
             "id": "createPlan",
@@ -1048,7 +977,9 @@
               "altText": "Creating a new plan file",
               "markdown": "media/walkthrough-plan.md"
             },
-            "completionEvents": ["onCommand:agentTaskPlayer.newPlan"]
+            "completionEvents": [
+              "onCommand:agentTaskPlayer.newPlan"
+            ]
           },
           {
             "id": "addPlaylistAndTask",
@@ -1058,7 +989,9 @@
               "altText": "Adding playlists and tasks to a plan",
               "markdown": "media/walkthrough-tasks.md"
             },
-            "completionEvents": ["onCommand:agentTaskPlayer.addPlaylist"]
+            "completionEvents": [
+              "onCommand:agentTaskPlayer.addPlaylist"
+            ]
           },
           {
             "id": "hitPlay",
@@ -1068,7 +1001,9 @@
               "altText": "Playing tasks and viewing output",
               "markdown": "media/walkthrough-play.md"
             },
-            "completionEvents": ["onCommand:agentTaskPlayer.play"]
+            "completionEvents": [
+              "onCommand:agentTaskPlayer.play"
+            ]
           },
           {
             "id": "advancedFeatures",

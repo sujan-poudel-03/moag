@@ -129,7 +129,15 @@ export class HistoryStore {
       ? entry.changedFiles.slice(0, maxChangedFiles).map((f) => this.clampText(f, 260))
       : undefined;
     const artifacts = entry.artifacts
-      ? entry.artifacts.slice(0, maxArtifacts)
+      ? entry.artifacts.slice(0, maxArtifacts).map(a => ({
+          ...a,
+          target: a.target.slice(0, 260),
+          resolvedPath: a.resolvedPath?.slice(0, 260),
+          failureSummary: a.failureSummary?.slice(0, 500),
+          screenshots: a.screenshots?.slice(0, 20).map(p => p.slice(0, 260)),
+          traces: a.traces?.slice(0, 10).map(p => p.slice(0, 260)),
+          logs: a.logs?.slice(0, 20).map(p => p.slice(0, 260)),
+        }))
       : undefined;
 
     return {

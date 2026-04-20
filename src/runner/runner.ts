@@ -22,17 +22,61 @@ import {
 } from '../models/types';
 import { generateId } from '../models/plan';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
-import { resolveProfile, ProfileName, ProfileConfig } from '../models/execution-profiles';
+import { resolveProfile, resolveValidationProfile, ProfileName, ProfileConfig } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
 import { getValidationAdapters, validationResultToEngineResult } from '../adapters/validation/index';
 import { HistoryStore } from '../history/store';
-import { buildContext, getContextSettings } from '../context/context-builder';
+import { buildContext, getContextSettings, runRetrievalCascade } from '../context/context-builder';
 import { analyzeProject } from '../context/project-analyzer';
 import { PromptLibraryStore } from '../templates/prompt-library';
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const GIT_TIMEOUT_MS = 30_000;
 const VERIFY_TIMEOUT_MS = 30_000;
+
+/**
+ * Parse a .env-style file into a key-value map.
+ * Handles: comments (#), blank lines, quoted values (single or double), KEY=VALUE.
+ */
+function parseEnvFile(filePath: string): Record<string, string> {
+  let content: string;
+  try {
+    content = fs.readFileSync(filePath, 'utf-8');
+  } catch {
+    return {};
+  }
+  const result: Record<string, string> = {};
+  for (const raw of content.split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) {
+      continue;
+    }
+    const eqIdx = line.indexOf('=');
+    if (eqIdx < 1) {
+      continue;
+    }
+    const key = line.slice(0, eqIdx).trim();
+    let value = line.slice(eqIdx + 1).trim();
+    // Strip surrounding quotes
+    if ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (key) {
+      result[key] = value;
+    }
+  }
+  return result;
+}
+
+function composeAbortSignals(...signals: AbortSignal[]): AbortSignal {
+  const controller = new AbortController();
+  for (const s of signals) {
+    if (s.aborted) { controller.abort(); return controller.signal; }
+    s.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  return controller.signal;
+}
 const DEFAULT_SERVICE_STARTUP_TIMEOUT_MS = 60_000;
 
 export interface BudgetExceededEvent {
@@ -85,11 +129,14 @@ export class TaskRunner {
   private _serviceProcesses = new Map<string, ServiceHandle>();
   private _currentRunId: string | null = null;
   private _totalCostUsd = 0;
+  private _sessionCostUsd = 0;
   private _budgetExceededEmitted = false;
   private _autoFixedTasks = new Set<string>();
 
   private _promptLibrary: PromptLibraryStore | null = null;
   private _pendingScreenshots: string[] = [];
+  /** Stores failure context (stderr + verify output) from the last failed attempt, keyed by task id */
+  private _taskFailureContext = new Map<string, string>();
 
   constructor(private readonly historyStore: HistoryStore) {}
 
@@ -145,8 +192,13 @@ export class TaskRunner {
     this.emit('state-changed', state);
   }
 
+  getSessionCost(): number {
+    return this._sessionCostUsd;
+  }
+
   private resetRunBudgetTracking(): void {
     this._totalCostUsd = 0;
+    this._sessionCostUsd = 0;
     this._budgetExceededEmitted = false;
     this._autoFixedTasks.clear();
   }
@@ -162,6 +214,7 @@ export class TaskRunner {
     }
 
     this._totalCostUsd += estimatedCost;
+    this._sessionCostUsd += estimatedCost;
 
     const budget = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('costBudgetUsd', 0);
     if (budget <= 0 || this._budgetExceededEmitted || this._totalCostUsd <= budget) {
@@ -628,9 +681,28 @@ export class TaskRunner {
     (task as Task & { _profileModelPreset?: string })._profileModelPreset = profile.modelPreset;
 
     const cwd = this.resolveCwd(task.cwd);
-    const executionDescription = (taskType === 'agent' || taskType === 'review')
-      ? this.buildPrompt(task, cwd, plan, playlist)
+
+    // Gap 3: Resolve inherited env files — merge before task.env (task.env wins)
+    const workspaceRoot = this.resolveCwd(undefined);
+    let resolvedEnv: Record<string, string> | undefined = task.env;
+    if (task.inheritEnvFiles && task.inheritEnvFiles.length > 0) {
+      const inherited: Record<string, string> = {};
+      for (const relPath of task.inheritEnvFiles) {
+        const absPath = path.isAbsolute(relPath) ? relPath : path.join(workspaceRoot, relPath);
+        Object.assign(inherited, parseEnvFile(absPath));
+      }
+      // task.env takes precedence over inherited values
+      resolvedEnv = { ...inherited, ...(task.env ?? {}) };
+    }
+
+    // Gap 6: Inject failure context into prompt when retrying a failed task
+    const failureContext = this._taskFailureContext.get(task.id);
+    const basePrompt = (taskType === 'agent' || taskType === 'review')
+      ? await this.buildPrompt(task, cwd, plan, playlist)
       : this.buildTaskDescription(task);
+    const executionDescription = failureContext
+      ? `[RETRY CONTEXT — previous attempt failed]\n${failureContext}\n\n[TASK]\n${basePrompt}`
+      : basePrompt;
 
     task.status = TaskStatus.Running;
     const startedAt = new Date().toISOString();
@@ -652,13 +724,26 @@ export class TaskRunner {
     let verification: VerificationResult | undefined;
     let artifacts: TaskArtifact[] | undefined;
 
+    // Gap 1: Pre-flight baseline check — run verifyCommand before the agent
+    let baselineVerification: VerificationResult | undefined;
+    if (task.verifyCommand && taskType !== 'check') {
+      this.emit('task-output', task, `\n-- Pre-flight baseline: ${task.verifyCommand} --\n`, 'stdout');
+      baselineVerification = await this.runVerification(task.verifyCommand, cwd, resolvedEnv, taskAbort.signal, task);
+      baselineVerification.baselinePassed = baselineVerification.passed;
+      if (!baselineVerification.passed) {
+        this.emit('task-output', task,
+          `[Pre-flight] Baseline already broken before agent runs — task will not be blamed for this failure\n`,
+          'stderr');
+      }
+    }
+
     try {
       let result: EngineResult;
 
       if (task.consensus && task.consensus.engines.length > 0 && taskType === 'agent') {
         result = await this.runConsensusTask(task, cwd, executionDescription, taskAbort.signal, plan);
       } else {
-        result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal, plan, plan.fallbackEngine);
+        result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal, plan, plan.fallbackEngine, resolvedEnv);
       }
 
       if (taskAbort.signal.aborted && !this._abortController?.signal.aborted) {
@@ -672,11 +757,30 @@ export class TaskRunner {
 
       if (result.exitCode === 0 && task.verifyCommand && taskType !== 'check') {
         this.emit('task-output', task, `\n-- Verify: ${task.verifyCommand} --\n`, 'stdout');
-        verification = await this.runVerification(task.verifyCommand, cwd, task.env, taskAbort.signal, task);
+
+        // Gap 2: Scoped verify — limit to changed files when task.scopedVerify is set
+        let changedFilesForScope: string[] | undefined;
+        if (task.scopedVerify) {
+          const nameOnly = await this.runGitCommand(['diff', '--name-only', 'HEAD', '--', '*.ts', '*.tsx', '*.js', '*.jsx'], cwd);
+          changedFilesForScope = nameOnly ? nameOnly.split('\n').filter(f => f.length > 0) : [];
+        }
+
+        verification = await this.runVerification(task.verifyCommand, cwd, resolvedEnv, taskAbort.signal, task, changedFilesForScope);
+
+        // Gap 1: Determine if failure is pre-existing (baseline was already broken)
+        if (!verification.passed && baselineVerification && !baselineVerification.passed) {
+          verification.baselineBroken = true;
+          this.emit('task-output', task,
+            `[Verify] Pre-existing failure detected — baseline was already broken. Treating as completed.\n`,
+            'stderr');
+          // Override exit code: not the task's fault
+          result = { ...result, exitCode: 0 };
+        }
+
         if (verification.output) {
           this.emit('task-output', task, verification.output, verification.passed ? 'stdout' : 'stderr');
         }
-        if (!verification.passed) {
+        if (!verification.passed && !verification.baselineBroken) {
           result = {
             ...result,
             exitCode: verification.exitCode,
@@ -760,8 +864,19 @@ export class TaskRunner {
       this.trackTaskCost(result);
 
       if (task.status === TaskStatus.Completed) {
+        // Gap 6: Clear failure context on success
+        this._taskFailureContext.delete(task.id);
         this.emit('task-completed', task, result);
       } else {
+        // Gap 6: Store failure context for retry
+        const failureLines: string[] = [];
+        if (result.stderr) { failureLines.push('Error output:\n' + result.stderr.slice(-2000)); }
+        if (verification && !verification.passed && !verification.baselineBroken) {
+          failureLines.push('Verification failed:\n' + verification.output.slice(-2000));
+        }
+        if (failureLines.length > 0) {
+          this._taskFailureContext.set(task.id, failureLines.join('\n\n'));
+        }
         this.emit('task-failed', task, result);
         this.applyFailurePolicy(task, result);
       }
@@ -841,16 +956,17 @@ export class TaskRunner {
     signal: AbortSignal,
     plan: Plan,
     fallbackEngine?: EngineId,
+    resolvedEnv?: Record<string, string>,
   ): Promise<EngineResult> {
     switch (taskType) {
       case 'agent':
         return this.runAgentTask(task, engineId, cwd, fullPrompt, signal, fallbackEngine);
       case 'command':
-        return this.runCommandTask(task, cwd, signal);
+        return this.runCommandTask(task, cwd, signal, resolvedEnv);
       case 'service':
         return this.runServiceTask(task, cwd, signal);
       case 'check':
-        return this.runCheckTask(task, cwd, signal);
+        return this.runCheckTask(task, cwd, signal, resolvedEnv);
       case 'review':
         return this.runReviewTask(task, engineId, cwd, signal, plan, fallbackEngine);
       case 'validate':
@@ -1019,19 +1135,28 @@ export class TaskRunner {
       };
     }
 
-    this.emit('task-output', task, `\n[validate] Profile: ${profile}  Targets: ${rawTargets.join(', ')}\n`, 'stdout');
+    const profileConfig = resolveValidationProfile(profile);
+    const { parallelTargets, maxWallClockMs } = profileConfig;
+
+    this.emit('task-output', task, `\n[validate] Profile: ${profile}  Targets: ${rawTargets.join(', ')}  Parallel: ${parallelTargets}\n`, 'stdout');
+
+    // Scoped signal that also fires when the wall-clock budget expires
+    const wallController = new AbortController();
+    const wallTimer = setTimeout(() => {
+      wallController.abort();
+      this.emit('task-output', task, `\n[validate] Wall-clock budget (${maxWallClockMs / 1000}s) exceeded — aborting remaining targets\n`, 'stderr');
+    }, maxWallClockMs);
+    const scopedSignal = composeAbortSignals(signal, wallController.signal);
 
     const results: import('../adapters/validation/types').ValidationResult[] = [];
     const runStartedAt = Date.now();
 
-    for (const adapter of adapters) {
-      if (signal.aborted) { break; }
-
+    const runAdapter = async (adapter: import('../adapters/validation/types').ValidationAdapter) => {
       const available = await adapter.isAvailable(cwd);
       if (!available) {
         const reason = await adapter.unavailableReason(cwd);
         this.emit('task-output', task, `\n[validate:${adapter.target}] SKIPPED — ${reason}\n`, 'stderr');
-        results.push({
+        return {
           target: adapter.target,
           available: false,
           skipReason: reason,
@@ -1040,23 +1165,32 @@ export class TaskRunner {
           durationMs: 0,
           output: '',
           summary: 'skipped',
-        });
-        continue;
+        } as import('../adapters/validation/types').ValidationResult;
       }
 
       this.emit('task-output', task, `\n[validate:${adapter.target}] Starting ${profile} validation...\n`, 'stdout');
       const result = await adapter.run({
         cwd,
         profile,
-        signal,
+        signal: scopedSignal,
         env: task.env,
         onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
       });
-      results.push(result);
 
       const icon = result.exitCode === 0 ? '✓' : '✗';
       this.emit('task-output', task, `\n[validate:${adapter.target}] ${icon} ${result.summary}\n`, result.exitCode === 0 ? 'stdout' : 'stderr');
+      return result;
+    };
+
+    // Run adapters in parallel batches respecting the profile's parallelTargets limit
+    for (let i = 0; i < adapters.length; i += parallelTargets) {
+      if (scopedSignal.aborted) { break; }
+      const batch = adapters.slice(i, i + parallelTargets);
+      const batchResults = await Promise.all(batch.map(runAdapter));
+      results.push(...batchResults);
     }
+
+    clearTimeout(wallTimer);
 
     const engineResult = validationResultToEngineResult(results);
     engineResult.durationMs = Date.now() - runStartedAt;
@@ -1164,7 +1298,7 @@ export class TaskRunner {
     return rotation[defaultEngine] ?? 'claude';
   }
 
-  private async runCommandTask(task: Task, cwd: string, signal: AbortSignal): Promise<EngineResult> {
+  private async runCommandTask(task: Task, cwd: string, signal: AbortSignal, resolvedEnv?: Record<string, string>): Promise<EngineResult> {
     const command = task.command?.trim();
     if (!command) {
       return { stdout: '', stderr: 'Command task is missing the "command" field.', exitCode: 1, durationMs: 0 };
@@ -1172,14 +1306,15 @@ export class TaskRunner {
     this.emit('task-output', task, `\n-- Command: ${command} --\n`, 'stdout');
     const result = await this.runLocalCommand(command, {
       cwd,
-      env: task.env,
+      env: resolvedEnv ?? task.env,
       signal,
       onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
     });
+    // Gap 7: command tasks — exit code 0 = success, non-zero = failure. No stdout-pattern checks.
     return { ...result, summary: result.exitCode === 0 ? 'Command completed successfully.' : 'Command exited with an error.' };
   }
 
-  private async runCheckTask(task: Task, cwd: string, signal: AbortSignal): Promise<EngineResult> {
+  private async runCheckTask(task: Task, cwd: string, signal: AbortSignal, resolvedEnv?: Record<string, string>): Promise<EngineResult> {
     const command = task.command?.trim() || task.verifyCommand?.trim();
     if (!command) {
       return { stdout: '', stderr: 'Check task requires "command" or "verifyCommand".', exitCode: 1, durationMs: 0 };
@@ -1187,10 +1322,11 @@ export class TaskRunner {
     this.emit('task-output', task, `\n-- Check: ${command} --\n`, 'stdout');
     const result = await this.runLocalCommand(command, {
       cwd,
-      env: task.env,
+      env: resolvedEnv ?? task.env,
       signal,
       onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
     });
+    // Gap 7: check tasks — exit code 0 = passed, non-zero = failed. No stdout-pattern checks.
     return { ...result, summary: result.exitCode === 0 ? 'Check passed.' : 'Check failed.' };
   }
 
@@ -1421,14 +1557,36 @@ export class TaskRunner {
     env: Record<string, string> | undefined,
     parentSignal: AbortSignal,
     task: Task,
+    changedFiles?: string[],
   ): Promise<VerificationResult> {
+    // Gap 2: Scoped verify — transform command to target only changed files
+    let effectiveCommand = command;
+    if (changedFiles && changedFiles.length > 0) {
+      const tsFiles = changedFiles.filter(f => /\.(ts|tsx)$/.test(f));
+      const jsFiles = changedFiles.filter(f => /\.(js|jsx)$/.test(f));
+      const scopedFiles = [...tsFiles, ...jsFiles];
+      if (scopedFiles.length > 0) {
+        const fileArgs = scopedFiles.map(f => JSON.stringify(f)).join(' ');
+        if (/\bnpx\s+tsc\b/.test(command) || /\btsc\s+--noEmit\b/.test(command)) {
+          // Append files after --noEmit
+          effectiveCommand = command.replace(/(--noEmit)/, `$1 ${fileArgs}`);
+          if (effectiveCommand === command) {
+            effectiveCommand = command + ' ' + fileArgs;
+          }
+        } else if (/\beslint\b/.test(command)) {
+          effectiveCommand = command + ' ' + fileArgs;
+        }
+        // Otherwise fall through with original command
+      }
+    }
+
     const verifyAbort = new AbortController();
     const timer = setTimeout(() => verifyAbort.abort(), VERIFY_TIMEOUT_MS);
     const onParentAbort = () => verifyAbort.abort();
     parentSignal.addEventListener('abort', onParentAbort, { once: true });
 
     try {
-      const result = await this.runLocalCommand(command, {
+      const result = await this.runLocalCommand(effectiveCommand, {
         cwd,
         env,
         signal: verifyAbort.signal,
@@ -1436,7 +1594,7 @@ export class TaskRunner {
       });
       const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
       return {
-        command,
+        command: effectiveCommand,
         exitCode: result.exitCode,
         output,
         durationMs: result.durationMs,
@@ -1537,7 +1695,7 @@ export class TaskRunner {
     }
   }
 
-  private buildPrompt(task: Task, cwd: string, plan: Plan, playlist: Playlist): string {
+  private async buildPrompt(task: Task, cwd: string, plan: Plan, playlist: Playlist): Promise<string> {
     const settings = getContextSettings();
     let prompt = '';
     if (settings.enabled) {
@@ -1546,7 +1704,15 @@ export class TaskRunner {
         : undefined;
       // Consume the queue — screenshots attach to the first task after capture
       this._pendingScreenshots = [];
-      const ctx = buildContext({ plan, playlist, task, cwd, historyStore: this.historyStore, settings, pendingScreenshots });
+
+      // Run retrieval cascade: symbol hints → semantic provider
+      const { spans: retrievedSpans, usedSemantic: retrievedSpansUsedSemantic } =
+        await runRetrievalCascade(task, cwd, settings.maxFileContextChars);
+
+      const ctx = buildContext({
+        plan, playlist, task, cwd, historyStore: this.historyStore, settings,
+        pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
+      });
       if (ctx) {
         prompt += ctx + '\n\n';
       }

@@ -289,6 +289,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: 'setBusy', busy });
   }
 
+  postSessionCost(costUsd: number): void {
+    this._view?.webview.postMessage({ type: 'sessionCost', cost: costUsd });
+  }
+
   clear(): void {
     this._view?.webview.postMessage({ type: 'clear' });
   }
@@ -1145,7 +1149,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
 
     /* ─── Sidebar Sandbox ─── */
-    .sidebar-sandbox { border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15)); margin-top: 6px; padding-top: 2px; }
+    .sidebar-sandbox { display: none; padding: 2px 8px 0; flex-shrink: 0; border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2)); }
+    .sidebar-sandbox.active { display: block; }
     .sidebar-sandbox-toggle {
       display: flex; align-items: center; gap: 4px; width: 100%;
       border: none; background: none; cursor: pointer; user-select: none;
@@ -1429,7 +1434,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
     .input-wrap:focus-within { border-color: var(--vscode-focusBorder); }
     .input-wrap.drag-over { border-color: var(--vscode-focusBorder); background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.07)); }
-    .textarea-row { display: flex; align-items: flex-end; }
+    .textarea-row { display: block; }
     .image-preview-bar { display: none; padding: 6px 8px 0; gap: 6px; flex-wrap: wrap; }
     .image-preview-bar.visible { display: flex; }
     .image-preview-item { position: relative; }
@@ -1446,61 +1451,91 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
     textarea {
       flex: 1;
-      min-height: 52px;
-      max-height: 160px;
+      min-height: 112px;
+      max-height: 260px;
       resize: none;
       border: none;
       outline: none;
       background: transparent;
       color: var(--vscode-input-foreground);
       font-family: var(--vscode-font-family);
-      font-size: 12px;
+      font-size: 13px;
       line-height: 1.45;
       padding: 8px 10px;
       overflow-y: auto;
     }
     textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
     textarea:disabled { opacity: 0.6; cursor: not-allowed; }
-    .send {
-      width: 26px;
-      height: 26px;
-      margin: 0 6px 6px 0;
+    .composer-actions {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 0 1px;
+    }
+    .run-btn {
+      flex: 1;
+      height: 32px;
       border: none;
-      border-radius: 6px;
+      border-radius: 8px;
       background: var(--vscode-button-background);
       color: var(--vscode-button-foreground);
       cursor: pointer;
-      font-size: 11px;
+      font-size: 12px;
+      font-weight: 600;
       line-height: 1;
-      flex-shrink: 0;
       display: flex;
       align-items: center;
       justify-content: center;
     }
-    .send:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
-    .send:disabled { opacity: 0.45; cursor: not-allowed; }
-    .composer-meta {
+    .run-btn:hover:not(:disabled) { background: var(--vscode-button-hoverBackground); }
+    .run-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .attach-btn {
+      height: 32px;
+      min-width: 32px;
+      padding: 0 9px;
+      border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      border-radius: 8px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      white-space: nowrap;
+      gap: 4px;
+    }
+    .attach-btn svg { width: 12px; height: 12px; fill: currentColor; flex-shrink: 0; }
+    .attach-btn:hover:not(:disabled) {
+      color: var(--vscode-foreground);
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+    }
+    .attach-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .engine-row {
       display: flex; align-items: center; gap: 4px;
-      padding: 3px 4px 2px; min-height: 26px;
+      padding: 0 1px;
     }
-    .composer-meta-btn {
-      height: 22px; min-width: 22px; padding: 0 6px; border: none; border-radius: 4px;
-      background: transparent; color: var(--vscode-descriptionForeground);
-      font-size: 11px; font-family: var(--vscode-font-family);
-      cursor: pointer; display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0;
+    .engine-label {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+      flex-shrink: 0;
+      min-width: 44px;
     }
-    .composer-meta-btn:hover:not(:disabled) { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1)); }
-    .composer-meta-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-    .composer-meta-btn svg { width: 12px; height: 12px; fill: currentColor; flex-shrink: 0; }
-    .composer-meta-sep { width: 1px; height: 14px; background: var(--vscode-panel-border, rgba(128,128,128,0.3)); margin: 0 2px; flex-shrink: 0; }
-    .meta-grow { flex: 1; min-width: 0; }
+    .char-count {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      padding: 0 2px;
+      min-height: 12px;
+    }
     select {
       height: 22px; padding: 0 6px;
       border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
       border-radius: 4px;
       background: var(--vscode-dropdown-background, var(--vscode-input-background));
       color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
-      font-size: 11px; font-family: var(--vscode-font-family); max-width: 130px;
+      font-size: 11px; font-family: var(--vscode-font-family); width: 100%;
     }
     select:disabled { opacity: 0.6; cursor: not-allowed; }
     /* context bar → compact icon chips */
@@ -1518,9 +1553,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
 <body>
   <div class="topbar">
     <div class="tabs">
-      <button class="tab active" data-tab="chat" type="button" title="Chat">
+      <button class="tab active" data-tab="chat" type="button" title="Prompt">
         <svg class="tab-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M1 3c0-.6.4-1 1-1h12c.6 0 1 .4 1 1v8c0 .6-.4 1-1 1H9l-2 2-2-2H2c-.6 0-1-.4-1-1V3z"/></svg>
-        Chat
+        Prompt
       </button>
       <button class="tab" data-tab="plan" type="button" title="Plan">
         <svg class="tab-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M3 4h1v1H3V4zm3 0h7v1H6V4zm-3 4h1v1H3V8zm3 0h7v1H6V8zm-3 4h1v1H3v-1zm3 0h7v1H6v-1z"/></svg>
@@ -1621,31 +1656,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div id="planListHeading" class="plan-list-heading"><input id="planListSelectModeCb" type="checkbox" aria-label="Enable selection mode"><span>All Tasks</span><button id="planHeadingCollapseBtn" class="plan-tool-btn" type="button" title="Collapse All" aria-label="Collapse All">Collapse All</button></div>
     <div id="planList" class="list"></div>
-
-    <!-- Sidebar Sandbox -->
-    <div id="sidebarSandbox" class="sidebar-sandbox">
-      <button class="sidebar-sandbox-toggle collapsed" id="sbToggle" type="button">
-        <span class="sidebar-sandbox-icon">&#x25BC;</span>
-        <span class="sidebar-sandbox-label">Sandbox</span>
-        <span class="sidebar-sandbox-badge" id="sbBadge"></span>
-      </button>
-      <div class="sidebar-sandbox-body collapsed" id="sbBody">
-        <div class="sidebar-sandbox-row">
-          <span class="sidebar-sandbox-dot" id="sbDot"></span>
-          <span class="sidebar-sandbox-status" id="sbStatus">Not started</span>
-          <span class="sidebar-sandbox-framework" id="sbFramework"></span>
-        </div>
-        <div class="sidebar-sandbox-row">
-          <a class="sidebar-sandbox-url" id="sbUrl" style="display:none;"></a>
-        </div>
-        <div class="sidebar-sandbox-actions">
-          <button class="sb-btn primary" id="sbLaunch" type="button">Launch</button>
-          <button class="sb-btn" id="sbStop" type="button" style="display:none;">Stop</button>
-          <button class="sb-btn" id="sbScreenshot" type="button">Screenshot</button>
-        </div>
-      </div>
-    </div>
-
     <div id="historyTools" class="history-tools">
       <span class="tool-label">View</span>
       <select id="historyViewMode" class="tool-select">
@@ -1669,6 +1679,30 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     <div id="listEmpty" class="empty"></div>
   </div>
 
+  <!-- Sidebar Sandbox (above composer, visible on PLAN tab) -->
+  <div id="sidebarSandbox" class="sidebar-sandbox">
+    <button class="sidebar-sandbox-toggle collapsed" id="sbToggle" type="button">
+      <span class="sidebar-sandbox-icon">&#x25BC;</span>
+      <span class="sidebar-sandbox-label">Sandbox</span>
+      <span class="sidebar-sandbox-badge" id="sbBadge"></span>
+    </button>
+    <div class="sidebar-sandbox-body collapsed" id="sbBody">
+      <div class="sidebar-sandbox-row">
+        <span class="sidebar-sandbox-dot" id="sbDot"></span>
+        <span class="sidebar-sandbox-status" id="sbStatus">Not started</span>
+        <span class="sidebar-sandbox-framework" id="sbFramework"></span>
+      </div>
+      <div class="sidebar-sandbox-row">
+        <a class="sidebar-sandbox-url" id="sbUrl" style="display:none;"></a>
+      </div>
+      <div class="sidebar-sandbox-actions">
+        <button class="sb-btn primary" id="sbLaunch" type="button">Launch</button>
+        <button class="sb-btn" id="sbStop" type="button" style="display:none;">Stop</button>
+        <button class="sb-btn" id="sbScreenshot" type="button">Screenshot</button>
+      </div>
+    </div>
+  </div>
+
   <div class="composer">
     <div id="contextBar" class="context-bar">
       <span id="ctxPlan" class="ctx-chip">
@@ -1679,27 +1713,33 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         <svg viewBox="0 0 16 16"><circle cx="8" cy="8" r="5" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
         IDLE
       </span>
+      <span id="ctxCost" class="ctx-chip" style="display:none;">
+        <svg viewBox="0 0 16 16"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm.5 10.5v.5h-1v-.5A2.5 2.5 0 0 1 5.5 9h1A1.5 1.5 0 0 0 8 10.5zM8 9a1 1 0 1 1 0-2 1 1 0 0 1 0 2zm.5-3.5V5h-1v.5A2.5 2.5 0 0 1 5.5 8h1A1.5 1.5 0 0 0 8 9.5z"/></svg>
+        $0.00
+      </span>
     </div>
-    <div class="input-wrap" id="inputWrap">
-      <div id="imagePreviewBar" class="image-preview-bar">
-        <div class="image-preview-item">
-          <img id="imagePreviewThumb" class="image-preview-thumb" alt="Attached image" />
-          <button id="imageRemoveBtn" class="image-remove-btn" type="button" title="Remove image">&#x2715;</button>
+      <div class="input-wrap" id="inputWrap">
+        <div id="imagePreviewBar" class="image-preview-bar">
+          <div class="image-preview-item">
+            <img id="imagePreviewThumb" class="image-preview-thumb" alt="Attached image" />
+            <button id="imageRemoveBtn" class="image-remove-btn" type="button" title="Remove image">&#x2715;</button>
+          </div>
+        </div>
+        <div class="textarea-row">
+          <textarea id="prompt" placeholder="Describe a task for the AI agent..." rows="5"></textarea>
         </div>
       </div>
-      <div class="textarea-row">
-        <textarea id="prompt" placeholder="Describe what to build" rows="2"></textarea>
-        <button id="send" class="send" type="button" title="Run (Ctrl+Enter)"><svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor"><path d="M2.5 2L14 8l-11.5 6V9.5L9 8 2.5 6.5V2z"/></svg></button>
-      </div>
-    </div>
-    <div class="composer-meta">
-      <button class="composer-meta-btn" id="attachBtn" type="button" title="Attach file or image">
+    <div class="composer-actions">
+      <button id="send" class="run-btn" type="button" title="Run (Ctrl+Enter)">Run</button>
+      <button class="attach-btn" id="attachBtn" type="button" title="Attach file or image" aria-label="Attach file or image">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5.5l-6.4 6.4a3.2 3.2 0 01-4.5-4.5L9.5 1a2.1 2.1 0 013 3L6.1 10.4a1.1 1.1 0 01-1.5-1.5L10 3.5"/></svg>
       </button>
-      <div class="composer-meta-sep"></div>
-      <select id="engine"></select>
-      <span class="meta-grow"></span>
     </div>
+    <div class="engine-row">
+      <label class="engine-label" for="engine">Engine</label>
+      <select id="engine"></select>
+    </div>
+    <div id="promptCharCount" class="char-count">0 characters</div>
   </div>
 
   <script>
@@ -1767,6 +1807,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const listEmptyEl = document.getElementById('listEmpty');
     const ctxPlanEl = document.getElementById('ctxPlan');
     const ctxRunnerEl = document.getElementById('ctxRunner');
+    const ctxCostEl = document.getElementById('ctxCost');
+    const promptCharCountEl = document.getElementById('promptCharCount');
     let busy = false;
     let activeTab = 'chat';
     let chatItems = [];
@@ -1810,10 +1852,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
 
     function autoResize() {
       promptEl.style.height = 'auto';
-      promptEl.style.height = Math.min(Math.max(promptEl.scrollHeight, 52), 160) + 'px';
+      promptEl.style.height = Math.min(Math.max(promptEl.scrollHeight, 112), 260) + 'px';
     }
 
     function updateActionState() {
+      const charCount = promptEl.value.length;
+      promptCharCountEl.textContent = charCount === 1 ? '1 character' : charCount + ' characters';
       sendEl.disabled = busy || !promptEl.value.trim();
     }
 
@@ -2733,6 +2777,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       renderPlanListHeading();
       historyListEl.classList.toggle('active', activeTab === 'history');
       historyToolsEl.classList.toggle('active', activeTab === 'history');
+      sbSectionEl.classList.toggle('active', activeTab === 'plan');
 
       if (showChat) {
         listEmptyEl.classList.remove('active');
@@ -3142,6 +3187,14 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         if (msg.sandboxState) { renderSidebarSandbox(msg.sandboxState); }
       } else if (msg.type === 'sandbox-state') {
         renderSidebarSandbox(msg.sandboxState);
+      } else if (msg.type === 'sessionCost') {
+        const cost = typeof msg.cost === 'number' ? msg.cost : 0;
+        if (cost > 0 && ctxCostEl) {
+          ctxCostEl.textContent = '$' + cost.toFixed(cost < 0.01 ? 4 : 2);
+          ctxCostEl.style.display = '';
+        } else if (cost === 0 && ctxCostEl) {
+          ctxCostEl.style.display = 'none';
+        }
       }
     });
 

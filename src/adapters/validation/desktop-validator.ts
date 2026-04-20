@@ -9,6 +9,7 @@ import {
   ValidationRunOptions,
   ValidationStageResult,
 } from './types';
+import { resolveValidationProfile } from '../../models/execution-profiles';
 
 type DesktopTool = 'electron-playwright' | 'spectron' | 'winappdriver' | 'generic';
 
@@ -71,11 +72,13 @@ export class DesktopValidator implements ValidationAdapter {
     const stages: ValidationStageResult[] = [];
     const startedAt = Date.now();
 
-    // Always run unit tests
-    stages.push(await this.runStage('unit', this.unitCommand(cwd), cwd, env, signal, onOutput));
+    const { stages: enabledStages } = resolveValidationProfile(profile);
 
-    // UI (e2e) tests only for pr and full profiles
-    if ((profile === 'pr' || profile === 'full') && !signal.aborted) {
+    if (enabledStages.includes('unit')) {
+      stages.push(await this.runStage('unit', this.unitCommand(cwd), cwd, env, signal, onOutput));
+    }
+
+    if (enabledStages.includes('e2e') && !signal.aborted) {
       const uiCommand = this.uiCommand(cwd, tool);
       stages.push(await this.runStage('e2e', uiCommand, cwd, env, signal, onOutput));
     }

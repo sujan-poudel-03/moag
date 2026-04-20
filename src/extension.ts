@@ -983,6 +983,10 @@ export function activate(context: vscode.ExtensionContext): void {
     if (state === RunnerState.Idle) {
       savePauseState(context);
     }
+    // Reset session cost display when a new run starts
+    if (state === RunnerState.Playing) {
+      promptViewProvider?.postSessionCost(0);
+    }
   });
 
   runner.on('task-started', (task, playlist, fullPrompt) => {
@@ -1083,6 +1087,7 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
     notifyTaskCompleted(task);
+    promptViewProvider?.postSessionCost(runner.getSessionCost());
   });
 
   runner.on('task-failed', (task, result) => {
@@ -1240,7 +1245,6 @@ export function activate(context: vscode.ExtensionContext): void {
       updateEngineStatusBar(result.available);
       syncPromptProviderEngines(promptProvider, result.available);
     }),
-    vscode.commands.registerCommand('agentTaskPlayer.loadExamplePlan', cmdLoadExamplePlan),
     vscode.commands.registerCommand('agentTaskPlayer.showThreadList', cmdShowThreadList),
     vscode.commands.registerCommand('agentTaskPlayer.runPlanFile', cmdRunPlanFile),
     vscode.commands.registerCommand('agentTaskPlayer.bulkDelete', cmdBulkDelete),
@@ -1961,6 +1965,8 @@ async function runPromptSubmission(
     return false;
   }
 
+  void vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+
   const activePlan = getActivePlan();
   if (!activePlan) {
     runner.resetPlan(promptPlan);
@@ -2527,49 +2533,6 @@ async function cmdNewPlan(): Promise<void> {
   }
 
   await createPlanFromIdea(rawIdea, workspaceFolder);
-}
-
-async function cmdLoadExamplePlan(): Promise<void> {
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  if (!workspaceFolder) {
-    UserMsg.showError(UserMsg.noWorkspace());
-    return;
-  }
-
-  currentPlan = createEmptyPlan('Example: Todo CLI App');
-  currentPlan.description = 'Build a simple command-line todo app with add, list, complete, and delete operations. This is an example plan to show how MOAG works.';
-
-  const pl = currentPlan.playlists[0];
-  pl.name = 'Build Todo App';
-  pl.tasks = [
-    createTask(
-      'Set up project structure',
-      'Create a new Node.js project with a package.json. Set up a src/ directory with an index.ts entry point. Add TypeScript as a dev dependency and create a tsconfig.json with strict mode enabled.',
-    ),
-    createTask(
-      'Implement todo data model',
-      'Create src/todo.ts with a Todo interface (id, title, completed, createdAt) and a TodoStore class that stores todos in a JSON file. Implement methods: add(title), list(), complete(id), delete(id), and save/load from ~/.todos.json.',
-    ),
-    createTask(
-      'Build CLI interface',
-      'Update src/index.ts to parse command-line arguments using process.argv. Support these commands: add <title>, list, done <id>, delete <id>. Print a helpful usage message if no arguments are given. Use the TodoStore to persist data.',
-    ),
-    createTask(
-      'Add tests',
-      'Create src/todo.test.ts with unit tests for the TodoStore class. Test add, list, complete, and delete operations. Use a temp directory for the test JSON file. Make sure tests clean up after themselves.',
-    ),
-  ];
-
-  currentPlanPath = getNewPlanSavePath() || path.join(workspaceFolder.uri.fsPath, 'example-todo-app.agent-plan.json');
-  saveAndRefresh();
-  vscode.window.showInformationMessage(
-    'Example plan loaded! Click Play to start building, or explore the tasks first.',
-    'Play Now',
-  ).then(action => {
-    if (action === 'Play Now') {
-      vscode.commands.executeCommand('agentTaskPlayer.play');
-    }
-  });
 }
 
 async function cmdNewPlanFromTemplate(): Promise<void> {

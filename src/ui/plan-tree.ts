@@ -89,7 +89,7 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
           'task',
           element.playlistIndex,
           i,
-          task.name,
+          this.truncateLabel(task.name, 64),
           vscode.TreeItemCollapsibleState.None,
         );
         item.iconPath = this.taskIcon(task);
@@ -110,13 +110,9 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
 
   private playlistIcon(pl: Playlist): vscode.ThemeIcon {
     const allDone = pl.tasks.length > 0 && pl.tasks.every(t => t.status === TaskStatus.Completed);
-    const anyRunning = pl.tasks.some(t => t.status === TaskStatus.Running);
     const anyFailed = pl.tasks.some(t => t.status === TaskStatus.Failed);
-    const anyBlocked = pl.tasks.some(t => t.status === TaskStatus.Blocked);
     if (anyFailed) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('testing.iconFailed')); }
     if (allDone) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('testing.iconPassed')); }
-    if (anyRunning) { return new vscode.ThemeIcon('folder-opened', new vscode.ThemeColor('progressBar.background')); }
-    if (anyBlocked) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('editorWarning.foreground')); }
     return new vscode.ThemeIcon('folder', new vscode.ThemeColor('descriptionForeground'));
   }
 
@@ -124,23 +120,24 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
     switch (task.status) {
       case TaskStatus.Pending: return new vscode.ThemeIcon('circle-outline', new vscode.ThemeColor('descriptionForeground'));
       case TaskStatus.Running: return new vscode.ThemeIcon('loading~spin', new vscode.ThemeColor('progressBar.background'));
-      case TaskStatus.Paused: return new vscode.ThemeIcon('debug-pause', new vscode.ThemeColor('debugIcon.pauseForeground'));
       case TaskStatus.Completed: return new vscode.ThemeIcon('check', new vscode.ThemeColor('testing.iconPassed'));
       case TaskStatus.Failed: return new vscode.ThemeIcon('close', new vscode.ThemeColor('testing.iconFailed'));
-      case TaskStatus.Blocked: return new vscode.ThemeIcon('debug-disconnect', new vscode.ThemeColor('editorWarning.foreground'));
-      case TaskStatus.Skipped: return new vscode.ThemeIcon('circle-slash', new vscode.ThemeColor('descriptionForeground'));
-      default: return new vscode.ThemeIcon('circle-outline');
+      case TaskStatus.Paused:
+      case TaskStatus.Blocked:
+      case TaskStatus.Skipped:
+      default:
+        return new vscode.ThemeIcon('circle-outline', new vscode.ThemeColor('descriptionForeground'));
     }
   }
 
   private taskDescription(task: Task, playlist: Playlist): string {
     const executor = this.taskExecutorLabel(task, playlist);
-    return `${executor} | ${this.taskStatusLabel(task.status)}`;
+    return `${executor} ${this.taskSummaryStatus(task.status)}`;
   }
 
   private taskTooltip(task: Task): string {
-    const preview = this.promptPreview(task.prompt, 100);
-    return preview ? `${task.name}\n\n${preview}` : task.name;
+    const preview = this.promptPreview(task.prompt, 100) ?? 'No prompt';
+    return `${task.name}\n\nPrompt: ${preview}`;
   }
 
   private taskExecutorLabel(task: Task, playlist: Playlist): string {
@@ -153,18 +150,22 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
     return executor.charAt(0).toUpperCase() + executor.slice(1);
   }
 
-  private taskStatusLabel(status: TaskStatus): string {
+  private taskSummaryStatus(status: TaskStatus): string {
     switch (status) {
-      case TaskStatus.Completed: return 'done';
-      case TaskStatus.Failed: return 'failed';
-      case TaskStatus.Running: return 'running';
-      case TaskStatus.Paused: return 'paused';
-      case TaskStatus.Blocked: return 'blocked';
-      case TaskStatus.Skipped: return 'skipped';
-      case TaskStatus.Pending:
+      case TaskStatus.Completed:
+        return 'done';
+      case TaskStatus.Failed:
+        return 'failed';
       default:
         return 'pending';
     }
+  }
+
+  private truncateLabel(label: string, limit: number): string {
+    if (label.length <= limit) {
+      return label;
+    }
+    return `${label.substring(0, limit - 3)}...`;
   }
 
   private promptPreview(prompt: string | undefined, limit: number): string | undefined {

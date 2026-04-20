@@ -1,5 +1,5 @@
 import { strict as assert } from 'assert';
-import { RunSession } from '../../../models/run-session';
+import { RunSession, RunArtifact } from '../../../models/run-session';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const proxyquire = require('proxyquire').noCallThru();
@@ -170,6 +170,73 @@ describe('RunSessionStore', () => {
     store.create(makeSession({ id: 's2', engines: ['claude', 'codex', 'gemini'] }));
     const session = store.get('s2')!;
     assert.deepEqual(session.engines, ['claude', 'codex', 'gemini']);
+  });
+
+  it('should store and retrieve run artifacts with stageStatus and durationMs', () => {
+    const artifacts: RunArtifact[] = [
+      { taskId: 't1', taskName: 'Lint', target: 'lint.log', exists: true, stage: 'lint', stageStatus: 'pass', durationMs: 400 },
+      { taskId: 't2', taskName: 'E2E', target: 'e2e-report.html', exists: true, stage: 'e2e', stageStatus: 'fail', durationMs: 12000, failureSummary: 'assertion failed' },
+      { taskId: 't3', taskName: 'Unit', target: 'unit.xml', exists: false, stage: 'unit', stageStatus: 'skip', durationMs: 0 },
+    ];
+    store.create(makeSession({ id: 'stage-sess', artifacts }));
+    const retrieved = store.get('stage-sess')!;
+    assert.equal(retrieved.artifacts![0].stageStatus, 'pass');
+    assert.equal(retrieved.artifacts![0].durationMs, 400);
+    assert.equal(retrieved.artifacts![1].stageStatus, 'fail');
+    assert.equal(retrieved.artifacts![1].durationMs, 12000);
+    assert.equal(retrieved.artifacts![1].failureSummary, 'assertion failed');
+    assert.equal(retrieved.artifacts![2].stageStatus, 'skip');
+  });
+
+  it('should store and retrieve run artifacts', () => {
+    const artifact: RunArtifact = {
+      taskId: 'task-1',
+      taskName: 'E2E Tests',
+      target: 'test-results/report.html',
+      exists: true,
+      validationTarget: 'web',
+      stage: 'e2e',
+      screenshots: ['screenshots/fail.png'],
+      traces: ['traces/run.zip'],
+      logs: ['logs/test.log'],
+      failureSummary: 'Button not found',
+      flaky: false,
+    };
+    store.create(makeSession({ id: 'art-sess', artifacts: [artifact] }));
+    const retrieved = store.get('art-sess')!;
+    assert.ok(retrieved.artifacts);
+    assert.equal(retrieved.artifacts!.length, 1);
+    const a = retrieved.artifacts![0];
+    assert.equal(a.taskId, 'task-1');
+    assert.equal(a.validationTarget, 'web');
+    assert.equal(a.stage, 'e2e');
+    assert.deepEqual(a.screenshots, ['screenshots/fail.png']);
+    assert.deepEqual(a.traces, ['traces/run.zip']);
+    assert.deepEqual(a.logs, ['logs/test.log']);
+    assert.equal(a.failureSummary, 'Button not found');
+  });
+
+  it('should clamp artifacts and their string arrays on sanitize', () => {
+    const artifacts: RunArtifact[] = Array.from({ length: 5 }, (_, i) => ({
+      taskId: `task-${i}`,
+      taskName: `Task ${i}`,
+      target: 'a'.repeat(300),
+      exists: true,
+      failureSummary: 'x'.repeat(600),
+      screenshots: Array.from({ length: 25 }, (__, j) => `screen-${j}.png`),
+      traces: Array.from({ length: 15 }, (__, j) => `trace-${j}.zip`),
+      logs: Array.from({ length: 25 }, (__, j) => `log-${j}.txt`),
+    }));
+    store.create(makeSession({ id: 'clamp-sess', artifacts }));
+    const retrieved = store.get('clamp-sess')!;
+    assert.ok(retrieved.artifacts);
+    for (const a of retrieved.artifacts!) {
+      assert.ok(a.target.length <= 260, 'target should be clamped');
+      assert.ok((a.failureSummary ?? '').length <= 500, 'failureSummary should be clamped');
+      assert.ok((a.screenshots ?? []).length <= 20, 'screenshots should be clamped');
+      assert.ok((a.traces ?? []).length <= 10, 'traces should be clamped');
+      assert.ok((a.logs ?? []).length <= 20, 'logs should be clamped');
+    }
   });
 
   it('should trim oldest sessions when serialized sessions exceed byte budget', () => {

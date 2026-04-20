@@ -183,6 +183,46 @@ describe('HistoryStore', () => {
     assert.ok((persisted.verification?.output || '').length < 70, 'verification output should be truncated');
   });
 
+  it('should preserve stageStatus and durationMs on artifacts', () => {
+    const memento = createMemento();
+    const store = new HistoryStore(memento);
+    store.add(makeEntry({
+      artifacts: [
+        { target: 'report.html', exists: true, stage: 'e2e', stageStatus: 'fail', durationMs: 3200, failureSummary: 'timeout' },
+        { target: 'unit.xml', exists: true, stage: 'unit', stageStatus: 'pass', durationMs: 800 },
+        { target: 'skipped.log', exists: false, stage: 'lint', stageStatus: 'skip', durationMs: 0 },
+      ],
+    }));
+    const persisted = (memento._store['agentTaskPlayer.history'] as HistoryEntry[])[0];
+    assert.equal(persisted.artifacts![0].stageStatus, 'fail');
+    assert.equal(persisted.artifacts![0].durationMs, 3200);
+    assert.equal(persisted.artifacts![1].stageStatus, 'pass');
+    assert.equal(persisted.artifacts![2].stageStatus, 'skip');
+  });
+
+  it('should clamp artifact string arrays within history entries', () => {
+    const memento = createMemento();
+    const store = new HistoryStore(memento);
+    store.add(makeEntry({
+      artifacts: [{
+        target: 'a'.repeat(300),
+        exists: true,
+        failureSummary: 'x'.repeat(600),
+        screenshots: Array.from({ length: 25 }, (_, i) => `screen-${i}.png`),
+        traces: Array.from({ length: 15 }, (_, i) => `trace-${i}.zip`),
+        logs: Array.from({ length: 25 }, (_, i) => `log-${i}.txt`),
+      }],
+    }));
+
+    const persisted = (memento._store['agentTaskPlayer.history'] as HistoryEntry[])[0];
+    const a = persisted.artifacts![0];
+    assert.ok(a.target.length <= 260, 'target should be clamped');
+    assert.ok((a.failureSummary ?? '').length <= 500, 'failureSummary should be clamped');
+    assert.ok((a.screenshots ?? []).length <= 20, 'screenshots should be clamped');
+    assert.ok((a.traces ?? []).length <= 10, 'traces should be clamped');
+    assert.ok((a.logs ?? []).length <= 20, 'logs should be clamped');
+  });
+
   it('should trim oldest entries when serialized history exceeds byte budget', () => {
     vscodeMock.setMockConfig('agentTaskPlayer', {
       maxHistoryStorageBytes: 1800,

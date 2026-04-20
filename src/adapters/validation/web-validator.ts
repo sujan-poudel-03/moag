@@ -9,6 +9,7 @@ import {
   ValidationRunOptions,
   ValidationStageResult,
 } from './types';
+import { resolveValidationProfile } from '../../models/execution-profiles';
 
 /** Commands probed to detect web test tooling */
 const PLAYWRIGHT_MARKERS = ['playwright.config.ts', 'playwright.config.js'];
@@ -63,11 +64,11 @@ export class WebValidator implements ValidationAdapter {
     const stages: ValidationStageResult[] = [];
     const startedAt = Date.now();
 
-    // Quick: lint + unit only; pr: + integration; full: all including e2e
-    const runLint = true;
-    const runUnit = true;
-    const runIntegration = profile !== 'quick';
-    const runE2e = profile === 'full' || profile === 'pr';
+    const { stages: enabledStages } = resolveValidationProfile(profile);
+    const runLint = enabledStages.includes('lint');
+    const runUnit = enabledStages.includes('unit');
+    const runIntegration = enabledStages.includes('integration');
+    const runE2e = enabledStages.includes('e2e');
 
     if (runLint) {
       stages.push(await this.runStage('lint', this.lintCommand(cwd), cwd, env, signal, onOutput));

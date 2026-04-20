@@ -6,6 +6,7 @@ import { ClaudeAdapter } from './claude-adapter';
 import { GeminiAdapter } from './gemini-adapter';
 import { OllamaAdapter } from './ollama-adapter';
 import { CustomAdapter } from './custom-adapter';
+import { CopilotAdapter } from './copilot-adapter';
 
 export function registerAllEngines(): void {
   registerEngine(new CodexAdapter());
@@ -13,6 +14,7 @@ export function registerAllEngines(): void {
   registerEngine(new GeminiAdapter());
   registerEngine(new OllamaAdapter());
   registerEngine(new CustomAdapter());
+  registerEngine(new CopilotAdapter());
 }
 
 export { getEngine, getAllEngines, checkEngineAvailability } from './engine';
