@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.9.5] - 2026-04-23
+
+### Prompt Workspace Upgrades
+- Sidebar prompt workspace now supports inline task editing, one-click plan generation from prompt text, and active-file context injection for faster task authoring
+- Live task output streams directly in the prompt sidebar while runs are in progress
+- Task and session chips now show token usage and estimated cost metadata where available
+
+### Reliability and Retry Guidance
+- Added failure classification for auth, rate-limit, missing CLI, timeout, compile, test, and generic code failures to provide clearer recovery actions
+- Retry-with-note now pre-fills actionable auto-fix context by extracting meaningful error lines and filtering CLI startup noise
+- Improved stderr summarization by ignoring noisy preamble lines from agent CLIs before surfacing failure reasons
+
+### Sandbox Configuration
+- Plans can now define explicit sandbox targets (`sandbox.targets`) with per-target command/cwd/port to support monorepos and multi-service workspaces
+- Sandbox launch now accepts plan-level sandbox overrides instead of relying only on project auto-detection
+
 ## [0.9.4] - 2026-04-20
 
 ### GitHub Copilot Engine

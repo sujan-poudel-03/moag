@@ -109,8 +109,10 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
   }
 
   private playlistIcon(pl: Playlist): vscode.ThemeIcon {
+    const anyRunning = pl.tasks.some(t => t.status === TaskStatus.Running);
     const allDone = pl.tasks.length > 0 && pl.tasks.every(t => t.status === TaskStatus.Completed);
     const anyFailed = pl.tasks.some(t => t.status === TaskStatus.Failed);
+    if (anyRunning) { return new vscode.ThemeIcon('folder-opened', new vscode.ThemeColor('progressBar.background')); }
     if (anyFailed) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('testing.iconFailed')); }
     if (allDone) { return new vscode.ThemeIcon('folder', new vscode.ThemeColor('testing.iconPassed')); }
     return new vscode.ThemeIcon('folder', new vscode.ThemeColor('descriptionForeground'));
@@ -132,12 +134,12 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
 
   private taskDescription(task: Task, playlist: Playlist): string {
     const executor = this.taskExecutorLabel(task, playlist);
-    return `${executor} ${this.taskSummaryStatus(task.status)}`;
+    return `${executor} | ${this.taskSummaryStatus(task.status)}`;
   }
 
   private taskTooltip(task: Task): string {
     const preview = this.promptPreview(task.prompt, 100) ?? 'No prompt';
-    return `${task.name}\n\nPrompt: ${preview}`;
+    return `${task.name}\n\n${preview}`;
   }
 
   private taskExecutorLabel(task: Task, playlist: Playlist): string {
@@ -152,6 +154,8 @@ export class PlanTreeProvider implements vscode.TreeDataProvider<PlanTreeItem>, 
 
   private taskSummaryStatus(status: TaskStatus): string {
     switch (status) {
+      case TaskStatus.Running:
+        return 'running';
       case TaskStatus.Completed:
         return 'done';
       case TaskStatus.Failed:

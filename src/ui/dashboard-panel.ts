@@ -943,10 +943,29 @@ export class DashboardPanel {
     }
 
     /* ─── Diff Viewer ─── */
-    .diff-add { background: rgba(78,201,176,0.15); color: inherit; }
-    .diff-remove { background: rgba(244,71,71,0.15); color: inherit; }
-    .diff-hunk { color: var(--dimmed); font-style: italic; }
-    .diff-header { font-weight: 700; color: var(--fg); }
+    .diff-add { background: rgba(78,201,176,0.15); color: inherit; display: block; }
+    .diff-remove { background: rgba(244,71,71,0.15); color: inherit; display: block; }
+    .diff-hunk { color: var(--dimmed); font-style: italic; display: block; }
+    .diff-header { font-weight: 700; color: var(--fg); display: block; }
+    /* ─── Changed Files Panel ─── */
+    .ct-files { margin-top: 6px; }
+    .ct-files-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 3px; }
+    .ct-files-label { font-size: 10px; color: var(--dimmed); font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; }
+    .ct-file-list { display: flex; flex-direction: column; gap: 1px; margin-bottom: 4px; }
+    .ct-file-item { font-size: 10px; color: var(--fg); font-family: var(--vscode-editor-font-family, monospace); padding: 1px 0; opacity: 0.85; }
+    .ct-diff-toggle {
+      font-size: 10px; background: none; border: 1px solid var(--border); border-radius: 3px;
+      padding: 1px 6px; cursor: pointer; color: var(--dimmed);
+      font-family: var(--vscode-font-family);
+    }
+    .ct-diff-toggle:hover { color: var(--fg); border-color: var(--focus-border); }
+    .ct-diff {
+      font-size: 10px; line-height: 1.4; max-height: 200px; overflow-y: auto;
+      padding: 4px 6px; border-radius: 3px;
+      background: var(--terminal-bg, var(--bg));
+      font-family: var(--vscode-editor-font-family, monospace);
+      white-space: pre;
+    }
 
     /* ─── Sandbox Panel ─── */
     .sandbox-section { border-top: 1px solid var(--border); flex-shrink: 0; }
@@ -1924,6 +1943,8 @@ export class DashboardPanel {
         engine: state.engine || '',
         durationMs: msg.durationMs || 0,
         filesCount: Array.isArray(msg.changedFiles) ? msg.changedFiles.length : 0,
+        changedFiles: Array.isArray(msg.changedFiles) ? msg.changedFiles : [],
+        codeChanges: state.codeChanges || '',
         stderr: msg.stderr || '',
         output: state.output || msg.stdoutTail || '',
       });
@@ -1944,6 +1965,21 @@ export class DashboardPanel {
       if (!output) { return '(no output captured)'; }
       var lines = String(output).split('\\n');
       return lines.length > limit ? lines.slice(-limit).join('\\n') : lines.join('\\n');
+    }
+
+    function renderDiff(diffText) {
+      if (!diffText) { return ''; }
+      var lines = diffText.split('\\n').slice(0, 600);
+      return lines.map(function(line) {
+        var esc = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        if (/^(diff |index |--- |\\+\\+\\+ )/.test(line)) {
+          return '<span class="diff-header">' + esc + '</span>';
+        }
+        if (/^@@/.test(line)) { return '<span class="diff-hunk">' + esc + '</span>'; }
+        if (line.charAt(0) === '+') { return '<span class="diff-add">' + esc + '</span>'; }
+        if (line.charAt(0) === '-') { return '<span class="diff-remove">' + esc + '</span>'; }
+        return esc;
+      }).join('\\n');
     }
 
     function renderCompletedCards() {
@@ -2021,6 +2057,51 @@ export class DashboardPanel {
         outputDiv.className = 'terminal-output ct-detail-output';
         outputDiv.textContent = getOutputTail(entry.output || entry.stderr, 50);
         detail.appendChild(outputDiv);
+
+        // Changed files + diff panel
+        if (entry.changedFiles && entry.changedFiles.length > 0) {
+          var filesDiv = document.createElement('div');
+          filesDiv.className = 'ct-files';
+
+          var filesHeader = document.createElement('div');
+          filesHeader.className = 'ct-files-header';
+          var filesLabel = document.createElement('span');
+          filesLabel.className = 'ct-files-label';
+          filesLabel.textContent = entry.changedFiles.length + ' file' + (entry.changedFiles.length !== 1 ? 's' : '') + ' changed';
+          filesHeader.appendChild(filesLabel);
+          filesDiv.appendChild(filesHeader);
+
+          var fileList = document.createElement('div');
+          fileList.className = 'ct-file-list';
+          entry.changedFiles.forEach(function(f) {
+            var fi = document.createElement('div');
+            fi.className = 'ct-file-item';
+            fi.textContent = f;
+            fileList.appendChild(fi);
+          });
+          filesDiv.appendChild(fileList);
+
+          if (entry.codeChanges) {
+            var diffToggle = document.createElement('button');
+            diffToggle.className = 'ct-diff-toggle';
+            diffToggle.textContent = 'Show diff';
+            var diffDiv = document.createElement('pre');
+            diffDiv.className = 'ct-diff';
+            diffDiv.hidden = true;
+            diffDiv.innerHTML = renderDiff(entry.codeChanges);
+            diffToggle.addEventListener('click', function(e) {
+              e.stopPropagation();
+              var visible = !diffDiv.hidden;
+              diffDiv.hidden = visible;
+              diffToggle.textContent = visible ? 'Show diff' : 'Hide diff';
+            });
+            filesHeader.appendChild(diffToggle);
+            filesDiv.appendChild(diffDiv);
+          }
+
+          detail.appendChild(filesDiv);
+        }
+
         card.appendChild(detail);
         body.appendChild(card);
       });

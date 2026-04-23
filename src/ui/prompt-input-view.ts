@@ -5,6 +5,7 @@ export interface PromptInputSubmitRequest {
   prompt: string;
   engineId?: string;
   imageData?: string; // base64 data URI (e.g. data:image/png;base64,...)
+  activeFilePath?: string; // absolute path of the active editor file to inject into context
 }
 
 export interface PromptEngineOption {
@@ -27,7 +28,7 @@ export interface PromptSidebarPlanGroup {
   name: string;
   playlistStatus: string;
   progress: { done: number; total: number };
-  tasks: Array<{ id: string; name: string; status: string; failureReason?: string }>;
+  tasks: Array<{ id: string; name: string; status: string; failureReason?: string; tokenUsage?: { totalTokens?: number; estimatedCost?: number } }>;
 }
 
 export interface PromptSidebarChatMessage {
@@ -40,6 +41,7 @@ export interface PromptSidebarChatMessage {
   durationMs?: number;
   verificationPassed?: boolean;
   exitCode?: number;
+  tokenUsage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number; estimatedCost?: number };
 }
 
 export interface PromptSidebarRunnerState {
@@ -63,11 +65,15 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
   private _activePlanName = '';
   private _activePlaylistName = '';
   private _sandboxState: unknown = null;
+  private _liveOutputBuffer = new Map<string, string>();
+  private _liveFlushTimer: ReturnType<typeof setInterval> | null = null;
+  private _activeFile: { name: string; path: string } | null = null;
 
   constructor(
     private readonly _extensionUri: vscode.Uri,
     private readonly _onSubmit: (request: PromptInputSubmitRequest) => Promise<boolean>,
     private readonly _onOpenItem: (id: string, kind: 'thread' | 'run' | 'plan' | 'history') => void,
+    private readonly _onGeneratePlan?: (prompt: string) => Promise<void>,
   ) {}
 
   resolveWebviewView(
@@ -223,6 +229,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
             prompt: message.text.trim(),
             engineId: typeof message.engineId === 'string' ? message.engineId : undefined,
             imageData: typeof message.imageData === 'string' ? message.imageData : undefined,
+            activeFilePath: typeof message.activeFilePath === 'string' ? message.activeFilePath : undefined,
           });
           if (submitted) {
             this.clear();
@@ -230,6 +237,28 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         } finally {
           this.setBusy(false);
         }
+      }
+
+      if (message.type === 'generatePlan' && message.text?.trim()) {
+        this.setBusy(true);
+        try {
+          await this._onGeneratePlan?.(message.text.trim());
+          this.clear();
+        } finally {
+          this.setBusy(false);
+        }
+        return;
+      }
+
+      if (message.type === 'saveTaskEdit') {
+        const playlistIndex = Number(message.playlistIndex);
+        const taskIndex = Number(message.taskIndex);
+        const name = typeof message.name === 'string' ? message.name.trim() : '';
+        const prompt = typeof message.prompt === 'string' ? message.prompt : '';
+        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0 && name) {
+          void vscode.commands.executeCommand('agentTaskPlayer.saveTaskEdit', { playlistIndex, taskIndex, name, prompt });
+        }
+        return;
       }
 
       if (message.type === 'launchSandbox') {
@@ -289,8 +318,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     this._view?.webview.postMessage({ type: 'setBusy', busy });
   }
 
-  postSessionCost(costUsd: number): void {
-    this._view?.webview.postMessage({ type: 'sessionCost', cost: costUsd });
+  postSessionCost(costUsd: number, tokensIn = 0, tokensOut = 0): void {
+    this._view?.webview.postMessage({ type: 'sessionCost', cost: costUsd, tokensIn, tokensOut });
   }
 
   clear(): void {
@@ -313,6 +342,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     activePlanName: this._activePlanName,
     activePlaylistName: this._activePlaylistName,
     sandboxState: this._sandboxState,
+    activeFile: this._activeFile,
   });
   }
 
@@ -320,6 +350,48 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
   postSandboxState(state: unknown): void {
     this._sandboxState = state;
     this._view?.webview.postMessage({ type: 'sandbox-state', sandboxState: state });
+  }
+
+  /** Signal that a task has started — creates a live output block in the chat feed */
+  postLiveOutputStart(taskId: string, taskName: string): void {
+    this._liveOutputBuffer.delete(taskId);
+    this._view?.webview.postMessage({ type: 'live-output-start', taskId, taskName });
+  }
+
+  /**
+   * Buffer a raw output chunk and flush to the webview at 120ms intervals.
+   * Batching prevents overwhelming the sidebar with hundreds of small messages
+   * when an agent writes rapidly to stdout.
+   */
+  postLiveOutputChunk(taskId: string, text: string): void {
+    const current = this._liveOutputBuffer.get(taskId) ?? '';
+    this._liveOutputBuffer.set(taskId, current + text);
+
+    if (!this._liveFlushTimer) {
+      this._liveFlushTimer = setInterval(() => {
+        if (this._liveOutputBuffer.size === 0) {
+          clearInterval(this._liveFlushTimer!);
+          this._liveFlushTimer = null;
+          return;
+        }
+        for (const [id, buffered] of this._liveOutputBuffer) {
+          this._view?.webview.postMessage({ type: 'live-output-chunk', taskId: id, text: buffered });
+          this._liveOutputBuffer.delete(id);
+        }
+      }, 120);
+    }
+  }
+
+  /** Push the currently active editor file to the sidebar — shows as an injectable context pill */
+  postActiveFile(file: { name: string; path: string } | null): void {
+    this._activeFile = file;
+    this._view?.webview.postMessage({ type: 'active-file', file });
+  }
+
+  /** Signal that a task finished — updates the live block badge then lets syncState replace it */
+  postLiveOutputEnd(taskId: string, status: string): void {
+    this._liveOutputBuffer.delete(taskId);
+    this._view?.webview.postMessage({ type: 'live-output-end', taskId, status });
   }
 
   private _getHtml(): string {
@@ -502,6 +574,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     .item-subtitle.error {
       color: #f44747;
       font-size: 10px;
+      margin-top: -1px;
+    }
+    .item-subtitle.token-meta {
+      color: var(--vscode-descriptionForeground);
+      font-size: 10px;
+      opacity: 0.7;
       margin-top: -1px;
     }
     .run-badge {
@@ -1131,6 +1209,45 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       color: #cca700;
       background: rgba(204,167,0,0.12);
     }
+    .task-edit-panel {
+      padding: 8px 12px 10px 20px;
+      border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
+      background: var(--vscode-sideBar-background);
+    }
+    .task-edit-form { display: flex; flex-direction: column; gap: 6px; }
+    .task-edit-name, .task-edit-prompt {
+      font-size: 12px;
+      padding: 4px 6px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-input-foreground);
+      border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.3));
+      border-radius: 3px;
+      outline: none;
+      width: 100%;
+      box-sizing: border-box;
+    }
+    .task-edit-name:focus, .task-edit-prompt:focus { border-color: var(--vscode-focusBorder); }
+    .task-edit-prompt {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 11px;
+      resize: vertical;
+      min-height: 80px;
+    }
+    .task-edit-btns { display: flex; gap: 6px; justify-content: flex-end; }
+    .task-edit-save {
+      font-size: 10px; padding: 3px 10px;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none; border-radius: 3px; cursor: pointer;
+    }
+    .task-edit-save:hover { background: var(--vscode-button-hoverBackground); }
+    .task-edit-cancel {
+      font-size: 10px; padding: 3px 10px;
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
+      border-radius: 3px; cursor: pointer;
+    }
     .chip-row { display: inline-flex; gap: 4px; margin-left: 4px; }
     .chip {
       border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.25));
@@ -1395,6 +1512,74 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-foreground);
       font-weight: 600;
     }
+    .result-tokens {
+      color: var(--vscode-descriptionForeground);
+      opacity: 0.75;
+      cursor: default;
+    }
+
+    /* ─── Active File Pill ─── */
+    .file-pill-row {
+      display: flex; align-items: center; gap: 4px;
+      padding: 0 1px; min-height: 20px;
+    }
+    .file-pill {
+      display: inline-flex; align-items: center; gap: 4px;
+      font-size: 10px; padding: 2px 7px; border-radius: 10px;
+      background: rgba(0,120,212,0.12);
+      color: var(--vscode-textLink-foreground);
+      border: 1px solid rgba(0,120,212,0.22);
+      max-width: 200px; cursor: default;
+    }
+    .file-pill-icon { flex-shrink: 0; opacity: 0.75; }
+    .file-pill-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .file-pill-dismiss {
+      flex-shrink: 0; opacity: 0.55; cursor: pointer;
+      border: none; background: none; padding: 0; color: inherit;
+      font-size: 11px; line-height: 1;
+    }
+    .file-pill-dismiss:hover { opacity: 1; }
+    .file-pill-hint { font-size: 10px; color: var(--vscode-descriptionForeground); opacity: 0.6; }
+
+    /* ─── Live Output Block ─── */
+    .live-output-block {
+      margin: 6px 0 2px;
+      border-radius: 6px;
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
+      overflow: hidden;
+    }
+    .live-output-header {
+      display: flex; align-items: center; gap: 6px;
+      padding: 5px 10px;
+      background: var(--vscode-sideBarSectionHeader-background, rgba(128,128,128,0.05));
+    }
+    .live-output-task-name {
+      flex: 1; font-size: 11px; font-weight: 600;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .live-output-badge {
+      font-size: 10px; padding: 1px 7px; border-radius: 10px;
+      background: rgba(0,120,212,0.15); color: var(--vscode-textLink-foreground);
+    }
+    .live-output-badge.running {
+      animation: live-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes live-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+    .live-output-badge.completed {
+      background: rgba(76,175,80,0.18); color: #4caf50; animation: none;
+    }
+    .live-output-badge.failed {
+      background: rgba(244,71,71,0.18); color: #f44747; animation: none;
+    }
+    .live-output-body {
+      font-family: var(--vscode-editor-font-family, monospace);
+      font-size: 10px; line-height: 1.45;
+      padding: 6px 10px; margin: 0;
+      background: var(--vscode-terminal-background, rgba(0,0,0,0.25));
+      color: var(--vscode-terminal-foreground, inherit);
+      max-height: 140px; overflow-y: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
 
     .composer {
       flex-shrink: 0;
@@ -1511,6 +1696,27 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
     .attach-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .gen-plan-btn {
+      height: 32px;
+      padding: 0 10px;
+      border: 1px solid var(--vscode-button-border, var(--vscode-panel-border));
+      border-radius: 8px;
+      background: var(--vscode-input-background);
+      color: var(--vscode-descriptionForeground);
+      cursor: pointer;
+      font-size: 11px;
+      font-weight: 500;
+      white-space: nowrap;
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .gen-plan-btn svg { width: 11px; height: 11px; flex-shrink: 0; }
+    .gen-plan-btn:hover:not(:disabled) {
+      color: var(--vscode-foreground);
+      background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+    }
+    .gen-plan-btn:disabled { opacity: 0.45; cursor: not-allowed; }
     .engine-row {
       display: flex; align-items: center; gap: 4px;
       padding: 0 1px;
@@ -1729,8 +1935,20 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           <textarea id="prompt" placeholder="Describe a task for the AI agent..." rows="5"></textarea>
         </div>
       </div>
+    <div class="file-pill-row" id="filePillRow" style="display:none">
+      <div class="file-pill" id="filePill">
+        <svg class="file-pill-icon" viewBox="0 0 16 16" fill="currentColor" width="10" height="10"><path d="M9 1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V5L9 1zm0 1.5L12.5 5H9V2.5z"/></svg>
+        <span class="file-pill-name" id="filePillName"></span>
+        <button class="file-pill-dismiss" id="filePillDismiss" type="button" title="Remove from context">&#x2715;</button>
+      </div>
+      <span class="file-pill-hint">will be included in prompt</span>
+    </div>
     <div class="composer-actions">
       <button id="send" class="run-btn" type="button" title="Run (Ctrl+Enter)">Run</button>
+      <button id="generatePlanBtn" class="gen-plan-btn" type="button" title="Generate a structured task plan from this description">
+        <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1l1.2 3.8L13 6l-3.8 1.2L8 11l-1.2-3.8L3 6l3.8-1.2L8 1z"/><circle cx="13" cy="2" r="1"/><circle cx="3" cy="13" r="1"/></svg>
+        Plan
+      </button>
       <button class="attach-btn" id="attachBtn" type="button" title="Attach file or image" aria-label="Attach file or image">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M14 5.5l-6.4 6.4a3.2 3.2 0 01-4.5-4.5L9.5 1a2.1 2.1 0 013 3L6.1 10.4a1.1 1.1 0 01-1.5-1.5L10 3.5"/></svg>
       </button>
@@ -1746,6 +1964,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const vscode = acquireVsCodeApi();
     const promptEl = document.getElementById('prompt');
     const sendEl = document.getElementById('send');
+    const generatePlanBtnEl = document.getElementById('generatePlanBtn');
     const engineEl = document.getElementById('engine');
     const attachBtnEl = document.getElementById('attachBtn');
     const dashboardBtnEl = document.getElementById('dashboardBtn');
@@ -1755,7 +1974,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const imagePreviewBarEl = document.getElementById('imagePreviewBar');
     const imagePreviewThumbEl = document.getElementById('imagePreviewThumb');
     const imageRemoveBtnEl = document.getElementById('imageRemoveBtn');
+    const filePillRowEl = document.getElementById('filePillRow');
+    const filePillNameEl = document.getElementById('filePillName');
+    const filePillDismissEl = document.getElementById('filePillDismiss');
     let attachedImage = null;
+    let activeFile = null; // { name, path } | null
+    let activeFileDismissed = false;
     const tabEls = Array.from(document.querySelectorAll('.tab'));
     const chatScreenEl = document.getElementById('chatScreen');
     const chatTitleEl = document.getElementById('chatTitle');
@@ -1858,7 +2082,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     function updateActionState() {
       const charCount = promptEl.value.length;
       promptCharCountEl.textContent = charCount === 1 ? '1 character' : charCount + ' characters';
-      sendEl.disabled = busy || !promptEl.value.trim();
+      const hasText = !!promptEl.value.trim();
+      sendEl.disabled = busy || !hasText;
+      if (generatePlanBtnEl) { generatePlanBtnEl.disabled = busy || !hasText; }
     }
 
     function renderEngines(engines, selectedEngineId) {
@@ -2169,10 +2395,21 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
                     ? ICON_SKIPPED
                     : ICON_PENDING;
           const isFailedLike = status === 'failed' || status === 'blocked';
+          const editBtnHtml = status !== 'running' ? '<button type="button" class="task-act-btn task-edit-btn" title="Edit task">✏</button>' : '';
           const actionButtons = isFailedLike
             ? '<button type="button" class="task-act-btn task-retry">Retry</button>' +
-              '<button type="button" class="task-act-btn task-fix">Fix</button>'
-            : '<button type="button" class="task-act-btn task-toggle">' + escHtml(status === 'running' ? 'Pause' : 'Play') + '</button>';
+              '<button type="button" class="task-act-btn task-fix">Fix</button>' +
+              editBtnHtml
+            : '<button type="button" class="task-act-btn task-toggle">' + escHtml(status === 'running' ? 'Pause' : 'Play') + '</button>' +
+              editBtnHtml;
+          const tokenMeta = (() => {
+            const u = task.tokenUsage;
+            if (!u || (!u.totalTokens && !u.estimatedCost)) { return ''; }
+            const parts: string[] = [];
+            if (u.totalTokens) { parts.push((u.totalTokens >= 1000 ? (u.totalTokens / 1000).toFixed(1) + 'K' : String(u.totalTokens)) + ' tok'); }
+            if (u.estimatedCost) { parts.push('$' + u.estimatedCost.toFixed(u.estimatedCost < 0.01 ? 4 : 2)); }
+            return parts.length ? '<span class="item-subtitle token-meta">' + escHtml(parts.join(' · ')) + '</span>' : '';
+          })();
           taskBtn.innerHTML =
             '<div class="task-row">' +
               '<input type="checkbox" class="task-check"' + (selectedTasks[taskKey] ? ' checked' : '') + '>' +
@@ -2180,6 +2417,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
                 '<span class="item-title"><span class="item-dot"></span>' + escHtml(task.name || 'Untitled task') + '</span>' +
                 '<span class="item-subtitle">' + escHtml(statusLabel) + '</span>' +
                 (failureReason ? '<span class="item-subtitle error" title="' + escHtml(failureReason) + '">' + escHtml(failureReason) + '</span>' : '') +
+                tokenMeta +
                 (status === 'running' ? '<span class="run-badge">Running</span>' : '') +
               '</button>' +
               '<span class="task-actions' + (status === 'running' || isFailedLike ? ' always-visible' : '') + '">' +
@@ -2232,7 +2470,42 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
             event.stopPropagation();
             vscode.postMessage({ type: 'retryTaskWithNote', playlistIndex: i, taskIndex: originalIndex });
           });
+
+          const editPanel = document.createElement('div');
+          editPanel.className = 'task-edit-panel';
+          editPanel.style.display = 'none';
+          editPanel.innerHTML =
+            '<div class="task-edit-form">' +
+              '<input class="task-edit-name" type="text" value="' + escHtml(task.name || '') + '" placeholder="Task name">' +
+              '<textarea class="task-edit-prompt" rows="5" placeholder="Task prompt">' + escHtml(task.prompt || '') + '</textarea>' +
+              '<div class="task-edit-btns">' +
+                '<button type="button" class="task-edit-cancel">Cancel</button>' +
+                '<button type="button" class="task-edit-save">Save</button>' +
+              '</div>' +
+            '</div>';
+
+          const editBtnEl = taskBtn.querySelector('.task-edit-btn');
+          editBtnEl?.addEventListener('click', (event) => {
+            event.stopPropagation();
+            const open = editPanel.style.display !== 'none';
+            editPanel.style.display = open ? 'none' : 'block';
+            if (!open) { (editPanel.querySelector('.task-edit-name'))?.focus(); }
+          });
+
+          editPanel.querySelector('.task-edit-save')?.addEventListener('click', () => {
+            const nameVal = ((editPanel.querySelector('.task-edit-name'))?.value || '').trim();
+            const promptVal = (editPanel.querySelector('.task-edit-prompt'))?.value || '';
+            if (!nameVal) { (editPanel.querySelector('.task-edit-name'))?.focus(); return; }
+            vscode.postMessage({ type: 'saveTaskEdit', playlistIndex: i, taskIndex: originalIndex, name: nameVal, prompt: promptVal });
+            editPanel.style.display = 'none';
+          });
+
+          editPanel.querySelector('.task-edit-cancel')?.addEventListener('click', () => {
+            editPanel.style.display = 'none';
+          });
+
           targetEl.appendChild(taskBtn);
+          targetEl.appendChild(editPanel);
         }
       }
       if (!renderedAny) {
@@ -2533,12 +2806,27 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       const files = typeof msg.changedFilesCount === 'number' ? msg.changedFilesCount : 0;
       const duration = formatDuration(msg.durationMs);
       const fileLabel = files === 1 ? '1 file' : files + ' files';
+      const u = msg.tokenUsage;
+      const totalTok = (u && ((u.totalTokens || 0) || ((u.inputTokens || 0) + (u.outputTokens || 0)))) || 0;
+      const tokLabel = totalTok > 0
+        ? (totalTok >= 1000 ? (totalTok / 1000).toFixed(1) + 'K' : String(totalTok)) + ' tok'
+        : '';
+      const costLabel = u && u.estimatedCost > 0
+        ? '$' + u.estimatedCost.toFixed(u.estimatedCost < 0.01 ? 4 : 2)
+        : '';
+      const tokTitle = u && u.inputTokens
+        ? 'In: ' + (u.inputTokens || 0).toLocaleString() + '  Out: ' + (u.outputTokens || 0).toLocaleString() + '  Total: ' + totalTok.toLocaleString()
+        : '';
       return (
         '<div class="result-card">' +
           '<span class="result-pill ' + escHtml(normalized) + '">' + escHtml(outcome) + '</span>' +
           '<span class="result-strong">' + escHtml(fileLabel) + '</span>' +
           '<span class="result-sep">' + ICON_DOT + '</span>' +
           '<span>' + escHtml(duration) + '</span>' +
+          (tokLabel || costLabel
+            ? '<span class="result-sep">' + ICON_DOT + '</span>' +
+              '<span class="result-tokens" title="' + escHtml(tokTitle) + '">' + escHtml([tokLabel, costLabel].filter(Boolean).join(' · ')) + '</span>'
+            : '') +
         '</div>'
       );
     }
@@ -2804,17 +3092,26 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       imagePreviewBarEl.classList.remove('visible');
     }
 
+    function updateFilePill() {
+      if (!filePillRowEl || !filePillNameEl) { return; }
+      const show = activeFile && !activeFileDismissed;
+      filePillRowEl.style.display = show ? '' : 'none';
+      if (show && activeFile) { filePillNameEl.textContent = activeFile.name; }
+    }
+
     function submit() {
       const text = promptEl.value.trim();
       if (!text || sendEl.disabled) {
         return;
       }
       setActiveTab('chat');
+      const injectPath = (activeFile && !activeFileDismissed) ? activeFile.path : undefined;
       vscode.postMessage({
         type: 'submit',
         text,
         engineId: engineEl.disabled ? undefined : engineEl.value,
         imageData: attachedImage || undefined,
+        activeFilePath: injectPath,
       });
     }
 
@@ -2825,6 +3122,15 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
 
     sendEl.addEventListener('click', submit);
+    generatePlanBtnEl?.addEventListener('click', () => {
+      const text = promptEl.value.trim();
+      if (!text || generatePlanBtnEl.disabled) { return; }
+      vscode.postMessage({ type: 'generatePlan', text });
+    });
+    filePillDismissEl?.addEventListener('click', () => {
+      activeFileDismissed = true;
+      updateFilePill();
+    });
     newChatBtnEl.addEventListener('click', () => vscode.postMessage({ type: 'newThread' }));
     dashboardBtnEl.addEventListener('click', () => vscode.postMessage({ type: 'showDashboard' }));
     attachBtnEl.addEventListener('click', function() {
@@ -3185,15 +3491,75 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         engineEl.disabled = busy || engineEl.options.length === 0 || engineEl.value === '';
         updateActionState();
         if (msg.sandboxState) { renderSidebarSandbox(msg.sandboxState); }
+        if (msg.activeFile !== undefined) { activeFile = msg.activeFile || null; updateFilePill(); }
+      } else if (msg.type === 'active-file') {
+        const prev = activeFile ? activeFile.path : null;
+        activeFile = msg.file || null;
+        // Auto-show pill when a new file becomes active; reset dismissed state
+        if (activeFile && activeFile.path !== prev) { activeFileDismissed = false; }
+        updateFilePill();
       } else if (msg.type === 'sandbox-state') {
         renderSidebarSandbox(msg.sandboxState);
       } else if (msg.type === 'sessionCost') {
         const cost = typeof msg.cost === 'number' ? msg.cost : 0;
-        if (cost > 0 && ctxCostEl) {
-          ctxCostEl.textContent = '$' + cost.toFixed(cost < 0.01 ? 4 : 2);
+        const tokensIn = typeof msg.tokensIn === 'number' ? msg.tokensIn : 0;
+        const tokensOut = typeof msg.tokensOut === 'number' ? msg.tokensOut : 0;
+        const totalTok = tokensIn + tokensOut;
+        if ((cost > 0 || totalTok > 0) && ctxCostEl) {
+          const tokStr = totalTok > 0
+            ? (totalTok >= 1000 ? (totalTok / 1000).toFixed(1) + 'K' : String(totalTok)) + ' tok'
+            : '';
+          const costStr = cost > 0 ? '$' + cost.toFixed(cost < 0.01 ? 4 : 2) : '';
+          ctxCostEl.textContent = [tokStr, costStr].filter(Boolean).join(' · ');
+          ctxCostEl.title = tokensIn > 0
+            ? 'Input: ' + tokensIn.toLocaleString() + ' · Output: ' + tokensOut.toLocaleString() + ' · Total: ' + totalTok.toLocaleString() + ' tokens'
+            : '';
           ctxCostEl.style.display = '';
         } else if (cost === 0 && ctxCostEl) {
           ctxCostEl.style.display = 'none';
+        }
+      } else if (msg.type === 'live-output-start') {
+        // Auto-switch to chat tab so the user sees the live stream
+        setActiveTab('chat');
+        var block = document.getElementById('live-block-' + msg.taskId);
+        if (!block) {
+          block = document.createElement('div');
+          block.id = 'live-block-' + msg.taskId;
+          block.className = 'live-output-block';
+          chatFeedEl.appendChild(block);
+          chatEmptyEl.style.display = 'none';
+        }
+        block.innerHTML =
+          '<div class="live-output-header">' +
+            '<svg class="msg-avatar" viewBox="0 0 16 16" fill="currentColor"><path d="M9 1L3 9h5l-1 6 6-8H8L9 1z"/></svg>' +
+            '<span class="live-output-task-name">' + escHtml(msg.taskName || 'Running...') + '</span>' +
+            '<span class="live-output-badge running" id="live-badge-' + msg.taskId + '">running</span>' +
+          '</div>' +
+          '<pre class="live-output-body" id="live-body-' + msg.taskId + '"></pre>';
+        chatFeedEl.scrollTop = chatFeedEl.scrollHeight;
+
+      } else if (msg.type === 'live-output-chunk') {
+        var bodyEl = document.getElementById('live-body-' + msg.taskId);
+        if (bodyEl) {
+          // Keep last 4000 chars to avoid unbounded DOM growth
+          var combined = (bodyEl.textContent || '') + (msg.text || '');
+          bodyEl.textContent = combined.length > 4000 ? combined.slice(-4000) : combined;
+          bodyEl.scrollTop = bodyEl.scrollHeight;
+        }
+
+      } else if (msg.type === 'live-output-end') {
+        var badge = document.getElementById('live-badge-' + msg.taskId);
+        if (badge) {
+          var passed = msg.status === 'completed';
+          badge.textContent = passed ? 'done' : 'failed';
+          badge.className = 'live-output-badge ' + (passed ? 'completed' : 'failed');
+        }
+        // Remove block after brief pause — syncState will re-render the real result card
+        var endBlock = document.getElementById('live-block-' + msg.taskId);
+        if (endBlock) {
+          setTimeout(function() {
+            if (endBlock.parentNode) { endBlock.parentNode.removeChild(endBlock); }
+          }, 1800);
         }
       }
     });

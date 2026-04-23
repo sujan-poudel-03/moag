@@ -76,9 +76,23 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
     });
 
     // Pipe prompt via stdin if configured (avoids Windows command-line length limit)
-    if (config.useStdin && proc.stdin) {
-      proc.stdin.write(options.prompt);
-      proc.stdin.end();
+    if (config.useStdin) {
+      if (!proc.stdin) {
+        // stdin pipe allocation failed — this is a crash path on Windows when shell:true
+        // and the child process is not spawned correctly. Fail fast with a clear message.
+        reject(new Error(
+          `Failed to open stdin pipe for "${config.command}". ` +
+          `Ensure the CLI is installed and accessible. On Windows, try reinstalling via npm.`
+        ));
+        return;
+      }
+      try {
+        proc.stdin.write(options.prompt, 'utf-8');
+        proc.stdin.end();
+      } catch (stdinErr) {
+        reject(new Error(`Failed to write prompt to "${config.command}" stdin: ${stdinErr instanceof Error ? stdinErr.message : String(stdinErr)}`));
+        return;
+      }
     }
 
     let stdout = '';

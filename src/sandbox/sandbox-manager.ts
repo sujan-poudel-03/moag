@@ -6,6 +6,7 @@ import { EventEmitter } from 'events';
 import { spawn, ChildProcess } from 'child_process';
 import * as net from 'net';
 import { detectProject, ProjectInfo } from './project-detector';
+import { SandboxConfig } from '../models/types';
 
 export type SandboxStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -33,13 +34,34 @@ export class SandboxManager extends EventEmitter {
     return { ...this._state };
   }
 
-  /** Detect project type and start the appropriate sandbox environment. */
-  async launch(cwd: string): Promise<void> {
+  /**
+   * Detect project type and start the appropriate sandbox environment.
+   * Pass an optional SandboxConfig from the plan to override auto-detection.
+   */
+  async launch(cwd: string, config?: SandboxConfig): Promise<void> {
     if (this._state.status === 'running' || this._state.status === 'starting') {
       return;
     }
 
-    const info = detectProject(cwd);
+    // Build a ProjectInfo from the plan's sandbox config if provided
+    let info: ProjectInfo;
+    if (config?.command) {
+      info = { type: 'web', framework: 'Custom', devCommand: config.command, defaultPort: config.port ?? 3000 };
+    } else if (config?.targets && config.targets.length > 0) {
+      // Launch first target (multi-target support: start all and track first URL)
+      const first = config.targets[0];
+      const effectiveCwd = first.cwd ? (require('path').isAbsolute(first.cwd) ? first.cwd : require('path').join(cwd, first.cwd)) : cwd;
+      info = { type: 'web', framework: first.name, devCommand: first.command, defaultPort: first.port ?? 3000, resolvedCwd: effectiveCwd };
+      // Launch additional targets in background (fire-and-forget)
+      for (let i = 1; i < config.targets.length; i++) {
+        const t = config.targets[i];
+        const tCwd = t.cwd ? (require('path').isAbsolute(t.cwd) ? t.cwd : require('path').join(cwd, t.cwd)) : cwd;
+        this._spawnBackground(t.command, tCwd);
+      }
+    } else {
+      info = detectProject(cwd);
+    }
+
     this._setState({
       status: 'starting',
       projectInfo: info,
@@ -49,21 +71,28 @@ export class SandboxManager extends EventEmitter {
     });
 
     if (info.type === 'unknown' || !info.devCommand) {
-      this._setState({
-        ...this._state,
-        status: 'error',
-        error: 'Could not detect project type. Add a package.json or pubspec.yaml.',
-      });
+      const hint = info.framework === 'monorepo'
+        ? 'Monorepo detected but no runnable app found. Add a "sandbox" field to your plan JSON with explicit targets.'
+        : 'Could not detect project type. Add a package.json or pubspec.yaml, or set "sandbox.command" in your plan.';
+      this._setState({ ...this._state, status: 'error', error: hint });
       return;
     }
 
+    const effectiveCwd = info.resolvedCwd ?? cwd;
     if (info.type === 'web') {
-      this._launchWebServer(cwd, info);
+      this._launchWebServer(effectiveCwd, info);
     } else if (info.type === 'mobile') {
-      this._launchMobileApp(cwd, info);
+      this._launchMobileApp(effectiveCwd, info);
     } else if (info.type === 'desktop') {
-      this._launchDesktopApp(cwd, info);
+      this._launchDesktopApp(effectiveCwd, info);
     }
+  }
+
+  /** Start a background process without tracking its URL or state. */
+  private _spawnBackground(command: string, cwd: string): void {
+    const [cmd, ...args] = command.split(' ');
+    const proc = spawn(cmd, args, { cwd, shell: true, stdio: 'ignore', detached: false });
+    proc.on('error', () => { /* background — ignore */ });
   }
 
   /** Stop the running sandbox process. */

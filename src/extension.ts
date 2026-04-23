@@ -261,11 +261,16 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
       return undefined;
     }
     const merged = [latest.result.stderr, latest.result.stdout].filter(Boolean).join('\n');
-    const firstLine = merged
-      .split(/\r?\n/)
-      .map(line => line.trim())
-      .find(line => line.length > 0);
-    return firstLine ? firstLine.substring(0, 160) : undefined;
+    const lines = merged.split(/\r?\n/).map(line => line.trim()).filter(line => line.length > 0);
+    // Skip known Claude Code / Codex startup noise that isn't the real error
+    const noisePatterns = [
+      /^reading prompt from stdin/i,
+      /^─+\s*(command|response)\s*─+/i,
+      /^github copilot/i,
+      /^claude code/i,
+    ];
+    const errorLine = lines.find(line => !noisePatterns.some(p => p.test(line)));
+    return errorLine ? errorLine.substring(0, 160) : undefined;
   };
 
   return plan.playlists.map((playlist, index) => {
@@ -291,12 +296,18 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
       name: playlist.name || `Playlist ${index + 1}`,
       playlistStatus: status,
       progress: { done, total },
-      tasks: tasks.map((task) => ({
-        id: task.id,
-        name: task.name,
-        status: task.status ?? 'pending',
-        failureReason: getTaskFailureReason(task),
-      })),
+      tasks: tasks.map((task) => {
+        const latestEntry = historyStore.getForTask(task.id)[0];
+        return {
+          id: task.id,
+          name: task.name,
+          status: task.status ?? 'pending',
+          failureReason: getTaskFailureReason(task),
+          tokenUsage: latestEntry?.result.tokenUsage
+            ? { totalTokens: latestEntry.result.tokenUsage.totalTokens, estimatedCost: latestEntry.result.tokenUsage.estimatedCost }
+            : undefined,
+        };
+      }),
     };
   });
 }
@@ -496,6 +507,7 @@ function getPromptSidebarChatState(): { title: string; messages: PromptSidebarCh
           durationMs: entry.result.durationMs,
           verificationPassed: entry.verification?.passed,
           exitCode: entry.result.exitCode,
+          tokenUsage: entry.result.tokenUsage,
         });
       }
 
@@ -894,7 +906,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Register prompt input webview in sidebar
   const promptProvider = new PromptInputViewProvider(
     context.extensionUri,
-    async ({ prompt, engineId, imageData }) => {
+    async ({ prompt, engineId, imageData, activeFilePath }) => {
       let finalPrompt = prompt;
       if (imageData) {
         const match = imageData.match(/^data:(image\/[\w+]+);base64,(.+)$/s);
@@ -904,6 +916,18 @@ export function activate(context: vscode.ExtensionContext): void {
           fs.writeFileSync(tmpFile, Buffer.from(match[2], 'base64'));
           finalPrompt = `${prompt}\n\n[Attached image: ${tmpFile}]`;
         }
+      }
+      if (activeFilePath) {
+        try {
+          const content = fs.readFileSync(activeFilePath, 'utf-8');
+          const MAX_FILE_CHARS = 20_000;
+          const truncated = content.length > MAX_FILE_CHARS
+            ? content.slice(0, MAX_FILE_CHARS) + '\n...[file truncated]'
+            : content;
+          const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+          const relPath = root ? path.relative(root, activeFilePath) : path.basename(activeFilePath);
+          finalPrompt = `[Active file: ${relPath}]\n\`\`\`\n${truncated}\n\`\`\`\n\n${finalPrompt}`;
+        } catch { /* unreadable — proceed without it */ }
       }
       return runPromptSubmission(finalPrompt, isEngineId(engineId) ? engineId : undefined);
     },
@@ -936,12 +960,28 @@ export function activate(context: vscode.ExtensionContext): void {
       }
       cmdShowHistory();
     },
+    async (prompt: string) => {
+      await generatePlanFromDashboardPrompt(prompt);
+    },
   );
   promptViewProvider = promptProvider;
   syncPromptProviderEngines(
     promptProvider,
     context.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []),
   );
+
+  // Push the active editor file to the sidebar whenever it changes
+  const pushActiveFile = () => {
+    const editor = vscode.window.activeTextEditor;
+    if (editor && !editor.document.isUntitled && editor.document.uri.scheme === 'file') {
+      promptProvider.postActiveFile({ name: path.basename(editor.document.fileName), path: editor.document.fileName });
+    } else {
+      promptProvider.postActiveFile(null);
+    }
+  };
+  pushActiveFile();
+  context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(pushActiveFile));
+
   schedulePromptProviderSidebarSync(0);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(PromptInputViewProvider.viewType, promptProvider),
@@ -1019,6 +1059,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
     scheduleDashboardUpdate();
     DashboardPanel.currentPanel?.startTaskCard(task, playlist, fullPrompt);
+    promptViewProvider?.postLiveOutputStart(task.id, task.name);
 
     // Show real progress in status bar and notification
     const shortName = task.name.length > 40 ? task.name.substring(0, 37) + '...' : task.name;
@@ -1029,6 +1070,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   runner.on('task-output', (task, chunk, stream) => {
     DashboardPanel.currentPanel?.appendOutput(chunk, stream, task.id);
+    promptViewProvider?.postLiveOutputChunk(task.id, chunk);
   });
 
   runner.on('engine-fallback', ({ taskId, fromEngine, toEngine }) => {
@@ -1087,7 +1129,9 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
     notifyTaskCompleted(task);
-    promptViewProvider?.postSessionCost(runner.getSessionCost());
+    const { tokensIn, tokensOut } = runner.getSessionTokens();
+    promptViewProvider?.postSessionCost(runner.getSessionCost(), tokensIn, tokensOut);
+    promptViewProvider?.postLiveOutputEnd(task.id, task.status);
   });
 
   runner.on('task-failed', (task, result) => {
@@ -1118,6 +1162,7 @@ export function activate(context: vscode.ExtensionContext): void {
     const shortErr = result.stderr.split('\n').filter(l => l.trim()).slice(0, 1).join('').substring(0, 80);
     vscode.window.setStatusBarMessage(`$(warning) Task "${task.name}" failed: ${shortErr || 'exit ' + result.exitCode}`, 5000);
     notifyTaskFailed(task);
+    promptViewProvider?.postLiveOutputEnd(task.id, task.status);
   });
 
   runner.on('playlist-completed', (_playlist) => {
@@ -1218,6 +1263,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.addPlaylist', cmdAddPlaylist),
     vscode.commands.registerCommand('agentTaskPlayer.addTask', cmdAddTask),
     vscode.commands.registerCommand('agentTaskPlayer.editTask', cmdEditTask),
+    vscode.commands.registerCommand('agentTaskPlayer.saveTaskEdit', cmdSaveTaskEdit),
     vscode.commands.registerCommand('agentTaskPlayer.deleteItem', cmdDeleteItem),
     vscode.commands.registerCommand('agentTaskPlayer.moveUp', cmdMoveUp),
     vscode.commands.registerCommand('agentTaskPlayer.moveDown', cmdMoveDown),
@@ -1295,7 +1341,7 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
       ensureDashboardOpen();
-      await sandboxManager!.launch(cwd);
+      await sandboxManager!.launch(cwd, currentPlan?.sandbox);
     }),
 
     vscode.commands.registerCommand('agentTaskPlayer.stopSandbox', () => {
@@ -2802,6 +2848,16 @@ async function cmdEditTask(arg?: unknown): Promise<void> {
   });
 }
 
+function cmdSaveTaskEdit(arg?: unknown): void {
+  if (!currentPlan || !arg || typeof arg !== 'object') { return; }
+  const { playlistIndex, taskIndex, name, prompt } = arg as { playlistIndex: number; taskIndex: number; name: string; prompt: string };
+  const task = currentPlan.playlists[playlistIndex]?.tasks[taskIndex];
+  if (!task || !name?.trim()) { return; }
+  task.name = name.trim();
+  task.prompt = prompt ?? task.prompt;
+  saveAndRefresh();
+}
+
 async function cmdDeleteItem(item?: PlanTreeItem): Promise<void> {
   if (!currentPlan || !item) { return; }
 
@@ -3485,14 +3541,41 @@ async function cmdRetryTaskWithNote(item?: PlanTreeItem | TaskLocation): Promise
     return;
   }
 
+  // Extract the meaningful error from history to auto-build a repair prompt
+  const entries = historyStore.getForTask(task.id);
+  const latest = entries[0];
+  const noisePatterns = [
+    /^reading prompt from stdin/i,
+    /^─+\s*(command|response)\s*─+/i,
+    /^github copilot/i,
+    /^claude code/i,
+    /^── /,
+  ];
+  const extractError = (text: string): string => {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    const meaningful = lines.filter(l => !noisePatterns.some(p => p.test(l)));
+    return meaningful.slice(0, 15).join('\n');
+  };
+
+  let autoNote = '';
+  if (latest) {
+    const errText = extractError([latest.result.stderr, latest.result.stdout].filter(Boolean).join('\n'));
+    if (errText) {
+      autoNote = `[AUTO-FIX] Previous attempt failed with:\n${errText}\n\nAnalyze this error carefully and fix the root cause. Do not repeat the same approach.`;
+    }
+  }
+
+  // Show the auto-generated note in the input so the user can refine it, but pre-fill it
   const note = await vscode.window.showInputBox({
-    prompt: `Retry note for "${task.name}"`,
-    placeHolder: 'Describe what should change on the retry',
+    prompt: `Fix "${task.name}" — review or edit the repair instruction`,
+    value: autoNote || '',
+    placeHolder: autoNote ? '' : 'Describe what should change on the retry',
     ignoreFocusOut: true,
   });
-  if (!note) { return; }
+  if (note === undefined) { return; }
 
-  const noteBlock = `Retry revision note:\n${note}`;
+  const noteBlock = note || autoNote;
+  if (!noteBlock) { return; }
   if (task.ownerNote) {
     task.ownerNote = `${task.ownerNote}\n\n${noteBlock}`;
   } else {

@@ -69,6 +69,131 @@ function parseEnvFile(filePath: string): Record<string, string> {
   return result;
 }
 
+/**
+ * Classify a task failure into an actionable category.
+ *
+ * This drives three downstream behaviours:
+ *  - auto-fix: skip the agent-repair loop for non-code failures (auth/rate-limit are not fixable by writing code)
+ *  - retry: surface human-readable guidance instead of a generic "retry"
+ *  - task card: show the right badge/message so the user knows what action to take
+ */
+export type FailureCategory =
+  | 'auth'        // Not authenticated — user needs to login
+  | 'rate-limit'  // API quota / 429 — wait and retry
+  | 'cli-missing' // CLI not installed or not on PATH
+  | 'timeout'     // Task timed out
+  | 'compile'     // TypeScript / build compilation error — agent-fixable
+  | 'test'        // Test suite failure — agent-fixable
+  | 'code'        // Generic runtime/lint code error — agent-fixable
+  | 'unknown';    // Unrecognised — attempt auto-fix anyway
+
+export interface FailureClassification {
+  category: FailureCategory;
+  /** One-line human-readable reason (stripped of noise, shown in UI) */
+  reason: string;
+  /** Whether the auto-fix agent loop should run for this failure */
+  agentCanFix: boolean;
+  /** Specific error lines extracted for injection into the repair prompt */
+  errorLines: string[];
+}
+
+const NOISE_LINES = [
+  /^reading prompt from stdin/i,
+  /^─+\s*(command|response)\s*─+/i,
+  /^github copilot/i,
+  /^claude code/i,
+  /^── /,
+  /^\s*$/,
+];
+
+export function classifyFailure(stderr: string, stdout: string): FailureClassification {
+  const combined = [stderr, stdout].filter(Boolean).join('\n');
+  const lines = combined.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+  const meaningful = lines.filter(l => !NOISE_LINES.some(p => p.test(l)));
+  const text = combined.toLowerCase();
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  if (/not authenticated|unauthorized|please log ?in|sign in|invalid api key|api key.*invalid|authentication failed/i.test(combined)) {
+    return {
+      category: 'auth',
+      reason: 'Not authenticated — run `claude login` or check your API key.',
+      agentCanFix: false,
+      errorLines: meaningful.slice(0, 3),
+    };
+  }
+
+  // ── Rate limit ────────────────────────────────────────────────────────────
+  if (/rate.?limit|quota.?exceeded|too many requests|429|overloaded/i.test(combined)) {
+    return {
+      category: 'rate-limit',
+      reason: 'Rate limit or quota exceeded — wait a moment then retry.',
+      agentCanFix: false,
+      errorLines: meaningful.slice(0, 3),
+    };
+  }
+
+  // ── CLI missing ───────────────────────────────────────────────────────────
+  if (/command not found|ENOENT|is not recognized as|cannot find.*command|no such file/i.test(combined)) {
+    return {
+      category: 'cli-missing',
+      reason: 'CLI not found — ensure the engine is installed and on PATH.',
+      agentCanFix: false,
+      errorLines: meaningful.slice(0, 3),
+    };
+  }
+
+  // ── Timeout ───────────────────────────────────────────────────────────────
+  if (/timed? ?out|SIGKILL|exceeded.*timeout/i.test(combined)) {
+    return {
+      category: 'timeout',
+      reason: 'Task timed out — consider splitting it into smaller steps.',
+      agentCanFix: false,
+      errorLines: meaningful.slice(0, 3),
+    };
+  }
+
+  // ── TypeScript / compile ──────────────────────────────────────────────────
+  const tsErrors = meaningful.filter(l => /error TS\d+:|\.tsx?.*error|compilation error|type error/i.test(l));
+  if (tsErrors.length > 0) {
+    return {
+      category: 'compile',
+      reason: tsErrors[0].substring(0, 120),
+      agentCanFix: true,
+      errorLines: tsErrors.slice(0, 10),
+    };
+  }
+
+  // ── Test failure ──────────────────────────────────────────────────────────
+  const testErrors = meaningful.filter(l => /● |✕ |FAIL |× |AssertionError|Expected.*Received|test.*failed/i.test(l));
+  if (testErrors.length > 0 || /\d+ (failing|failed)/i.test(text)) {
+    const summary = meaningful.find(l => /\d+ (failing|failed)/i.test(l)) ?? testErrors[0] ?? 'Tests failed';
+    return {
+      category: 'test',
+      reason: summary.substring(0, 120),
+      agentCanFix: true,
+      errorLines: testErrors.slice(0, 10),
+    };
+  }
+
+  // ── Generic code error ────────────────────────────────────────────────────
+  const errorLines = meaningful.filter(l => /error:|Error:|exception|SyntaxError|ReferenceError|TypeError|Cannot find/i.test(l));
+  if (errorLines.length > 0) {
+    return {
+      category: 'code',
+      reason: errorLines[0].substring(0, 120),
+      agentCanFix: true,
+      errorLines: errorLines.slice(0, 10),
+    };
+  }
+
+  return {
+    category: 'unknown',
+    reason: meaningful[0]?.substring(0, 120) ?? 'Task failed with no output.',
+    agentCanFix: true,
+    errorLines: meaningful.slice(0, 10),
+  };
+}
+
 function composeAbortSignals(...signals: AbortSignal[]): AbortSignal {
   const controller = new AbortController();
   for (const s of signals) {
@@ -130,6 +255,8 @@ export class TaskRunner {
   private _currentRunId: string | null = null;
   private _totalCostUsd = 0;
   private _sessionCostUsd = 0;
+  private _sessionTokensIn = 0;
+  private _sessionTokensOut = 0;
   private _budgetExceededEmitted = false;
   private _autoFixedTasks = new Set<string>();
 
@@ -196,9 +323,15 @@ export class TaskRunner {
     return this._sessionCostUsd;
   }
 
+  getSessionTokens(): { tokensIn: number; tokensOut: number } {
+    return { tokensIn: this._sessionTokensIn, tokensOut: this._sessionTokensOut };
+  }
+
   private resetRunBudgetTracking(): void {
     this._totalCostUsd = 0;
     this._sessionCostUsd = 0;
+    this._sessionTokensIn = 0;
+    this._sessionTokensOut = 0;
     this._budgetExceededEmitted = false;
     this._autoFixedTasks.clear();
   }
@@ -215,6 +348,8 @@ export class TaskRunner {
 
     this._totalCostUsd += estimatedCost;
     this._sessionCostUsd += estimatedCost;
+    this._sessionTokensIn += result.tokenUsage?.inputTokens ?? 0;
+    this._sessionTokensOut += result.tokenUsage?.outputTokens ?? 0;
 
     const budget = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('costBudgetUsd', 0);
     if (budget <= 0 || this._budgetExceededEmitted || this._totalCostUsd <= budget) {
@@ -375,8 +510,67 @@ export class TaskRunner {
     }
   }
 
+  /**
+   * Detect dependency cycles in the plan's tasks using DFS.
+   * Tasks that form a cycle are marked Blocked so the runner skips them gracefully.
+   * Returns the names of cyclic tasks (for warning display).
+   */
+  private detectAndMarkCycles(plan: Plan): string[] {
+    const allTasks = plan.playlists.flatMap(pl => pl.tasks);
+    const taskMap = new Map(allTasks.map(t => [t.id, t]));
+    const cycleTaskIds = new Set<string>();
+
+    const WHITE = 0, GRAY = 1, BLACK = 2;
+    const color = new Map<string, number>(allTasks.map(t => [t.id, WHITE as number]));
+
+    const visit = (id: string, path: string[]): void => {
+      const c = color.get(id);
+      if (c === BLACK) { return; }
+
+      const cycleStart = path.indexOf(id);
+      if (cycleStart !== -1) {
+        // All tasks from cycleStart to end of path are in the cycle
+        for (const cycleId of path.slice(cycleStart)) { cycleTaskIds.add(cycleId); }
+        return;
+      }
+
+      const task = taskMap.get(id);
+      if (!task) { return; }
+
+      color.set(id, GRAY);
+      path.push(id);
+      for (const depId of task.dependsOn ?? []) { visit(depId, path); }
+      path.pop();
+      color.set(id, BLACK);
+    };
+
+    for (const task of allTasks) {
+      if (color.get(task.id) === WHITE) { visit(task.id, []); }
+    }
+
+    const cycleNames: string[] = [];
+    for (const id of cycleTaskIds) {
+      const task = taskMap.get(id);
+      if (task) {
+        task.status = TaskStatus.Blocked;
+        cycleNames.push(task.name);
+      }
+    }
+    return cycleNames;
+  }
+
   private async runLoop(): Promise<void> {
     const plan = this._plan!;
+
+    // Fix 2: Detect dependency cycles before running — cyclic tasks are marked Blocked
+    const cycleNames = this.detectAndMarkCycles(plan);
+    if (cycleNames.length > 0) {
+      this.emit('error', new Error(
+        `Dependency cycle detected — the following tasks have been blocked: ${cycleNames.join(', ')}. ` +
+        `Fix "dependsOn" references so no task depends on itself or on a chain that loops back to it.`
+      ));
+    }
+
     const failSafe = this.isFailSafeMode();
     const concurrentPlaylists = vscode.workspace.getConfiguration('agentTaskPlayer')
       .get<number>('parallelPlaylists', 1);
@@ -585,9 +779,25 @@ export class TaskRunner {
         return;
       }
       if (attempt < effectiveMaxAttempts) {
-        this.emit('task-output', task, `\n[Retry ${attempt}/${task.retryCount}] Retrying "${task.name}"...\n`, 'stderr');
+        // Fix 5: use failure category to drive retry behaviour
+        const failCtxRaw = this._taskFailureContext.get(task.id) ?? '';
+        const categoryMatch = failCtxRaw.match(/^Failure category:\s*(\S+)/m);
+        const failCategory = categoryMatch?.[1] as FailureCategory | undefined;
+
+        if (failCategory === 'auth') {
+          // Auth failures cannot be resolved by retrying — stop the loop immediately
+          this.emit('task-output', task, `[Retry] Stopping — authentication failure cannot be resolved by retrying.\n`, 'stderr');
+          break;
+        }
+
+        const retryDelayMs = failCategory === 'rate-limit' ? 30_000 : 2_000;
+        if (failCategory === 'rate-limit') {
+          this.emit('task-output', task, `[Retry] Rate limit — waiting 30s before retry ${attempt + 1}...\n`, 'stderr');
+        } else {
+          this.emit('task-output', task, `\n[Retry ${attempt}/${task.retryCount}] Retrying "${task.name}"...\n`, 'stderr');
+        }
         task.status = TaskStatus.Pending;
-        await this.sleep(2000);
+        await this.sleep(retryDelayMs);
       }
     }
 
@@ -616,30 +826,41 @@ export class TaskRunner {
     const lastEntry = entries[0];
     if (!lastEntry) { return; }
 
-    const errorOutput = [lastEntry.result.stderr, lastEntry.result.stdout]
-      .filter(Boolean)
-      .join('\n')
-      .slice(-2000);
+    const classification = classifyFailure(lastEntry.result.stderr, lastEntry.result.stdout);
     const changedFiles = lastEntry.changedFiles?.join(', ') || 'none';
 
     this.emit('task-output', task, '\n\n━━━ MOAG Auto-Fix ━━━\n', 'stdout');
-    this.emit('task-output', task, '[Auto-Fix] Analyzing failure and attempting repair...\n', 'stdout');
+
+    // Non-fixable failures: skip the agent loop entirely, surface guidance instead
+    if (!classification.agentCanFix) {
+      this.emit('task-output', task,
+        `[Auto-Fix] Skipped — this failure cannot be fixed by code changes.\n` +
+        `Category: ${classification.category}\n` +
+        `Reason: ${classification.reason}\n`,
+        'stderr');
+      return;
+    }
+
+    this.emit('task-output', task, `[Auto-Fix] Category: ${classification.category} — attempting targeted repair...\n`, 'stdout');
+
+    const specificErrors = classification.errorLines.length > 0
+      ? `SPECIFIC ERRORS TO FIX:\n${classification.errorLines.map(l => `  ${l}`).join('\n')}`
+      : `ERROR SUMMARY: ${classification.reason}`;
 
     const repairPrompt = [
-      `The previous attempt to complete this task FAILED. Here is the context:`,
+      `The previous attempt to complete this task FAILED with a ${classification.category} error.`,
       ``,
       `ORIGINAL TASK: ${task.name}`,
       `ORIGINAL PROMPT:`,
       task.prompt,
       ``,
-      `ERROR OUTPUT (last 2000 chars):`,
-      errorOutput,
+      specificErrors,
       ``,
       `FILES CHANGED BY FAILED ATTEMPT: ${changedFiles}`,
       ``,
-      `INSTRUCTIONS: Analyze the failure above. Fix the issues and complete the original task. ` +
-      `Do NOT start over from scratch — build on what the previous attempt already did. ` +
-      `Focus specifically on what went wrong and correct it.`,
+      `INSTRUCTIONS: Fix ONLY the errors listed above. Do NOT start over from scratch — ` +
+      `build on what the previous attempt already did. ` +
+      `Address each error line specifically and verify the fix compiles/passes before finishing.`,
     ].join('\n');
 
     // Save original prompt, swap in repair prompt, run, restore
@@ -668,6 +889,23 @@ export class TaskRunner {
 
   private async executeTask(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
     const taskType = this.getTaskType(task);
+
+    // Fix 4: Fail-fast on empty prompt — sending blank text to an agent wastes tokens and
+    // produces confusing output. Surface a clear error immediately instead.
+    if ((taskType === 'agent' || taskType === 'review') && !task.prompt?.trim()) {
+      const emptyResult: EngineResult = {
+        stdout: '',
+        stderr: 'Task prompt is empty — add a description to this task before running it.',
+        exitCode: 1,
+        durationMs: 0,
+        summary: 'Task has no prompt.',
+      };
+      task.status = TaskStatus.Failed;
+      this.emit('task-output', task, `[Error] "${task.name}" has an empty prompt.\n`, 'stderr');
+      this.emit('task-failed', task, emptyResult);
+      return;
+    }
+
     const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
 
     // Resolve execution profile
@@ -829,6 +1067,17 @@ export class TaskRunner {
       };
 
       const { changedFiles, codeChanges } = await this.captureGitDiff(gitRef, cwd);
+
+      // Fix 6: warn when agent exits 0 but changed nothing and has no verifyCommand —
+      // this strongly suggests the agent printed text instead of editing files.
+      if (result.exitCode === 0 && taskType === 'agent' && changedFiles.length === 0 && !task.verifyCommand) {
+        this.emit('task-output', task,
+          `\n[Warning] Task completed with exit 0 but no files were changed and no verifyCommand is configured. ` +
+          `The agent may have only printed output without making code changes — ` +
+          `consider adding a verifyCommand or checking the task prompt.\n`,
+          'stderr');
+      }
+
       const finishedAt = new Date().toISOString();
       const threadMeta = task as Task & { _threadId?: string; _turnIndex?: number };
 
@@ -868,15 +1117,21 @@ export class TaskRunner {
         this._taskFailureContext.delete(task.id);
         this.emit('task-completed', task, result);
       } else {
-        // Gap 6: Store failure context for retry
-        const failureLines: string[] = [];
-        if (result.stderr) { failureLines.push('Error output:\n' + result.stderr.slice(-2000)); }
+        // Classify and store failure context for retry/auto-fix
+        const fc = classifyFailure(result.stderr, result.stdout);
+        const failureLines: string[] = [
+          `Failure category: ${fc.category}`,
+          `Reason: ${fc.reason}`,
+        ];
+        if (fc.errorLines.length > 0) {
+          failureLines.push('Specific errors:\n' + fc.errorLines.map(l => `  ${l}`).join('\n'));
+        } else if (result.stderr) {
+          failureLines.push('Error output:\n' + result.stderr.slice(-1000));
+        }
         if (verification && !verification.passed && !verification.baselineBroken) {
-          failureLines.push('Verification failed:\n' + verification.output.slice(-2000));
+          failureLines.push('Verification failed:\n' + verification.output.slice(-1000));
         }
-        if (failureLines.length > 0) {
-          this._taskFailureContext.set(task.id, failureLines.join('\n\n'));
-        }
+        this._taskFailureContext.set(task.id, failureLines.join('\n\n'));
         this.emit('task-failed', task, result);
         this.applyFailurePolicy(task, result);
       }
@@ -1747,6 +2002,9 @@ export class TaskRunner {
       prompt += `\n\nExecution contract:\n${contract}`;
     }
 
+    // Fix 3: record where task.prompt was appended so we can trim context prefix if needed
+    const taskPartStart = prompt.length - task.prompt.length;
+
     if (task.files && task.files.length > 0) {
       const fileContents: string[] = [];
       let remainingFileBudget = Math.max(settings.maxFileContextChars, 1000);
@@ -1769,6 +2027,21 @@ export class TaskRunner {
         }
       }
       prompt += `\n\nContext files:\n\n${fileContents.join('\n\n')}`;
+    }
+
+    // Fix 3: hard cap at 80K chars — trim the context prefix to preserve the task prompt
+    const MAX_PROMPT_CHARS = 80_000;
+    if (prompt.length > MAX_PROMPT_CHARS) {
+      const taskPart = prompt.slice(taskPartStart);
+      const allowedPrefixLen = MAX_PROMPT_CHARS - taskPart.length;
+      if (allowedPrefixLen > 0) {
+        prompt = prompt.slice(0, allowedPrefixLen) +
+          '\n...[context trimmed to fit 80K limit]\n\n' +
+          taskPart;
+      } else {
+        // Task portion alone is already huge — truncate at limit
+        prompt = taskPart.slice(0, MAX_PROMPT_CHARS) + '\n...[prompt truncated at 80K chars]';
+      }
     }
 
     // Variable substitution: {{varName}} → value

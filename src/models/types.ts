@@ -123,6 +123,36 @@ export interface Playlist {
   tasks: Task[];
 }
 
+/**
+ * Optional sandbox configuration — overrides auto-detection.
+ * Useful for monorepos where the root package.json doesn't represent any runnable app.
+ *
+ * Example for a monorepo with separate frontend and backend:
+ *   "sandbox": { "targets": [
+ *     { "name": "Frontend", "cwd": "apps/web", "command": "npm run dev", "port": 3000 },
+ *     { "name": "Backend",  "cwd": "apps/api", "command": "npm run dev", "port": 4000 }
+ *   ]}
+ */
+export interface SandboxTarget {
+  /** Display label for this target (e.g. "Frontend", "API") */
+  name: string;
+  /** Path relative to workspace root where the dev command runs */
+  cwd: string;
+  /** Shell command to start the dev server (e.g. "npm run dev") */
+  command: string;
+  /** Expected port so MOAG can detect readiness and build the URL */
+  port?: number;
+}
+
+export interface SandboxConfig {
+  /** Explicit list of apps/services to start. When provided, auto-detection is skipped. */
+  targets?: SandboxTarget[];
+  /** Shorthand: a single command at the workspace root (overrides auto-detection) */
+  command?: string;
+  /** Port for the shorthand single-command target */
+  port?: number;
+}
+
 /** Top-level plan file structure */
 export interface Plan {
   /** Schema version for forward compatibility */
@@ -137,6 +167,8 @@ export interface Plan {
   variables?: Record<string, string>;
   /** Validation defaults (targets/profile/budget) used by validation-aware tasks */
   validation: ValidationSettings;
+  /** Optional sandbox configuration — overrides project auto-detection */
+  sandbox?: SandboxConfig;
   playlists: Playlist[];
 }
 

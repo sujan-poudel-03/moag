@@ -17,3 +17,6 @@ media/icon.svg
 *.test.*
 *.vsix
 out/test/**
+.moag/**
+debug.log
+tmp_block.txt
