@@ -48,6 +48,22 @@ export interface PromptSidebarRunnerState {
   state: 'idle' | 'playing' | 'paused' | 'stopping';
 }
 
+export interface AiRuleSidebarItem {
+  id: string;
+  name: string;
+  category: string;
+  scope: 'global' | 'workspace';
+  enabled: boolean;
+  charCount: number;
+}
+
+export type RulesAction =
+  | { type: 'add' }
+  | { type: 'openLibrary' }
+  | { type: 'toggle'; id: string; scope: 'global' | 'workspace' }
+  | { type: 'edit'; id: string; scope: 'global' | 'workspace' }
+  | { type: 'delete'; id: string; scope: 'global' | 'workspace' };
+
 export class PromptInputViewProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'agentTaskPlayer.promptView';
 
@@ -65,6 +81,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
   private _activePlanName = '';
   private _activePlaylistName = '';
   private _sandboxState: unknown = null;
+  private _aiRules: AiRuleSidebarItem[] = [];
   private _liveOutputBuffer = new Map<string, string>();
   private _liveFlushTimer: ReturnType<typeof setInterval> | null = null;
   private _activeFile: { name: string; path: string } | null = null;
@@ -74,6 +91,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     private readonly _onSubmit: (request: PromptInputSubmitRequest) => Promise<boolean>,
     private readonly _onOpenItem: (id: string, kind: 'thread' | 'run' | 'plan' | 'history') => void,
     private readonly _onGeneratePlan?: (prompt: string) => Promise<void>,
+    private readonly _onRulesAction?: (action: RulesAction) => void,
   ) {}
 
   resolveWebviewView(
@@ -250,6 +268,15 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         return;
       }
 
+      if (message.type === 'previewTask') {
+        const playlistIndex = Number(message.playlistIndex);
+        const taskIndex = Number(message.taskIndex);
+        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0) {
+          void vscode.commands.executeCommand('agentTaskPlayer.previewTaskPrompt', { playlistIndex, taskIndex });
+        }
+        return;
+      }
+
       if (message.type === 'saveTaskEdit') {
         const playlistIndex = Number(message.playlistIndex);
         const taskIndex = Number(message.taskIndex);
@@ -278,6 +305,33 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         if (url) {
           void vscode.commands.executeCommand('simpleBrowser.api.open', url);
         }
+        return;
+      }
+
+      if (message.type === 'addRule') {
+        this._onRulesAction?.({ type: 'add' });
+        return;
+      }
+      if (message.type === 'openRulesLibrary') {
+        this._onRulesAction?.({ type: 'openLibrary' });
+        return;
+      }
+      if (message.type === 'toggleRule') {
+        const id = typeof message.id === 'string' ? message.id : '';
+        const scope = message.scope === 'workspace' ? 'workspace' : 'global';
+        if (id) { this._onRulesAction?.({ type: 'toggle', id, scope }); }
+        return;
+      }
+      if (message.type === 'editRule') {
+        const id = typeof message.id === 'string' ? message.id : '';
+        const scope = message.scope === 'workspace' ? 'workspace' : 'global';
+        if (id) { this._onRulesAction?.({ type: 'edit', id, scope }); }
+        return;
+      }
+      if (message.type === 'deleteRule') {
+        const id = typeof message.id === 'string' ? message.id : '';
+        const scope = message.scope === 'workspace' ? 'workspace' : 'global';
+        if (id) { this._onRulesAction?.({ type: 'delete', id, scope }); }
         return;
       }
     });
@@ -343,6 +397,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     activePlaylistName: this._activePlaylistName,
     sandboxState: this._sandboxState,
     activeFile: this._activeFile,
+    aiRules: this._aiRules,
   });
   }
 
@@ -350,6 +405,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
   postSandboxState(state: unknown): void {
     this._sandboxState = state;
     this._view?.webview.postMessage({ type: 'sandbox-state', sandboxState: state });
+  }
+
+  /** Push AI rules state to the sidebar webview */
+  postRulesState(rules: AiRuleSidebarItem[]): void {
+    this._aiRules = rules;
+    this._view?.webview.postMessage({ type: 'rules-state', rules });
   }
 
   /** Signal that a task has started — creates a live output block in the chat feed */
@@ -360,12 +421,16 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
 
   /**
    * Buffer a raw output chunk and flush to the webview at 120ms intervals.
-   * Batching prevents overwhelming the sidebar with hundreds of small messages
-   * when an agent writes rapidly to stdout.
+   * Skipped entirely when the sidebar is not visible — zero cost during normal execution
+   * where the user is watching the Dashboard instead.
+   * Buffer is capped at 3K chars per task to prevent large DOM dumps on flush.
    */
   postLiveOutputChunk(taskId: string, text: string): void {
+    if (!this._view?.visible) { return; }
     const current = this._liveOutputBuffer.get(taskId) ?? '';
-    this._liveOutputBuffer.set(taskId, current + text);
+    if (current.length < 3000) {
+      this._liveOutputBuffer.set(taskId, current + text);
+    }
 
     if (!this._liveFlushTimer) {
       this._liveFlushTimer = setInterval(() => {
@@ -374,6 +439,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           this._liveFlushTimer = null;
           return;
         }
+        if (!this._view?.visible) { return; }
         for (const [id, buffered] of this._liveOutputBuffer) {
           this._view?.webview.postMessage({ type: 'live-output-chunk', taskId: id, text: buffered });
           this._liveOutputBuffer.delete(id);
@@ -1266,6 +1332,64 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
 
     /* ─── Sidebar Sandbox ─── */
+    /* ── AI Rules section ── */
+    .sidebar-rules { display: none; padding: 2px 8px 0; flex-shrink: 0; border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2)); }
+    .sidebar-rules.active { display: block; }
+    .sidebar-rules-toggle {
+      display: flex; align-items: center; gap: 5px; width: 100%;
+      background: transparent; border: none; cursor: pointer;
+      padding: 5px 0; color: var(--vscode-foreground); opacity: 0.75;
+    }
+    .sidebar-rules-toggle:hover { opacity: 1; }
+    .sidebar-rules-icon { font-size: 10px; width: 14px; text-align: center; transition: transform 0.1s; }
+    .sidebar-rules-toggle.collapsed .sidebar-rules-icon { transform: rotate(-90deg); }
+    .sidebar-rules-label { font-weight: 600; text-transform: uppercase; font-size: 10px; letter-spacing: 0.5px; flex: 1; text-align: left; }
+    .sidebar-rules-badge {
+      font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 999px;
+      border: 1px solid transparent; text-transform: uppercase; letter-spacing: 0.3px;
+    }
+    .sidebar-rules-badge.has-active { border-color: rgba(79,163,255,0.5); color: #4fa3ff; background: rgba(79,163,255,0.1); }
+    .sidebar-rules-hd-btns { display: flex; gap: 2px; margin-left: auto; }
+    .sidebar-rules-hd-btn {
+      width: 20px; height: 20px; border: none; background: transparent;
+      color: var(--vscode-descriptionForeground); cursor: pointer; border-radius: 3px;
+      display: inline-flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1;
+    }
+    .sidebar-rules-hd-btn:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1)); }
+    .sidebar-rules-body { padding: 4px 0 6px; }
+    .sidebar-rules-body.collapsed { display: none; }
+    .sidebar-rules-list { display: flex; flex-direction: column; gap: 1px; }
+    .sidebar-rules-empty { font-size: 11px; color: var(--vscode-descriptionForeground); padding: 4px 2px; }
+    .rule-item {
+      display: flex; align-items: center; gap: 5px; padding: 3px 2px;
+      border-radius: 4px; min-width: 0;
+    }
+    .rule-item:hover { background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.07)); }
+    .rule-item:hover .rule-actions { opacity: 1; }
+    .rule-toggle {
+      width: 16px; height: 16px; border-radius: 3px; border: 1px solid rgba(128,128,128,0.4);
+      background: transparent; cursor: pointer; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center; font-size: 10px; color: #4fa3ff;
+    }
+    .rule-toggle.enabled { background: rgba(79,163,255,0.15); border-color: rgba(79,163,255,0.6); }
+    .rule-toggle.enabled::after { content: '✓'; }
+    .rule-name { font-size: 11px; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rule-name.disabled { opacity: 0.45; }
+    .rule-scope-badge {
+      font-size: 9px; padding: 0px 4px; border-radius: 3px; flex-shrink: 0;
+      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.25));
+      color: var(--vscode-descriptionForeground); text-transform: uppercase; letter-spacing: 0.3px;
+    }
+    .rule-scope-badge.workspace { border-color: rgba(62,191,106,0.4); color: #3ebf6a; background: rgba(62,191,106,0.1); }
+    .rule-actions { display: flex; gap: 1px; opacity: 0; transition: opacity 0.1s; flex-shrink: 0; }
+    .rule-action-btn {
+      width: 18px; height: 18px; border: none; background: transparent;
+      cursor: pointer; border-radius: 3px; display: flex; align-items: center;
+      justify-content: center; font-size: 10px; color: var(--vscode-descriptionForeground);
+    }
+    .rule-action-btn:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.15)); }
+    .rule-action-btn.delete:hover { color: #f44747; }
+
     .sidebar-sandbox { display: none; padding: 2px 8px 0; flex-shrink: 0; border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2)); }
     .sidebar-sandbox.active { display: block; }
     .sidebar-sandbox-toggle {
@@ -1885,6 +2009,23 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     <div id="listEmpty" class="empty"></div>
   </div>
 
+  <!-- Sidebar AI Rules (above sandbox, visible on plan/chat tabs) -->
+  <div id="sidebarRules" class="sidebar-rules">
+    <button class="sidebar-rules-toggle collapsed" id="rulesToggle" type="button">
+      <span class="sidebar-rules-icon">&#x25BC;</span>
+      <span class="sidebar-rules-label">AI Rules</span>
+      <span class="sidebar-rules-badge" id="rulesBadge"></span>
+      <span class="sidebar-rules-hd-btns">
+        <button id="rulesLibBtn" class="sidebar-rules-hd-btn" type="button" title="Browse built-in rule library">&#x1F4DA;</button>
+        <button id="rulesAddBtn" class="sidebar-rules-hd-btn" type="button" title="Add custom rule">&#x2B;</button>
+      </span>
+    </button>
+    <div class="sidebar-rules-body collapsed" id="rulesBody">
+      <div id="rulesList" class="sidebar-rules-list"></div>
+      <div id="rulesEmpty" class="sidebar-rules-empty">No rules yet. Click + to add one.</div>
+    </div>
+  </div>
+
   <!-- Sidebar Sandbox (above composer, visible on PLAN tab) -->
   <div id="sidebarSandbox" class="sidebar-sandbox">
     <button class="sidebar-sandbox-toggle collapsed" id="sbToggle" type="button">
@@ -2396,12 +2537,13 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
                     : ICON_PENDING;
           const isFailedLike = status === 'failed' || status === 'blocked';
           const editBtnHtml = status !== 'running' ? '<button type="button" class="task-act-btn task-edit-btn" title="Edit task">✏</button>' : '';
+          const previewBtnHtml = '<button type="button" class="task-act-btn task-preview-btn" title="Preview prompt">👁</button>';
           const actionButtons = isFailedLike
             ? '<button type="button" class="task-act-btn task-retry">Retry</button>' +
               '<button type="button" class="task-act-btn task-fix">Fix</button>' +
-              editBtnHtml
+              editBtnHtml + previewBtnHtml
             : '<button type="button" class="task-act-btn task-toggle">' + escHtml(status === 'running' ? 'Pause' : 'Play') + '</button>' +
-              editBtnHtml;
+              editBtnHtml + previewBtnHtml;
           const tokenMeta = (() => {
             const u = task.tokenUsage;
             if (!u || (!u.totalTokens && !u.estimatedCost)) { return ''; }
@@ -2490,6 +2632,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
             const open = editPanel.style.display !== 'none';
             editPanel.style.display = open ? 'none' : 'block';
             if (!open) { (editPanel.querySelector('.task-edit-name'))?.focus(); }
+          });
+
+          const previewBtnEl = taskBtn.querySelector('.task-preview-btn');
+          previewBtnEl?.addEventListener('click', (event) => {
+            event.stopPropagation();
+            vscode.postMessage({ type: 'previewTask', playlistIndex: i, taskIndex: originalIndex });
           });
 
           editPanel.querySelector('.task-edit-save')?.addEventListener('click', () => {
@@ -3066,6 +3214,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       historyListEl.classList.toggle('active', activeTab === 'history');
       historyToolsEl.classList.toggle('active', activeTab === 'history');
       sbSectionEl.classList.toggle('active', activeTab === 'plan');
+      rulesSectionEl.classList.toggle('active', activeTab === 'plan' || activeTab === 'chat');
 
       if (showChat) {
         listEmptyEl.classList.remove('active');
@@ -3387,6 +3536,102 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     });
     engineEl.addEventListener('change', () => renderContextBar());
 
+    // ─── Sidebar AI Rules ───
+    const rulesSectionEl = document.getElementById('sidebarRules');
+    const rulesToggleEl = document.getElementById('rulesToggle');
+    const rulesBodyEl = document.getElementById('rulesBody');
+    const rulesBadgeEl = document.getElementById('rulesBadge');
+    const rulesListEl = document.getElementById('rulesList');
+    const rulesEmptyEl = document.getElementById('rulesEmpty');
+    const rulesAddBtnEl = document.getElementById('rulesAddBtn');
+    const rulesLibBtnEl = document.getElementById('rulesLibBtn');
+    let rulesCollapsed = true;
+    let aiRules = [];
+
+    rulesToggleEl.addEventListener('click', (e) => {
+      if (e.target === rulesAddBtnEl || e.target === rulesLibBtnEl ||
+          rulesAddBtnEl.contains(e.target) || rulesLibBtnEl.contains(e.target)) { return; }
+      rulesCollapsed = !rulesCollapsed;
+      rulesToggleEl.classList.toggle('collapsed', rulesCollapsed);
+      rulesBodyEl.classList.toggle('collapsed', rulesCollapsed);
+    });
+    rulesAddBtnEl.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ type: 'addRule' }); });
+    rulesLibBtnEl.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ type: 'openRulesLibrary' }); });
+
+    function renderSidebarRules(rules) {
+      aiRules = Array.isArray(rules) ? rules : [];
+      const activeCount = aiRules.filter(r => r.enabled).length;
+      rulesBadgeEl.textContent = activeCount > 0 ? activeCount + ' active' : '';
+      rulesBadgeEl.className = 'sidebar-rules-badge' + (activeCount > 0 ? ' has-active' : '');
+      rulesListEl.innerHTML = '';
+      if (aiRules.length === 0) {
+        rulesEmptyEl.style.display = '';
+      } else {
+        rulesEmptyEl.style.display = 'none';
+        for (var i = 0; i < aiRules.length; i++) {
+          var rule = aiRules[i];
+          var item = document.createElement('div');
+          item.className = 'rule-item';
+          item.dataset.id = rule.id;
+          item.dataset.scope = rule.scope;
+          var toggleBtn = document.createElement('button');
+          toggleBtn.type = 'button';
+          toggleBtn.className = 'rule-toggle' + (rule.enabled ? ' enabled' : '');
+          toggleBtn.title = rule.enabled ? 'Disable rule' : 'Enable rule';
+          toggleBtn.dataset.id = rule.id;
+          toggleBtn.dataset.scope = rule.scope;
+          var nameSpan = document.createElement('span');
+          nameSpan.className = 'rule-name' + (rule.enabled ? '' : ' disabled');
+          nameSpan.textContent = rule.name;
+          nameSpan.title = rule.name + ' (' + rule.charCount + ' chars)';
+          var scopeBadge = document.createElement('span');
+          scopeBadge.className = 'rule-scope-badge' + (rule.scope === 'workspace' ? ' workspace' : '');
+          scopeBadge.textContent = rule.scope === 'workspace' ? 'ws' : 'global';
+          var actions = document.createElement('div');
+          actions.className = 'rule-actions';
+          var editBtn = document.createElement('button');
+          editBtn.type = 'button';
+          editBtn.className = 'rule-action-btn';
+          editBtn.title = 'Edit rule';
+          editBtn.textContent = '✏';
+          editBtn.dataset.id = rule.id;
+          editBtn.dataset.scope = rule.scope;
+          var deleteBtn = document.createElement('button');
+          deleteBtn.type = 'button';
+          deleteBtn.className = 'rule-action-btn delete';
+          deleteBtn.title = 'Delete rule';
+          deleteBtn.textContent = '✕';
+          deleteBtn.dataset.id = rule.id;
+          deleteBtn.dataset.scope = rule.scope;
+          actions.appendChild(editBtn);
+          actions.appendChild(deleteBtn);
+          item.appendChild(toggleBtn);
+          item.appendChild(nameSpan);
+          item.appendChild(scopeBadge);
+          item.appendChild(actions);
+          rulesListEl.appendChild(item);
+          toggleBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            vscode.postMessage({ type: 'toggleRule', id: this.dataset.id, scope: this.dataset.scope });
+          });
+          editBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            vscode.postMessage({ type: 'editRule', id: this.dataset.id, scope: this.dataset.scope });
+          });
+          deleteBtn.addEventListener('click', function(e) {
+            e.stopPropagation();
+            vscode.postMessage({ type: 'deleteRule', id: this.dataset.id, scope: this.dataset.scope });
+          });
+        }
+      }
+      // Auto-expand when first rule is added
+      if (aiRules.length > 0 && rulesCollapsed && activeCount > 0) {
+        rulesCollapsed = false;
+        rulesToggleEl.classList.remove('collapsed');
+        rulesBodyEl.classList.remove('collapsed');
+      }
+    }
+
     // ─── Sidebar Sandbox ───
     const sbSectionEl = document.getElementById('sidebarSandbox');
     const sbToggleEl = document.getElementById('sbToggle');
@@ -3491,7 +3736,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         engineEl.disabled = busy || engineEl.options.length === 0 || engineEl.value === '';
         updateActionState();
         if (msg.sandboxState) { renderSidebarSandbox(msg.sandboxState); }
+        if (msg.aiRules !== undefined) { renderSidebarRules(msg.aiRules); }
         if (msg.activeFile !== undefined) { activeFile = msg.activeFile || null; updateFilePill(); }
+      } else if (msg.type === 'rules-state') {
+        renderSidebarRules(msg.rules);
       } else if (msg.type === 'active-file') {
         const prev = activeFile ? activeFile.path : null;
         activeFile = msg.file || null;

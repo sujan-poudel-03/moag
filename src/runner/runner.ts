@@ -29,6 +29,7 @@ import { HistoryStore } from '../history/store';
 import { buildContext, getContextSettings, runRetrievalCascade } from '../context/context-builder';
 import { analyzeProject } from '../context/project-analyzer';
 import { PromptLibraryStore } from '../templates/prompt-library';
+import { AiRulesStore } from '../ai-rules/rules-store';
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const GIT_TIMEOUT_MS = 30_000;
@@ -261,6 +262,7 @@ export class TaskRunner {
   private _autoFixedTasks = new Set<string>();
 
   private _promptLibrary: PromptLibraryStore | null = null;
+  private _aiRulesStore: AiRulesStore | null = null;
   private _pendingScreenshots: string[] = [];
   /** Stores failure context (stderr + verify output) from the last failed attempt, keyed by task id */
   private _taskFailureContext = new Map<string, string>();
@@ -269,6 +271,10 @@ export class TaskRunner {
 
   setPromptLibrary(store: PromptLibraryStore): void {
     this._promptLibrary = store;
+  }
+
+  setAiRulesStore(store: AiRulesStore): void {
+    this._aiRulesStore = store;
   }
 
   /**
@@ -1964,9 +1970,11 @@ export class TaskRunner {
       const { spans: retrievedSpans, usedSemantic: retrievedSpansUsedSemantic } =
         await runRetrievalCascade(task, cwd, settings.maxFileContextChars);
 
+      const aiRules = this._aiRulesStore?.getEnabledText(cwd) ?? '';
       const ctx = buildContext({
         plan, playlist, task, cwd, historyStore: this.historyStore, settings,
         pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
+        aiRules: aiRules || undefined,
       });
       if (ctx) {
         prompt += ctx + '\n\n';

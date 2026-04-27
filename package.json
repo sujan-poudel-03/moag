@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
   "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
-  "version": "0.9.5",
+  "version": "0.9.6",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -150,6 +150,18 @@
         "title": "Show Dashboard",
         "category": "MOAG",
         "icon": "$(dashboard)"
+      },
+      {
+        "command": "agentTaskPlayer.addAiRule",
+        "title": "Add AI Rule",
+        "category": "MOAG",
+        "icon": "$(add)"
+      },
+      {
+        "command": "agentTaskPlayer.manageAiRules",
+        "title": "Manage AI Rules",
+        "category": "MOAG",
+        "icon": "$(list-unordered)"
       },
       {
         "command": "agentTaskPlayer.clearHistory",

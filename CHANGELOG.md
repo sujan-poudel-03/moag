@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.6] - 2026-04-27
+
+### AI Rules (Prompt Rules)
+- **AI Rules sidebar section** — add, toggle, edit, and delete reusable coding rules that are automatically injected into every task prompt; rules appear under a collapsible "AI Rules" section alongside the sandbox and content sections
+- **Built-in rule library** — 8 pre-made rules (SOLID, OWASP Top 10, Clean Code, TDD, Self-Documenting, Error Handling, Performance, DRY) browseable via "Open Library" or command palette
+- **AI-generated rules** — when a configured engine (Claude, Copilot, Codex, etc.) is available, MOAG offers to ask it to generate 5 project-specific rules based on detected stack signals; rules appear in a multi-select picker (all pre-selected) before saving
+- **Project auto-detection** — detects JS/TS (package.json), Python (requirements.txt, pyproject.toml), Go (go.mod), Rust (Cargo.toml), and Java (pom.xml, build.gradle) to pre-select relevant built-in rules and surface meaningful stack signals (React, FastAPI, GORM, Axum, Spring Boot, etc.)
+- **Global vs Workspace scope** — rules saved globally apply to all projects; workspace rules live in `.moag/rules.json` alongside the plan file
+- **Always-on injection** — enabled rules are injected at the highest context priority (never budget-trimmed) so the AI always sees them; rules appear in the `## AI Rules` section of every task prompt
+- **Rule Editor webview** — full-screen form with name, category (Code Quality / Security / Architecture / Testing / Performance / Custom), scope picker, text area with live char count, and injection preview
+- **One-time suggestion** — on first workspace open, MOAG checks for a configured engine and offers "Ask [Claude] for rules" or "Use Library"; shown once per workspace, dismissible
+
 ## [0.9.5] - 2026-04-23
 
 ### Prompt Workspace Upgrades
@@ -97,7 +109,6 @@
 - skipIf conditions — conditional task execution based on expressions
 - Plan Variables — `{{varName}}` substitution across task prompts
 - Output Chaining — previous task output feeds into the next task
-- Prompt Rules — auto-injects best practices and constraints into every prompt
 - Prompt Snippets — reusable prompt fragments with auto-inject support
 - Relevant File Detection — auto-detects and includes referenced files as context
 

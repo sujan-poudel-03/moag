@@ -62,6 +62,8 @@ export interface ContextOptions {
   retrievedSpans?: SemanticSpan[];
   /** True when retrievedSpans were produced by the semantic provider (not just rg/hint). */
   retrievedSpansUsedSemantic?: boolean;
+  /** Pre-formatted text from enabled AI rules — injected as the highest-priority context section. */
+  aiRules?: string;
 }
 
 /** Read context settings from VS Code configuration */
@@ -113,31 +115,36 @@ export function buildContext(options: ContextOptions): string {
   let usedSemanticRetrieval = options.retrievedSpansUsedSemantic ?? false;
   let semanticSpansReturned = options.retrievedSpans?.length ?? 0;
 
+  const allPlanTasks = options.plan.playlists.flatMap(pl => pl.tasks);
+  const isFirstTask = allPlanTasks.length === 0 || allPlanTasks[0]?.id === options.task.id;
+
+  if (options.aiRules && options.aiRules.trim()) {
+    sections.push({ priority: -1, header: '## AI Rules', body: options.aiRules.trim() });
+  }
+
   if (options.pendingScreenshots && options.pendingScreenshots.length > 0) {
     const body = options.pendingScreenshots
       .map((p, i) => `Screenshot ${i + 1}: ${p}`)
       .join('\n');
-    sections.push({ priority: 0, header: '=== SANDBOX SCREENSHOTS ===', body });
+    sections.push({ priority: 0, header: '## Screenshots', body });
   }
 
   if (settings.planOverview) {
     const body = gatherPlanOverview(options.plan, options.playlist, options.task);
     if (body) {
-      sections.push({ priority: 1, header: '=== PROJECT PLAN ===', body });
+      sections.push({ priority: 1, header: '## Plan', body });
     }
   }
 
-  if (settings.cumulativeProgress) {
-    const body = gatherCumulativeProgress(options.historyStore, options.plan, options.task);
+  // Merge progress + changed files into one section — both describe prior task outcomes,
+  // no reason to spend two budget slots and two headers on overlapping information.
+  if (settings.cumulativeProgress || settings.changedFiles) {
+    const body = gatherProgressAndFiles(
+      options.historyStore, options.plan, options.playlist, options.task,
+      { progress: settings.cumulativeProgress, changedFiles: settings.changedFiles },
+    );
     if (body) {
-      sections.push({ priority: 2, header: '=== PROGRESS SO FAR ===', body });
-    }
-  }
-
-  if (settings.changedFiles) {
-    const body = gatherChangedFiles(options.historyStore, options.playlist, options.task);
-    if (body) {
-      sections.push({ priority: 3, header: '=== FILES CHANGED BY PRIOR TASKS ===', body });
+      sections.push({ priority: 2, header: '## Progress', body });
     }
   }
 
@@ -146,26 +153,26 @@ export function buildContext(options: ContextOptions): string {
     const spanBudget = Math.floor(settings.maxFileContextChars * 0.8);
     const body = formatSpans(options.retrievedSpans, spanBudget);
     if (body) {
-      sections.push({ priority: 3.3, header: '=== RELEVANT CODE SPANS ===', body });
+      sections.push({ priority: 3, header: '## Code', body });
     }
   } else if (settings.relevantFiles) {
-    const body = gatherRelevantFiles(options.task, options.cwd, settings);
+    const body = gatherRelevantFiles(options.task, options.cwd, settings, isFirstTask);
     if (body) {
-      sections.push({ priority: 3.5, header: '=== RELEVANT FILES ===', body });
+      sections.push({ priority: 3, header: '## Files', body });
     }
   }
 
   if (settings.priorTaskOutputs) {
     const body = gatherPriorOutputs(options.historyStore, options.plan, options.playlist, options.task, settings);
     if (body) {
-      sections.push({ priority: 4, header: '=== PRIOR TASK RESULTS ===', body });
+      sections.push({ priority: 4, header: '## Output', body });
     }
   }
 
   if (settings.projectState) {
     const body = gatherProjectState(options.cwd, settings);
     if (body) {
-      sections.push({ priority: 5, header: '=== PROJECT STATE ===', body });
+      sections.push({ priority: 5, header: '## Project', body });
     }
   }
 
@@ -292,10 +299,25 @@ const MAX_HINT_FILE_BYTES = 50 * 1024;
 
 /** Common English words that are never useful code search terms */
 const STOP_WORDS = new Set([
+  // articles / pronouns / conjunctions
   'that', 'this', 'with', 'from', 'have', 'will', 'your', 'what', 'when', 'then',
   'they', 'them', 'into', 'just', 'also', 'some', 'each', 'like', 'over', 'where',
   'been', 'were', 'there', 'their', 'would', 'could', 'should', 'which', 'about',
-  'after', 'before', 'because', 'through', 'make', 'more', 'only', 'both', 'used',
+  'after', 'before', 'because', 'through', 'more', 'only', 'both', 'used',
+  // generic action verbs — too broad to be useful search terms
+  'make', 'create', 'update', 'change', 'remove', 'delete', 'refactor', 'rename',
+  'move', 'copy', 'write', 'read', 'open', 'close', 'send', 'receive', 'return',
+  'call', 'pass', 'load', 'save', 'show', 'hide', 'add', 'edit', 'build', 'test',
+  'check', 'handle', 'ensure', 'implement', 'using', 'define', 'extend',
+  // generic code nouns — match too many files
+  'file', 'files', 'code', 'task', 'tasks', 'type', 'types', 'name', 'value',
+  'data', 'list', 'item', 'items', 'line', 'lines', 'path', 'error', 'result',
+  'output', 'input', 'state', 'event', 'class', 'function', 'method', 'object',
+  'string', 'number', 'boolean', 'array', 'index', 'count', 'length', 'size',
+  'node', 'root', 'tree', 'view', 'model', 'controller', 'service', 'config',
+  'util', 'utils', 'helper', 'helpers', 'handler', 'callback', 'options', 'props',
+  'param', 'params', 'args', 'async', 'await', 'promise', 'import', 'export',
+  'default', 'const', 'interface', 'property', 'module', 'package', 'version',
 ]);
 
 function escapeRegex(s: string): string {
@@ -568,43 +590,75 @@ export function gatherPlanOverview(plan: Plan, currentPlaylist: Playlist, curren
     lines.push(`Description: ${plan.description}`);
   }
   lines.push('');
-  lines.push('Tasks:');
 
+  // Only emit: completed/failed/blocked tasks + current + next 2 upcoming.
+  // Skipping all other future tasks keeps the overview short regardless of plan size.
+  const LOOKAHEAD = 2;
   for (const pl of plan.playlists) {
-    lines.push(`  Playlist "${pl.name}":`);
+    const relevantTasks = pl.tasks.filter((t, idx) => {
+      const s = t.status ?? TaskStatus.Pending;
+      if (s !== TaskStatus.Pending) { return true; } // completed/failed/blocked/skipped/running
+      if (t.id === currentTask.id) { return true; }
+      // Include up to LOOKAHEAD pending tasks after current
+      const currentIdx = pl.tasks.findIndex(x => x.id === currentTask.id);
+      return currentIdx >= 0 && idx > currentIdx && idx <= currentIdx + LOOKAHEAD;
+    });
+    if (relevantTasks.length === 0) { continue; }
+
+    lines.push(`Playlist "${pl.name}":`);
     for (let i = 0; i < pl.tasks.length; i++) {
       const t = pl.tasks[i];
+      if (!relevantTasks.includes(t)) { continue; }
       const marker = statusMarker(t, currentTask);
       const arrow = t.id === currentTask.id ? '  <-- YOU ARE HERE' : '';
-      lines.push(`    ${marker} ${i + 1}. ${t.name}${arrow}`);
+      lines.push(`  ${marker} ${i + 1}. ${t.name}${arrow}`);
+    }
+    // Show how many upcoming tasks were omitted
+    const omitted = pl.tasks.filter(t => {
+      const s = t.status ?? TaskStatus.Pending;
+      return s === TaskStatus.Pending && !relevantTasks.includes(t);
+    }).length;
+    if (omitted > 0) {
+      lines.push(`  ... (${omitted} more upcoming task${omitted > 1 ? 's' : ''} not shown)`);
     }
   }
 
   return lines.join('\n');
 }
 
+/** Max prior tasks to include in cumulative progress — older ones are noise */
+const MAX_PROGRESS_ENTRIES = 8;
+
 export function gatherCumulativeProgress(historyStore: HistoryStore, plan: Plan, currentTask: Task): string {
-  const lines: string[] = [];
   const allTasks = plan.playlists.flatMap(pl => pl.tasks);
+  const entries: string[] = [];
 
   for (const t of allTasks) {
     if (t.id === currentTask.id) { break; }
     if (t.status === TaskStatus.Completed) {
-      const entries = historyStore.getForTask(t.id);
-      const latest = entries[0]; // getForTask returns newest first
+      const runs = historyStore.getForTask(t.id);
+      const latest = runs[0];
       const fileCount = latest?.changedFiles?.length ?? 0;
       const fileSuffix = fileCount > 0 ? ` (${fileCount} file${fileCount === 1 ? '' : 's'} changed)` : '';
-      lines.push(`- "${t.name}": completed${fileSuffix}`);
+      entries.push(`- "${t.name}": completed${fileSuffix}`);
     } else if (t.status === TaskStatus.Failed) {
-      lines.push(`- "${t.name}": failed`);
+      entries.push(`- "${t.name}": failed`);
     } else if (t.status === TaskStatus.Blocked) {
-      lines.push(`- "${t.name}": blocked`);
+      entries.push(`- "${t.name}": blocked`);
     } else if (t.status === TaskStatus.Skipped) {
-      lines.push(`- "${t.name}": skipped`);
+      entries.push(`- "${t.name}": skipped`);
     }
   }
 
-  return lines.length > 0 ? lines.join('\n') : '';
+  if (entries.length === 0) { return ''; }
+
+  // Cap to the most recent N entries; prepend an omission note if truncated
+  if (entries.length > MAX_PROGRESS_ENTRIES) {
+    const omitted = entries.length - MAX_PROGRESS_ENTRIES;
+    return `(${omitted} earlier task${omitted > 1 ? 's' : ''} omitted)\n` +
+      entries.slice(-MAX_PROGRESS_ENTRIES).join('\n');
+  }
+  return entries.join('\n');
 }
 
 export function gatherChangedFiles(historyStore: HistoryStore, playlist: Playlist, currentTask: Task): string {
@@ -630,6 +684,56 @@ export function gatherChangedFiles(historyStore: HistoryStore, playlist: Playlis
     lines.push(`${file} (by: ${taskName})`);
   }
   return lines.join('\n');
+}
+
+/**
+ * Merged progress + changed-files section.
+ * Format per task: `- "Name" [done] — file.ts, other.ts`
+ * More compact than two separate sections: saves one header + one budget slot.
+ */
+export function gatherProgressAndFiles(
+  historyStore: HistoryStore,
+  plan: Plan,
+  playlist: Playlist,
+  currentTask: Task,
+  opts: { progress: boolean; changedFiles: boolean },
+): string {
+  const allTasks = plan.playlists.flatMap(pl => pl.tasks);
+  const lines: string[] = [];
+  let totalEntries = 0;
+
+  for (const t of allTasks) {
+    if (t.id === currentTask.id) { break; }
+    const s = t.status ?? TaskStatus.Pending;
+    if (s === TaskStatus.Pending || s === TaskStatus.Running) { continue; }
+
+    totalEntries++;
+    if (totalEntries > MAX_PROGRESS_ENTRIES) { continue; }
+
+    let line = `- "${t.name}" [${s}]`;
+
+    if (opts.changedFiles && s === TaskStatus.Completed) {
+      const entries = historyStore.getForTask(t.id);
+      const latest = entries[0];
+      const files = latest?.changedFiles ?? [];
+      // Only show files from this playlist's scope to keep the list relevant
+      const inPlaylist = playlist.tasks.some(pt => pt.id === t.id);
+      if (files.length > 0 && inPlaylist) {
+        const fileList = files.length > 4
+          ? files.slice(0, 4).join(', ') + ` +${files.length - 4} more`
+          : files.join(', ');
+        line += ` — ${fileList}`;
+      }
+    }
+
+    lines.push(line);
+  }
+
+  if (lines.length === 0) { return ''; }
+
+  const omitted = totalEntries - lines.length;
+  const prefix = omitted > 0 ? `(${omitted} earlier task${omitted > 1 ? 's' : ''} omitted)\n` : '';
+  return prefix + lines.join('\n');
 }
 
 export function gatherPriorOutputs(
@@ -669,19 +773,28 @@ export function gatherPriorOutputs(
   const parts: string[] = [];
   for (const taskId of capped) {
     const entries = historyStore.getForTask(taskId);
-    const latest = entries[0]; // newest first
+    const latest = entries[0];
     if (!latest || latest.status !== TaskStatus.Completed) { continue; }
 
     const name = taskNameMap.get(taskId) ?? taskId;
-    let stdout = latest.result.stdout || '';
+    let stdout = (latest.result.stdout || '').trim();
+    if (!stdout) { continue; }
 
-    if (stdout.length > settings.maxOutputPerTask) {
-      stdout = '...[truncated]...\n' + stdout.slice(stdout.length - settings.maxOutputPerTask);
+    const isDep = depIds.has(taskId);
+    const limit = settings.maxOutputPerTask;
+
+    if (stdout.length > limit) {
+      if (isDep) {
+        // Explicit dependency: show head + tail so the agent sees both the plan and the outcome
+        const half = Math.floor(limit / 2);
+        stdout = stdout.slice(0, half) + '\n...[truncated]...\n' + stdout.slice(stdout.length - half);
+      } else {
+        // Incidental prior task: only the tail (most recent output) is useful
+        stdout = '...[truncated]...\n' + stdout.slice(stdout.length - limit);
+      }
     }
 
-    if (stdout.trim()) {
-      parts.push(`--- Task "${name}" (completed) ---\n${stdout.trim()}`);
-    }
+    parts.push(`--- Task "${name}" (completed) ---\n${stdout}`);
   }
 
   return parts.length > 0 ? parts.join('\n\n') : '';
@@ -696,10 +809,22 @@ const PATH_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|rs|java|rb|css|scss|html|json|ya
 /** Match file-path-like tokens in text */
 const PATH_PATTERN = /(?:^|\s|['"`(,])([a-zA-Z0-9_\-./\\]+(?:\/[a-zA-Z0-9_\-./\\]+)+(?:\.[a-zA-Z0-9]+)?)/g;
 
-/** Always-include files: extract only relevant portions to save budget */
-const ALWAYS_INCLUDE: { file: string; extract: (raw: string) => string | null }[] = [
+/** Keywords that signal the task needs build/dependency context */
+const BUILD_KEYWORDS = /\b(package\.json|tsconfig|dependencies|devDependencies|scripts|install|build|compile|compilerOptions|webpack|vite|rollup|jest|eslint|prettier|typescript|node_modules)\b/i;
+
+/**
+ * Conditionally-include files: only injected when the task prompt references
+ * build/dependency concerns, or when it's the very first task in the plan
+ * (where bootstrap context is genuinely useful).
+ */
+const CONDITIONAL_INCLUDE: {
+  file: string;
+  relevant: (prompt: string, isFirstTask: boolean) => boolean;
+  extract: (raw: string) => string | null;
+}[] = [
   {
     file: 'package.json',
+    relevant: (prompt, isFirstTask) => isFirstTask || BUILD_KEYWORDS.test(prompt),
     extract: (raw) => {
       try {
         const pkg = JSON.parse(raw);
@@ -713,6 +838,7 @@ const ALWAYS_INCLUDE: { file: string; extract: (raw: string) => string | null }[
   },
   {
     file: 'tsconfig.json',
+    relevant: (prompt, isFirstTask) => isFirstTask || BUILD_KEYWORDS.test(prompt),
     extract: (raw) => {
       try {
         const tsconfig = JSON.parse(raw);
@@ -727,15 +853,15 @@ const ALWAYS_INCLUDE: { file: string; extract: (raw: string) => string | null }[
 
 /**
  * Scan the task prompt for file paths, read existing ones, and include their content.
- * Also always includes package.json (scripts+deps) and tsconfig.json (compilerOptions) if present.
+ * Conditionally includes package.json / tsconfig.json only when the prompt references
+ * build/dependency concerns, or when this is the first task in the plan.
  */
-export function gatherRelevantFiles(task: Task, cwd: string, settings: ContextSettings): string {
+export function gatherRelevantFiles(task: Task, cwd: string, settings: ContextSettings, isFirstTask = false): string {
   const budget = settings.maxFileContextChars;
   const parts: string[] = [];
   let totalChars = 0;
   const included = new Set<string>();
 
-  // Helper: add a file's content (or extracted portion) to the output
   const addFile = (relPath: string, content: string): boolean => {
     if (included.has(relPath)) { return false; }
     if (totalChars + content.length > budget) { return false; }
@@ -746,22 +872,21 @@ export function gatherRelevantFiles(task: Task, cwd: string, settings: ContextSe
     return true;
   };
 
-  // 1. Always-include files (extracted portions only)
-  for (const { file, extract } of ALWAYS_INCLUDE) {
+  // 1. Conditionally-include config files
+  const prompt = task.prompt || '';
+  for (const { file, relevant, extract } of CONDITIONAL_INCLUDE) {
+    if (!relevant(prompt, isFirstTask)) { continue; }
     const fullPath = path.join(cwd, file);
     try {
       const raw = fs.readFileSync(fullPath, 'utf-8');
       const extracted = extract(raw);
-      if (extracted) {
-        addFile(file, extracted);
-      }
+      if (extracted) { addFile(file, extracted); }
     } catch {
       // file doesn't exist — skip
     }
   }
 
   // 2. Scan prompt for file path references
-  const prompt = task.prompt || '';
   const detectedPaths = new Set<string>();
 
   let match: RegExpExecArray | null;

@@ -18,15 +18,24 @@ import { HistoryTreeProvider } from './ui/history-tree';
 import { DashboardPanel } from './ui/dashboard-panel';
 import { ExecutionDetailPanel } from './ui/execution-detail-panel';
 import { TaskEditorPanel } from './ui/task-editor-panel';
+import { RuleEditorPanel } from './ui/rule-editor-panel';
 import {
   PromptEngineOption,
   PromptInputViewProvider,
   PromptSidebarListItem,
   PromptSidebarChatMessage,
   PromptSidebarPlanGroup,
+  AiRuleSidebarItem,
+  RulesAction,
 } from './ui/prompt-input-view';
+import { AiRulesStore, AiRule, RuleScope } from './ai-rules/rules-store';
+import { BUILT_IN_RULES } from './ai-rules/built-in-rules';
+import { detectProjectRules } from './ai-rules/project-detector';
 import { detectAndConfigureEngines, detectEngines, redetectEngines } from './engine-detection';
 import { analyzeProject, formatAnalysis } from './context/project-analyzer';
+import {
+  buildContext, getContextSettings, runRetrievalCascade, ContextBudgetUsage,
+} from './context/context-builder';
 import { RunSessionStore, RunSession } from './models/run-session';
 import * as UserMsg from './utils/user-messages';
 import { SessionsTreeProvider, SessionsTreeItem } from './ui/sessions-tree';
@@ -60,6 +69,9 @@ let currentSidebarThreadId: string | null = null;
 let pendingSidebarTurn: { prompt: string; engine: EngineId; startedAt: string; threadId: string; turnIndex: number } | null = null;
 let promptSidebarSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let dashboardUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ─── AI Rules ───
+let aiRulesStore: AiRulesStore | null = null;
 
 // ─── Sandbox state ───
 let sandboxManager: SandboxManager | null = null;
@@ -873,6 +885,289 @@ function isDefaultPlanPath(planPath: string | null): boolean {
   return Boolean(planPath && defaultPath && normalizeFilePath(planPath) === normalizeFilePath(defaultPath));
 }
 
+function getWorkspaceCwd(): string {
+  return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+}
+
+function syncRulesSidebar(): void {
+  if (!promptViewProvider || !aiRulesStore) { return; }
+  const cwd = getWorkspaceCwd();
+  const items: AiRuleSidebarItem[] = aiRulesStore.getAllRules(cwd).map(r => ({
+    id: r.id,
+    name: r.name,
+    category: r.category,
+    scope: r.scope,
+    enabled: r.enabled,
+    charCount: r.text.length,
+  }));
+  promptViewProvider.postRulesState(items);
+}
+
+async function handleRulesAction(action: RulesAction): Promise<void> {
+  if (!aiRulesStore) { return; }
+  const cwd = getWorkspaceCwd();
+  const hasWorkspace = !!cwd;
+
+  if (action.type === 'add') {
+    const choice = await vscode.window.showQuickPick(
+      [
+        { label: '$(library) Browse built-in library', value: 'library' },
+        { label: '$(edit) Create custom rule', value: 'custom' },
+      ],
+      { placeHolder: 'How would you like to add a rule?' },
+    );
+    if (!choice) { return; }
+    if (choice.value === 'library') {
+      await openBuiltInLibrary(cwd, hasWorkspace);
+    } else {
+      RuleEditorPanel.open({
+        rule: null,
+        hasWorkspace,
+        onSave: (rule) => { aiRulesStore!.addRule(rule, cwd); syncRulesSidebar(); },
+      });
+    }
+    return;
+  }
+
+  if (action.type === 'openLibrary') {
+    await openBuiltInLibrary(cwd, hasWorkspace);
+    return;
+  }
+
+  if (action.type === 'toggle') {
+    aiRulesStore.toggleRule(action.id, action.scope as RuleScope, cwd);
+    syncRulesSidebar();
+    return;
+  }
+
+  if (action.type === 'edit') {
+    const rule = aiRulesStore.getAllRules(cwd).find(r => r.id === action.id && r.scope === action.scope);
+    if (!rule) { return; }
+    RuleEditorPanel.open({
+      rule,
+      hasWorkspace,
+      onSave: (updated) => { aiRulesStore!.updateRule(updated, cwd); syncRulesSidebar(); },
+    });
+    return;
+  }
+
+  if (action.type === 'delete') {
+    const rule = aiRulesStore.getAllRules(cwd).find(r => r.id === action.id && r.scope === action.scope);
+    const name = rule?.name ?? 'this rule';
+    const confirmed = await vscode.window.showWarningMessage(
+      `Delete "${name}"?`, { modal: true }, 'Delete',
+    );
+    if (confirmed === 'Delete') {
+      aiRulesStore.deleteRule(action.id, action.scope as RuleScope, cwd);
+      syncRulesSidebar();
+    }
+  }
+}
+
+async function openBuiltInLibrary(cwd: string, hasWorkspace: boolean): Promise<void> {
+  if (!aiRulesStore) { return; }
+  const existingIds = new Set(aiRulesStore.getAllRules(cwd).map(r => r.id));
+  const items = BUILT_IN_RULES.map(r => ({
+    label: r.name,
+    description: r.category.replace(/-/g, ' '),
+    detail: r.text.split('\n')[0],
+    picked: existingIds.has(r.id),
+    id: r.id,
+  }));
+  const picks = await vscode.window.showQuickPick(items, {
+    placeHolder: 'Select rules to add (already added rules are pre-checked)',
+    canPickMany: true,
+  });
+  if (!picks || picks.length === 0) { return; }
+
+  const scopePick = hasWorkspace
+    ? await vscode.window.showQuickPick(
+      [
+        { label: 'Global', description: 'Applies to all projects', value: 'global' as RuleScope },
+        { label: 'Workspace', description: 'Applies to this project only (.moag/rules.json)', value: 'workspace' as RuleScope },
+      ],
+      { placeHolder: 'Save these rules as:' },
+    )
+    : { value: 'global' as RuleScope };
+
+  if (!scopePick) { return; }
+  const scope = scopePick.value;
+
+  for (const pick of picks) {
+    if (existingIds.has(pick.id)) { continue; }
+    const builtin = BUILT_IN_RULES.find(r => r.id === pick.id);
+    if (!builtin) { continue; }
+    const rule: AiRule = {
+      id: builtin.id,
+      name: builtin.name,
+      category: builtin.category,
+      scope,
+      text: builtin.text,
+      enabled: true,
+    };
+    aiRulesStore.addRule(rule, cwd);
+  }
+  syncRulesSidebar();
+}
+
+const RULES_PROMPT_KEY = 'agentTaskPlayer.rulesPromptShown';
+
+/** Parse `### Rule Name\n[text]` blocks from an AI engine response. */
+function parseRulesFromOutput(output: string): { name: string; text: string }[] {
+  // Support: ### Name, ## Name, **Name**, 1. Name:
+  const normalized = output.replace(/^(\d+\.\s+\*\*|##\s+|\*\*)/gm, '### ');
+  const blocks = normalized.split(/^###\s+/m).filter(b => b.trim().length > 0);
+  return blocks
+    .map(block => {
+      const lines = block.trim().split('\n');
+      const name = lines[0].replace(/\*+/g, '').replace(/:$/, '').trim();
+      const text = lines.slice(1).join('\n').trim();
+      return { name, text };
+    })
+    .filter(r => r.name.length > 2 && r.text.length > 10);
+}
+
+/** Ask the configured AI engine to generate project-specific rules. */
+async function generateAiRules(
+  engineId: EngineId,
+  signals: string[],
+  cwd: string,
+): Promise<{ name: string; text: string }[]> {
+  const engine = getEngine(engineId);
+  const prompt = `You are a code quality assistant helping configure an AI coding agent.
+
+This project uses: ${signals.join(', ')}.
+
+Generate exactly 5 concise, actionable coding rules tailored to this specific stack.
+Each rule should guide an AI coding agent on what to always do or avoid in this project.
+
+Format each rule exactly like this (use ### heading):
+
+### Rule Name
+2-4 sentence description of what to do and why, specific to the stack above.
+
+Output only the 5 rules. No preamble, no conclusion, no numbering outside the ### headings.`;
+
+  const result = await engine.runTask({ prompt, cwd });
+  if (result.exitCode !== 0 || !result.stdout.trim()) { return []; }
+  return parseRulesFromOutput(result.stdout);
+}
+
+/** Ask the user which scope to save rules under. Returns null if cancelled. */
+async function pickRuleScope(cwd: string): Promise<RuleScope | null> {
+  const pick = cwd
+    ? await vscode.window.showQuickPick(
+      [
+        { label: 'Global', description: 'All projects — saved to your user profile', value: 'global' as RuleScope },
+        { label: 'Workspace', description: 'This project only — committed to .moag/rules.json', value: 'workspace' as RuleScope },
+      ],
+      { placeHolder: 'Save these rules as:' },
+    )
+    : { value: 'global' as RuleScope };
+  return pick?.value ?? null;
+}
+
+async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<void> {
+  if (!aiRulesStore) { return; }
+  const cwd = getWorkspaceCwd();
+  if (!cwd) { return; }
+
+  if (context.workspaceState.get<boolean>(RULES_PROMPT_KEY)) { return; }
+
+  if (aiRulesStore.getAllRules(cwd).length > 0) {
+    void context.workspaceState.update(RULES_PROMPT_KEY, true);
+    return;
+  }
+
+  const { signals, suggestedRuleIds } = detectProjectRules(cwd);
+  if (signals.length === 0) { return; }
+
+  void context.workspaceState.update(RULES_PROMPT_KEY, true);
+
+  const signalStr = signals.slice(0, 3).join(', ');
+  const preferredEngine = getPreferredPromptEngine(detectedPromptEngines);
+  const engineName = preferredEngine ? getEngineDisplayName(preferredEngine) : null;
+
+  // Primary button: ask the configured engine if one is available
+  const primaryLabel = engineName ? `Ask ${engineName}` : 'Use Library';
+  const buttons = engineName
+    ? [primaryLabel, 'Use Library', 'Dismiss']
+    : [primaryLabel, 'Dismiss'];
+  const choice = await vscode.window.showInformationMessage(
+    `MOAG detected ${signalStr}. Generate tailored AI rules for this project?`,
+    ...buttons,
+  );
+
+  if (!choice || choice === 'Dismiss') { return; }
+
+  // ── AI generation path ──────────────────────────────────────────────────
+  if (choice === primaryLabel && engineName && preferredEngine) {
+    let generated: { name: string; text: string }[] = [];
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Generating AI rules for ${signalStr}…`,
+        cancellable: true,
+      },
+      async (_progress, token) => {
+        const abort = new AbortController();
+        token.onCancellationRequested(() => abort.abort());
+        try {
+          generated = await generateAiRules(preferredEngine, signals, cwd);
+        } catch {
+          generated = [];
+        }
+      },
+    );
+
+    if (generated.length === 0) {
+      void vscode.window.showWarningMessage(
+        `${engineName} didn't return parseable rules. Falling back to built-in library.`,
+      );
+      await openBuiltInLibrary(cwd, !!cwd);
+      return;
+    }
+
+    // Show generated rules in a reviewable QuickPick (all pre-selected)
+    const items = generated.map((r, i) => ({
+      label: r.name,
+      detail: r.text.split('\n')[0],
+      picked: true,
+      idx: i,
+    }));
+
+    const picks = await vscode.window.showQuickPick(items, {
+      placeHolder: `Review ${engineName}-generated rules — deselect any you don't want`,
+      canPickMany: true,
+    });
+    if (!picks || picks.length === 0) { return; }
+
+    const scope = await pickRuleScope(cwd);
+    if (!scope) { return; }
+
+    for (const pick of picks) {
+      const r = generated[pick.idx];
+      aiRulesStore.addRule({
+        id: generateId(),
+        name: r.name,
+        category: 'custom',
+        scope,
+        text: r.text,
+        enabled: true,
+      }, cwd);
+    }
+    syncRulesSidebar();
+    void vscode.window.showInformationMessage(
+      `Added ${picks.length} AI rule${picks.length === 1 ? '' : 's'} from ${engineName}. Active on every task.`,
+    );
+    return;
+  }
+
+  // ── Static library fallback ─────────────────────────────────────────────
+  await openBuiltInLibrary(cwd, !!cwd);
+}
+
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
 
@@ -894,6 +1189,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // Initialize task runner
   runner = new TaskRunner(historyStore);
   runner.setPromptLibrary(promptLibraryStore);
+
+  // Initialize AI rules store
+  aiRulesStore = new AiRulesStore(context.globalStorageUri.fsPath);
+  runner.setAiRulesStore(aiRulesStore);
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
@@ -963,6 +1262,7 @@ export function activate(context: vscode.ExtensionContext): void {
     async (prompt: string) => {
       await generatePlanFromDashboardPrompt(prompt);
     },
+    (action: RulesAction) => { void handleRulesAction(action); },
   );
   promptViewProvider = promptProvider;
   syncPromptProviderEngines(
@@ -983,6 +1283,9 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(pushActiveFile));
 
   schedulePromptProviderSidebarSync(0);
+  setTimeout(() => syncRulesSidebar(), 200);
+  // Delay rule suggestion so it doesn't fire during startup noise
+  setTimeout(() => { void maybePromptAiRules(context); }, 3000);
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider(PromptInputViewProvider.viewType, promptProvider),
   );
@@ -1264,12 +1567,19 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.addTask', cmdAddTask),
     vscode.commands.registerCommand('agentTaskPlayer.editTask', cmdEditTask),
     vscode.commands.registerCommand('agentTaskPlayer.saveTaskEdit', cmdSaveTaskEdit),
+    vscode.commands.registerCommand('agentTaskPlayer.previewTaskPrompt', cmdPreviewTaskPrompt),
     vscode.commands.registerCommand('agentTaskPlayer.deleteItem', cmdDeleteItem),
     vscode.commands.registerCommand('agentTaskPlayer.moveUp', cmdMoveUp),
     vscode.commands.registerCommand('agentTaskPlayer.moveDown', cmdMoveDown),
     vscode.commands.registerCommand('agentTaskPlayer.showHistory', cmdShowHistory),
     vscode.commands.registerCommand('agentTaskPlayer.showDashboard', cmdShowDashboard),
     vscode.commands.registerCommand('agentTaskPlayer.clearHistory', cmdClearHistory),
+    vscode.commands.registerCommand('agentTaskPlayer.addAiRule', () => {
+      void handleRulesAction({ type: 'add' });
+    }),
+    vscode.commands.registerCommand('agentTaskPlayer.manageAiRules', () => {
+      void handleRulesAction({ type: 'openLibrary' });
+    }),
     vscode.commands.registerCommand('agentTaskPlayer.switchEngine', cmdSwitchEngine),
     vscode.commands.registerCommand('agentTaskPlayer.playPlaylist', cmdPlayPlaylist),
     vscode.commands.registerCommand('agentTaskPlayer.playTask', cmdPlayTask),
@@ -2856,6 +3166,93 @@ function cmdSaveTaskEdit(arg?: unknown): void {
   task.name = name.trim();
   task.prompt = prompt ?? task.prompt;
   saveAndRefresh();
+}
+
+async function cmdPreviewTaskPrompt(arg?: unknown): Promise<void> {
+  if (!currentPlan || !arg || typeof arg !== 'object') { return; }
+  const { playlistIndex, taskIndex } = arg as { playlistIndex: number; taskIndex: number };
+  const playlist = currentPlan.playlists[playlistIndex];
+  const task = playlist?.tasks[taskIndex];
+  if (!task || !playlist) { return; }
+
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+  const settings = getContextSettings();
+  const budgetUsage: ContextBudgetUsage = {
+    totalCharsUsed: 0, totalCharsBudget: settings.maxContextChars,
+    sectionsDropped: 0, usedSemanticRetrieval: false, semanticSpansReturned: 0,
+  };
+
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title: 'Building context preview…', cancellable: false },
+    async () => {
+      const { spans: retrievedSpans, usedSemantic } =
+        await runRetrievalCascade(task, cwd, settings.maxFileContextChars);
+
+      const previewAiRules = aiRulesStore?.getEnabledText(cwd) || undefined;
+      const ctx = buildContext({
+        plan: currentPlan!, playlist, task, cwd, historyStore,
+        settings, budgetUsage, retrievedSpans, retrievedSpansUsedSemantic: usedSemantic,
+        aiRules: previewAiRules,
+      });
+
+      // Replicate runner prompt assembly (minus screenshots/variable substitution)
+      let fullPrompt = ctx ? ctx + '\n\n' : '';
+      const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+      if (cfg.get<boolean>('promptRulesEnabled', true)) {
+        const rules = cfg.get<string>('promptRules', '');
+        if (rules) { fullPrompt += rules + '\n\n'; }
+      }
+      fullPrompt += task.prompt ?? '';
+
+      const totalChars = fullPrompt.length;
+      const tokenEst = Math.ceil(totalChars / 4);
+      const ctxPct = budgetUsage.totalCharsBudget > 0
+        ? Math.round((budgetUsage.totalCharsUsed / budgetUsage.totalCharsBudget) * 100)
+        : 0;
+
+      const engine = task.engine ?? (playlist as any).engine ?? 'default';
+      const taskType = task.type ?? 'agent';
+
+      const lines: string[] = [
+        `# Context Preview — "${task.name}"`,
+        ``,
+        `| Field | Value |`,
+        `|---|---|`,
+        `| Engine | \`${engine}\` |`,
+        `| Type | \`${taskType}\` |`,
+        `| Playlist | ${playlist.name} |`,
+        `| Status | ${task.status ?? 'pending'} |`,
+        ``,
+        `---`,
+        ``,
+        `## Token Budget`,
+        ``,
+        `| Metric | Value |`,
+        `|---|---|`,
+        `| Context chars used | **${budgetUsage.totalCharsUsed.toLocaleString()} / ${budgetUsage.totalCharsBudget.toLocaleString()}** (${ctxPct}%) |`,
+        `| Sections dropped | ${budgetUsage.sectionsDropped} |`,
+        `| Semantic retrieval | ${budgetUsage.usedSemanticRetrieval ? `yes — ${budgetUsage.semanticSpansReturned} span${budgetUsage.semanticSpansReturned !== 1 ? 's' : ''}` : 'no'} |`,
+        `| **Total prompt** | **~${tokenEst.toLocaleString()} tokens · ${totalChars.toLocaleString()} chars** |`,
+        ``,
+        `---`,
+        ``,
+        `## Full Prompt`,
+        ``,
+        `\`\`\``,
+        fullPrompt,
+        `\`\`\``,
+      ];
+
+      const doc = await vscode.workspace.openTextDocument({
+        content: lines.join('\n'),
+        language: 'markdown',
+      });
+      await vscode.window.showTextDocument(doc, {
+        preview: true,
+        viewColumn: vscode.ViewColumn.Beside,
+      });
+    },
+  );
 }
 
 async function cmdDeleteItem(item?: PlanTreeItem): Promise<void> {
