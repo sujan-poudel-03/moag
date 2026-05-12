@@ -16,7 +16,7 @@ const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '9';
+const HTML_VERSION = '11';
 
 export class DashboardPanel {
   public static currentPanel: DashboardPanel | undefined;
@@ -125,7 +125,9 @@ export class DashboardPanel {
       this._webviewReadyFallbackTimer = null;
       if (!this._webviewReady) {
         outputChannel.appendLine('[renderWebview] webview-ready handshake timed out; sending fallback update');
+        this._webviewReady = true;
         this.update();
+        this.replayHistoryCards();
       }
     }, 3000);
   }
@@ -298,6 +300,40 @@ export class DashboardPanel {
     this.postMessageWithRetries({ type: 'clear-timeline' });
   }
 
+  /**
+   * Replay completed history entries as task cards.
+   * Called on webview-ready so a re-opened dashboard always shows prior results
+   * even if the panel was closed during or after a run.
+   */
+  private replayHistoryCards(): void {
+    const entries = this.historyStore.getAll().slice(0, 50);
+    const replayable = entries.filter(
+      e => e.result && (e.status === 'completed' || e.status === 'failed' || e.status === 'blocked'),
+    );
+    outputChannel.appendLine(`[replayHistoryCards] replaying ${replayable.length} entries`);
+    for (const entry of replayable) {
+      const r = entry.result;
+      this.safePostMessage({
+        type: 'complete-task-card',
+        taskId: entry.taskId,
+        taskName: entry.taskName,
+        status: entry.status,
+        exitCode: r.exitCode,
+        durationMs: r.durationMs,
+        stderr: (r.stderr ?? '').substring(0, 8000),
+        stdoutTail: (r.stdout ?? '').substring(Math.max(0, (r.stdout ?? '').length - 3000)),
+        command: r.command || '',
+        summary: r.summary || '',
+        changedFiles: entry.changedFiles,
+        codeChanges: entry.codeChanges,
+        verification: entry.verification,
+        artifacts: entry.artifacts,
+        autoFixed: entry.autoFixed || false,
+        validationTargetResults: entry.validationTargetResults ?? null,
+      });
+    }
+  }
+
   private async handlePromptSubmission(msg: { prompt?: unknown; engineId?: unknown }): Promise<void> {
     const prompt = typeof msg.prompt === 'string' ? msg.prompt.trim() : '';
     const engineId = typeof msg.engineId === 'string' ? msg.engineId : undefined;
@@ -356,6 +392,7 @@ export class DashboardPanel {
         this._webviewReady = true;
         this.clearWebviewReadyFallback();
         this.update();
+        this.replayHistoryCards();
         break;
       case 'play':
         vscode.commands.executeCommand('agentTaskPlayer.play');
@@ -765,35 +802,32 @@ export class DashboardPanel {
 
     /* ─── Active Task Terminal ─── */
     .active-task {
+      margin: 6px;
+      border: 1px solid var(--focus-border);
+      border-radius: 6px;
+      overflow: hidden;
       display: none;
       flex-direction: column;
       flex-grow: 1;
-      margin: 0 6px;
-      border: 1px solid var(--focus-border);
-      border-radius: 4px;
-      overflow: hidden;
-      min-height: 0;
+      min-height: 120px;
     }
-    .active-task.visible {
-      display: flex;
-    }
+    body.task-active .active-task { display: flex; }
+    .active-task.visible { display: flex; }
     .active-task-header {
       display: flex; align-items: center; gap: 8px;
-      min-height: 32px; height: 32px; max-height: 32px; padding: 0 10px;
-      background: rgba(0,122,204,0.04);
-      border-bottom: 1px solid var(--border); flex-shrink: 0;
+      padding: 6px 10px;
+      background: rgba(0,122,204,0.06);
+      flex-shrink: 0;
     }
     .active-dot {
-      width: 8px; height: 8px; border-radius: 50%;
-      background: var(--success); flex-shrink: 0;
-      animation: dot-pulse 1s ease-in-out infinite;
+      width: 8px; height: 8px; border-radius: 50%; background: var(--success); animation: dot-pulse 1s infinite;
     }
     @keyframes dot-pulse {
       0%, 100% { transform: scale(1); opacity: 1; }
       50% { transform: scale(0.7); opacity: 0.4; }
     }
     .active-task-name {
-      flex: 1; font-weight: 600; font-size: 12px;
+      flex: 1; font-weight: 600; font-size: 13px;
       white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .engine-badge {
@@ -806,8 +840,7 @@ export class DashboardPanel {
     .engine-ollama { background: #9c27b022; color: #9c27b0; }
     .engine-custom { background: rgba(128,128,128,0.15); color: var(--dimmed); }
     .active-timer {
-      font-size: 11px; font-family: var(--vscode-editor-font-family, monospace);
-      color: var(--dimmed); flex-shrink: 0;
+      font-size: 12px; font-family: monospace; color: var(--dimmed);
     }
 
     /* ─── Terminal Output ─── */
@@ -818,19 +851,12 @@ export class DashboardPanel {
       word-break: break-all; word-wrap: break-word; line-height: 1.4;
     }
     .active-task-output {
-      flex: 1;
-      min-height: 0;
-      overflow-y: auto;
-      overflow-x: hidden;
-      padding: 8px 10px;
-      background: var(--terminal-bg);
-      color: var(--terminal-fg);
-      font-family: var(--vscode-editor-font-family, monospace);
-      font-size: 12px;
-      white-space: pre-wrap;
-      word-break: break-all;
-      line-height: 1.5;
+      padding: 8px 10px; min-height: 80px; flex: 1;
+      overflow-y: auto; overflow-x: hidden; max-width: 100%;
     }
+    .active-task-details { border-top: 1px solid var(--border); font-size: 12px; }
+    .active-task-details summary { padding: 4px 10px; cursor: pointer; color: var(--dimmed); }
+    .active-task-details pre { padding: 6px 10px; margin: 0; max-height: 150px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
     .active-output-empty { color: var(--dimmed); font-style: italic; }
 
     /* ─── Idle Plan Summary ─── */
@@ -871,21 +897,18 @@ export class DashboardPanel {
 
     /* ─── Result Banner ─── */
     .result-banner {
-      margin: 8px; padding: 10px 14px; border-radius: 6px;
-      border-left: 3px solid var(--success); background: rgba(76,175,80,0.10); flex-shrink: 0;
+      margin: 8px; padding: 12px 14px; border-radius: 6px; display: none;
     }
-    .result-banner.result-warning { border-left-color: var(--warning); background: rgba(229,160,0,0.12); }
-    .result-banner-header { display: flex; align-items: flex-start; gap: 12px; flex-wrap: wrap; }
-    .result-banner-copy { flex: 1; min-width: 0; }
-    .result-banner-title { font-weight: 600; font-size: 12px; margin-bottom: 2px; }
-    .result-banner-meta { font-size: 11px; color: var(--dimmed); }
-    .result-banner-actions { display: flex; gap: 6px; flex-wrap: wrap; flex-shrink: 0; }
+    .result-banner.success { background: rgba(78,201,176,0.12); border: 1px solid rgba(78,201,176,0.5); }
+    .result-banner.has-failures { background: rgba(200,140,40,0.12); border: 1px solid rgba(220,160,50,0.6); }
+    .result-banner-title { font-weight: 700; font-size: 14px; margin-bottom: 8px; }
+    .result-banner.success .result-banner-title { color: var(--success); }
+    .result-banner.has-failures .result-banner-title { color: #e8a838; }
+    .result-banner-actions { display: flex; gap: 6px; flex-wrap: wrap; }
     .result-banner-btn {
-      font-size: 11px; padding: 3px 10px; background: var(--button-bg); color: var(--button-fg);
-      border: none; border-radius: 3px; cursor: pointer; font-family: var(--vscode-font-family);
+      padding: 5px 14px; border-radius: 4px; font-size: 12px; font-weight: 600;
+      cursor: pointer; border: 1px solid; white-space: nowrap;
     }
-    .result-banner-btn:hover { background: var(--button-hover); }
-    .result-banner-btn:disabled { opacity: 0.4; cursor: default; }
 
     /* ─── Section Toggle ─── */
     .section-toggle {
@@ -914,58 +937,25 @@ export class DashboardPanel {
       font-family: var(--vscode-font-family);
     }
     .completed-show-all:hover { text-decoration: underline; }
-    .completed-task { border-left: 2px solid transparent; margin: 0 8px 2px; border-radius: 3px; }
-    .completed-task.failed-task { border-left-color: var(--error); }
-    .completed-task-row {
-      display: flex; align-items: center; gap: 8px;
-      min-height: 28px; height: 28px; padding: 0 8px; cursor: pointer; border-radius: 3px;
+    .completed-card { border: 1px solid var(--border); border-radius: 4px; margin-bottom: 3px; overflow: hidden; }
+    .completed-card.failed { border-left: 3px solid var(--error); }
+    .completed-card-row {
+      display: flex; align-items: center; gap: 6px;
+      padding: 4px 8px; cursor: pointer; font-size: 12px; height: 30px;
     }
-    .completed-task-row:hover { background: var(--hover-bg); }
-    .ct-icon {
-      width: 16px; height: 16px; border-radius: 50%;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 10px; font-weight: 700; flex-shrink: 0;
-    }
-    .ct-icon.pass { background: rgba(76,175,80,0.15); color: var(--success); }
-    .ct-icon.fail { background: rgba(244,71,71,0.15); color: var(--error); }
-    .ct-icon.skip { background: rgba(128,128,128,0.1); color: var(--dimmed); }
-    .ct-name { flex: 1; font-size: 12px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .ct-stats { display: flex; align-items: center; gap: 4px; flex-shrink: 0; font-size: 11px; color: var(--dimmed); }
-    .ct-error-line {
-      font-size: 11px; color: var(--error); padding: 2px 8px 4px 32px;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
-    .ct-detail { display: none; padding: 4px 8px 8px 32px; }
-    .completed-task.expanded .ct-detail { display: block; }
-    .ct-detail-output {
-      font-size: 10px; padding: 4px 6px; border-radius: 3px;
-      margin-bottom: 4px; max-height: 160px; overflow-y: auto;
-    }
+    .completed-card-row:hover { background: var(--hover-bg); }
+    .cc-icon { font-size: 12px; flex-shrink: 0; width: 14px; text-align: center; }
+    .cc-icon.pass { color: var(--success); }
+    .cc-icon.fail { color: var(--error); }
+    .cc-name { flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cc-meta { font-size: 10px; color: var(--dimmed); flex-shrink: 0; }
+    .cc-error { font-size: 11px; color: var(--error); padding: 2px 8px 4px 28px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .cc-detail { display: none; border-top: 1px solid var(--border); }
+    .completed-card.expanded .cc-detail { display: block; }
 
     /* ─── Diff Viewer ─── */
     .diff-add { background: rgba(78,201,176,0.15); color: inherit; display: block; }
-    .diff-remove { background: rgba(244,71,71,0.15); color: inherit; display: block; }
     .diff-hunk { color: var(--dimmed); font-style: italic; display: block; }
-    .diff-header { font-weight: 700; color: var(--fg); display: block; }
-    /* ─── Changed Files Panel ─── */
-    .ct-files { margin-top: 6px; }
-    .ct-files-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 3px; }
-    .ct-files-label { font-size: 10px; color: var(--dimmed); font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px; }
-    .ct-file-list { display: flex; flex-direction: column; gap: 1px; margin-bottom: 4px; }
-    .ct-file-item { font-size: 10px; color: var(--fg); font-family: var(--vscode-editor-font-family, monospace); padding: 1px 0; opacity: 0.85; }
-    .ct-diff-toggle {
-      font-size: 10px; background: none; border: 1px solid var(--border); border-radius: 3px;
-      padding: 1px 6px; cursor: pointer; color: var(--dimmed);
-      font-family: var(--vscode-font-family);
-    }
-    .ct-diff-toggle:hover { color: var(--fg); border-color: var(--focus-border); }
-    .ct-diff {
-      font-size: 10px; line-height: 1.4; max-height: 200px; overflow-y: auto;
-      padding: 4px 6px; border-radius: 3px;
-      background: var(--terminal-bg, var(--bg));
-      font-family: var(--vscode-editor-font-family, monospace);
-      white-space: pre;
-    }
 
     /* ─── Sandbox Panel ─── */
     .sandbox-section { border-top: 1px solid var(--border); flex-shrink: 0; }
@@ -998,6 +988,21 @@ export class DashboardPanel {
       object-fit: contain; display: block;
     }
     .sandbox-screenshot-label { font-size: 10px; color: var(--dimmed); margin-bottom: 3px; }
+    .sandbox-error-banner {
+      display: none; flex-direction: column; gap: 6px;
+      background: rgba(244,67,54,0.12); border: 1px solid rgba(244,67,54,0.4);
+      border-radius: 4px; padding: 8px 10px;
+    }
+    .sandbox-error-banner.visible { display: flex; }
+    .sandbox-error-title { font-size: 11px; font-weight: 600; color: #f44336; }
+    .sandbox-error-msg { font-size: 11px; color: var(--fg); line-height: 1.5; word-break: break-word; }
+    .sandbox-error-hint { font-size: 10px; color: var(--dimmed); line-height: 1.4; }
+    .sandbox-retry-btn {
+      align-self: flex-start; font-size: 11px; padding: 3px 10px;
+      background: rgba(244,67,54,0.2); border: 1px solid rgba(244,67,54,0.5);
+      color: #f88; border-radius: 3px; cursor: pointer;
+    }
+    .sandbox-retry-btn:hover { background: rgba(244,67,54,0.35); }
     .sandbox-output {
       font-family: var(--vscode-editor-font-family, monospace);
       font-size: 10px; line-height: 1.4; color: var(--terminal-fg);
@@ -1028,7 +1033,7 @@ export class DashboardPanel {
     <button class="plan-name" id="plan-name" onclick="vscode.postMessage({type:'switch-plan'})">MOAG</button>
     <span id="runner-status" class="status-badge status-idle">Idle</span>
     <div class="transport">
-      <button id="btn-play" class="icon-btn primary" title="Play">▶</button>
+      <button id="btn-play" class="icon-btn primary" title="Execute">▶</button>
       <button id="btn-pause" class="icon-btn" title="Pause">⏸</button>
       <button id="btn-stop" class="icon-btn" title="Stop">■</button>
     </div>
@@ -1056,6 +1061,10 @@ export class DashboardPanel {
         <span class="active-timer" id="active-timer">0s</span>
       </div>
       <div class="terminal-output active-task-output" id="active-output"></div>
+      <details class="active-task-details" id="active-task-details">
+        <summary>Details</summary>
+        <pre id="active-task-details-content"></pre>
+      </details>
     </div>
 
     <!-- IDLE: Plan summary -->
@@ -1071,19 +1080,7 @@ export class DashboardPanel {
     </div>
 
     <!-- IDLE + COMPLETE: Result banner -->
-    <div class="result-banner" id="result-banner" hidden>
-      <div class="result-banner-header">
-        <div class="result-banner-copy">
-          <div class="result-banner-title" id="result-banner-title"></div>
-          <div class="result-banner-meta" id="result-banner-meta"></div>
-        </div>
-        <div class="result-banner-actions">
-          <button class="result-banner-btn" id="result-banner-review">Review Changes</button>
-          <button class="result-banner-btn" id="result-banner-retry">Retry Failed</button>
-          <button class="result-banner-btn" id="result-banner-export">Export</button>
-        </div>
-      </div>
-    </div>
+    <div class="result-banner" id="result-banner"></div>
 
     <!-- IDLE + COMPLETE: Error banner -->
     <div class="error-banner" id="error-banner"></div>
@@ -1116,6 +1113,12 @@ export class DashboardPanel {
             <button class="sandbox-btn" id="sandbox-btn-screenshot"
                     onclick="vscode.postMessage({type:'sandbox-screenshot'})"
                     title="Capture screenshot and attach to next agent task">Screenshot</button>
+          </div>
+          <div class="sandbox-error-banner" id="sandbox-error-banner">
+            <span class="sandbox-error-title">&#9888; Sandbox failed to start</span>
+            <span class="sandbox-error-msg" id="sandbox-error-msg"></span>
+            <span class="sandbox-error-hint" id="sandbox-error-hint"></span>
+            <button class="sandbox-retry-btn" onclick="vscode.postMessage({type:'sandbox-launch'})">&#8635; Retry</button>
           </div>
           <div id="sandbox-output-wrap" hidden>
             <div class="sandbox-output" id="sandbox-output"></div>
@@ -1213,13 +1216,6 @@ export class DashboardPanel {
     document.getElementById('btn-stop').onclick = () => vscode.postMessage({ type: 'stop' });
     var summaryPlayBtn = document.getElementById('plan-summary-play');
     if (summaryPlayBtn) { summaryPlayBtn.onclick = () => vscode.postMessage({ type: 'play' }); }
-    var resultBannerReview = document.getElementById('result-banner-review');
-    if (resultBannerReview) { resultBannerReview.onclick = () => vscode.postMessage({ type: 'review-changes' }); }
-    var resultBannerRetry = document.getElementById('result-banner-retry');
-    if (resultBannerRetry) { resultBannerRetry.onclick = () => vscode.postMessage({ type: 'retry-failed' }); }
-    var resultBannerExport = document.getElementById('result-banner-export');
-    if (resultBannerExport) { resultBannerExport.onclick = () => vscode.postMessage({ type: 'export-results' }); }
-
     // ─── State Machine ───
     function setDashboardState(newState) {
       if (newState !== 'idle' && newState !== 'executing' && newState !== 'complete') {
@@ -1236,7 +1232,6 @@ export class DashboardPanel {
       var completedSection = document.getElementById('completed-section');
       var errorBanner = document.getElementById('error-banner');
       var sandboxSection = document.getElementById('sandbox-section');
-      var hasResults = !!(resultBanner && resultBanner.dataset.hasResults === 'true');
       var hasPlan = hasPlanLoaded();
 
       // Hide all dashboard sections first.
@@ -1264,8 +1259,9 @@ export class DashboardPanel {
       if (progressSection) { progressSection.hidden = false; }
 
       if (newState === 'complete') {
+        renderResultBanner();
         if (completedSection) { completedSection.hidden = false; }
-        if (hasResults && resultBanner) { resultBanner.hidden = false; }
+        if (resultBanner && resultBanner.style.display !== 'none') { resultBanner.hidden = false; }
         if (errorBanner && errorBanner.textContent && errorBanner.textContent.trim()) {
           errorBanner.hidden = false;
         }
@@ -1277,9 +1273,7 @@ export class DashboardPanel {
       } else {
         if (noPlanMessage) { noPlanMessage.hidden = false; }
       }
-      if (hasResults && resultBanner) {
-        resultBanner.hidden = false;
-      }
+      if (sandboxSection) { sandboxSection.hidden = false; }
       if (errorBanner && errorBanner.textContent && errorBanner.textContent.trim()) {
         errorBanner.hidden = false;
       }
@@ -1501,43 +1495,24 @@ export class DashboardPanel {
 
     // ─── Result Banner ───
     function renderResultBanner() {
-      const banner = document.getElementById('result-banner');
-      const title = document.getElementById('result-banner-title');
-      const meta = document.getElementById('result-banner-meta');
-      const retryBtn = document.getElementById('result-banner-retry');
-      if (!banner || !title || !meta || !retryBtn) { return; }
-      if (!currentPlan) {
-        banner.dataset.hasResults = 'false';
-        title.textContent = '';
-        meta.textContent = '';
-        retryBtn.disabled = true;
-        setDashboardState(dashboardState);
-        return;
-      }
-      const stats = getPlanStats(currentPlan);
-      const failures = stats.failed + stats.blocked;
-      const hasResults = hasTaskResults(stats);
-      if (!hasResults) {
-        banner.dataset.hasResults = 'false';
-        title.textContent = '';
-        meta.textContent = '';
-        retryBtn.disabled = true;
-        setDashboardState(dashboardState);
-        return;
-      }
-      banner.dataset.hasResults = 'true';
-      banner.className = 'result-banner' + (failures > 0 ? ' result-warning' : '');
-      if (failures > 0) {
-        title.textContent = stats.completed + ' passed, ' + failures + ' failed \u2014 ' +
-          totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's' : '') + ' changed';
-        meta.textContent = runStartTime ? 'Run time: ' + formatDuration(Date.now() - runStartTime) : '';
-      } else {
-        title.textContent = 'All ' + stats.completed + ' tasks completed \u2014 ' +
-          totalFilesChanged + ' file' + (totalFilesChanged !== 1 ? 's' : '') + ' changed';
-        meta.textContent = runStartTime ? 'Run time: ' + formatDuration(Date.now() - runStartTime) : '';
-      }
-      retryBtn.disabled = failures === 0;
-      setDashboardState(dashboardState);
+      var el = document.getElementById('result-banner');
+      if (!el || !currentPlan) { if (el) el.style.display = 'none'; return; }
+      var tasks = currentPlan.playlists.flatMap(function(pl) { return pl.tasks || []; });
+      var passed = tasks.filter(function(t) { return t.status === 'completed'; }).length;
+      var failed = tasks.filter(function(t) { return t.status === 'failed'; }).length;
+      var total = tasks.length;
+      if (passed === 0 && failed === 0) { el.style.display = 'none'; return; }
+
+      var hasFailures = failed > 0;
+      el.className = 'result-banner ' + (hasFailures ? 'has-failures' : 'success');
+      el.style.display = '';
+      el.innerHTML =
+        '<div class="result-banner-title">' + passed + ' passed' + (failed > 0 ? ', ' + failed + ' failed' : '') + ' \u2014 ' + totalFilesChanged + ' files changed</div>' +
+        '<div class="result-banner-actions">' +
+          '<button class="result-banner-btn" onclick="vscode.postMessage({type:\\'review-changes\\'})" style="background:rgba(78,201,176,0.18);color:var(--success);border-color:rgba(78,201,176,0.4);">Review Changes</button>' +
+          (hasFailures ? '<button class="result-banner-btn" onclick="vscode.postMessage({type:\\'retry-failed\\'})" style="background:rgba(220,160,50,0.18);color:#e8a838;border-color:rgba(220,160,50,0.4);">Retry Failed</button>' : '') +
+          '<button class="result-banner-btn" onclick="vscode.postMessage({type:\\'export-results\\'})" style="background:rgba(128,128,128,0.1);color:var(--dimmed);border-color:var(--border);">Export</button>' +
+        '</div>';
     }
 
     function renderIdleOverview(plan) {
@@ -1710,16 +1685,50 @@ export class DashboardPanel {
       var btnStop = document.getElementById('sandbox-btn-stop');
       var screenshotWrap = document.getElementById('sandbox-screenshot-wrap');
       var screenshotImg = document.getElementById('sandbox-screenshot-img');
+      var errorBannerEl = document.getElementById('sandbox-error-banner');
+      var errorMsgEl = document.getElementById('sandbox-error-msg');
+      var errorHintEl = document.getElementById('sandbox-error-hint');
+      var sectionBody = document.getElementById('body-sandbox');
 
       if (!dot) { return; }
+
+      var isError = state.status === 'error';
+
+      // Auto-expand section on error so user always sees the failure
+      if (isError && sectionBody && sectionBody.classList.contains('collapsed')) {
+        sectionBody.classList.remove('collapsed');
+        var icon = sectionBody.previousElementSibling && sectionBody.previousElementSibling.querySelector('.section-toggle-icon');
+        if (icon) { icon.textContent = '▼'; }
+      }
 
       // Status dot
       dot.className = 'sandbox-status-dot ' + (state.status || 'stopped');
 
-      // Status label
-      var labelMap = { stopped: 'Stopped', starting: 'Starting...', running: 'Running', error: 'Error' };
-      label.textContent = state.error || labelMap[state.status] || state.status;
-      badge.textContent = state.status === 'running' ? '●' : '';
+      // Status label — show 'Error' text in header row, full message in banner
+      var labelMap = { stopped: 'Stopped', starting: 'Starting…', running: 'Running', error: 'Error' };
+      label.textContent = labelMap[state.status] || state.status;
+      badge.textContent = state.status === 'running' ? '●' : (isError ? '!' : '');
+
+      // Error banner
+      if (isError && state.error) {
+        errorBannerEl.classList.add('visible');
+        errorMsgEl.textContent = state.error;
+        // Generate an actionable hint based on the error text
+        var hint = '';
+        if (/detect|package\.json|pubspec/i.test(state.error)) {
+          hint = 'Fix: add "sandbox": {"command": "npm run dev"} to your plan JSON, or run from a project folder with a package.json.';
+        } else if (/timed out/i.test(state.error)) {
+          hint = 'Fix: verify the command runs manually in terminal. Set a custom "sandbox.command" in your plan JSON if the default detection is wrong.';
+        } else if (/exited with code/i.test(state.error)) {
+          hint = 'Fix: check the sandbox output log above for the crash reason. The server process started but failed immediately.';
+        } else if (/ENOENT|not found|Cannot find/i.test(state.error)) {
+          hint = 'Fix: the command was not found. Make sure the tool is installed (e.g. npm install) and available in PATH.';
+        }
+        errorHintEl.textContent = hint;
+        errorHintEl.hidden = !hint;
+      } else {
+        errorBannerEl.classList.remove('visible');
+      }
 
       // Framework label
       if (state.projectInfo) {
@@ -1773,6 +1782,10 @@ export class DashboardPanel {
       document.getElementById('active-engine').textContent = '';
       document.getElementById('active-engine').className = 'engine-badge engine-custom';
       document.getElementById('active-timer').textContent = '0s';
+      var detailsEl = document.getElementById('active-task-details');
+      if (detailsEl) { detailsEl.open = false; }
+      var detailsContent = document.getElementById('active-task-details-content');
+      if (detailsContent) { detailsContent.textContent = ''; }
       renderCompletedCards();
       updateProgress();
       renderResultBanner();
@@ -1836,6 +1849,20 @@ export class DashboardPanel {
       engineEl.textContent = getActiveRuntimeLabel(msg);
       engineEl.className = 'engine-badge engine-' + (msg.engine || 'custom');
       document.getElementById('active-timer').textContent = '0s';
+      var detailsParts = [];
+      if (msg.playlistName) { detailsParts.push('Playlist: ' + msg.playlistName); }
+      detailsParts.push('Type: ' + (msg.taskType || 'agent'));
+      if (msg.command) { detailsParts.push('Command: ' + msg.command); }
+      if (Array.isArray(msg.acceptanceCriteria) && msg.acceptanceCriteria.length > 0) {
+        detailsParts.push('Acceptance Criteria:');
+        for (var i = 0; i < msg.acceptanceCriteria.length; i++) {
+          detailsParts.push('- ' + msg.acceptanceCriteria[i]);
+        }
+      }
+      var detailsContent = document.getElementById('active-task-details-content');
+      if (detailsContent) { detailsContent.textContent = detailsParts.join('\n'); }
+      var detailsEl = document.getElementById('active-task-details');
+      if (detailsEl) { detailsEl.open = false; }
       showActiveOutputPlaceholder('Waiting for terminal output...');
       updateStatusSummary('Running: ' + msg.taskName);
       setDashboardState('executing');
@@ -1872,6 +1899,16 @@ export class DashboardPanel {
       } else {
         showActiveOutputPlaceholder('Waiting for terminal output...');
       }
+      var queuedDetails = document.getElementById('active-task-details-content');
+      if (queuedDetails) {
+        queuedDetails.textContent = [
+          'Playlist: ' + playlistName,
+          'Type: ' + (candidate.task.taskType || 'agent'),
+          candidate.task.command ? ('Command: ' + candidate.task.command) : ''
+        ].filter(Boolean).join('\n');
+      }
+      var detailsEl = document.getElementById('active-task-details');
+      if (detailsEl) { detailsEl.open = false; }
 
       updateStatusSummary('Running: ' + taskName);
       setDashboardState('executing');
@@ -1911,6 +1948,33 @@ export class DashboardPanel {
       const passed = msg.status === 'completed';
       const blocked = msg.status === 'blocked';
       const failed = !passed && !blocked && msg.status !== 'skipped';
+
+      // BUG 3 fix: autoFix calls executeTask a second time, which fires task-completed again.
+      // Guard against re-counting and duplicate cards — update the existing entry instead.
+      const alreadyCompleted = completedOrder.includes(msg.taskId);
+      if (alreadyCompleted) {
+        // Undo the prior counters for this task, then re-apply with updated status
+        const prior = completedTasks.find(function(t) { return t.taskId === msg.taskId; });
+        if (prior) {
+          const priorFailed = prior.status === 'failed' || prior.status === 'blocked';
+          if (priorFailed && !failed) { failedCount = Math.max(0, failedCount - 1); }
+          if (prior.status === 'blocked' && !blocked) { blockedCount = Math.max(0, blockedCount - 1); }
+          // Update existing entry in-place
+          prior.status = msg.status;
+          prior.filesCount = Array.isArray(msg.changedFiles) ? msg.changedFiles.length : prior.filesCount;
+          prior.changedFiles = Array.isArray(msg.changedFiles) ? msg.changedFiles : prior.changedFiles;
+          prior.stderr = msg.stderr || '';
+          prior.output = (state && state.output) ? state.output : (msg.stdoutTail || '');
+          if (!priorFailed && failed) { failedCount++; }
+          if (!prior.status.includes('blocked') && blocked) { blockedCount++; }
+        }
+        renderCompletedCards();
+        updateProgress();
+        renderResultBanner();
+        renderPlaylistTiles(currentPlan);
+        return;
+      }
+
       completedCount++;
       if (failed) { failedCount++; }
       if (blocked) { blockedCount++; }
@@ -1921,13 +1985,6 @@ export class DashboardPanel {
       updateProgress();
       renderResultBanner();
       renderPlaylistTiles(currentPlan);
-      if (runnerState === 'playing') {
-        setDashboardState('executing');
-      } else if (runnerState === 'idle' && completedCount > 0 && completedCount >= totalTasks) {
-        setDashboardState('complete');
-      } else if (runnerState === 'idle' && currentPlan) {
-        setDashboardState('idle');
-      }
     }
 
     function addCompletedCard(taskId, taskName, msg) {
@@ -1947,6 +2004,7 @@ export class DashboardPanel {
         codeChanges: state.codeChanges || '',
         stderr: msg.stderr || '',
         output: state.output || msg.stdoutTail || '',
+        exitCode: msg.exitCode,
       });
       renderCompletedCards();
     }
@@ -1965,21 +2023,6 @@ export class DashboardPanel {
       if (!output) { return '(no output captured)'; }
       var lines = String(output).split('\\n');
       return lines.length > limit ? lines.slice(-limit).join('\\n') : lines.join('\\n');
-    }
-
-    function renderDiff(diffText) {
-      if (!diffText) { return ''; }
-      var lines = diffText.split('\\n').slice(0, 600);
-      return lines.map(function(line) {
-        var esc = line.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-        if (/^(diff |index |--- |\\+\\+\\+ )/.test(line)) {
-          return '<span class="diff-header">' + esc + '</span>';
-        }
-        if (/^@@/.test(line)) { return '<span class="diff-hunk">' + esc + '</span>'; }
-        if (line.charAt(0) === '+') { return '<span class="diff-add">' + esc + '</span>'; }
-        if (line.charAt(0) === '-') { return '<span class="diff-remove">' + esc + '</span>'; }
-        return esc;
-      }).join('\\n');
     }
 
     function renderCompletedCards() {
@@ -2017,25 +2060,24 @@ export class DashboardPanel {
       var visibleCards = showAllCompletedCards ? completedTasks : completedTasks.slice(-10);
       visibleCards.forEach(function(entry) {
         var passed = entry.status === 'completed';
-        var skipped = entry.status === 'skipped';
         var failed = entry.status === 'failed' || entry.status === 'blocked';
         var card = document.createElement('div');
-        card.className = 'completed-task' + (failed ? ' failed-task' : '') +
+        card.className = 'completed-card' + (failed ? ' failed' : '') +
           (completedExpandedState[entry.taskId] ? ' expanded' : '');
         card.dataset.taskId = entry.taskId;
 
         var row = document.createElement('div');
-        row.className = 'completed-task-row';
+        row.className = 'completed-card-row';
+        var duration = formatDuration(entry.durationMs || 0);
+        var files = entry.filesCount || 0;
         row.innerHTML =
-          '<span class="ct-icon ' + (passed ? 'pass' : skipped ? 'skip' : 'fail') + '">' +
-          (passed ? '\\u2713' : skipped ? '\\u2212' : '\\u2717') +
+          '<span class="cc-icon ' + (passed ? 'pass' : 'fail') + '">' +
+          (passed ? '\\u2713' : '\\u2717') +
           '</span>' +
-          '<span class="ct-name">' + escHtml(entry.taskName) + '</span>' +
-          '<span class="ct-stats">' +
-          (entry.engine ? '<span class="engine-badge engine-' + escHtml(String(entry.engine).toLowerCase()) + '">' + escHtml(entry.engine) + '</span>' : '') +
-          '<span>' + formatDuration(entry.durationMs) + '</span>' +
-          '<span>' + entry.filesCount + ' file' + (entry.filesCount !== 1 ? 's' : '') + '</span>' +
-          '</span>';
+          '<span class="cc-name">' + escHtml(entry.taskName) + '</span>' +
+          (entry.engine ? '<span class="cc-meta">' + escHtml(entry.engine) + '</span>' : '') +
+          '<span class="cc-meta">' + duration + '</span>' +
+          (files > 0 ? '<span class="cc-meta">' + files + 'f</span>' : '');
         row.onclick = function() {
           completedExpandedState[entry.taskId] = !completedExpandedState[entry.taskId];
           card.classList.toggle('expanded', completedExpandedState[entry.taskId]);
@@ -2044,62 +2086,22 @@ export class DashboardPanel {
 
         if (failed) {
           var errLine = document.createElement('div');
-          errLine.className = 'ct-error-line';
+          errLine.className = 'cc-error';
           var firstErrLine = firstNonEmptyLine(entry.stderr);
-          errLine.textContent = firstErrLine || 'Task failed without stderr output';
+          errLine.textContent = (firstErrLine || ('exit ' + (entry.exitCode || 1))).substring(0, 120);
           errLine.title = entry.stderr || '';
           card.appendChild(errLine);
         }
 
         var detail = document.createElement('div');
-        detail.className = 'ct-detail';
-        var outputDiv = document.createElement('pre');
-        outputDiv.className = 'terminal-output ct-detail-output';
-        outputDiv.textContent = getOutputTail(entry.output || entry.stderr, 50);
-        detail.appendChild(outputDiv);
-
-        // Changed files + diff panel
-        if (entry.changedFiles && entry.changedFiles.length > 0) {
-          var filesDiv = document.createElement('div');
-          filesDiv.className = 'ct-files';
-
-          var filesHeader = document.createElement('div');
-          filesHeader.className = 'ct-files-header';
-          var filesLabel = document.createElement('span');
-          filesLabel.className = 'ct-files-label';
-          filesLabel.textContent = entry.changedFiles.length + ' file' + (entry.changedFiles.length !== 1 ? 's' : '') + ' changed';
-          filesHeader.appendChild(filesLabel);
-          filesDiv.appendChild(filesHeader);
-
-          var fileList = document.createElement('div');
-          fileList.className = 'ct-file-list';
-          entry.changedFiles.forEach(function(f) {
-            var fi = document.createElement('div');
-            fi.className = 'ct-file-item';
-            fi.textContent = f;
-            fileList.appendChild(fi);
-          });
-          filesDiv.appendChild(fileList);
-
-          if (entry.codeChanges) {
-            var diffToggle = document.createElement('button');
-            diffToggle.className = 'ct-diff-toggle';
-            diffToggle.textContent = 'Show diff';
-            var diffDiv = document.createElement('pre');
-            diffDiv.className = 'ct-diff';
-            diffDiv.hidden = true;
-            diffDiv.innerHTML = renderDiff(entry.codeChanges);
-            diffToggle.addEventListener('click', function(e) {
-              e.stopPropagation();
-              var visible = !diffDiv.hidden;
-              diffDiv.hidden = visible;
-              diffToggle.textContent = visible ? 'Show diff' : 'Hide diff';
-            });
-            filesHeader.appendChild(diffToggle);
-            filesDiv.appendChild(diffDiv);
-          }
-
-          detail.appendChild(filesDiv);
+        detail.className = 'cc-detail';
+        if (entry.output) {
+          var outputDiv = document.createElement('pre');
+          outputDiv.className = 'terminal-output';
+          outputDiv.style.maxHeight = '200px';
+          outputDiv.style.padding = '6px 8px';
+          outputDiv.textContent = getOutputTail(entry.output || entry.stderr, 50);
+          detail.appendChild(outputDiv);
         }
 
         card.appendChild(detail);
@@ -2241,7 +2243,8 @@ export class DashboardPanel {
     function renderStatus(state) {
       runnerState = state;
       const el = document.getElementById('runner-status');
-      el.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+      const stateLabels = { playing: 'Executing', paused: 'Paused', stopping: 'Stopping', idle: 'Idle' };
+      el.textContent = stateLabels[state] || (state.charAt(0).toUpperCase() + state.slice(1));
       el.className = 'status-badge status-' + state;
       const playBtn = document.getElementById('btn-play');
       const pauseBtn = document.getElementById('btn-pause');

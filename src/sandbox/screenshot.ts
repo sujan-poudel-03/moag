@@ -31,7 +31,7 @@ export async function captureScreenshot(opts: ScreenshotOptions): Promise<string
 
   if (projectType === 'web') {
     if (!url) { return null; }
-    return captureWebScreenshot(url, outputPath);
+    return captureWebScreenshot(url, outputPath, cwd);
   }
 
   if (projectType === 'mobile') {
@@ -43,10 +43,10 @@ export async function captureScreenshot(opts: ScreenshotOptions): Promise<string
 
 // ── Web ───────────────────────────────────────────────────────────────────────
 
-async function captureWebScreenshot(url: string, outputPath: string): Promise<string | null> {
+async function captureWebScreenshot(url: string, outputPath: string, cwd: string): Promise<string | null> {
   // Prefer a locally-installed playwright binary over npx to avoid the
   // interactive install prompt on first run.
-  const playwrightBin = findLocalPlaywright();
+  const playwrightBin = findLocalPlaywright(cwd);
 
   return new Promise((resolve) => {
     const args = playwrightBin
@@ -54,6 +54,7 @@ async function captureWebScreenshot(url: string, outputPath: string): Promise<st
       : ['npx', '--yes', 'playwright', 'screenshot', '--full-page', url, outputPath];
 
     const proc = spawn(args[0], args.slice(1), {
+      cwd,
       shell: true,
       stdio: 'pipe',
     });
@@ -73,11 +74,11 @@ async function captureWebScreenshot(url: string, outputPath: string): Promise<st
   });
 }
 
-function findLocalPlaywright(): string | null {
-  // Look for playwright in node_modules/.bin of the calling process's cwd
+function findLocalPlaywright(cwd: string): string | null {
+  // Look for playwright in node_modules/.bin relative to the workspace/sandbox cwd
   const candidates = [
-    path.join(process.cwd(), 'node_modules', '.bin', 'playwright'),
-    path.join(process.cwd(), 'node_modules', '.bin', 'playwright.cmd'),
+    path.join(cwd, 'node_modules', '.bin', 'playwright'),
+    path.join(cwd, 'node_modules', '.bin', 'playwright.cmd'),
   ];
   for (const c of candidates) {
     if (fs.existsSync(c)) { return c; }

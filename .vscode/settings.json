@@ -12,5 +12,6 @@
   "agentTaskPlayer.context.maxPriorTasks": 2,
   "agentTaskPlayer.context.maxOutputPerTask": 800,
   "agentTaskPlayer.context.maxContextChars": 8000,
-  "agentTaskPlayer.context.maxFileContextChars": 4000
+  "agentTaskPlayer.context.maxFileContextChars": 4000,
+  "agentTaskPlayer.testTool": "sandbox"
 }

@@ -1,10 +1,10 @@
 // ─── Core data models for Agent Task Player ───
 
 /** Supported agent engine identifiers */
-export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom' | 'copilot';
+export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom' | 'copilot' | 'anthropic';
 
 /** Supported task execution modes */
-export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review' | 'validate';
+export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review' | 'validate' | 'manual' | 'visual-test';
 
 /** Supported validation targets for cross-platform checks */
 export type ValidationTarget = 'web' | 'mobile' | 'desktop' | 'all';
@@ -94,6 +94,8 @@ export interface Task {
   healthCheckUrl?: string;
   /** Startup timeout override for service tasks */
   startupTimeoutMs?: number;
+  /** Per-task timeout override in milliseconds (overrides profile and global setting) */
+  timeoutMs?: number;
   /** Number of times to retry on failure (default 0 = no retry) */
   retryCount?: number;
   /** Task IDs that must complete before this task runs */
@@ -120,6 +122,12 @@ export interface Playlist {
   autoplayDelay?: number;
   /** Run all tasks in this playlist concurrently */
   parallel?: boolean;
+  /** Freeform rules/guidelines injected before every task in this playlist (merges with plan-level and global rules) */
+  aiRules?: string;
+  /** When true, this playlist represents the test/verification phase of a PRD workflow */
+  testPhase?: boolean;
+  /** The PRD snippet that generated this playlist */
+  prdContext?: string;
   tasks: Task[];
 }
 
@@ -153,6 +161,13 @@ export interface SandboxConfig {
   port?: number;
 }
 
+/** A saved snapshot of a PRD at a specific version */
+export interface PrdVersion {
+  version: string;
+  text: string;
+  createdAt: string;
+}
+
 /** Top-level plan file structure */
 export interface Plan {
   /** Schema version for forward compatibility */
@@ -169,6 +184,16 @@ export interface Plan {
   validation: ValidationSettings;
   /** Optional sandbox configuration — overrides project auto-detection */
   sandbox?: SandboxConfig;
+  /** Freeform rules/guidelines injected before every task in this plan (merges with global/workspace rules) */
+  aiRules?: string;
+  /** Full original PRD text from which this plan was generated */
+  prdSource?: string;
+  /** Version history of the PRD — each entry is a snapshot saved by the user */
+  prdVersions?: PrdVersion[];
+  /** Number of fix-iteration playlists generated so far (iteration guard ceiling: 3) */
+  fixIterations?: number;
+  /** GitHub issues this plan was generated from — used to close them after successful completion */
+  sourceIssues?: Array<{ repo: string; number: number; title: string }>;
   playlists: Playlist[];
 }
 
@@ -197,6 +222,14 @@ export interface TokenUsage {
   totalTokens?: number;
   /** Estimated cost in USD (if computable) */
   estimatedCost?: number;
+}
+
+/** Result of an AI-driven PRD verification pass */
+export interface PrdVerificationResult {
+  passed: boolean;
+  score: number;
+  gaps: string[];
+  suggestion: string;
 }
 
 /** Result of a verification command */
@@ -286,6 +319,8 @@ export interface HistoryEntry {
   }>;
   /** Total flaky detections across all validation targets in this run */
   flakyCount?: number;
+  /** Rule-based compressed summary of what this task accomplished (~250 chars, set after completion) */
+  summary?: string;
   /** Context budget usage for this task execution */
   contextBudgetUsage?: {
     totalCharsUsed: number;
@@ -306,6 +341,8 @@ export interface PlanFile {
   fallbackEngine?: EngineId;
   /** User-defined variables for template substitution in prompts */
   variables?: Record<string, string>;
+  /** GitHub issues this plan was generated from */
+  sourceIssues?: Array<{ repo: string; number: number; title: string }>;
   /** Optional plan-level validation defaults */
   validation?: {
     targets?: ValidationTarget[];

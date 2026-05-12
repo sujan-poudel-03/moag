@@ -83,7 +83,7 @@ describe('resolveProfile (engine profiles)', () => {
   it('fast has no auto-fix and short timeout', () => {
     const cfg = resolveProfile('fast');
     assert.strictEqual(cfg.autoFix, false);
-    assert.ok(cfg.taskTimeoutMs <= 5 * 60 * 1000);
+    assert.ok(cfg.taskTimeoutMs <= 15 * 60 * 1000);
   });
 
   it('quality has deep model and auto-fix', () => {

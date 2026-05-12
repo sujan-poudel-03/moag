@@ -5,6 +5,7 @@
 import { EventEmitter } from 'events';
 import { spawn, ChildProcess } from 'child_process';
 import * as net from 'net';
+import * as path from 'path';
 import { detectProject, ProjectInfo } from './project-detector';
 import { SandboxConfig } from '../models/types';
 
@@ -22,6 +23,7 @@ export interface SandboxState {
 
 export class SandboxManager extends EventEmitter {
   private _process: ChildProcess | null = null;
+  private _backgroundProcesses: ChildProcess[] = [];
   private _state: SandboxState = {
     status: 'stopped',
     projectInfo: null,
@@ -50,12 +52,12 @@ export class SandboxManager extends EventEmitter {
     } else if (config?.targets && config.targets.length > 0) {
       // Launch first target (multi-target support: start all and track first URL)
       const first = config.targets[0];
-      const effectiveCwd = first.cwd ? (require('path').isAbsolute(first.cwd) ? first.cwd : require('path').join(cwd, first.cwd)) : cwd;
+      const effectiveCwd = first.cwd ? (path.isAbsolute(first.cwd) ? first.cwd : path.join(cwd, first.cwd)) : cwd;
       info = { type: 'web', framework: first.name, devCommand: first.command, defaultPort: first.port ?? 3000, resolvedCwd: effectiveCwd };
-      // Launch additional targets in background (fire-and-forget)
+      // Launch additional targets in background and track them for proper stop().
       for (let i = 1; i < config.targets.length; i++) {
         const t = config.targets[i];
-        const tCwd = t.cwd ? (require('path').isAbsolute(t.cwd) ? t.cwd : require('path').join(cwd, t.cwd)) : cwd;
+        const tCwd = t.cwd ? (path.isAbsolute(t.cwd) ? t.cwd : path.join(cwd, t.cwd)) : cwd;
         this._spawnBackground(t.command, tCwd);
       }
     } else {
@@ -92,7 +94,12 @@ export class SandboxManager extends EventEmitter {
   private _spawnBackground(command: string, cwd: string): void {
     const [cmd, ...args] = command.split(' ');
     const proc = spawn(cmd, args, { cwd, shell: true, stdio: 'ignore', detached: false });
-    proc.on('error', () => { /* background — ignore */ });
+    this._backgroundProcesses.push(proc);
+    const cleanup = () => {
+      this._backgroundProcesses = this._backgroundProcesses.filter(p => p !== proc);
+    };
+    proc.on('exit', cleanup);
+    proc.on('error', cleanup);
   }
 
   /** Stop the running sandbox process. */
@@ -101,6 +108,14 @@ export class SandboxManager extends EventEmitter {
       this._process.kill('SIGTERM');
       this._process = null;
     }
+    for (const proc of this._backgroundProcesses) {
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+    }
+    this._backgroundProcesses = [];
     this._setState({ ...this._state, status: 'stopped', url: null, error: null });
   }
 
@@ -137,32 +152,38 @@ export class SandboxManager extends EventEmitter {
     this._process.on('exit', (code) => {
       this._process = null;
       if (this._state.status !== 'stopped') {
+        const failed = code !== null && code !== 0;
         this._setState({
           ...this._state,
-          status: 'stopped',
-          error: code !== 0 ? `Dev server exited with code ${code}` : null,
+          status: failed ? 'error' : 'stopped',
+          error: failed ? `Dev server exited with code ${code}. Check the sandbox output for details.` : null,
         });
       }
     });
 
     this._process.on('error', (err) => {
       this._process = null;
-      this._setState({ ...this._state, status: 'error', error: err.message });
+      this._setState({ ...this._state, status: 'error', error: `Failed to start process: ${err.message}` });
     });
 
-    // Fallback: poll port after 12s in case no URL is printed to stdout
+    // Fallback: poll port after 30s. If still starting and port is closed, emit a timeout error.
     setTimeout(async () => {
-      if (this._state.status === 'starting' && info.defaultPort > 0) {
+      if (this._state.status !== 'starting') { return; }
+      if (info.defaultPort > 0) {
         const open = await this._isPortOpen(info.defaultPort);
         if (open) {
-          this._setState({
-            ...this._state,
-            status: 'running',
-            url: `http://localhost:${info.defaultPort}`,
-          });
+          this._setState({ ...this._state, status: 'running', url: `http://localhost:${info.defaultPort}` });
+          return;
         }
       }
-    }, 12000);
+      // Still starting after 30s — emit a clear timeout error
+      const cmd = info.devCommand;
+      this._setState({
+        ...this._state,
+        status: 'error',
+        error: `Sandbox timed out after 30s. Command "${cmd}" did not print a URL or open a port. Check the output panel for errors.`,
+      });
+    }, 30000);
   }
 
   private _launchMobileApp(cwd: string, info: ProjectInfo): void {
@@ -179,17 +200,18 @@ export class SandboxManager extends EventEmitter {
     this._process.on('exit', (code) => {
       this._process = null;
       if (this._state.status !== 'stopped') {
+        const failed = code !== null && code !== 0;
         this._setState({
           ...this._state,
-          status: 'stopped',
-          error: code !== 0 ? `Process exited with code ${code}` : null,
+          status: failed ? 'error' : 'stopped',
+          error: failed ? `Process exited with code ${code}. Check the sandbox output for details.` : null,
         });
       }
     });
 
     this._process.on('error', (err) => {
       this._process = null;
-      this._setState({ ...this._state, status: 'error', error: err.message });
+      this._setState({ ...this._state, status: 'error', error: `Failed to start process: ${err.message}` });
     });
 
     this._setState({ ...this._state, status: 'running' });

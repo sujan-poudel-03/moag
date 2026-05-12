@@ -348,10 +348,11 @@ export class TaskEditorPanel {
           <div class="field">
             <label>Type</label>
             <select id="type" onchange="onTypeChange()">
-              <option value="agent" ${taskType === 'agent' ? 'selected' : ''}>Agent</option>
-              <option value="command" ${taskType === 'command' ? 'selected' : ''}>Command</option>
-              <option value="service" ${taskType === 'service' ? 'selected' : ''}>Service</option>
-              <option value="check" ${taskType === 'check' ? 'selected' : ''}>Check</option>
+              <option value="agent" ${taskType === 'agent' ? 'selected' : ''}>Agent — Claude executes the prompt</option>
+              <option value="command" ${taskType === 'command' ? 'selected' : ''}>Command — run a shell command</option>
+              <option value="service" ${taskType === 'service' ? 'selected' : ''}>Service — long-running background process</option>
+              <option value="check" ${taskType === 'check' ? 'selected' : ''}>Check — automated polling command (requires command/verifyCommand)</option>
+              <option value="manual" ${taskType === 'manual' ? 'selected' : ''}>Manual — human gate, waits for "Mark Complete"</option>
             </select>
           </div>
           <div class="field">
@@ -512,12 +513,15 @@ export class TaskEditorPanel {
 
     function onTypeChange() {
       const type = document.getElementById('type').value;
-      document.getElementById('sectionCommand').style.display = type !== 'agent' ? 'block' : 'none';
+      // manual tasks have no command field — hide it to avoid confusion
+      document.getElementById('sectionCommand').style.display = (type !== 'agent' && type !== 'manual') ? 'block' : 'none';
       document.getElementById('sectionService').style.display = type === 'service' ? 'block' : 'none';
 
       // Update prompt hint
       const hint = document.getElementById('promptHint');
-      hint.textContent = type === 'agent' ? '(required for agent tasks)' : '(optional description)';
+      if (type === 'agent') { hint.textContent = '(required for agent tasks)'; }
+      else if (type === 'manual') { hint.textContent = '(instructions shown to the user in the "Mark Complete" notification)'; }
+      else { hint.textContent = '(optional description)'; }
     }
 
     function validate() {
@@ -537,9 +541,9 @@ export class TaskEditorPanel {
       if (type === 'agent' && !prompt) { promptErr.classList.add('visible'); valid = false; }
       else { promptErr.classList.remove('visible'); }
 
-      // Command required for command/service/check
+      // Command required for command/service/check — not for agent or manual
       const cmdErr = document.getElementById('commandError');
-      if (type !== 'agent' && !command) { cmdErr.classList.add('visible'); valid = false; }
+      if (type !== 'agent' && type !== 'manual' && !command) { cmdErr.classList.add('visible'); valid = false; }
       else { cmdErr.classList.remove('visible'); }
 
       return valid;

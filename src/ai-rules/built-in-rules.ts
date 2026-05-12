@@ -95,4 +95,14 @@ export const BUILT_IN_RULES: BuiltInRule[] = [
 - Prefer configuration over duplication in similar code paths
 - Avoid copy-paste programming`,
   },
+  {
+    id: 'builtin-dev-workflow',
+    name: 'Dev Workflow',
+    category: 'custom',
+    text: `Before writing any code for this task:
+1. Read the files most relevant to this task — understand existing patterns first.
+2. Check if a utility, helper, or abstraction already exists before creating a new one.
+3. Match the naming conventions and code style of the files you are editing.
+4. After completing: run the project lint/build check and confirm no regressions.`,
+  },
 ];

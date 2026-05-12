@@ -64,6 +64,17 @@ export interface ContextOptions {
   retrievedSpansUsedSemantic?: boolean;
   /** Pre-formatted text from enabled AI rules — injected as the highest-priority context section. */
   aiRules?: string;
+  /**
+   * Prior turns from the same chat thread (oldest-first, excluding the current turn).
+   * Injected as a high-priority section so the agent has conversational context.
+   */
+  priorThread?: HistoryEntry[];
+  /**
+   * Live sandbox URL — only passed when the playlist is a test phase and the
+   * sandbox is running. Injected as an Environment section so the agent knows
+   * what URL to test against.
+   */
+  sandboxUrl?: string;
 }
 
 /** Read context settings from VS Code configuration */
@@ -122,11 +133,35 @@ export function buildContext(options: ContextOptions): string {
     sections.push({ priority: -1, header: '## AI Rules', body: options.aiRules.trim() });
   }
 
+  if (options.priorThread && options.priorThread.length > 0) {
+    const MAX_TURNS = 6;
+    const MAX_PROMPT_CHARS = 600;
+    const MAX_OUTPUT_CHARS = 800;
+    const turns = options.priorThread.slice(-MAX_TURNS);
+    const body = turns.map(entry => {
+      const userMsg = entry.prompt.length > MAX_PROMPT_CHARS
+        ? entry.prompt.slice(0, MAX_PROMPT_CHARS) + '…'
+        : entry.prompt;
+      const raw = [entry.result.stdout, entry.result.stderr].filter(Boolean).join('\n').trim();
+      const agentMsg = raw.length > MAX_OUTPUT_CHARS ? raw.slice(0, MAX_OUTPUT_CHARS) + '…' : raw;
+      return `User: ${userMsg}\nAgent: ${agentMsg || '(no output)'}`;
+    }).join('\n\n');
+    sections.push({ priority: 0, header: '## Prior conversation', body });
+  }
+
   if (options.pendingScreenshots && options.pendingScreenshots.length > 0) {
     const body = options.pendingScreenshots
       .map((p, i) => `Screenshot ${i + 1}: ${p}`)
       .join('\n');
     sections.push({ priority: 0, header: '## Screenshots', body });
+  }
+
+  if (options.sandboxUrl) {
+    sections.push({
+      priority: 0,
+      header: '## Environment',
+      body: `Sandbox is running at: ${options.sandboxUrl}\nUse this URL when testing the application in a browser or sending HTTP requests.`,
+    });
   }
 
   if (settings.planOverview) {
@@ -736,6 +771,54 @@ export function gatherProgressAndFiles(
   return prefix + lines.join('\n');
 }
 
+/**
+ * Score how relevant a prior history entry is to the current task.
+ *
+ * Explicit `dependsOn` entries always score 1.0 and sort to the front.
+ * Otherwise the score is a weighted blend of token overlap, shared file
+ * overlap, and a weak recency signal.
+ *
+ * @param recencyIndex 0 = immediately prior task, higher = older
+ */
+export function scorePriorEntry(
+  entry: HistoryEntry,
+  currentTask: Task,
+  recencyIndex: number,
+): number {
+  if ((currentTask.dependsOn ?? []).includes(entry.taskId)) { return 1.0; }
+
+  // Token overlap between prior task name/summary and current prompt
+  const priorText = `${entry.taskName} ${entry.summary ?? ''}`.toLowerCase();
+  const currentText = currentTask.prompt.toLowerCase();
+  const toTokens = (s: string) => s.split(/\W+/).filter(t => t.length > 3 && !STOP_WORDS.has(t));
+  const priorTokenSet = new Set(toTokens(priorText));
+  const currentTokens = toTokens(currentText);
+  const tokenOverlap = currentTokens.filter(t => priorTokenSet.has(t)).length;
+  const tokenScore = tokenOverlap / Math.max(currentTokens.length, 1);
+
+  // File overlap: does the current prompt mention files this task touched?
+  const mentionedFiles = extractMentionedBasenames(currentTask.prompt);
+  const priorFiles = new Set((entry.changedFiles ?? []).map(f => path.basename(f)));
+  const fileOverlap = mentionedFiles.filter(f => priorFiles.has(f)).length;
+  const fileScore = fileOverlap / Math.max(mentionedFiles.length + 1, 1);
+
+  // Recency: weak tie-breaker — most recent = highest score
+  const recencyScore = 1 / (recencyIndex + 1);
+
+  return 0.5 * tokenScore + 0.4 * fileScore + 0.1 * recencyScore;
+}
+
+/** Extract unique file basenames mentioned in a prompt string */
+function extractMentionedBasenames(prompt: string): string[] {
+  const basenames: string[] = [];
+  const pattern = new RegExp(PATH_PATTERN.source, 'g');
+  let m: RegExpExecArray | null;
+  while ((m = pattern.exec(prompt)) !== null) {
+    basenames.push(path.basename(m[1]));
+  }
+  return [...new Set(basenames)];
+}
+
 export function gatherPriorOutputs(
   historyStore: HistoryStore,
   plan: Plan,
@@ -748,53 +831,88 @@ export function gatherPriorOutputs(
   const currentIdx = playlistTaskIds.indexOf(currentTask.id);
   const priorPlaylistIds = currentIdx > 0 ? playlistTaskIds.slice(0, currentIdx).reverse() : [];
 
-  // Explicit dependencies take priority; then same-playlist prior tasks (most recent first)
   const depIds = new Set(currentTask.dependsOn ?? []);
-  const ordered: string[] = [
-    ...priorPlaylistIds.filter(id => depIds.has(id)),   // deps that are in this playlist first
-    ...priorPlaylistIds.filter(id => !depIds.has(id)),  // then remaining playlist tasks
-    ...[...depIds].filter(id => !playlistTaskIds.includes(id)), // cross-playlist deps last
-  ];
 
+  // Cross-playlist explicit deps (not in this playlist)
+  const crossPlaylistDepIds = [...depIds].filter(id => !playlistTaskIds.includes(id));
+
+  // Build the candidate pool
+  let candidates: string[];
   if (settings.allPriorOutputs) {
-    // allPriorOutputs already included via priorPlaylistIds above — just ensure all deps present
+    candidates = [
+      ...priorPlaylistIds.filter(id => depIds.has(id)),
+      ...priorPlaylistIds.filter(id => !depIds.has(id)),
+      ...crossPlaylistDepIds,
+    ];
   } else if (depIds.size === 0) {
-    // No explicit deps and allPriorOutputs=false: include only the N most recent same-playlist tasks
-    ordered.splice(0, ordered.length, ...priorPlaylistIds.slice(0, settings.maxPriorTasks));
+    // No explicit deps: take the most recent N (they'll be relevance-sorted below)
+    candidates = priorPlaylistIds.slice(0, settings.maxPriorTasks ?? 3);
+  } else {
+    candidates = [
+      ...priorPlaylistIds.filter(id => depIds.has(id)),
+      ...priorPlaylistIds.filter(id => !depIds.has(id)),
+      ...crossPlaylistDepIds,
+    ];
   }
 
-  // Apply maxPriorTasks cap
-  const capped = ordered.slice(0, settings.maxPriorTasks);
-  if (capped.length === 0) { return ''; }
+  if (candidates.length === 0) { return ''; }
 
   const allTasks = plan.playlists.flatMap(pl => pl.tasks);
   const taskNameMap = new Map(allTasks.map(t => [t.id, t.name]));
 
-  const parts: string[] = [];
-  for (const taskId of capped) {
+  // Resolve history entries for each candidate
+  interface Candidate {
+    taskId: string;
+    name: string;
+    entry: HistoryEntry;
+    recencyIndex: number;
+  }
+  const resolved: Candidate[] = [];
+  for (let i = 0; i < candidates.length; i++) {
+    const taskId = candidates[i];
     const entries = historyStore.getForTask(taskId);
     const latest = entries[0];
     if (!latest || latest.status !== TaskStatus.Completed) { continue; }
+    resolved.push({ taskId, name: taskNameMap.get(taskId) ?? taskId, entry: latest, recencyIndex: i });
+  }
 
-    const name = taskNameMap.get(taskId) ?? taskId;
-    let stdout = (latest.result.stdout || '').trim();
-    if (!stdout) { continue; }
+  if (resolved.length === 0) { return ''; }
 
+  // Sort by relevance: explicit deps always first (score 1.0), then by scored relevance
+  resolved.sort((a, b) =>
+    scorePriorEntry(b.entry, currentTask, b.recencyIndex) -
+    scorePriorEntry(a.entry, currentTask, a.recencyIndex),
+  );
+
+  const capped = resolved.slice(0, settings.maxPriorTasks ?? 3);
+
+  const parts: string[] = [];
+  for (const { taskId, name, entry } of capped) {
     const isDep = depIds.has(taskId);
-    const limit = settings.maxOutputPerTask;
 
-    if (stdout.length > limit) {
-      if (isDep) {
-        // Explicit dependency: show head + tail so the agent sees both the plan and the outcome
+    if (isDep) {
+      // Explicit dependency: always show raw output (head+tail) — full fidelity
+      let stdout = (entry.result.stdout || '').trim();
+      if (!stdout) { continue; }
+      const limit = settings.maxOutputPerTask;
+      if (stdout.length > limit) {
         const half = Math.floor(limit / 2);
         stdout = stdout.slice(0, half) + '\n...[truncated]...\n' + stdout.slice(stdout.length - half);
-      } else {
-        // Incidental prior task: only the tail (most recent output) is useful
+      }
+      parts.push(`--- Task "${name}" (completed) ---\n${stdout}`);
+    } else if (entry.summary) {
+      // Non-dep with summary: emit the compact summary
+      parts.push(`--- Task "${name}" (completed) ---\n${entry.summary}`);
+    } else {
+      // Legacy entry (no summary): fall back to raw tail
+      let stdout = (entry.result.stdout || '').trim();
+      if (!stdout) { continue; }
+      const limit = settings.maxOutputPerTask;
+      if (stdout.length > limit) {
         stdout = '...[truncated]...\n' + stdout.slice(stdout.length - limit);
       }
+      parts.push(`--- Task "${name}" (completed) ---\n${stdout}`);
     }
-
-    parts.push(`--- Task "${name}" (completed) ---\n${stdout}`);
   }
 
   return parts.length > 0 ? parts.join('\n\n') : '';

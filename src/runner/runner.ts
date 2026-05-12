@@ -27,9 +27,11 @@ import { getEngine } from '../adapters/index';
 import { getValidationAdapters, validationResultToEngineResult } from '../adapters/validation/index';
 import { HistoryStore } from '../history/store';
 import { buildContext, getContextSettings, runRetrievalCascade } from '../context/context-builder';
+import { extractSummary } from '../context/memory-extractor';
 import { analyzeProject } from '../context/project-analyzer';
 import { PromptLibraryStore } from '../templates/prompt-library';
 import { AiRulesStore } from '../ai-rules/rules-store';
+import { TaskQueue } from './task-queue';
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const GIT_TIMEOUT_MS = 30_000;
@@ -195,6 +197,44 @@ export function classifyFailure(stderr: string, stdout: string): FailureClassifi
   };
 }
 
+interface InteractiveCommandWarning {
+  issue: string;
+  fix: string;
+}
+
+const INTERACTIVE_PATTERNS: Array<{ pattern: RegExp; issue: string; fix: string }> = [
+  { pattern: /\bprisma\s+migrate\s+dev\b(?!.*--name)/,
+    issue: 'prisma migrate dev prompts for a migration name on stdin',
+    fix: 'Add --name flag: prisma migrate dev --name <your_migration_name>' },
+  { pattern: /\bgit\s+rebase\s+-i\b/,
+    issue: 'git rebase -i opens an interactive editor — no TTY available',
+    fix: 'Use git rebase <base-branch> for non-interactive rebase' },
+  { pattern: /\bnpm\s+init\b(?!.*-y)/,
+    issue: 'npm init prompts for package details on stdin',
+    fix: 'Add -y to skip prompts: npm init -y' },
+  { pattern: /\byarn\s+init\b(?!.*-y)/,
+    issue: 'yarn init prompts for package details on stdin',
+    fix: 'Add -y to skip prompts: yarn init -y' },
+  { pattern: /\bpnpm\s+create\b(?!.*--)/,
+    issue: 'pnpm create may prompt for project options',
+    fix: 'Pass all required options as flags' },
+  { pattern: /(?:^|\s|&&|\|\|)read\s+/m,
+    issue: 'bash "read" reads from stdin — no TTY available in MOAG',
+    fix: 'Hardcode the value or pass it via environment variable' },
+  { pattern: /\bssh-keygen\b(?!.*-f\s)/,
+    issue: 'ssh-keygen prompts for filename and passphrase',
+    fix: 'Add -f <path> -t rsa -N "" to run non-interactively' },
+];
+
+export function detectInteractiveCommand(command: string): InteractiveCommandWarning | null {
+  for (const p of INTERACTIVE_PATTERNS) {
+    if (p.pattern.test(command)) {
+      return { issue: p.issue, fix: p.fix };
+    }
+  }
+  return null;
+}
+
 function composeAbortSignals(...signals: AbortSignal[]): AbortSignal {
   const controller = new AbortController();
   for (const s of signals) {
@@ -216,11 +256,16 @@ export interface RunnerEvents {
   'task-output': (task: Task, chunk: string, stream: 'stdout' | 'stderr') => void;
   'task-completed': (task: Task, result: EngineResult) => void;
   'task-failed': (task: Task, result: EngineResult) => void;
+  /** Fired when auto-fix has exhausted its attempts — human intervention needed */
+  'task-escalate': (task: Task, category: string, errorLines: string[]) => void;
   'engine-fallback': (details: { taskId: string; fromEngine: EngineId; toEngine: EngineId }) => void;
   'budget-exceeded': (details: BudgetExceededEvent) => void;
+  'playlist-started': (playlist: Playlist) => void;
   'playlist-completed': (playlist: Playlist) => void;
   'all-completed': () => void;
   'error': (err: Error) => void;
+  /** Fired when a type:"manual" task is waiting for human confirmation */
+  'manual-gate': (task: Task) => void;
 }
 
 interface ServiceHandle {
@@ -260,12 +305,19 @@ export class TaskRunner {
   private _sessionTokensOut = 0;
   private _budgetExceededEmitted = false;
   private _autoFixedTasks = new Set<string>();
+  /** Live task queue for the currently-running sequential playlist. Null during parallel execution. */
+  private _activeQueue: TaskQueue | null = null;
+  /** Session key passed to session-aware adapters (e.g. AnthropicAdapter) for multi-turn context. */
+  private _currentSessionId: string | null = null;
 
   private _promptLibrary: PromptLibraryStore | null = null;
   private _aiRulesStore: AiRulesStore | null = null;
   private _pendingScreenshots: string[] = [];
+  private _sandboxUrl: string | null = null;
   /** Stores failure context (stderr + verify output) from the last failed attempt, keyed by task id */
   private _taskFailureContext = new Map<string, string>();
+  /** Pending manual gate resolvers — keyed by task id, resolved when user marks step complete */
+  private _manualGates = new Map<string, { complete: () => void; skip: () => void }>();
 
   constructor(private readonly historyStore: HistoryStore) {}
 
@@ -275,6 +327,10 @@ export class TaskRunner {
 
   setAiRulesStore(store: AiRulesStore): void {
     this._aiRulesStore = store;
+  }
+
+  setSandboxUrl(url: string | null): void {
+    this._sandboxUrl = url;
   }
 
   /**
@@ -508,6 +564,24 @@ export class TaskRunner {
     }
   }
 
+  /** Called by UI when the user clicks "Mark Complete" on a manual gate task */
+  resolveManualGate(taskId: string): void {
+    const gate = this._manualGates.get(taskId);
+    if (gate) {
+      gate.complete();
+      this._manualGates.delete(taskId);
+    }
+  }
+
+  /** Called by UI when the user clicks "Skip" on a manual gate task */
+  skipManualGate(taskId: string): void {
+    const gate = this._manualGates.get(taskId);
+    if (gate) {
+      gate.skip();
+      this._manualGates.delete(taskId);
+    }
+  }
+
   resetPlan(plan: Plan): void {
     for (const pl of plan.playlists) {
       for (const t of pl.tasks) {
@@ -605,6 +679,8 @@ export class TaskRunner {
         return;
       }
 
+      this.emit('playlist-started', playlist);
+
       if (playlist.parallel && !failSafe) {
         await this.runPlaylistParallel(playlist, plan);
       } else {
@@ -629,6 +705,7 @@ export class TaskRunner {
           nextIndex++;
           running++;
 
+          this.emit('playlist-started', playlist);
           const runPlaylist = (playlist.parallel && !this.isFailSafeMode())
             ? this.runPlaylistParallel(playlist, plan)
             : this.runPlaylistSequential(playlist, plan, 0);
@@ -661,58 +738,63 @@ export class TaskRunner {
   }
 
   private async runPlaylistSequential(playlist: Playlist, plan: Plan, startTask: number): Promise<void> {
-    for (let ti = startTask; ti < playlist.tasks.length; ti++) {
-      if (this.state === RunnerState.Stopping) {
-        return;
-      }
+    // Build the live queue from remaining tasks — repair tasks will be injected mid-run
+    const queue = new TaskQueue();
+    queue.enqueueAll(playlist.tasks.slice(startTask), playlist);
+    this._activeQueue = queue;
+    this._currentSessionId = playlist.id;
 
-      if (this.state === RunnerState.Paused) {
-        if (this._pauseResolve) {
-          this._pauseResolve();
+    try {
+      while (!queue.isEmpty) {
+        if (this.state === RunnerState.Stopping) { break; }
+
+        if (this.state === RunnerState.Paused) {
+          if (this._pauseResolve) { this._pauseResolve(); }
+          await new Promise<void>((resolve) => { this._pauseResolve = resolve; });
+          if (this.isStopping()) { break; }
         }
-        await new Promise<void>((resolve) => {
-          this._pauseResolve = resolve;
-        });
-        if (this.isStopping()) {
-          return;
-        }
-      }
 
-      const task = playlist.tasks[ti];
-      this._currentTaskIndex = ti;
+        const entry = queue.dequeue();
+        if (!entry) { break; }
 
-      if (task.status === TaskStatus.Completed || task.status === TaskStatus.Skipped) {
-        continue;
-      }
+        const { task, playlist: taskPlaylist, synthetic, repairCycle } = entry;
 
-      if (task.dependsOn && task.dependsOn.length > 0) {
-        const depStatus = this.checkDependencies(task, plan);
-        if (depStatus === 'skip') {
-          task.status = TaskStatus.Skipped;
-          this.emit('task-output', task, `[Skipped] "${task.name}" - dependency not met\n`, 'stderr');
-          this.emit('task-completed', task, { stdout: '', stderr: 'Skipped: dependency not met', exitCode: 0, durationMs: 0 });
+        // Completed/skipped/blocked tasks are replayed during resume — skip them (but always run synthetic repair tasks)
+        if (!synthetic && (task.status === TaskStatus.Completed || task.status === TaskStatus.Skipped || task.status === TaskStatus.Blocked)) {
           continue;
         }
-      }
 
-      if (this.shouldSkipIf(task, plan)) {
-        task.status = TaskStatus.Skipped;
-        this.emit('task-output', task, `[Skipped] "${task.name}" - skipIf condition met\n`, 'stderr');
-        this.emit('task-completed', task, { stdout: '', stderr: 'Skipped: skipIf condition met', exitCode: 0, durationMs: 0 });
-        continue;
-      }
+        if (!synthetic && task.dependsOn && task.dependsOn.length > 0) {
+          const depStatus = this.checkDependencies(task, plan);
+          if (depStatus === 'skip') {
+            task.status = TaskStatus.Skipped;
+            this.emit('task-output', task, `[Skipped] "${task.name}" - dependency not met\n`, 'stderr');
+            this.emit('task-completed', task, { stdout: '', stderr: 'Skipped: dependency not met', exitCode: 0, durationMs: 0 });
+            continue;
+          }
+        }
 
-      await this.executeTaskWithRetry(task, playlist, plan);
+        if (!synthetic && this.shouldSkipIf(task, plan)) {
+          task.status = TaskStatus.Skipped;
+          this.emit('task-output', task, `[Skipped] "${task.name}" - skipIf condition met\n`, 'stderr');
+          this.emit('task-completed', task, { stdout: '', stderr: 'Skipped: skipIf condition met', exitCode: 0, durationMs: 0 });
+          continue;
+        }
 
-      if (this.isStopping()) {
-        return;
-      }
+        await this.executeTaskWithRetry(task, taskPlaylist, plan, repairCycle);
 
-      if (playlist.autoplay && ti < playlist.tasks.length - 1) {
-        const delay = playlist.autoplayDelay ??
-          vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('autoplayDelay', 2000);
-        await this.sleep(delay);
+        if (this.isStopping()) { break; }
+
+        // Autoplay delay only between non-synthetic original tasks
+        if (!synthetic && playlist.autoplay && !queue.isEmpty) {
+          const delay = taskPlaylist.autoplayDelay ??
+            vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('autoplayDelay', 2000);
+          await this.sleep(delay);
+        }
       }
+    } finally {
+      this._activeQueue = null;
+      this._currentSessionId = null;
     }
   }
 
@@ -730,8 +812,9 @@ export class TaskRunner {
           }
           const depStatus = this.checkDependencies(task, plan);
           if (depStatus === 'skip') {
-            task.status = TaskStatus.Skipped;
-            this.emit('task-output', task, `[Skipped] "${task.name}" - dependency not met\n`, 'stderr');
+            task.status = TaskStatus.Blocked;
+            this.emit('task-output', task, `[Blocked] "${task.name}" - dependency failed\n`, 'stderr');
+            this.emit('task-failed', task, { stdout: '', stderr: 'Blocked: dependency failed', exitCode: 1, durationMs: 0 });
             return;
           }
         }
@@ -770,7 +853,7 @@ export class TaskRunner {
     return ref.status === task.skipIf.status;
   }
 
-  private async executeTaskWithRetry(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
+  private async executeTaskWithRetry(task: Task, playlist: Playlist, plan: Plan, repairCycle = 0): Promise<void> {
     const failSafe = this.isFailSafeMode();
     const fullAuto = !failSafe && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('fullAuto', false);
     const effectiveMaxAttempts = fullAuto ? Math.max((task.retryCount ?? 0) + 1, 4) : (task.retryCount ?? 0) + 1;
@@ -780,30 +863,38 @@ export class TaskRunner {
     }
 
     for (let attempt = 1; attempt <= effectiveMaxAttempts; attempt++) {
-      await this.executeTask(task, playlist, plan);
+      await this.executeTask(task, playlist, plan, repairCycle);
       if (task.status === TaskStatus.Completed || this.state === RunnerState.Stopping) {
         return;
       }
       if (attempt < effectiveMaxAttempts) {
-        // Fix 5: use failure category to drive retry behaviour
         const failCtxRaw = this._taskFailureContext.get(task.id) ?? '';
         const categoryMatch = failCtxRaw.match(/^Failure category:\s*(\S+)/m);
         const failCategory = categoryMatch?.[1] as FailureCategory | undefined;
 
         if (failCategory === 'auth') {
-          // Auth failures cannot be resolved by retrying — stop the loop immediately
-          this.emit('task-output', task, `[Retry] Stopping — authentication failure cannot be resolved by retrying.\n`, 'stderr');
+          // Auth cannot be fixed by retrying — surface an actionable hint
+          this.emit('task-output', task,
+            `[Retry] Stopping — authentication failure cannot be resolved by retrying.\n` +
+            `[ACTION:auth] Re-authenticate and retry: run the engine's login command (e.g. \`claude login\`, \`codex login\`), then right-click this task → Retry.\n`,
+            'stderr');
           break;
         }
 
-        const retryDelayMs = failCategory === 'rate-limit' ? 30_000 : 2_000;
         if (failCategory === 'rate-limit') {
-          this.emit('task-output', task, `[Retry] Rate limit — waiting 30s before retry ${attempt + 1}...\n`, 'stderr');
+          // Countdown so the user sees progress during the mandatory wait
+          const waitSecs = 30;
+          this.emit('task-output', task,
+            `[Retry] Rate limit hit — waiting ${waitSecs}s before retry ${attempt + 1}...\n`,
+            'stderr');
+          await this.sleepWithCountdown(task, waitSecs);
         } else {
-          this.emit('task-output', task, `\n[Retry ${attempt}/${task.retryCount}] Retrying "${task.name}"...\n`, 'stderr');
+          this.emit('task-output', task,
+            `\n[Retry ${attempt}/${task.retryCount}] Retrying "${task.name}"...\n`,
+            'stderr');
+          await this.sleep(2_000);
         }
         task.status = TaskStatus.Pending;
-        await this.sleep(retryDelayMs);
       }
     }
 
@@ -889,14 +980,86 @@ export class TaskRunner {
     if ((task.status as string) === TaskStatus.Completed) {
       this.emit('task-output', task, '[Auto-Fix] Repair succeeded!\n', 'stdout');
     } else {
-      this.emit('task-output', task, '[Auto-Fix] Repair also failed. Manual intervention needed.\n', 'stderr');
+      this.emit('task-output', task, '[Auto-Fix] Repair also failed. Use Smart Fix in the sidebar for guided repair.\n', 'stderr');
+      this.emit('task-escalate', task, classification.category, classification.errorLines);
     }
   }
 
-  private async executeTask(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
+  private async executeTask(task: Task, playlist: Playlist, plan: Plan, repairCycle = 0): Promise<void> {
     const taskType = this.getTaskType(task);
 
-    // Fix 4: Fail-fast on empty prompt — sending blank text to an agent wastes tokens and
+    // type:"check" with no command or verifyCommand — point toward type:"manual" instead
+    if (taskType === 'check' && !task.command?.trim() && !task.verifyCommand?.trim()) {
+      const noCommandResult: EngineResult = {
+        stdout: '',
+        stderr: 'check task missing command and verifyCommand',
+        exitCode: 1,
+        durationMs: 0,
+      };
+      task.status = TaskStatus.Failed;
+      this.emit('task-output', task,
+        `[Config Error] type:"check" is an automated check — it requires "command" or "verifyCommand".\n` +
+        `  For a human gate with no automated command, use type:"manual" instead.\n` +
+        `  type:"manual" shows a "Mark Complete" notification and waits for human confirmation.\n`,
+        'stderr');
+      this.emit('task-failed', task, noCommandResult);
+      return;
+    }
+
+    // Fix 1: type:"command" with no command field but with a prompt → user almost certainly meant type:"agent"
+    if (taskType === 'command' && !task.command?.trim() && task.prompt?.trim()) {
+      const mismatchResult: EngineResult = {
+        stdout: '',
+        stderr: 'command field missing on command task',
+        exitCode: 1,
+        durationMs: 0,
+      };
+      task.status = TaskStatus.Failed;
+      this.emit('task-output', task,
+        `[Config Error] type:"command" tasks run the "command" field — the "prompt" is ignored.\n` +
+        `  This task has a prompt but no "command". Did you mean type:"agent"?\n` +
+        `  → Change type to "agent" so Claude reads and executes the prompt.\n`,
+        'stderr');
+      this.emit('task-failed', task, mismatchResult);
+      return;
+    }
+
+    // Fix 1b: type:"command" with multi-line prompt → soft warning that prompt is ignored
+    if (taskType === 'command' && task.command?.trim() && task.prompt && task.prompt.split('\n').filter(l => l.trim()).length > 2) {
+      this.emit('task-output', task,
+        `[Warning] type:"command" — only the "command" field runs. The multi-line prompt is ignored.\n` +
+        `  If you want Claude to execute steps from the prompt, change type to "agent".\n`,
+        'stderr');
+    }
+
+    // Fix 2: Detect interactive CLI commands that require a TTY (will hang in MOAG)
+    for (const cmd of [task.command, task.verifyCommand].filter(Boolean) as string[]) {
+      const interactive = detectInteractiveCommand(cmd);
+      if (interactive) {
+        this.emit('task-output', task,
+          `[Warning] Potentially interactive command detected — MOAG has no TTY:\n` +
+          `  Command : ${cmd}\n` +
+          `  Problem : ${interactive.issue}\n` +
+          `  Fix     : ${interactive.fix}\n`,
+          'stderr');
+      }
+    }
+
+    // Fix 4: Warn about missing context files before the agent starts
+    if (task.files && task.files.length > 0 && (taskType === 'agent' || taskType === 'review')) {
+      const cwdForFiles = this.resolveCwd(task.cwd);
+      for (const filePath of task.files) {
+        const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwdForFiles, filePath);
+        if (!fs.existsSync(resolved)) {
+          this.emit('task-output', task,
+            `[Warning] Context file not found: ${filePath}\n` +
+            `  Claude will have no context for this file — verify the path in the task's "files" field.\n`,
+            'stderr');
+        }
+      }
+    }
+
+    // Fail-fast on empty prompt — sending blank text to an agent wastes tokens and
     // produces confusing output. Surface a clear error immediately instead.
     if ((taskType === 'agent' || taskType === 'review') && !task.prompt?.trim()) {
       const emptyResult: EngineResult = {
@@ -958,9 +1121,15 @@ export class TaskRunner {
     }
 
     const taskAbort = new AbortController();
+    const settingOverrideMs = (() => {
+      try {
+        const v = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('taskTimeoutMs');
+        return typeof v === 'number' && v >= 30000 ? v : undefined;
+      } catch { return undefined; }
+    })();
     const taskTimeoutMs = taskType === 'service'
       ? (task.startupTimeoutMs ?? DEFAULT_SERVICE_STARTUP_TIMEOUT_MS)
-      : profile.taskTimeoutMs;
+      : (task.timeoutMs ?? settingOverrideMs ?? profile.taskTimeoutMs);
     const timeoutId = setTimeout(() => taskAbort.abort(), taskTimeoutMs);
     const onParentAbort = () => taskAbort.abort();
     this._abortController?.signal.addEventListener('abort', onParentAbort, { once: true });
@@ -975,6 +1144,26 @@ export class TaskRunner {
       baselineVerification = await this.runVerification(task.verifyCommand, cwd, resolvedEnv, taskAbort.signal, task);
       baselineVerification.baselinePassed = baselineVerification.passed;
       if (!baselineVerification.passed) {
+        const haltOnBroken = (() => {
+          try {
+            return vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('haltOnBrokenBaseline', true);
+          } catch { return true; }
+        })();
+        if (haltOnBroken) {
+          const haltMsg = `[Pre-flight] Baseline already broken (exit ${baselineVerification.exitCode ?? 1}) — halting to prevent cascading failures.\n` +
+            `Fix the baseline before re-running. Disable agentTaskPlayer.haltOnBrokenBaseline to proceed anyway.\n`;
+          this.emit('task-output', task, haltMsg, 'stderr');
+          task.status = TaskStatus.Failed;
+          this.emit('task-failed', task, {
+            stdout: '',
+            stderr: haltMsg,
+            exitCode: baselineVerification.exitCode ?? 1,
+            durationMs: 0,
+          });
+          clearTimeout(timeoutId);
+          this._abortController?.signal.removeEventListener('abort', onParentAbort);
+          return;
+        }
         this.emit('task-output', task,
           `[Pre-flight] Baseline already broken before agent runs — task will not be blamed for this failure\n`,
           'stderr');
@@ -997,6 +1186,40 @@ export class TaskRunner {
           exitCode: 124,
           durationMs: taskTimeoutMs,
         };
+
+        // Reconciliation: if the agent wrote output despite the timeout, don't waste the work.
+        // Check 1 — explicit artifacts: if all expectedArtifacts exist on disk, treat as done.
+        if (task.expectedArtifacts && task.expectedArtifacts.length > 0) {
+          const allExist = task.expectedArtifacts.every(artifact => {
+            const resolved = path.isAbsolute(artifact) ? artifact : path.join(cwd, artifact);
+            return fs.existsSync(resolved);
+          });
+          if (allExist) {
+            this.emit('task-output', task,
+              `[Reconcile] All ${task.expectedArtifacts.length} expected artifacts found on disk — treating as completed despite timeout.\n`,
+              'stdout');
+            result = { ...result, exitCode: 0 };
+          }
+        }
+
+        // Check 2 — implicit: if git shows file changes since this task started, agent made real progress.
+        // Only kicks in when no expectedArtifacts are defined and task is still timed-out.
+        if (result.exitCode === 124) {
+          const gitRef = this._taskGitRefs.get(task.id);
+          if (gitRef) {
+            try {
+              const diff = await this.runGitCommand(['diff', '--name-only', gitRef.ref], cwd);
+              const changedFiles = diff ? diff.trim().split('\n').filter(f => f.length > 0) : [];
+              if (changedFiles.length > 0) {
+                this.emit('task-output', task,
+                  `[Reconcile] ${changedFiles.length} file(s) written before timeout — treating as completed.\n` +
+                  changedFiles.map(f => `  • ${f}`).join('\n') + '\n',
+                  'stdout');
+                result = { ...result, exitCode: 0 };
+              }
+            } catch { /* git unavailable — leave as timeout failure */ }
+          }
+        }
       }
 
       if (result.exitCode === 0 && task.verifyCommand && taskType !== 'check') {
@@ -1057,13 +1280,16 @@ export class TaskRunner {
 
       // Auto-test: run project tests after successful agent task
       if (result.exitCode === 0 && this.getTaskType(task) === 'agent') {
-        const testResult = await this.autoTestAfterTask(task, cwd, taskAbort.signal);
+        const testResult = await this.autoTestAfterTask(task, playlist, cwd, taskAbort.signal, repairCycle);
         if (!testResult.passed) {
-          result = {
-            ...result,
-            exitCode: 1,
-            stderr: (result.stderr ? result.stderr + '\n' : '') + '[Auto-Test] Tests failed:\n' + testResult.output.slice(-1000),
-          };
+          // If a repair task was queued, don't mark original task as failed — let the repair run
+          if (!testResult.repairQueued) {
+            result = {
+              ...result,
+              exitCode: 1,
+              stderr: (result.stderr ? result.stderr + '\n' : '') + '[Auto-Test] Tests failed:\n' + testResult.output.slice(-1000),
+            };
+          }
         }
       }
 
@@ -1114,6 +1340,7 @@ export class TaskRunner {
         modelId: (task as Task & { _modelId?: string })._modelId,
         modelReason: (task as Task & { _modelReason?: string })._modelReason,
         validationTargetResults: (task as Task & { _validationTargetResults?: HistoryEntry['validationTargetResults'] })._validationTargetResults,
+        summary: extractSummary(result.stdout, changedFiles.length > 0 ? changedFiles : undefined),
       };
       this.historyStore.add(entry);
       this.trackTaskCost(result);
@@ -1139,6 +1366,15 @@ export class TaskRunner {
         }
         this._taskFailureContext.set(task.id, failureLines.join('\n\n'));
         this.emit('task-failed', task, result);
+        // Fix 3: Hint when autoFix is off so users know why MOAG won't self-repair
+        const autoFixOn = !this.isFailSafeMode() && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
+        if (!autoFixOn && taskType === 'agent') {
+          this.emit('task-output', task,
+            `[Hint] autoFix is disabled — Claude won't attempt self-repair.\n` +
+            `  Enable it: Settings → agentTaskPlayer.autoFix: true\n` +
+            `  Or right-click the task → Retry Task with Note to manually guide the fix.\n`,
+            'stderr');
+        }
         this.applyFailurePolicy(task, result);
       }
     } catch (err) {
@@ -1177,6 +1413,15 @@ export class TaskRunner {
       });
 
       this.emit('task-failed', task, errorResult);
+      // Fix 3: Hint when autoFix is off so users know why MOAG won't self-repair
+      const autoFixOnCatch = !this.isFailSafeMode() && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
+      if (!autoFixOnCatch && taskType === 'agent') {
+        this.emit('task-output', task,
+          `[Hint] autoFix is disabled — Claude won't attempt self-repair.\n` +
+          `  Enable it: Settings → agentTaskPlayer.autoFix: true\n` +
+          `  Or right-click the task → Retry Task with Note to manually guide the fix.\n`,
+          'stderr');
+      }
       this.applyFailurePolicy(task, errorResult);
     } finally {
       clearTimeout(timeoutId);
@@ -1206,6 +1451,30 @@ export class TaskRunner {
       this.emit('task-output', task, `\n[Failure policy] Stopping after "${task.name}" failed (exit ${result.exitCode}).\n`, 'stderr');
       this.stop();
     }
+    // BUG 1 fix: propagate Blocked status to all tasks that depend on this failed task,
+    // including tasks in other playlists. Without this, cross-playlist dependents that
+    // have stale "completed" status from a previous run would bypass the dependency check.
+    this.markDependentsBlocked(task.id);
+  }
+
+  private markDependentsBlocked(failedTaskId: string): void {
+    const plan = this._plan;
+    if (!plan) { return; }
+    const allTasks = plan.playlists.flatMap(pl => pl.tasks);
+    // Propagate transitively: a task blocked because its dependency is blocked is also blocked
+    const toBlock = new Set<string>([failedTaskId]);
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const t of allTasks) {
+        if (t.status === TaskStatus.Blocked || t.status === TaskStatus.Completed || t.status === TaskStatus.Skipped) { continue; }
+        if (t.dependsOn?.some(depId => toBlock.has(depId))) {
+          t.status = TaskStatus.Blocked;
+          toBlock.add(t.id);
+          changed = true;
+        }
+      }
+    }
   }
 
   private async runTaskByType(
@@ -1232,9 +1501,93 @@ export class TaskRunner {
         return this.runReviewTask(task, engineId, cwd, signal, plan, fallbackEngine);
       case 'validate':
         return this.runValidateTask(task, cwd, signal, plan);
+      case 'manual':
+        return this.runManualTask(task, signal);
+      case 'visual-test':
+        return this.runVisualTestTask(task, cwd, fullPrompt, signal);
       default:
         return { stdout: '', stderr: `Unsupported task type "${taskType}"`, exitCode: 1, durationMs: 0 };
     }
+  }
+
+  private async runManualTask(task: Task, signal: AbortSignal): Promise<EngineResult> {
+    // In CI environments, skip manual gates automatically rather than hanging
+    if (process.env.CI === 'true') {
+      this.emit('task-output', task,
+        `[Manual Gate] CI environment detected — skipping "${task.name}" automatically.\n` +
+        `  Set CI="" in your environment to require manual confirmation.\n`,
+        'stderr');
+      return { stdout: 'Skipped in CI.', stderr: '', exitCode: 0, durationMs: 0 };
+    }
+
+    this.emit('task-output', task,
+      `\n[Manual Gate] "${task.name}" requires human action before continuing.\n` +
+      (task.prompt ? `  What to do: ${task.prompt}\n` : '') +
+      `  → Click "Mark Complete" in the notification to unblock execution.\n` +
+      `  → Click "Skip" to bypass this step and continue.\n`,
+      'stdout');
+
+    this.emit('manual-gate', task);
+
+    const startMs = Date.now();
+    return new Promise<EngineResult>((resolve) => {
+      this._manualGates.set(task.id, {
+        complete: () => resolve({
+          stdout: 'Manual step marked complete by user.',
+          stderr: '',
+          exitCode: 0,
+          durationMs: Date.now() - startMs,
+        }),
+        skip: () => resolve({
+          stdout: 'Manual step skipped by user.',
+          stderr: '',
+          exitCode: 0,
+          durationMs: Date.now() - startMs,
+        }),
+      });
+
+      signal.addEventListener('abort', () => {
+        this._manualGates.delete(task.id);
+        resolve({ stdout: '', stderr: 'Manual gate cancelled.', exitCode: 1, durationMs: Date.now() - startMs });
+      }, { once: true });
+    });
+  }
+
+  private async runVisualTestTask(
+    task: Task,
+    cwd: string,
+    fullPrompt: string,
+    signal: AbortSignal,
+  ): Promise<EngineResult> {
+    let engine: import('../adapters/engine').EngineAdapter;
+    try {
+      engine = getEngine('anthropic' as EngineId);
+    } catch {
+      return {
+        stdout: '',
+        stderr:
+          '[Visual Test] The "anthropic" engine is not available.\n' +
+          'Configure ANTHROPIC_API_KEY or add it in Settings → agentTaskPlayer.engines.anthropic.apiKey',
+        exitCode: 1,
+        durationMs: 0,
+      };
+    }
+
+    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer.engines.anthropic');
+    const model = cfg.get<string>('model', 'claude-sonnet-4-6');
+
+    return engine.runTask({
+      prompt: fullPrompt,
+      cwd,
+      signal,
+      browserEnabled: true,
+      sandboxUrl: this._sandboxUrl ?? undefined,
+      modelId: model,
+      sessionId: this._currentSessionId ?? undefined,
+      onOutput: (chunk, stream) => {
+        this.emit('task-output', task, chunk, stream);
+      },
+    });
   }
 
   private async runAgentTask(
@@ -1293,13 +1646,22 @@ export class TaskRunner {
       modelMeta._modelReason = selection?.reason;
     }
 
+    // BUG 2 fix: only pass file paths that actually exist on disk; invalid paths would cause
+    // the adapter to report 0 context files and Claude would run with no context.
+    const resolvedCwd = this.resolveCwd(task.cwd);
+    const validFiles = task.files?.filter(f => {
+      const abs = path.isAbsolute(f) ? f : path.join(resolvedCwd, f);
+      return fs.existsSync(abs);
+    });
+
     const engine = getEngine(engineId);
     const result = await engine.runTask({
       prompt: fullPrompt,
       cwd,
-      files: task.files,
+      files: validFiles?.length ? validFiles : undefined,
       signal,
       modelId: selection?.modelId,
+      sessionId: this._currentSessionId ?? undefined,
       onOutput: (chunk, stream) => {
         this.emit('task-output', task, chunk, stream);
       },
@@ -1547,6 +1909,7 @@ export class TaskRunner {
       gemini: 'claude',
       ollama: 'claude',
       custom: 'claude',
+      anthropic: 'claude',
     };
     const rotated = rotation[originalEngine];
     if (rotated && rotated !== originalEngine) {
@@ -1578,7 +1941,15 @@ export class TaskRunner {
   private async runCheckTask(task: Task, cwd: string, signal: AbortSignal, resolvedEnv?: Record<string, string>): Promise<EngineResult> {
     const command = task.command?.trim() || task.verifyCommand?.trim();
     if (!command) {
-      return { stdout: '', stderr: 'Check task requires "command" or "verifyCommand".', exitCode: 1, durationMs: 0 };
+      return {
+        stdout: '',
+        stderr:
+          `[Config Error] type:"check" requires a "command" or "verifyCommand" — it is an automated polling check, not a human gate.\n` +
+          `  If you need a human step with no automated command, use type:"manual" instead.\n` +
+          `  type:"manual" shows a "Mark Complete" button and waits for human confirmation.`,
+        exitCode: 1,
+        durationMs: 0,
+      };
     }
     this.emit('task-output', task, `\n-- Check: ${command} --\n`, 'stdout');
     const result = await this.runLocalCommand(command, {
@@ -1970,11 +2341,23 @@ export class TaskRunner {
       const { spans: retrievedSpans, usedSemantic: retrievedSpansUsedSemantic } =
         await runRetrievalCascade(task, cwd, settings.maxFileContextChars);
 
-      const aiRules = this._aiRulesStore?.getEnabledText(cwd) ?? '';
+      const ruleParts: string[] = [];
+      const storeRules = this._aiRulesStore?.getEnabledText(cwd) ?? '';
+      if (storeRules) { ruleParts.push(storeRules); }
+      if (plan.aiRules?.trim()) { ruleParts.push(`### Plan Rules\n${plan.aiRules.trim()}`); }
+      if (playlist.aiRules?.trim()) { ruleParts.push(`### Playlist Rules\n${playlist.aiRules.trim()}`); }
+      const aiRules = ruleParts.join('\n\n');
+      const threadMeta = task as Task & { _threadId?: string; _turnIndex?: number };
+      const priorThread = (threadMeta._threadId && (threadMeta._turnIndex ?? 0) > 0)
+        ? this.historyStore.getThread(threadMeta._threadId)
+            .filter(e => (e.turnIndex ?? 0) < (threadMeta._turnIndex ?? 0))
+        : undefined;
       const ctx = buildContext({
         plan, playlist, task, cwd, historyStore: this.historyStore, settings,
         pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
         aiRules: aiRules || undefined,
+        priorThread: priorThread?.length ? priorThread : undefined,
+        sandboxUrl: (playlist.testPhase && this._sandboxUrl) ? this._sandboxUrl : undefined,
       });
       if (ctx) {
         prompt += ctx + '\n\n';
@@ -2257,9 +2640,11 @@ export class TaskRunner {
 
   private async autoTestAfterTask(
     task: Task,
+    playlist: Playlist,
     cwd: string,
     signal: AbortSignal,
-  ): Promise<{ passed: boolean; output: string }> {
+    repairCycle: number,
+  ): Promise<{ passed: boolean; output: string; repairQueued?: boolean }> {
     const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
     if (!cfg.get<boolean>('autoTest', false)) {
       return { passed: true, output: '' };
@@ -2283,12 +2668,56 @@ export class TaskRunner {
       return { passed: true, output: result.stdout };
     }
 
+    const output = [result.stderr, result.stdout].filter(Boolean).join('\n');
     this.emit('task-output', task, `[Auto-Test] Tests failed (exit ${result.exitCode})\n`, 'stderr');
-    return { passed: false, output: [result.stderr, result.stdout].filter(Boolean).join('\n') };
+
+    // Queue a repair task if we're under the cycle cap and a queue is active
+    const MAX_REPAIR_CYCLES = 2;
+    if (repairCycle < MAX_REPAIR_CYCLES && this._activeQueue) {
+      const repairTask: Task = {
+        id: generateId(),
+        name: `[Auto-Repair ${repairCycle + 1}/${MAX_REPAIR_CYCLES}] Fix tests after: ${task.name}`,
+        prompt: [
+          `Tests are failing after the agent completed task: "${task.name}".`,
+          ``,
+          `TEST FAILURE OUTPUT:`,
+          output.slice(-3000),
+          ``,
+          `INSTRUCTIONS:`,
+          `- Fix the production code to make these tests pass.`,
+          `- Do NOT modify or delete test files.`,
+          `- Focus only on the minimal changes needed to fix the failing assertions.`,
+          `- After making changes, verify by reasoning through what each failing test checks.`,
+        ].join('\n'),
+        type: 'agent',
+        engine: task.engine,
+        cwd: task.cwd,
+        env: task.env,
+        status: TaskStatus.Pending,
+      };
+
+      this._activeQueue.injectNext(repairTask, playlist, repairCycle + 1);
+      this.emit('task-output', task,
+        `[Auto-Test] Repair task queued (cycle ${repairCycle + 1}/${MAX_REPAIR_CYCLES}) \u2014 continuing...\n`,
+        'stderr');
+      return { passed: false, output, repairQueued: true };
+    }
+
+    return { passed: false, output };
   }
 
   private sleep(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  /** Emit a live countdown tick every second so the user sees progress during rate-limit waits. */
+  private async sleepWithCountdown(task: Task, totalSecs: number): Promise<void> {
+    for (let remaining = totalSecs; remaining > 0; remaining--) {
+      if (this.isStopping()) { return; }
+      this.emit('task-output', task, `\r[Rate Limit] Retrying in ${remaining}s... `, 'stderr');
+      await this.sleep(1000);
+    }
+    this.emit('task-output', task, '\n', 'stderr');
   }
 
   private isStopping(): boolean {

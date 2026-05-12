@@ -1,5 +1,104 @@
 # Changelog
 
+## [0.9.9] - 2026-05-12
+
+### Browser-Level Visual Testing
+
+- **`visual-test` task type** — new task type that wires Claude's vision to your live sandbox; the Anthropic API adapter sends a screenshot directly to the model for visual analysis without leaving the MOAG workflow
+- **Playwright integration** — `browser-driver.ts` provides `capturePageScreenshotBase64` (full-page screenshot → base64 PNG) and `runPlaywrightSpec` (run `.spec.ts` files and return output); both prefer a local `node_modules/.bin/playwright` over npx
+- **Browser tools in Anthropic adapter** — `take_screenshot` and `run_playwright_test` tools are conditionally injected into the agentic loop when `browserEnabled: true`; the model can autonomously capture screenshots and iterate on visual regressions
+- **Sandbox URL forwarded** — the current sandbox URL is passed to visual-test tasks so `take_screenshot` can target the running dev server without extra configuration
+
+### UI Accessibility — Single Toolbar for All Actions
+
+- **All features in one place** — all 20+ MOAG actions are now reachable from the `agentTaskPlayer.promptView` title bar; previously split across non-existent `planView`/`historyView` groups that never appeared in the UI
+- **Always-visible navigation group** — Switch Plan, Play, Stop, and Dashboard promoted to the `navigation` group so they remain pinned to the title bar regardless of sidebar width
+- **Organized overflow menu** — remaining actions grouped into labelled sections: Run controls, Plan management, PRD, Sandbox, GitHub, History, Git, and Manage; no duplicate entries, no dead menu items
+- **Command palette decluttered** — 25 tree/webview-internal commands hidden from Ctrl+Shift+P via `"when": "false"` in `commandPalette` entries (playPlaylist, editTask, setTaskStatus, etc.)
+
+### SDLC — Test Tasks Auto-Injected at Plan Generation
+
+- **`detectTestCommand`** — inspects `package.json` scripts, `pytest.ini`, `go.mod`, `Cargo.toml`, and `pom.xml`/`build.gradle` to identify the project's test runner automatically
+- **`injectTestTaskIfMissing`** — appended to all three plan-generation flows (smart plan, GitHub issue, PRD); if no `type:"command"` test task exists, a testing task is appended to the last playlist
+- **Updated plan-generation prompt** — task type rules and a mandatory `testPhase: true` Testing playlist are now part of the generation prompt, so freshly-generated plans always include a test runner step
+- **`testPhase` playlist flag** — playlists with `testPhase: true` display as a distinct TEST & VERIFY section in the PLAN tab
+
+### Run Friction Feedback
+
+- **Silent friction capture** — after any run with failures or escalations, `collectRunFriction` builds a `RunFrictionReport` (retry counts, escalations, error categories, cost) and appends it to `.moag/feedback.jsonl`; limited to the last 20 runs
+- **Opt-in share notification** — a non-modal info bar appears after a friction run: "N failed — help MOAG improve? [Share Feedback]"; nothing is sent automatically
+- **`cmdShareRunFeedback`** — reads the last friction entry, resolves the GitHub repo (setting → auto-detect from `git remote` → prompt), and files a structured issue with a Friction Points table, error pattern breakdown, and an optional freeform notes field
+- **Enhanced bug reports** — `cmdReportIssue` (the "Report Bug" topbar button) now automatically appends the last friction report (< 24 h) to the bug issue body
+
+### PRD Source Linking
+
+- **`prdSource` persisted in plan.json** — when a plan is generated from a PRD, the full PRD text is stored in `plan.prdSource`; powers "Verify Against PRD" and makes plan intent self-contained
+- **Existing plan fix** — `.moag/plan.json` updated to carry the 29 KB PRD that produced it
+
+### Docs
+
+- `CLAUDE.md` added — project conventions, architecture overview, and test guidance for AI assistants working on this repo
+- `docs/architecture.md` — data flow, module responsibilities, and key design decisions
+- `docs/prd-workflow.md` — end-to-end PRD → Plan → Test → Ship workflow guide
+
+## [0.9.8] - 2026-05-09
+
+### PRD → Plan Generation
+
+- **PRD editor panel** — "Generate Plan from PRD" now opens a full-width dark-theme editor tab instead of VS Code's narrow QuickPick popup; paste long PRDs without width constraints, browse `.md`/`.txt` files directly
+- **Save PRD as file** — "Save as .md" button in the PRD editor lets you preserve the document before generating; no more lost PRDs when closing the panel early
+- **AI-assisted PRD drafting** — CHAT tab now has a "Draft PRD with AI" starter; MOAG asks one follow-up question about your project context, then generates a full PRD using the configured AI engine and opens it pre-filled in the editor
+- **"I have a PRD" shortcut** — second starter button opens the PRD file browser directly from the empty chat state
+
+### Engine Setup Guide
+
+- **Setup Guide** — when no AI engine (Claude Code, Codex, Gemini CLI, Ollama) is detected, MOAG shows a one-time setup panel listing all four engines with install commands, auth steps, and links; accessible any time via `MOAG: Open Setup Guide`
+- **No-deadlock guard** — AI-assisted PRD drafting checks for a configured engine first; if none is found, a clear notification with "Open Setup Guide" action replaces silent failure
+
+### Sidebar & UX Polish
+
+- **Dashboard stays put** — Dashboard no longer auto-opens on every play/chat submit; open it manually when you need it (13 unconditional auto-opens removed)
+- **Taller textarea** — composer input now grows up to 200px before scrolling (was 120px); overflow-y added so very long prompts scroll inside the box rather than expanding it infinitely
+- **AI Rules in PLAN tab only** — the AI Rules collapsible section is no longer shown under the CHAT tab, reducing clutter when composing free-form prompts
+
+### Smarter Context Memory
+
+- **Task summaries** — after each task completes, a compact ~250-char summary is extracted from the agent output and stored alongside the raw stdout; the summary captures the final meaningful lines of the agent's work, filtered of spinner/progress noise, with a file-count prefix when available
+- **Relevance-ranked prior outputs** — prior task context is now selected by relevance score (token overlap with current prompt + shared file overlap + recency) rather than simple "last N tasks"; the most topically related prior tasks surface first regardless of playlist order
+- **Summary-first context** — non-dependency prior tasks now inject their compact summary into context instead of raw truncated output, reducing noise and freeing budget for code spans and file content
+- **Explicit deps still get full fidelity** — tasks listed in `dependsOn` always receive raw head+tail output (unchanged), since those are the direct contractual inputs to the current task
+- **Backward compatible** — existing history entries without a summary field fall back to the previous raw-tail behavior automatically
+
+### Storage
+
+- **Workspace state size fix** — reduced default storage budgets for history (3 MB → 400 KB) and run sessions (800 KB → 200 KB); per-entry output clamping lowered to 4 KB (was 12 KB); eliminates VS Code's "large extension state" workspace warning
+
+## [0.9.7] - 2026-05-06
+
+### Sidebar UX Redesign
+- **Tabs with labels** — Chat / Plan / History tabs now show icon + text label in a compact column layout; previously icon-only
+- **All-in-one composer toolbar** — attach, Plan, engine selector, char count, +Queue, and Execute all live in a single toolbar row inside the bordered input box; engine row and action row no longer stack separately
+- **Compact textarea** — composer starts at 60px when empty (was ~95px); grows to 120px max before scrolling; no more tall blank textarea dominating the sidebar
+- **Execute button** — send button relabelled from "Run" to "Execute" for clarity
+- **State-aware plan header** — plan tools bar shows a colored left border that reflects current execution state: green (running), amber (paused), orange (stopping), red (failed tasks), green (completed)
+- **Keyboard queue shortcuts** — `Shift+Enter` now queues a prompt (joins existing `Alt+Enter`); button tooltip updated to reflect both shortcuts
+
+### Fix Flow Improvements
+- **Fix prompt** — clicking Fix on a failed task no longer embeds the full original task prompt (700+ chars); fix prompt is now concise (~100 chars): task name, failure category, up to 6 error lines, and a short directive
+- **Tab switch on Fix** — clicking Fix automatically switches to the Chat tab so the composer is visible without the plan list behind it
+- **Blocked dependents auto-unblock** — when a task completes (retry or manual mark-done), any Blocked dependents whose full dependency set is now satisfied are automatically reset to Pending; previously required Fix All
+- **Manual status → unblocks chain** — setting a task to Completed or Pending via right-click → Set Status now cascades to unblock dependents
+- **Parallel playlists use Blocked** — parallel-mode playlists now set dependency-failed tasks to `Blocked` (matching sequential mode) instead of `Skipped`; Fix All now catches these correctly
+- **Auto-fix escalation** — `saveAndRefresh()` fires immediately when auto-fix exhausts all attempts, so Smart Fix button is visible before the warning dialog appears
+
+### Notification Polish
+- **No toast storm** — per-task completion toasts suppressed during multi-task runs; the existing end-of-run summary ("Plan complete: 10/10 passed in 4m") is the only notification shown
+- **Failure cap** — failure toasts capped at 3 per run; additional failures are counted in the summary instead of stacking
+
+### History Tab
+- **Timeline layout** — history items now show a status icon (✓/✗/▶/dot), task name, plan/playlist breadcrumb, and age; previously a dense single-line format
+- **Compact toolbar** — View / Group / Status controls collapsed from 4 stacked rows into a single line; no labels, status chips use ✓/✗ symbols
+
 ## [0.9.6] - 2026-04-27
 
 ### AI Rules (Prompt Rules)

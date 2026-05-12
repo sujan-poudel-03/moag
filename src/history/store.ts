@@ -118,10 +118,10 @@ export class HistoryStore {
 
   private sanitizeEntry(entry: HistoryEntry): HistoryEntry {
     const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
-    const maxOutputChars = cfg.get<number>('maxStoredOutputChars', 12_000);
-    const maxPromptChars = cfg.get<number>('maxStoredPromptChars', 6_000);
-    const maxCodeChangesChars = cfg.get<number>('maxStoredCodeChangesChars', 12_000);
-    const maxVerificationChars = cfg.get<number>('maxStoredVerificationChars', 12_000);
+    const maxOutputChars = cfg.get<number>('maxStoredOutputChars', 4_000);
+    const maxPromptChars = cfg.get<number>('maxStoredPromptChars', 2_000);
+    const maxCodeChangesChars = cfg.get<number>('maxStoredCodeChangesChars', 4_000);
+    const maxVerificationChars = cfg.get<number>('maxStoredVerificationChars', 4_000);
     const maxChangedFiles = cfg.get<number>('maxStoredChangedFiles', 300);
     const maxArtifacts = cfg.get<number>('maxStoredArtifacts', 150);
 

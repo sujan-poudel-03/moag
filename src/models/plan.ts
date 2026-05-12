@@ -198,6 +198,7 @@ export function hydratePlan(file: PlanFile, sourceName = 'plan'): Plan {
     validation: normalizePlanValidation(file.validation, sourceName),
     playlists: file.playlists.map(p => hydratePlaylist(p, sourceName)),
   };
+  if (file.sourceIssues?.length) { plan.sourceIssues = file.sourceIssues; }
   // Ensure all task/playlist IDs are unique; fix duplicates or missing IDs
   ensureUniqueIds(plan);
   return plan;
@@ -283,6 +284,7 @@ export function dehydratePlan(plan: Plan): PlanFile {
   if (plan.variables && Object.keys(plan.variables).length > 0) {
     result.variables = plan.variables;
   }
+  if (plan.sourceIssues?.length) { result.sourceIssues = plan.sourceIssues; }
   return result;
 }
 

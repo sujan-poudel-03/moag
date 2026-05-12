@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
   "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
-  "version": "0.9.6",
+  "version": "0.9.9",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -48,7 +48,6 @@
     "copilot"
   ],
   "activationEvents": [
-    "onView:agentTaskPlayer.promptView",
     "workspaceContains:.moag/plan.json",
     "workspaceContains:**/*.agent-plan.json"
   ],
@@ -296,6 +295,12 @@
         "icon": "$(checklist)"
       },
       {
+        "command": "agentTaskPlayer.setTestPhase",
+        "title": "Toggle Test Phase",
+        "category": "MOAG",
+        "icon": "$(beaker)"
+      },
+      {
         "command": "agentTaskPlayer.runSelected",
         "title": "Run Selected",
         "category": "MOAG",
@@ -372,6 +377,36 @@
         "title": "Plan from GitHub Issue",
         "category": "MOAG",
         "icon": "$(github)"
+      },
+      {
+        "command": "agentTaskPlayer.reportIssue",
+        "title": "Report Issue to GitHub",
+        "category": "MOAG",
+        "icon": "$(bug)"
+      },
+      {
+        "command": "agentTaskPlayer.planFromOpenIssues",
+        "title": "Plan from Open GitHub Issues",
+        "category": "MOAG",
+        "icon": "$(github)"
+      },
+      {
+        "command": "agentTaskPlayer.setupGuide",
+        "title": "Setup Guide",
+        "category": "MOAG",
+        "icon": "$(getting-started)"
+      },
+      {
+        "command": "agentTaskPlayer.shareRunFeedback",
+        "title": "Share Run Feedback with MOAG",
+        "category": "MOAG",
+        "icon": "$(feedback)"
+      },
+      {
+        "command": "agentTaskPlayer.reviewSelfIssues",
+        "title": "Review MOAG Self-Issues",
+        "category": "MOAG",
+        "icon": "$(bug)"
       },
       {
         "command": "agentTaskPlayer.quickAddTask",
@@ -462,6 +497,42 @@
         "title": "Take Sandbox Screenshot (attaches to next task)",
         "category": "MOAG",
         "icon": "$(device-camera)"
+      },
+      {
+        "command": "agentTaskPlayer.reloadWindow",
+        "title": "Reload Window",
+        "category": "MOAG",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "agentTaskPlayer.markTaskComplete",
+        "title": "Mark Manual Task Complete",
+        "category": "MOAG",
+        "icon": "$(pass)"
+      },
+      {
+        "command": "agentTaskPlayer.planFromPrd",
+        "title": "Generate Plan from PRD",
+        "category": "MOAG",
+        "icon": "$(note)"
+      },
+      {
+        "command": "agentTaskPlayer.openPrdFromPlan",
+        "title": "Open PRD for Current Plan",
+        "category": "MOAG",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "agentTaskPlayer.verifyAgainstPrd",
+        "title": "Verify Against PRD",
+        "category": "MOAG",
+        "icon": "$(checklist)"
+      },
+      {
+        "command": "agentTaskPlayer.suggestCommit",
+        "title": "Commit & Push (PRD Workflow)",
+        "category": "MOAG",
+        "icon": "$(cloud-upload)"
       }
     ],
     "viewsContainers": {
@@ -493,43 +564,178 @@
       "view/title": [
         {
           "command": "agentTaskPlayer.switchPlan",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@0"
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "navigation@1"
         },
         {
           "command": "agentTaskPlayer.play",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@1"
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "navigation@2"
         },
         {
           "command": "agentTaskPlayer.stop",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "navigation@2"
-        },
-        {
-          "command": "agentTaskPlayer.pause",
-          "when": "view == agentTaskPlayer.planView",
-          "group": "run@0"
-        },
-        {
-          "command": "agentTaskPlayer.clearHistory",
-          "when": "view == agentTaskPlayer.historyView",
-          "group": "navigation@1"
-        },
-        {
-          "command": "agentTaskPlayer.showCostSummary",
-          "when": "view == agentTaskPlayer.historyView",
-          "group": "navigation@2"
-        },
-        {
-          "command": "agentTaskPlayer.showThreadList",
-          "when": "view == agentTaskPlayer.historyView",
+          "when": "view == agentTaskPlayer.promptView",
           "group": "navigation@3"
         },
         {
-          "command": "agentTaskPlayer.exportResults",
-          "when": "view == agentTaskPlayer.historyView",
+          "command": "agentTaskPlayer.showDashboard",
+          "when": "view == agentTaskPlayer.promptView",
           "group": "navigation@4"
+        },
+        {
+          "command": "agentTaskPlayer.pause",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "1_run@1"
+        },
+        {
+          "command": "agentTaskPlayer.toggleFullAuto",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "1_run@2"
+        },
+        {
+          "command": "agentTaskPlayer.switchProfile",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "1_run@3"
+        },
+        {
+          "command": "agentTaskPlayer.switchEngine",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "1_run@4"
+        },
+        {
+          "command": "agentTaskPlayer.dryRun",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "1_run@5"
+        },
+        {
+          "command": "agentTaskPlayer.newPlan",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "2_plan@1"
+        },
+        {
+          "command": "agentTaskPlayer.addPlaylist",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "2_plan@2"
+        },
+        {
+          "command": "agentTaskPlayer.openPlan",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "2_plan@3"
+        },
+        {
+          "command": "agentTaskPlayer.importPlan",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "2_plan@4"
+        },
+        {
+          "command": "agentTaskPlayer.exportPlan",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "2_plan@5"
+        },
+        {
+          "command": "agentTaskPlayer.planFromPrd",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "3_prd@1"
+        },
+        {
+          "command": "agentTaskPlayer.openPrdFromPlan",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "3_prd@2"
+        },
+        {
+          "command": "agentTaskPlayer.verifyAgainstPrd",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "3_prd@3"
+        },
+        {
+          "command": "agentTaskPlayer.suggestCommit",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "3_prd@4"
+        },
+        {
+          "command": "agentTaskPlayer.launchSandbox",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "4_sandbox@1"
+        },
+        {
+          "command": "agentTaskPlayer.stopSandbox",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "4_sandbox@2"
+        },
+        {
+          "command": "agentTaskPlayer.takeScreenshot",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "4_sandbox@3"
+        },
+        {
+          "command": "agentTaskPlayer.planFromGitHubIssue",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "5_github@1"
+        },
+        {
+          "command": "agentTaskPlayer.planFromOpenIssues",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "5_github@2"
+        },
+        {
+          "command": "agentTaskPlayer.reportIssue",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "5_github@3"
+        },
+        {
+          "command": "agentTaskPlayer.reviewSelfIssues",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "5_github@4"
+        },
+        {
+          "command": "agentTaskPlayer.shareRunFeedback",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "5_github@5"
+        },
+        {
+          "command": "agentTaskPlayer.showCostSummary",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "6_history@1"
+        },
+        {
+          "command": "agentTaskPlayer.showHistory",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "6_history@2"
+        },
+        {
+          "command": "agentTaskPlayer.showThreadList",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "6_history@3"
+        },
+        {
+          "command": "agentTaskPlayer.clearHistory",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "6_history@4"
+        },
+        {
+          "command": "agentTaskPlayer.exportResults",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "6_history@5"
+        },
+        {
+          "command": "agentTaskPlayer.reviewChanges",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "7_git@1"
+        },
+        {
+          "command": "agentTaskPlayer.createPR",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "7_git@2"
+        },
+        {
+          "command": "agentTaskPlayer.manageAiRules",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "9_manage@1"
+        },
+        {
+          "command": "agentTaskPlayer.reloadWindow",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "9_manage@2"
         }
       ],
       "view/item/context": [
@@ -614,10 +820,42 @@
           "group": "3_status@1"
         },
         {
+          "command": "agentTaskPlayer.setTestPhase",
+          "when": "view == agentTaskPlayer.planView && viewItem == playlist",
+          "group": "3_status@2"
+        },
+        {
           "command": "agentTaskPlayer.runSelected",
           "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/ && listMultiSelection",
           "group": "0_run@0"
         }
+      ],
+      "commandPalette": [
+        { "command": "agentTaskPlayer.openSession", "when": "false" },
+        { "command": "agentTaskPlayer.openThread", "when": "false" },
+        { "command": "agentTaskPlayer.deleteSession", "when": "false" },
+        { "command": "agentTaskPlayer.deleteThread", "when": "false" },
+        { "command": "agentTaskPlayer.renameThread", "when": "false" },
+        { "command": "agentTaskPlayer.newConversation", "when": "false" },
+        { "command": "agentTaskPlayer.markTaskComplete", "when": "false" },
+        { "command": "agentTaskPlayer.playPlaylist", "when": "false" },
+        { "command": "agentTaskPlayer.playTask", "when": "false" },
+        { "command": "agentTaskPlayer.retryTask", "when": "false" },
+        { "command": "agentTaskPlayer.retryTaskWithNote", "when": "false" },
+        { "command": "agentTaskPlayer.addTask", "when": "false" },
+        { "command": "agentTaskPlayer.editTask", "when": "false" },
+        { "command": "agentTaskPlayer.deleteItem", "when": "false" },
+        { "command": "agentTaskPlayer.moveUp", "when": "false" },
+        { "command": "agentTaskPlayer.moveDown", "when": "false" },
+        { "command": "agentTaskPlayer.setTaskStatus", "when": "false" },
+        { "command": "agentTaskPlayer.setPlaylistStatus", "when": "false" },
+        { "command": "agentTaskPlayer.setTestPhase", "when": "false" },
+        { "command": "agentTaskPlayer.saveTaskAsTemplate", "when": "false" },
+        { "command": "agentTaskPlayer.duplicateTask", "when": "false" },
+        { "command": "agentTaskPlayer.splitTask", "when": "false" },
+        { "command": "agentTaskPlayer.addReviewStep", "when": "false" },
+        { "command": "agentTaskPlayer.addTaskFromTemplate", "when": "false" },
+        { "command": "agentTaskPlayer.runSelected", "when": "false" }
       ],
       "editor/context": [
         {
@@ -651,7 +889,17 @@
             "gemini",
             "ollama",
             "custom",
-            "copilot"
+            "copilot",
+            "anthropic"
+          ],
+          "enumDescriptions": [
+            "OpenAI Codex CLI",
+            "Claude Code CLI (recommended)",
+            "Google Gemini CLI",
+            "Ollama (local models)",
+            "Custom CLI command",
+            "GitHub Copilot CLI",
+            "Anthropic API direct (no CLI required, requires ANTHROPIC_API_KEY)"
           ],
           "description": "Default agent engine to use for tasks."
         },
@@ -739,7 +987,8 @@
             "gemini",
             "ollama",
             "custom",
-            "copilot"
+            "copilot",
+            "anthropic"
           ],
           "description": "Backup engine to switch to when the primary engine hits a rate limit. Leave empty to disable auto-fallback."
         },
@@ -758,9 +1007,30 @@
         },
         "agentTaskPlayer.taskTimeoutMs": {
           "type": "number",
-          "default": 600000,
+          "default": 1800000,
           "minimum": 30000,
-          "description": "Per-task timeout in milliseconds (default 10 minutes). Tasks exceeding this limit are killed and marked failed."
+          "description": "Per-task timeout in milliseconds (default 30 minutes). Override per-task with task.timeoutMs. Profile timeouts: fast=10min, balanced=30min, quality=45min."
+        },
+        "agentTaskPlayer.haltOnBrokenBaseline": {
+          "type": "boolean",
+          "default": true,
+          "description": "When a task has a verifyCommand and the pre-flight baseline check fails (tests already broken before the agent runs), halt execution instead of proceeding. Prevents agents from running against a broken foundation. Set to false to proceed with a warning instead."
+        },
+        "agentTaskPlayer.issueRepo": {
+          "type": "string",
+          "default": "",
+          "description": "GitHub repo (owner/repo) where MOAG bug reports are filed via the Report Bug button. Example: myorg/moag. Leave blank to prompt each time."
+        },
+        "agentTaskPlayer.testTool": {
+          "type": "string",
+          "enum": ["claude-chrome", "sandbox", "playwright", "cypress", "custom", "manual"],
+          "default": "manual",
+          "description": "Default tool used for the TTT (Time to Test) phase"
+        },
+        "agentTaskPlayer.testToolCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Shell command to run when testTool is set to custom (e.g. npx playwright test)"
         },
         "agentTaskPlayer.costBudgetUsd": {
           "type": "number",
@@ -776,14 +1046,14 @@
         },
         "agentTaskPlayer.maxHistoryStorageBytes": {
           "type": "number",
-          "default": 3000000,
-          "minimum": 200000,
+          "default": 400000,
+          "minimum": 50000,
           "description": "Maximum serialized history storage size in bytes. Oldest entries are trimmed when exceeded."
         },
         "agentTaskPlayer.maxRunSessionStorageBytes": {
           "type": "number",
-          "default": 800000,
-          "minimum": 200000,
+          "default": 200000,
+          "minimum": 50000,
           "description": "Maximum serialized run session storage size in bytes. Oldest sessions are trimmed when exceeded."
         },
         "agentTaskPlayer.failSafeMode": {
@@ -936,6 +1206,38 @@
           "type": "boolean",
           "default": false,
           "description": "When enabled, instructs Claude to use extended step-by-step thinking for complex tasks. Increases token usage but improves output quality."
+        },
+        "agentTaskPlayer.engines.anthropic.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Anthropic API key for the direct API engine. If empty, falls back to the ANTHROPIC_API_KEY environment variable."
+        },
+        "agentTaskPlayer.engines.anthropic.model": {
+          "type": "string",
+          "default": "claude-sonnet-4-6",
+          "description": "Model ID for the Anthropic API engine (e.g. claude-sonnet-4-6, claude-opus-4-7)."
+        },
+        "agentTaskPlayer.engines.anthropic.maxTokens": {
+          "type": "number",
+          "default": 16000,
+          "minimum": 1024,
+          "description": "Maximum output tokens per Anthropic API response."
+        },
+        "agentTaskPlayer.engines.anthropic.extendedThinking": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable real extended thinking via the Anthropic API (claude-3-7+ models). Claude reasons deeply before producing output — significantly improves single-pass accuracy on complex tasks."
+        },
+        "agentTaskPlayer.engines.anthropic.thinkingBudget": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 1024,
+          "description": "Token budget allocated to the extended thinking phase. Higher values allow deeper reasoning."
+        },
+        "agentTaskPlayer.engines.anthropic.multiTurn": {
+          "type": "boolean",
+          "default": true,
+          "description": "Maintain conversation history across tasks in the same playlist. Claude remembers previous tasks' context, improving coherence in multi-step plans."
         }
       }
     },
@@ -1028,7 +1330,12 @@
     "test:live": "mocha --require ts-node/register \"src/test/unit/**/*live.test.ts\"",
     "test:integration": "vscode-test",
     "pretest:integration": "npm run compile",
-    "package": "vsce package"
+    "package": "vsce package",
+    "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
+    "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.0",

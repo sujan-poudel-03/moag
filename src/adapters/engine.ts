@@ -18,6 +18,16 @@ export interface EngineRunOptions {
   onOutput?: OutputCallback;
   /** Model override for auto-model selection (e.g., "claude-sonnet-4") */
   modelId?: string;
+  /**
+   * Multi-turn session key — adapters that support conversation history
+   * (e.g. AnthropicAdapter) group turns by this ID so consecutive tasks
+   * in the same playlist share context.
+   */
+  sessionId?: string;
+  /** Enable browser tools (take_screenshot, run_playwright_test) for visual-test tasks */
+  browserEnabled?: boolean;
+  /** URL of the running sandbox — injected for visual-test tasks */
+  sandboxUrl?: string;
 }
 
 /** Every engine adapter implements this interface */

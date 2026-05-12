@@ -2,12 +2,40 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "watch",
       "type": "npm",
       "script": "watch",
       "problemMatcher": "$tsc-watch",
       "isBackground": true,
       "presentation": { "reveal": "never" },
       "group": { "kind": "build", "isDefault": true }
+    },
+    {
+      "label": "Deploy to Local VS Code",
+      "type": "npm",
+      "script": "deploy",
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "group": "build"
+    },
+    {
+      "label": "Deploy: Watch + Auto-sync",
+      "type": "npm",
+      "script": "deploy:watch",
+      "problemMatcher": [],
+      "isBackground": true,
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": true,
+        "showReuseMessage": false
+      },
+      "group": "build"
     }
   ]
 }

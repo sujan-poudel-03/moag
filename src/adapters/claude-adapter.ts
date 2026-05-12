@@ -1,10 +1,24 @@
 // ─── Claude Code CLI adapter ───
 // Invokes the Claude Code CLI in print mode (-p) for non-interactive execution.
 
+import * as fs from 'fs';
+import * as path from 'path';
 import * as vscode from 'vscode';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId, TokenUsage } from '../models/types';
 import { runCli } from './base-cli';
+
+// Tools Claude Code CLI needs permission to use. Written to settings.local.json
+// before spawn so the CLI flag is not the only gate.
+const CLAUDE_ALLOW_ALL = [
+  'Bash(*)', 'Write(*)', 'Edit(*)', 'Read(*)',
+  'WebFetch(*)', 'TodoWrite', 'TodoRead',
+  'NotebookRead(*)', 'NotebookEdit(*)',
+];
+
+// Patterns that indicate Claude Code is waiting for a permission prompt.
+// Detected in output stream → surfaces a clear error instead of a silent hang.
+const PERMISSION_PROMPT_RE = /do you want to (allow|proceed|run|continue)|press .* to (allow|continue)|\[y\/n\]|awaiting your (permission|approval)/i;
 
 export class ClaudeAdapter implements EngineAdapter {
   readonly id: EngineId = 'claude';
@@ -19,9 +33,11 @@ export class ClaudeAdapter implements EngineAdapter {
     const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.claude');
     const command = this.getCommand();
     const extraArgs = config.get<string[]>('args', ['-p']);
-
     const autoApprove = config.get<boolean>('autoApprove', true);
     const extendedThinking = config.get<boolean>('extendedThinking', false);
+    // Configurable so users can fix a renamed flag instantly via VS Code settings
+    // without waiting for a MOAG release.
+    const autoApproveFlag = config.get<string>('autoApproveFlag', '--dangerously-skip-permissions');
 
     if (extendedThinking) {
       options = {
@@ -30,27 +46,85 @@ export class ClaudeAdapter implements EngineAdapter {
       };
     }
 
-    const result = await runCli(
-      {
-        command,
-        buildArgs: (opts) => {
-          const args = [...extraArgs];
-          if (autoApprove && !args.includes('--dangerously-skip-permissions')) {
-            args.push('--dangerously-skip-permissions');
-          }
-          // Only pass --model if explicitly set in extraArgs by the user.
-          // Otherwise let Claude Code CLI use its own default model selection.
-          return args;
-        },
-        useStdin: true,
-      },
-      options,
-      options.onOutput,
-    );
+    // ── Layer 1: write settings.local.json with broad permissions ──
+    // This pre-authorises the known tool set via Claude's own settings
+    // mechanism, so execution doesn't depend solely on the CLI flag.
+    const permState = autoApprove ? this._preparePermissions(options.cwd) : null;
 
-    // Parse token usage from Claude Code output (may appear in stdout or stderr)
+    // ── Layer 2: permission-prompt detector ──
+    // Wrap onOutput to catch the case where neither layer worked and Claude
+    // is sitting at an interactive prompt — surfaces a clear error.
+    let permissionHangDetected = false;
+    const wrappedOnOutput = options.onOutput
+      ? (text: string, stream: 'stdout' | 'stderr') => {
+          if (!permissionHangDetected && PERMISSION_PROMPT_RE.test(text)) {
+            permissionHangDetected = true;
+            options.onOutput!(
+              '\n[MOAG] Claude Code is waiting for a permission approval.\n' +
+              'The CLI interface may have changed. Update the flag via:\n' +
+              '  VS Code Settings → agentTaskPlayer.engines.claude.autoApproveFlag\n',
+              'stderr',
+            );
+          }
+          options.onOutput!(text, stream);
+        }
+      : undefined;
+
+    let result: EngineResult;
+    try {
+      result = await runCli(
+        {
+          command,
+          buildArgs: () => {
+            const args = [...extraArgs];
+            // ── Layer 2: CLI flag (secondary, configurable) ──
+            if (autoApprove && autoApproveFlag && !args.includes(autoApproveFlag)) {
+              args.push(autoApproveFlag);
+            }
+            return args;
+          },
+          useStdin: true,
+        },
+        { ...options, onOutput: wrappedOnOutput },
+        wrappedOnOutput,
+      );
+    } finally {
+      if (permState) { this._restorePermissions(permState); }
+    }
+
     result.tokenUsage = parseClaudeTokenUsage(result.stdout, result.stderr);
     return result;
+  }
+
+  // ── Settings.local.json helpers ──────────────────────────────────────────
+
+  private _preparePermissions(cwd: string): { settingsPath: string; backup: string | null } | null {
+    try {
+      const dir = path.join(cwd, '.claude');
+      const settingsPath = path.join(dir, 'settings.local.json');
+      fs.mkdirSync(dir, { recursive: true });
+      const backup = fs.existsSync(settingsPath) ? fs.readFileSync(settingsPath, 'utf-8') : null;
+      const existing = backup ? JSON.parse(backup) : {};
+      fs.writeFileSync(settingsPath, JSON.stringify({
+        ...existing,
+        permissions: { ...(existing.permissions ?? {}), allow: CLAUDE_ALLOW_ALL },
+      }, null, 2));
+      return { settingsPath, backup };
+    } catch {
+      return null;
+    }
+  }
+
+  private _restorePermissions(info: { settingsPath: string; backup: string | null }): void {
+    try {
+      if (info.backup !== null) {
+        fs.writeFileSync(info.settingsPath, info.backup);
+      } else if (fs.existsSync(info.settingsPath)) {
+        fs.unlinkSync(info.settingsPath);
+      }
+    } catch {
+      // best-effort
+    }
   }
 }
 

@@ -23,6 +23,7 @@ const {
   gatherRgGlobSpans,
   gatherSymbolHintSpans,
   mergeSpans,
+  scorePriorEntry,
 } = proxyquire('../../../context/context-builder', {
   'vscode': vscodeMock,
   './semantic-provider': {
@@ -147,7 +148,7 @@ describe('Context Builder', () => {
       const result = buildContext({
         plan, playlist, task: tasks[1], cwd: '/mock/workspace', historyStore, settings,
       });
-      assert.ok(result.includes('=== PROJECT PLAN ==='));
+      assert.ok(result.includes('## Plan'));
       assert.ok(result.includes('Plan: "Test Plan"'));
     });
   });
@@ -308,6 +309,77 @@ describe('Context Builder', () => {
       const settings = { ...defaultSettings(), allPriorOutputs: true };
       const result = gatherPriorOutputs(historyStore, plan, playlist, tasks[1], settings);
       assert.ok(result.includes('Setup done'));
+    });
+
+    it('uses summary instead of raw output for non-dep tasks', () => {
+      const { plan, playlist, tasks } = makePlanWithTasks();
+      const entries = [
+        makeHistoryEntry({
+          taskId: 'task-1',
+          result: { stdout: 'A'.repeat(3000), stderr: '', exitCode: 0, durationMs: 100 },
+          summary: 'Added auth module. 2 files changed.',
+        }),
+      ];
+      const historyStore = createMockHistoryStore(entries);
+      const settings = { ...defaultSettings(), allPriorOutputs: true };
+      const result = gatherPriorOutputs(historyStore, plan, playlist, tasks[1], settings);
+      assert.ok(result.includes('Added auth module. 2 files changed.'));
+      // Should not include the raw 3000-char stdout
+      assert.ok(!result.includes('AAAA'));
+    });
+
+    it('still uses raw output for explicit deps even when summary exists', () => {
+      const { plan, playlist, tasks } = makePlanWithTasks();
+      tasks[1].dependsOn = ['task-1'];
+      const entries = [
+        makeHistoryEntry({
+          taskId: 'task-1',
+          result: { stdout: 'Raw output: token=abc123', stderr: '', exitCode: 0, durationMs: 100 },
+          summary: 'Short summary only',
+        }),
+      ];
+      const historyStore = createMockHistoryStore(entries);
+      const result = gatherPriorOutputs(historyStore, plan, playlist, tasks[1], defaultSettings());
+      assert.ok(result.includes('Raw output: token=abc123'));
+    });
+  });
+
+  describe('scorePriorEntry', () => {
+    it('returns 1.0 for explicit dependencies', () => {
+      const { tasks } = makePlanWithTasks();
+      tasks[1].dependsOn = ['task-1'];
+      const entry = makeHistoryEntry({ taskId: 'task-1', taskName: 'Setup project' });
+      const score = scorePriorEntry(entry, tasks[1], 0);
+      assert.equal(score, 1.0);
+    });
+
+    it('returns higher score when task names share keywords with current prompt', () => {
+      const { tasks } = makePlanWithTasks();
+      tasks[1].prompt = 'Refactor authentication module to support OAuth tokens';
+      const entryRelevant = makeHistoryEntry({ taskId: 'task-1', taskName: 'Build authentication service', summary: 'Added OAuth login flow' });
+      const entryIrrelevant = makeHistoryEntry({ taskId: 'task-0', taskName: 'Setup database', summary: 'Configured PostgreSQL' });
+      const scoreRelevant = scorePriorEntry(entryRelevant, tasks[1], 0);
+      const scoreIrrelevant = scorePriorEntry(entryIrrelevant, tasks[1], 0);
+      assert.ok(scoreRelevant > scoreIrrelevant, `relevant (${scoreRelevant}) should beat irrelevant (${scoreIrrelevant})`);
+    });
+
+    it('gives higher score to recent tasks when token overlap is equal', () => {
+      const { tasks } = makePlanWithTasks();
+      const entryRecent = makeHistoryEntry({ taskId: 'task-1', taskName: 'Task A' });
+      const entryOld = makeHistoryEntry({ taskId: 'task-0', taskName: 'Task A' });
+      const scoreRecent = scorePriorEntry(entryRecent, tasks[1], 0);
+      const scoreOld = scorePriorEntry(entryOld, tasks[1], 5);
+      assert.ok(scoreRecent > scoreOld);
+    });
+
+    it('boosts score when current prompt mentions files the prior task changed', () => {
+      const { tasks } = makePlanWithTasks();
+      tasks[1].prompt = 'Update the logic in src/auth.ts to use refreshToken';
+      const entryWithFile = makeHistoryEntry({ taskId: 'task-1', taskName: 'Setup project', changedFiles: ['src/auth.ts'] });
+      const entryNoFile = makeHistoryEntry({ taskId: 'task-0', taskName: 'Setup project', changedFiles: ['src/unrelated.ts'] });
+      const scoreWithFile = scorePriorEntry(entryWithFile, tasks[1], 0);
+      const scoreNoFile = scorePriorEntry(entryNoFile, tasks[1], 0);
+      assert.ok(scoreWithFile > scoreNoFile);
     });
   });
 
@@ -532,11 +604,10 @@ describe('Context Builder', () => {
         plan, playlist, task: tasks[0], cwd: '/mock/workspace', historyStore, settings,
       });
       // Should have plan overview
-      assert.ok(result.includes('=== PROJECT PLAN ==='));
+      assert.ok(result.includes('## Plan'));
       // Should NOT have progress/changed/prior sections (no prior tasks)
-      assert.ok(!result.includes('=== PROGRESS SO FAR ==='));
-      assert.ok(!result.includes('=== FILES CHANGED BY PRIOR TASKS ==='));
-      assert.ok(!result.includes('=== PRIOR TASK RESULTS ==='));
+      assert.ok(!result.includes('## Progress'));
+      assert.ok(!result.includes('## Output'));
     });
   });
 

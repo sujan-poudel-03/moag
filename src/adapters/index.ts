@@ -7,6 +7,7 @@ import { GeminiAdapter } from './gemini-adapter';
 import { OllamaAdapter } from './ollama-adapter';
 import { CustomAdapter } from './custom-adapter';
 import { CopilotAdapter } from './copilot-adapter';
+import { AnthropicAdapter } from './anthropic-adapter';
 
 export function registerAllEngines(): void {
   registerEngine(new CodexAdapter());
@@ -15,7 +16,10 @@ export function registerAllEngines(): void {
   registerEngine(new OllamaAdapter());
   registerEngine(new CustomAdapter());
   registerEngine(new CopilotAdapter());
+  registerEngine(new AnthropicAdapter());
 }
+
+export { AnthropicAdapter } from './anthropic-adapter';
 
 export { getEngine, getAllEngines, checkEngineAvailability } from './engine';
 export type { EngineAdapter, EngineRunOptions, EngineAvailability } from './engine';

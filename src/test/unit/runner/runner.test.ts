@@ -538,8 +538,8 @@ describe('TaskRunner', () => {
 
     // First task fails
     assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
-    // Second task should be skipped because dependency failed
-    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Skipped);
+    // Second task should be blocked because its dependency failed
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Blocked);
   });
 
   it('should run tasks in parallel when playlist.parallel is true', async () => {
@@ -702,6 +702,27 @@ describe('TaskRunner', () => {
     assert.ok(task2Event, 'task-completed should fire for skipped task');
     assert.equal(task2Event!.status, TaskStatus.Skipped);
     assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Skipped);
+  });
+
+  it('should skip task and emit task-completed(Skipped) using auto-generated task id', async () => {
+    const { runner } = buildRunner();
+    const completedEvents: Array<{ name: string; status: TaskStatus }> = [];
+    runner.on('task-completed', (task: { name: string; status: TaskStatus }) => {
+      completedEvents.push({ name: task.name, status: task.status });
+    });
+
+    const plan = makePlan();
+    const task1 = plan.playlists[0].tasks[0];
+    const task2 = plan.playlists[0].tasks[1];
+    task1.status = TaskStatus.Completed;
+    task2.skipIf = { taskId: task1.id, status: TaskStatus.Completed };
+
+    await runner.play(plan);
+
+    assert.equal(task2.status, TaskStatus.Skipped);
+    const task2Event = completedEvents.find(e => e.name === task2.name);
+    assert.ok(task2Event, 'task-completed should fire for skipped task');
+    assert.equal(task2Event!.status, TaskStatus.Skipped);
   });
 
   it('should run task when skipIf condition does not match', async () => {

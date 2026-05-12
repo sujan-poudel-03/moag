@@ -77,28 +77,28 @@ const PROFILE_DEFINITIONS: Record<Exclude<ProfileName, 'auto'>, ProfileConfig> =
   fast: {
     preferredEngine: 'claude',
     modelPreset: 'fast',
-    taskTimeoutMs: 3 * 60 * 1000,
+    taskTimeoutMs: 10 * 60 * 1000,
     autoFix: false,
     promptRulesEnabled: true,
   },
   balanced: {
     preferredEngine: 'claude',
     modelPreset: 'balanced',
-    taskTimeoutMs: 10 * 60 * 1000,
+    taskTimeoutMs: 30 * 60 * 1000,
     autoFix: true,
     promptRulesEnabled: true,
   },
   quality: {
     preferredEngine: 'claude',
     modelPreset: 'deep',
-    taskTimeoutMs: 20 * 60 * 1000,
+    taskTimeoutMs: 45 * 60 * 1000,
     autoFix: true,
     promptRulesEnabled: true,
   },
   budget: {
     preferredEngine: 'ollama',
     modelPreset: 'fast',
-    taskTimeoutMs: 5 * 60 * 1000,
+    taskTimeoutMs: 10 * 60 * 1000,
     autoFix: false,
     promptRulesEnabled: true,
   },
@@ -106,10 +106,10 @@ const PROFILE_DEFINITIONS: Record<Exclude<ProfileName, 'auto'>, ProfileConfig> =
 
 export const PROFILE_META: ProfileMeta[] = [
   { name: 'auto', label: 'Auto', description: 'Use default settings (balanced)', icon: '$(sparkle)' },
-  { name: 'fast', label: 'Fast', description: 'Claude, fast model, 3min timeout, no auto-fix', icon: '$(zap)' },
-  { name: 'balanced', label: 'Balanced', description: 'Claude, balanced model, 10min timeout, auto-fix on', icon: '$(symbol-event)' },
-  { name: 'quality', label: 'Quality', description: 'Claude, deep model, 20min timeout, auto-fix on', icon: '$(star-full)' },
-  { name: 'budget', label: 'Budget', description: 'Ollama (local), fast model, 5min timeout, no auto-fix', icon: '$(database)' },
+  { name: 'fast', label: 'Fast', description: 'Claude, fast model, 10min timeout, no auto-fix', icon: '$(zap)' },
+  { name: 'balanced', label: 'Balanced', description: 'Claude, balanced model, 30min timeout, auto-fix on', icon: '$(symbol-event)' },
+  { name: 'quality', label: 'Quality', description: 'Claude, deep model, 45min timeout, auto-fix on', icon: '$(star-full)' },
+  { name: 'budget', label: 'Budget', description: 'Ollama (local), fast model, 10min timeout, no auto-fix', icon: '$(database)' },
 ];
 
 /**

@@ -5,11 +5,11 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { Plan, RunnerState, EngineId, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task } from './models/types';
+import { Plan, Playlist, RunnerState, EngineId, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task, PrdVerificationResult } from './models/types';
 import { loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
 import { registerAllEngines, checkEngineAvailability, getEngine } from './adapters/index';
 import { commandExists } from './utils/command-exists';
-import { TaskRunner } from './runner/runner';
+import { TaskRunner, classifyFailure } from './runner/runner';
 import { HistoryStore } from './history/store';
 import { TemplateStore } from './templates/store';
 import { generateId } from './models/plan';
@@ -84,11 +84,29 @@ let watchWatcher: vscode.FileSystemWatcher | null = null;
 let watchStatusBarItem: vscode.StatusBarItem | null = null;
 let watchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+// ─── Dev hot-reload watcher ───
+let devReloadWatcher: fs.FSWatcher | null = null;
+let devReloadTimer: ReturnType<typeof setTimeout> | null = null;
+
 // ─── Execution progress tracking ───
 let executionTaskCount = 0;
 let executionTasksCompleted = 0;
 let executionTasksFailed = 0;
 let executionStartTime = 0;
+
+// ─── Friction tracking (cleared at run start) ───
+const escalatedTaskIds = new Set<string>();
+
+interface RunFrictionReport {
+  runId: string;
+  date: string;
+  moagVersion: string;
+  engine: string;
+  projectType: string;
+  summary: { total: number; passed: number; failed: number; escalated: number; durationMs: number; estimatedCostUsd: number };
+  friction: Array<{ taskName: string; attempts: number; escalated: boolean; autoFixed: boolean; errorSummary: string }>;
+  errorCategories: Record<string, number>;
+}
 
 // ─── Execution progress notification ───
 let progressResolve: (() => void) | null = null;
@@ -98,6 +116,8 @@ const NO_ENGINES_PROMPT_KEY = 'agentTaskPlayer.noEnginesPromptShown';
 const RECENT_PLANS_KEY = 'moag.recentPlans';
 const CLAUDE_INSTALL_URL = 'https://www.npmjs.com/package/@anthropic-ai/claude-code';
 const CODEX_INSTALL_URL = 'https://www.npmjs.com/package/@openai/codex';
+// MOAG's own GitHub repo — always the target for bug reports
+const MOAG_REPO = 'sujan-poudel-03/moag';
 
 interface TaskLocation {
   playlistIndex: number;
@@ -308,13 +328,23 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
       name: playlist.name || `Playlist ${index + 1}`,
       playlistStatus: status,
       progress: { done, total },
+      aiRules: playlist.aiRules,
+      testPhase: playlist.testPhase,
       tasks: tasks.map((task) => {
-        const latestEntry = historyStore.getForTask(task.id)[0];
+        const taskEntries = historyStore.getForTask(task.id);
+        const latestEntry = taskEntries[0];
+        const isFailed = task.status === TaskStatus.Failed || task.status === TaskStatus.Blocked;
+        const classification = isFailed && latestEntry
+          ? classifyFailure(latestEntry.result.stderr, latestEntry.result.stdout)
+          : null;
         return {
           id: task.id,
           name: task.name,
           status: task.status ?? 'pending',
           failureReason: getTaskFailureReason(task),
+          errorCategory: classification?.category,
+          errorLines: classification?.errorLines.slice(0, 5),
+          attemptCount: taskEntries.length > 1 ? taskEntries.length : undefined,
           tokenUsage: latestEntry?.result.tokenUsage
             ? { totalTokens: latestEntry.result.tokenUsage.totalTokens, estimatedCost: latestEntry.result.tokenUsage.estimatedCost }
             : undefined,
@@ -324,9 +354,38 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
   });
 }
 
+function detectPrdFileInWorkspace(): string {
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!cwd) { return ''; }
+  const fsLib = require('fs') as typeof import('fs');
+  const pathLib = require('path') as typeof import('path');
+  const candidates = ['PRD.md', 'prd.md', 'docs/PRD.md', 'docs/prd.md', 'REQUIREMENTS.md', 'requirements.md'];
+  for (const rel of candidates) {
+    try {
+      if (fsLib.existsSync(pathLib.join(cwd, rel))) { return rel; }
+    } catch { /* ignore */ }
+  }
+  return '';
+}
+
 function syncPromptProviderSidebar(promptProvider: PromptInputViewProvider): void {
   const chatState = getPromptSidebarChatState();
   const context = getPromptSidebarActiveContext();
+  promptProvider.setPlanAiRules(getActivePlan()?.aiRules ?? '');
+  let effectivePrdSource = getActivePlan()?.prdSource ?? '';
+  let detectedPrdFilePath = '';
+  if (!effectivePrdSource) {
+    const detectedRel = detectPrdFileInWorkspace();
+    if (detectedRel) {
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+      try { effectivePrdSource = fs.readFileSync(path.join(cwd, detectedRel), 'utf-8'); detectedPrdFilePath = detectedRel; } catch { /* ignore */ }
+    }
+  }
+  promptProvider.setPlanPrdSource(effectivePrdSource);
+  promptProvider.setDetectedPrdFilePath(detectedPrdFilePath);
+  promptProvider.setPlanPrdVersions(getActivePlan()?.prdVersions ?? []);
+  promptProvider.setPlanFixIterations(getActivePlan()?.fixIterations ?? 0);
+  promptProvider.setPrdProjectMeta(getProjectMeta());
   promptProvider.setSidebarState(
     getPromptSidebarSessions(),
     getPromptSidebarPlanItems(),
@@ -669,6 +728,10 @@ function notifyTaskCompleted(task: Task): void {
   if (task.status !== TaskStatus.Completed || !shouldShowTaskNotifications()) {
     return;
   }
+  // Multi-task runs already show a single summary in all-completed — suppress per-task toasts.
+  if (executionTaskCount > 1) {
+    return;
+  }
 
   void vscode.window.showInformationMessage(
     `Task "${task.name}" completed`,
@@ -685,6 +748,10 @@ function notifyTaskCompleted(task: Task): void {
 
 function notifyTaskFailed(task: Task): void {
   if (!shouldShowTaskNotifications()) {
+    return;
+  }
+  // Cap failure toasts at 3 per run — the all-completed summary lists the total count.
+  if (executionTaskCount > 1 && executionTasksFailed > 3) {
     return;
   }
 
@@ -1174,6 +1241,27 @@ export function activate(context: vscode.ExtensionContext): void {
   // Register all engine adapters
   registerAllEngines();
 
+  // ── Dev hot-reload (FastAPI --reload equivalent) ───────────────────────
+  // Only active when launched via F5 (Extension Development Host).
+  // Watches out/ for compiled JS changes and auto-restarts the extension host —
+  // no manual Ctrl+R needed after every save.
+  if (context.extensionMode === vscode.ExtensionMode.Development) {
+    const outDir = path.join(context.extensionPath, 'out');
+    try {
+      devReloadWatcher = fs.watch(outDir, { recursive: true }, (_event, filename) => {
+        if (!filename?.endsWith('.js')) { return; }
+        // Debounce: TypeScript emits many files per compile — wait for the burst to settle
+        if (devReloadTimer) { clearTimeout(devReloadTimer); }
+        devReloadTimer = setTimeout(() => {
+          devReloadTimer = null;
+          vscode.commands.executeCommand('workbench.action.restartExtensionHost');
+        }, 600);
+      });
+    } catch {
+      // out/ may not exist yet on first launch — ignore
+    }
+  }
+
   // Initialize history store from workspace state
   historyStore = new HistoryStore(context.workspaceState);
 
@@ -1300,9 +1388,28 @@ export function activate(context: vscode.ExtensionContext): void {
   // ─── Sandbox manager ───
   sandboxManager = new SandboxManager();
 
+  let _prevSandboxStatus: string | null = null;
   sandboxManager.on('state-changed', (state) => {
     DashboardPanel.currentPanel?.postSandboxState(state);
     promptViewProvider?.postSandboxState(state);
+    runner.setSandboxUrl(state.status === 'running' ? (state.url ?? null) : null);
+    if (state.status === 'running' && _prevSandboxStatus !== 'running' && state.url) {
+      void vscode.commands.executeCommand('simpleBrowser.api.open', state.url);
+    }
+    if (state.status === 'error' && _prevSandboxStatus !== 'error') {
+      const msg = state.error ?? 'Sandbox failed to start.';
+      void vscode.window.showErrorMessage(
+        `Sandbox: ${msg}`,
+        'Open Dashboard', 'Configure',
+      ).then((action) => {
+        if (action === 'Open Dashboard') {
+          void vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+        } else if (action === 'Configure') {
+          void vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer.sandbox');
+        }
+      });
+    }
+    _prevSandboxStatus = state.status;
   });
 
   sandboxManager.on('output', (text: string) => {
@@ -1361,6 +1468,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     scheduleDashboardUpdate();
+    // If the panel was closed before this run started, reopen it so task cards are not lost
+    if (!DashboardPanel.currentPanel) { ensureDashboardOpen(); }
     DashboardPanel.currentPanel?.startTaskCard(task, playlist, fullPrompt);
     promptViewProvider?.postLiveOutputStart(task.id, task.name);
 
@@ -1409,6 +1518,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   runner.on('task-completed', (task, _result) => {
+    if (currentPlan) { unblockDependents(task.id, currentPlan); }
     planTree.refresh();
     saveAndRefresh();
     const entries = historyStore.getForTask(task.id);
@@ -1435,6 +1545,23 @@ export function activate(context: vscode.ExtensionContext): void {
     const { tokensIn, tokensOut } = runner.getSessionTokens();
     promptViewProvider?.postSessionCost(runner.getSessionCost(), tokensIn, tokensOut);
     promptViewProvider?.postLiveOutputEnd(task.id, task.status);
+    schedulePromptProviderSidebarSync();
+
+    // Auto-capture screenshot after each task if sandbox is running
+    const sbState = sandboxManager?.state;
+    if (sbState?.status === 'running' && sbState.url) {
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (cwd) {
+        captureScreenshot({ projectType: sbState.projectInfo?.type ?? 'web', url: sbState.url, cwd })
+          .then(screenshotPath => {
+            if (screenshotPath && sandboxManager) {
+              sandboxManager.setLastScreenshotPath(screenshotPath);
+              runner.queueScreenshots([screenshotPath]);
+            }
+          })
+          .catch(() => { /* silent — screenshot is best-effort */ });
+      }
+    }
   });
 
   runner.on('task-failed', (task, result) => {
@@ -1466,6 +1593,36 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.window.setStatusBarMessage(`$(warning) Task "${task.name}" failed: ${shortErr || 'exit ' + result.exitCode}`, 5000);
     notifyTaskFailed(task);
     promptViewProvider?.postLiveOutputEnd(task.id, task.status);
+    schedulePromptProviderSidebarSync();
+    // Silently log MOAG infrastructure failures (spawn errors, auth, context overflow, etc.)
+    const issueType = classifyMoagIssue(result.stderr, result.exitCode);
+    if (issueType) {
+      logMoagSelfIssue(issueType, `${issueType} during task "${task.name}"`, result.stderr.substring(0, 300));
+    }
+  });
+
+  runner.on('task-escalate', (task, _category, _errorLines) => {
+    saveAndRefresh();
+    escalatedTaskIds.add(task.id);
+    vscode.window.showWarningMessage(
+      `Auto-fix exhausted for "${task.name}". Use Smart Fix for guided repair.`,
+      'Smart Fix',
+    ).then((choice) => {
+      if (choice !== 'Smart Fix' || !currentPlan) { return; }
+      for (let pi = 0; pi < currentPlan.playlists.length; pi++) {
+        const ti = (currentPlan.playlists[pi].tasks || []).findIndex(t => t.id === task.id);
+        if (ti >= 0) {
+          void cmdShowSmartFix({ playlistIndex: pi, taskIndex: ti });
+          break;
+        }
+      }
+    });
+  });
+
+  runner.on('playlist-started', (playlist) => {
+    if (playlist.testPhase) {
+      handleTttPhaseStart(playlist);
+    }
   });
 
   runner.on('playlist-completed', (_playlist) => {
@@ -1499,6 +1656,56 @@ export function activate(context: vscode.ExtensionContext): void {
     const filesSuffix = totalFiles > 0 ? ` | ${totalFiles} file${totalFiles !== 1 ? 's' : ''} changed` : '';
 
     statusBarItem.text = `$(check) ATP: Done`;
+
+    // Collect friction and offer feedback sharing when the run had failures/escalations
+    const hasFriction = executionTasksFailed > 0 || escalatedTaskIds.size > 0;
+    const unfiledSelfIssues = readUnfiledSelfIssues();
+    if (runner.currentRunId && hasFriction) {
+      const report = collectRunFriction(runner.currentRunId, totalDuration);
+      if (report.friction.length > 0) {
+        appendFrictionLog(report);
+        const frictionMsg = `${report.summary.failed} failed` +
+          (report.summary.escalated > 0 ? `, ${report.summary.escalated} escalated` : '') +
+          ' — help improve MOAG?';
+        const frictionBtns: string[] = ['Share Feedback', 'Show Dashboard'];
+        if (unfiledSelfIssues.length > 0) { frictionBtns.splice(1, 0, `Review ${unfiledSelfIssues.length} Issues`); }
+        vscode.window.showInformationMessage(frictionMsg, ...frictionBtns).then(choice => {
+          if (choice === 'Share Feedback') { void cmdShareRunFeedback(); }
+          else if (choice?.startsWith('Review')) { void vscode.commands.executeCommand('agentTaskPlayer.reviewSelfIssues'); }
+          else if (choice === 'Show Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); }
+        });
+        return;
+      }
+    }
+
+    if (unfiledSelfIssues.length > 0) {
+      vscode.window.showInformationMessage(
+        `${summary}${filesSuffix} — ${unfiledSelfIssues.length} MOAG issue${unfiledSelfIssues.length > 1 ? 's' : ''} detected`,
+        'Review Issues', 'Show Dashboard',
+      ).then(action => {
+        if (action === 'Review Issues') { void vscode.commands.executeCommand('agentTaskPlayer.reviewSelfIssues'); }
+        else if (action === 'Show Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); }
+      });
+      return;
+    }
+
+    // Offer to close the GitHub issues this plan was generated from (only on full success)
+    const sourceIssues = currentPlan?.sourceIssues;
+    if (executionTasksFailed === 0 && sourceIssues?.length) {
+      const issueLabel = sourceIssues.length === 1
+        ? `Close #${sourceIssues[0].number} on GitHub`
+        : `Close ${sourceIssues.length} issues on GitHub`;
+      vscode.window.showInformationMessage(
+        `${summary}${filesSuffix}`,
+        issueLabel, 'Show Dashboard', 'Create PR',
+      ).then(action => {
+        if (action === issueLabel) { void cmdCloseSourceIssues(sourceIssues); }
+        else if (action === 'Show Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); }
+        else if (action === 'Create PR') { createPRFromRun(); }
+      });
+      return;
+    }
+
     vscode.window.showInformationMessage(
       `${summary}${filesSuffix}`,
       'Show Dashboard',
@@ -1512,6 +1719,23 @@ export function activate(context: vscode.ExtensionContext): void {
       } else if (action === 'Create PR') {
         createPRFromRun();
       }
+    });
+  });
+
+  runner.on('manual-gate', (task) => {
+    // Open dashboard so the user sees the waiting state
+    void vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
+    vscode.window.showInformationMessage(
+      `[MOAG] Manual step: "${task.name}"${task.prompt ? ' — ' + task.prompt.split('\n')[0] : ''}`,
+      'Mark Complete',
+      'Skip',
+    ).then(action => {
+      if (action === 'Mark Complete') {
+        runner.resolveManualGate(task.id);
+      } else if (action === 'Skip') {
+        runner.skipManualGate(task.id);
+      }
+      // Dismissed without clicking = do nothing; runner continues waiting until stop() is called
     });
   });
 
@@ -1567,12 +1791,35 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.addTask', cmdAddTask),
     vscode.commands.registerCommand('agentTaskPlayer.editTask', cmdEditTask),
     vscode.commands.registerCommand('agentTaskPlayer.saveTaskEdit', cmdSaveTaskEdit),
+    vscode.commands.registerCommand('agentTaskPlayer.savePlaylistRules', cmdSavePlaylistRules),
+    vscode.commands.registerCommand('agentTaskPlayer.savePlanRules', cmdSavePlanRules),
     vscode.commands.registerCommand('agentTaskPlayer.previewTaskPrompt', cmdPreviewTaskPrompt),
     vscode.commands.registerCommand('agentTaskPlayer.deleteItem', cmdDeleteItem),
     vscode.commands.registerCommand('agentTaskPlayer.moveUp', cmdMoveUp),
     vscode.commands.registerCommand('agentTaskPlayer.moveDown', cmdMoveDown),
     vscode.commands.registerCommand('agentTaskPlayer.showHistory', cmdShowHistory),
     vscode.commands.registerCommand('agentTaskPlayer.showDashboard', cmdShowDashboard),
+    vscode.commands.registerCommand('agentTaskPlayer.reloadWindow', () => {
+      void vscode.commands.executeCommand('workbench.action.reloadWindow');
+    }),
+    vscode.commands.registerCommand('agentTaskPlayer.markTaskComplete', async () => {
+      // Let the user pick which pending manual gate to resolve (if multiple)
+      const plan = getActivePlan();
+      if (!plan) { return; }
+      const waitingTasks = plan.playlists.flatMap(pl => pl.tasks)
+        .filter(t => t.type === 'manual' && t.status === 'running' as unknown as import('./models/types').TaskStatus);
+      if (waitingTasks.length === 0) {
+        vscode.window.showInformationMessage('No manual gates are currently waiting.');
+        return;
+      }
+      const pick = waitingTasks.length === 1
+        ? waitingTasks[0]
+        : await vscode.window.showQuickPick(
+            waitingTasks.map(t => ({ label: t.name, task: t })),
+            { placeHolder: 'Select the manual step to mark complete' }
+          ).then(sel => sel?.task);
+      if (pick) { runner.resolveManualGate(pick.id); }
+    }),
     vscode.commands.registerCommand('agentTaskPlayer.clearHistory', cmdClearHistory),
     vscode.commands.registerCommand('agentTaskPlayer.addAiRule', () => {
       void handleRulesAction({ type: 'add' });
@@ -1607,11 +1854,16 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.clearAllTasks', cmdClearAllTasks),
     vscode.commands.registerCommand('agentTaskPlayer.retryTask', cmdRetryTask),
     vscode.commands.registerCommand('agentTaskPlayer.retryTaskWithNote', cmdRetryTaskWithNote),
+    vscode.commands.registerCommand('agentTaskPlayer.retryTaskWithPrompt', cmdRetryTaskWithPrompt),
+    vscode.commands.registerCommand('agentTaskPlayer.showSmartFix', cmdShowSmartFix),
+    vscode.commands.registerCommand('agentTaskPlayer.fixAllFailed', cmdFixAllFailed),
+    vscode.commands.registerCommand('agentTaskPlayer.addTaskFromPrompt', cmdAddTaskFromPrompt),
     vscode.commands.registerCommand('agentTaskPlayer.exportResults', cmdExportResults),
     vscode.commands.registerCommand('agentTaskPlayer.dryRun', cmdDryRun),
     vscode.commands.registerCommand('agentTaskPlayer.undoTask', cmdUndoTask),
     vscode.commands.registerCommand('agentTaskPlayer.setTaskStatus', cmdSetTaskStatus),
     vscode.commands.registerCommand('agentTaskPlayer.setPlaylistStatus', cmdSetPlaylistStatus),
+    vscode.commands.registerCommand('agentTaskPlayer.setTestPhase', cmdSetTestPhase),
     vscode.commands.registerCommand('agentTaskPlayer.runSelected', cmdRunSelected),
     vscode.commands.registerCommand('agentTaskPlayer.openSession', cmdOpenSession),
     vscode.commands.registerCommand('agentTaskPlayer.openThread', cmdOpenThread),
@@ -1626,6 +1878,25 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.smartNewPlan', cmdSmartNewPlan),
     vscode.commands.registerCommand('agentTaskPlayer.splitTask', cmdSplitTask),
     vscode.commands.registerCommand('agentTaskPlayer.planFromGitHubIssue', cmdPlanFromGitHubIssue),
+    vscode.commands.registerCommand('agentTaskPlayer.reportIssue', cmdReportIssue),
+    vscode.commands.registerCommand('agentTaskPlayer.planFromOpenIssues', cmdPlanFromOpenIssues),
+    vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.planFromPrd', cmdPlanFromPRD),
+    vscode.commands.registerCommand('agentTaskPlayer.generatePlanFromPrdText', (prdText: string) => generatePlanFromPrdText(prdText)),
+    vscode.commands.registerCommand('agentTaskPlayer.prdChatAnswer', (payload: { answer: string; step: number; answers: string[] }) => void handlePrdChatAnswer(payload)),
+    vscode.commands.registerCommand('agentTaskPlayer.openPrdFromPlan', cmdOpenPrdFromPlan),
+    vscode.commands.registerCommand('agentTaskPlayer.savePrdToPlan', (prdText: string) => void cmdSavePrdToPlan(prdText)),
+    vscode.commands.registerCommand('agentTaskPlayer.verifyAgainstPrd', cmdVerifyAgainstPrd),
+    vscode.commands.registerCommand('agentTaskPlayer.prdAiImprove', (text: string) =>
+      void handlePrdAiImprove(text, (improved) => promptViewProvider?.postMessage({ type: 'prdAiImproveResult', text: improved }))),
+    vscode.commands.registerCommand('agentTaskPlayer.openPrdInBrowser', (text: string) => void openPrdInBrowser(text)),
+    vscode.commands.registerCommand('agentTaskPlayer.savePrdVersion', (payload: { text: string; version: string }) => {
+      const saved = savePrdVersionToActivePlan(payload.text, payload.version);
+      promptViewProvider?.postMessage({ type: 'prdVersionSaved', versions: saved.versions, version: saved.version });
+    }),
+    vscode.commands.registerCommand('agentTaskPlayer.suggestCommit', cmdSuggestCommit),
+    vscode.commands.registerCommand('agentTaskPlayer.shareRunFeedback', cmdShareRunFeedback),
+    vscode.commands.registerCommand('agentTaskPlayer.reviewSelfIssues', cmdReviewSelfIssues),
     vscode.commands.registerCommand('agentTaskPlayer.createPR', createPRFromRun),
     vscode.commands.registerCommand('agentTaskPlayer.quickAddTask', cmdQuickAddTask),
     vscode.commands.registerCommand('agentTaskPlayer.addTaskFromSelection', cmdAddTaskFromSelection),
@@ -1732,6 +2003,12 @@ export function activate(context: vscode.ExtensionContext): void {
       updateEngineStatusBar(result.available);
       syncPromptProviderEngines(promptProvider, result.available);
       await promptToInstallEngineOnce(context, result.available);
+      // Show setup guide on first install if no engines found
+      const hasSeenSetup = context.globalState.get<boolean>('moag.setupGuideSeen', false);
+      if (!hasSeenSetup && result.available.length === 0) {
+        context.globalState.update('moag.setupGuideSeen', true);
+        cmdShowSetupGuide(context);
+      }
     })
     .catch(() => undefined);
 
@@ -1814,6 +2091,9 @@ export function deactivate(): void {
   runner?.stop();
   runner?.stopAllServices();
   sandboxManager?.stop();
+  if (devReloadTimer) { clearTimeout(devReloadTimer); devReloadTimer = null; }
+  devReloadWatcher?.close();
+  devReloadWatcher = null;
   if (planFileWatcher) {
     planFileWatcher.dispose();
     planFileWatcher = null;
@@ -1822,6 +2102,76 @@ export function deactivate(): void {
 }
 
 // ─── Helper: save & refresh ───
+
+/**
+ * After a task is completed or manually marked done, reset any Blocked dependents
+ * whose full dependency set is now satisfied (all deps Completed or Skipped).
+ * Returns true if at least one task was unblocked.
+ */
+function unblockDependents(resolvedTaskId: string, plan: Plan): boolean {
+  const allTasks = plan.playlists.flatMap(pl => pl.tasks);
+  const resolved = new Set(
+    allTasks
+      .filter(t => t.status === TaskStatus.Completed || t.status === TaskStatus.Skipped || t.id === resolvedTaskId)
+      .map(t => t.id),
+  );
+  let any = false;
+  for (const t of allTasks) {
+    if (t.status !== TaskStatus.Blocked) { continue; }
+    if (!t.dependsOn?.length) { continue; }
+    if (t.dependsOn.every(depId => resolved.has(depId))) {
+      t.status = TaskStatus.Pending;
+      any = true;
+    }
+  }
+  return any;
+}
+
+function handleTttPhaseStart(playlist: Playlist): void {
+
+  const tool = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('testTool', 'manual');
+
+  DashboardPanel.currentPanel?.appendOutput(
+    `\n[TTT] Test phase started — playlist: "${playlist.name}" | tool: ${tool}\n`,
+    'stdout',
+  );
+
+  switch (tool) {
+    case 'claude-chrome':
+      vscode.window.showInformationMessage(
+        'TTT — Time to Test. Open Claude.ai in Chrome to verify visually.',
+        'Open Claude.ai',
+      ).then(action => {
+        if (action === 'Open Claude.ai') {
+          void vscode.env.openExternal(vscode.Uri.parse('https://claude.ai'));
+        }
+      });
+      break;
+
+    case 'sandbox': {
+      const state = sandboxManager?.state;
+      if (!state || state.status !== 'running') {
+        void vscode.commands.executeCommand('agentTaskPlayer.launchSandbox');
+      }
+      break;
+    }
+
+    case 'playwright':
+    case 'cypress':
+    case 'custom':
+      vscode.window.showInformationMessage(
+        `TTT — ${tool} will run automatically via test tasks.`,
+      );
+      break;
+
+    case 'manual':
+    default:
+      vscode.window.showInformationMessage(
+        'TTT — Time to Test. Mark tasks complete when done.',
+      );
+      break;
+  }
+}
 
 function saveAndRefresh(): void {
   const plan = getActivePlan();
@@ -2218,6 +2568,7 @@ function initializeSingleTaskExecution(): void {
   executionTasksCompleted = 0;
   executionTasksFailed = 0;
   executionStartTime = Date.now();
+  escalatedTaskIds.clear();
 }
 
 function initializeMultiTaskExecution(taskCount: number): void {
@@ -2225,6 +2576,7 @@ function initializeMultiTaskExecution(taskCount: number): void {
   executionTasksCompleted = 0;
   executionTasksFailed = 0;
   executionStartTime = Date.now();
+  escalatedTaskIds.clear();
 }
 
 function createPromptPlan(prompt: string, engineId: EngineId, threadId: string, turnIndex: number): Plan {
@@ -2321,7 +2673,6 @@ async function runPromptSubmission(
     return false;
   }
 
-  void vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
 
   const activePlan = getActivePlan();
   if (!activePlan) {
@@ -2467,13 +2818,14 @@ async function cmdPlay(): Promise<void> {
     return;
   }
 
+  // Profile picker — let user choose quality/speed trade-off per run
+  if (!await showProfilePicker()) { return; }
+
   // Initialize progress counters
   initializeMultiTaskExecution(activePlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0));
 
   saveAndRefresh();
   startProgressNotification();
-  // Auto-open the dashboard so the user sees live output
-  vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   runner.play(activePlan).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
@@ -2807,11 +3159,17 @@ async function createPlanFromIdea(
   currentPlan.description = trimmedIdea.length > 500 ? trimmedIdea.substring(0, 500) + '...' : trimmedIdea;
   currentPlan.playlists = playlists.map(pl => {
     const playlist = createPlaylist(pl.name, pl.engine as EngineId | undefined);
+    if ((pl as ParsedPlanPlaylist).testPhase) { playlist.testPhase = true; }
     for (const t of pl.tasks) {
-      playlist.tasks.push(createTask(t.name, t.prompt));
+      const task = createTask(t.name, t.prompt);
+      const pt = t as ParsedPlanTask;
+      if (pt.type) { task.type = pt.type as TaskType; }
+      if (pt.command) { task.command = pt.command; }
+      playlist.tasks.push(task);
     }
     return playlist;
   });
+  injectTestTaskIfMissing(currentPlan, cwd);
 
   const totalTasks = currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
   currentPlanPath = getNewPlanSavePath() || path.join(workspaceFolder.uri.fsPath, `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`);
@@ -2960,6 +3318,44 @@ async function cmdNewPlanFromTemplate(): Promise<void> {
   });
 }
 
+/** Detect the appropriate test runner command for the workspace. */
+function detectTestCommand(cwd: string): string | null {
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf-8')) as Record<string, unknown>;
+    const scripts = pkg.scripts as Record<string, string> | undefined;
+    if (scripts?.test && !scripts.test.startsWith('echo "Error: no test')) {
+      return 'npm test';
+    }
+  } catch { /* no package.json */ }
+  if (fs.existsSync(path.join(cwd, 'pytest.ini')) || fs.existsSync(path.join(cwd, 'pyproject.toml'))) { return 'pytest'; }
+  if (fs.existsSync(path.join(cwd, 'setup.py'))) { return 'python -m pytest'; }
+  if (fs.existsSync(path.join(cwd, 'go.mod'))) { return 'go test ./...'; }
+  if (fs.existsSync(path.join(cwd, 'Cargo.toml'))) { return 'cargo test'; }
+  if (fs.existsSync(path.join(cwd, 'pom.xml'))) { return 'mvn test'; }
+  if (fs.existsSync(path.join(cwd, 'build.gradle')) || fs.existsSync(path.join(cwd, 'build.gradle.kts'))) { return './gradlew test'; }
+  return null;
+}
+
+/** Append a test-runner task to the last playlist if the plan has no command-type test task. */
+function injectTestTaskIfMissing(plan: Plan, cwd: string): void {
+  const testCmd = detectTestCommand(cwd);
+  if (!testCmd) { return; }
+  const alreadyHasRunner = plan.playlists.some(pl =>
+    pl.tasks.some(t => t.type === 'command' && t.command && /test|spec|check/.test(t.command.toLowerCase())),
+  );
+  if (alreadyHasRunner) { return; }
+  let testPlaylist = plan.playlists.find(pl => /test/i.test(pl.name));
+  if (!testPlaylist) {
+    testPlaylist = createPlaylist('Testing');
+    testPlaylist.testPhase = true;
+    plan.playlists.push(testPlaylist);
+  }
+  const task = createTask('Run Test Suite', 'Run the full test suite and confirm all tests pass.');
+  task.type = 'command';
+  task.command = testCmd;
+  testPlaylist.tasks.push(task);
+}
+
 const PLAN_GENERATION_PROMPT = `You are a project planner. Given a raw idea or description, break it down into a concrete plan.
 
 Respond with ONLY valid JSON (no markdown fences, no commentary) in this exact format:
@@ -2984,33 +3380,44 @@ Respond with ONLY valid JSON (no markdown fences, no commentary) in this exact f
   "name": "Short project name (max 60 chars)",
   "playlists": [
     {
-      "name": "Phase name (e.g., Platform Core, Auth System, Discovery Engine)",
+      "name": "Phase name (e.g., Setup, Core, Features, Testing)",
+      "testPhase": false,
       "tasks": [
-        { "name": "Short task name", "prompt": "Detailed, actionable instruction for a coding agent. Include specifics: what files to create, what patterns to follow, what interfaces/types to define, what the expected behavior should be." }
+        {
+          "name": "Short task name",
+          "prompt": "Detailed, actionable instruction for a coding agent.",
+          "type": "agent",
+          "command": ""
+        }
       ]
     }
   ]
 }
 
-Rules:
-- Group tasks into logical playlists/phases that represent major system areas or build stages
-- Each phase should be executable after the previous phases are complete
+Task type rules — set the "type" field accordingly:
+- "agent"       AI coding tasks (default — use for most tasks)
+- "command"     Shell commands: builds, test runners, linters. Set "command" to the exact shell command and use "prompt" as a brief description. Example: { "type": "command", "command": "npm test", "name": "Run Tests", "prompt": "Run the full test suite." }
+- "visual-test" Browser UI verification via screenshot + AI vision. Only for web/frontend projects.
+
+Plan structure rules:
+- Group tasks into logical phases: Setup → Core → Features → Testing
+- ALWAYS end with a "Testing" playlist — set "testPhase": true on it
+- The Testing playlist MUST include at minimum one task with "type": "command" running the test suite (npm test / pytest / go test ./... / cargo test — pick the right one for the project)
+- For web/frontend projects, also add a "type": "visual-test" task in Testing to verify the UI
 - Each task should be a single, focused coding step a CLI agent can execute independently
-- Task prompts must be detailed and self-contained — include enough context so the agent doesn't need to guess
-- Include specific file paths, function names, data structures, and acceptance criteria in prompts
+- Task prompts must be detailed and self-contained — include file paths, interfaces, acceptance criteria
 - For large specs: aim for 4-12 playlists with 3-8 tasks each
 - For medium specs: aim for 2-5 playlists with 3-6 tasks each
 - Start with foundational work (project setup, core models, database) before features
-- End phases with testing/validation tasks where appropriate
 - The project name should be concise and descriptive
 - Do NOT create placeholder or "TODO later" tasks — only include what should be built now`;
 
+interface ParsedPlanTask { name: string; prompt: string; type?: string; command?: string }
+interface ParsedPlanPlaylist { name: string; engine?: string; testPhase?: boolean; tasks: ParsedPlanTask[] }
+interface ParsedPlan { name: string; tasks?: ParsedPlanTask[]; playlists?: ParsedPlanPlaylist[] }
+
 /** Try to extract structured plan from AI response */
-function parsePlanResponse(raw: string): {
-  name: string;
-  tasks?: Array<{ name: string; prompt: string }>;
-  playlists?: Array<{ name: string; engine?: string; tasks: Array<{ name: string; prompt: string }> }>;
-} | null {
+function parsePlanResponse(raw: string): ParsedPlan | null {
   try {
     // Strip markdown code fences if present
     let json = raw.trim();
@@ -3036,16 +3443,22 @@ function parsePlanResponse(raw: string): {
 
     // Multi-playlist format
     if (Array.isArray(parsed.playlists) && parsed.playlists.length > 0) {
-      const playlists = parsed.playlists
+      const playlists: ParsedPlanPlaylist[] = parsed.playlists
         .filter((pl: { name?: string; tasks?: unknown[] }) => pl.name && Array.isArray(pl.tasks) && pl.tasks.length > 0)
-        .map((pl: { name: string; engine?: string; tasks: Array<{ name?: string; prompt?: string }> }) => ({
+        .map((pl: { name: string; engine?: string; testPhase?: boolean; tasks: Array<{ name?: string; prompt?: string; type?: string; command?: string }> }) => ({
           name: pl.name,
           engine: pl.engine,
+          testPhase: pl.testPhase === true,
           tasks: pl.tasks
-            .filter(t => t.name && t.prompt)
-            .map(t => ({ name: String(t.name), prompt: String(t.prompt) })),
+            .filter(t => t.name && (t.prompt || t.type === 'command'))
+            .map(t => ({
+              name: String(t.name),
+              prompt: String(t.prompt ?? ''),
+              ...(t.type && t.type !== 'agent' ? { type: String(t.type) } : {}),
+              ...(t.command ? { command: String(t.command) } : {}),
+            })),
         }))
-        .filter((pl: { tasks: unknown[] }) => pl.tasks.length > 0);
+        .filter((pl: ParsedPlanPlaylist) => pl.tasks.length > 0);
       if (playlists.length > 0) {
         return { name: String(parsed.name).substring(0, 60), playlists };
       }
@@ -3053,9 +3466,14 @@ function parsePlanResponse(raw: string): {
 
     // Single tasks array format (backward compatible)
     if (Array.isArray(parsed.tasks) && parsed.tasks.length > 0) {
-      const tasks = parsed.tasks
+      const tasks: ParsedPlanTask[] = parsed.tasks
         .filter((t: { name?: string; prompt?: string }) => t.name && t.prompt)
-        .map((t: { name: string; prompt: string }) => ({ name: t.name, prompt: t.prompt }));
+        .map((t: { name: string; prompt: string; type?: string; command?: string }) => ({
+          name: t.name,
+          prompt: t.prompt,
+          ...(t.type && t.type !== 'agent' ? { type: t.type } : {}),
+          ...(t.command ? { command: t.command } : {}),
+        }));
       if (tasks.length > 0) {
         return { name: String(parsed.name).substring(0, 60), tasks };
       }
@@ -3165,6 +3583,22 @@ function cmdSaveTaskEdit(arg?: unknown): void {
   if (!task || !name?.trim()) { return; }
   task.name = name.trim();
   task.prompt = prompt ?? task.prompt;
+  saveAndRefresh();
+}
+
+function cmdSavePlaylistRules(arg?: unknown): void {
+  if (!currentPlan || !arg || typeof arg !== 'object') { return; }
+  const { playlistIndex, rules } = arg as { playlistIndex: number; rules: string };
+  const playlist = currentPlan.playlists[playlistIndex];
+  if (!playlist) { return; }
+  playlist.aiRules = rules.trim() || undefined;
+  saveAndRefresh();
+}
+
+function cmdSavePlanRules(arg?: unknown): void {
+  if (!currentPlan || !arg || typeof arg !== 'object') { return; }
+  const { rules } = arg as { rules: string };
+  currentPlan.aiRules = (rules as string).trim() || undefined;
   saveAndRefresh();
 }
 
@@ -3648,6 +4082,599 @@ async function cmdPlanFromGitHubIssue(): Promise<void> {
 
   currentPlan = createEmptyPlan(planName);
   currentPlan.description = `From GitHub issue #${issueNumber}: ${issueTitle}`;
+  currentPlan.sourceIssues = [{ repo: `${owner}/${repo}`, number: parseInt(issueNumber, 10), title: issueTitle }];
+  currentPlan.playlists = playlists.map(pl => {
+    const playlist = createPlaylist(pl.name);
+    if ((pl as ParsedPlanPlaylist).testPhase) { playlist.testPhase = true; }
+    for (const t of pl.tasks) {
+      const task = createTask(t.name, t.prompt);
+      const pt = t as ParsedPlanTask;
+      if (pt.type) { task.type = pt.type as TaskType; }
+      if (pt.command) { task.command = pt.command; }
+      playlist.tasks.push(task);
+    }
+    return playlist;
+  });
+  injectTestTaskIfMissing(currentPlan, cwd);
+  currentPlanPath = getNewPlanSavePath() || path.join(cwd, `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`);
+  saveAndRefresh();
+  vscode.window.showInformationMessage(`Plan created from issue #${issueNumber}: "${planName}" — ${currentPlan.playlists.reduce((s, p) => s + p.tasks.length, 0)} tasks.`);
+}
+
+// ─── GitHub Integration: report issue ───
+
+function collectRunFriction(runId: string, durationMs: number): RunFrictionReport {
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  const entries = historyStore.getForRun(runId);
+  const session = runSessionStore.get(runId);
+  const extVersion = (vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON as { version?: string } | undefined)?.version ?? 'unknown';
+
+  // Group entries by taskId to detect retries
+  const byTask = new Map<string, typeof entries>();
+  for (const e of entries) {
+    const group = byTask.get(e.taskId) ?? [];
+    group.push(e);
+    byTask.set(e.taskId, group);
+  }
+
+  // Project type from analyzeProject
+  let projectType = 'unknown';
+  try {
+    const analysis = analyzeProject(cwd);
+    projectType = [analysis.language, analysis.framework].filter(Boolean).join(' / ');
+  } catch { /* best-effort */ }
+
+  const dominantEngine = session?.engines?.[0] ?? (entries[0]?.engine ?? 'unknown');
+
+  const friction: RunFrictionReport['friction'] = [];
+  const errorCats: Record<string, number> = {};
+
+  for (const [taskId, group] of byTask) {
+    const isEscalated = escalatedTaskIds.has(taskId);
+    const wasAutoFixed = group.some(e => e.autoFixed);
+    const attempts = group.length;
+    const lastFailed = [...group].reverse().find(e => e.status === 'failed' || e.status === 'blocked');
+    const hasFriction = attempts > 1 || isEscalated || lastFailed;
+    if (!hasFriction) { continue; }
+
+    const errorSummary = lastFailed
+      ? (lastFailed.result.stderr || lastFailed.result.stdout || '')
+          .split('\n').map(l => l.trim()).find(l => l.length > 0) ?? ''
+      : '';
+
+    // Detect error category from stderr prefix patterns
+    const stderr = lastFailed?.result.stderr ?? '';
+    if (/error ts\d+|typeerror|syntaxerror|cannot find/i.test(stderr)) { errorCats['compile'] = (errorCats['compile'] ?? 0) + 1; }
+    else if (/assertionerror|test.*fail|failing.*test|expect.*received/i.test(stderr)) { errorCats['test'] = (errorCats['test'] ?? 0) + 1; }
+    else if (/etimedout|timed out|timeout/i.test(stderr)) { errorCats['timeout'] = (errorCats['timeout'] ?? 0) + 1; }
+    else if (/spawn.*enoent|command not found|not installed/i.test(stderr)) { errorCats['cli-missing'] = (errorCats['cli-missing'] ?? 0) + 1; }
+    else if (lastFailed) { errorCats['unknown'] = (errorCats['unknown'] ?? 0) + 1; }
+
+    friction.push({ taskName: group[0].taskName, attempts, escalated: isEscalated, autoFixed: wasAutoFixed, errorSummary: errorSummary.substring(0, 120) });
+  }
+
+  return {
+    runId,
+    date: new Date().toISOString(),
+    moagVersion: extVersion,
+    engine: dominantEngine,
+    projectType,
+    summary: {
+      total: executionTaskCount,
+      passed: executionTaskCount - executionTasksFailed,
+      failed: executionTasksFailed,
+      escalated: escalatedTaskIds.size,
+      durationMs,
+      estimatedCostUsd: session?.totalCost ?? 0,
+    },
+    friction,
+    errorCategories: errorCats,
+  };
+}
+
+function appendFrictionLog(report: RunFrictionReport): void {
+  try {
+    const moagDir = getMoagDir();
+    if (!moagDir) { return; }
+    if (!fs.existsSync(moagDir)) { fs.mkdirSync(moagDir, { recursive: true }); }
+    const logPath = path.join(moagDir, 'feedback.jsonl');
+    fs.appendFileSync(logPath, JSON.stringify(report) + '\n', 'utf-8');
+    const lines = fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean);
+    if (lines.length > 20) {
+      fs.writeFileSync(logPath, lines.slice(-20).join('\n') + '\n', 'utf-8');
+    }
+  } catch { /* best-effort */ }
+}
+
+function readLastFrictionReport(): RunFrictionReport | null {
+  try {
+    const moagDir = getMoagDir();
+    if (!moagDir) { return null; }
+    const logPath = path.join(moagDir, 'feedback.jsonl');
+    if (!fs.existsSync(logPath)) { return null; }
+    const lines = fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean);
+    const last = lines[lines.length - 1];
+    if (!last) { return null; }
+    const report = JSON.parse(last) as RunFrictionReport;
+    const age = Date.now() - new Date(report.date).getTime();
+    return age < 86_400_000 ? report : null;
+  } catch { return null; }
+}
+
+function buildFrictionIssueBody(report: RunFrictionReport, notes: string): string {
+  const durationStr = report.summary.durationMs > 0
+    ? `${Math.floor(report.summary.durationMs / 60000)}m ${Math.floor((report.summary.durationMs % 60000) / 1000)}s`
+    : 'n/a';
+  const costStr = report.summary.estimatedCostUsd > 0 ? `$${report.summary.estimatedCostUsd.toFixed(2)}` : 'n/a';
+
+  const frictionTable = report.friction.length > 0
+    ? `| Task | Attempts | Auto-fixed | Escalated | Error |\n` +
+      `|------|----------|------------|-----------|-------|\n` +
+      report.friction.map(f =>
+        `| ${f.taskName.substring(0, 40)} | ${f.attempts} | ${f.autoFixed ? '✓' : '✗'} | ${f.escalated ? '✓' : '✗'} | ${f.errorSummary.substring(0, 60)} |`
+      ).join('\n')
+    : '_No friction points recorded._';
+
+  const errorPatterns = Object.entries(report.errorCategories)
+    .map(([k, v]) => `${k}: ${v}`).join(' · ') || 'none';
+
+  return [
+    `## MOAG Session Feedback`,
+    ``,
+    `**MOAG:** v${report.moagVersion} | **Engine:** ${report.engine} | **Project:** ${report.projectType}`,
+    ``,
+    `### Run Summary`,
+    `- ${report.summary.total} tasks total · ${report.summary.passed} passed · ${report.summary.failed} failed · ${report.summary.escalated} escalated`,
+    `- Duration: ${durationStr} · Est. cost: ${costStr}`,
+    ``,
+    `### Friction Points`,
+    frictionTable,
+    ``,
+    `### Error Patterns`,
+    errorPatterns,
+    notes ? `\n### Notes\n${notes}` : '',
+    ``,
+    `---`,
+    `*Filed automatically by MOAG v${report.moagVersion}*`,
+  ].filter(l => l !== null).join('\n');
+}
+
+
+// --- MOAG Self-Issue Collection ---
+
+type SelfIssueType = 'engine-not-found' | 'spawn-error' | 'context-overflow' |
+  'auth-failure' | 'parse-error' | 'timeout' | 'moag-crash' | 'other';
+
+interface SelfIssue {
+  id: string; type: SelfIssueType; message: string; detail: string;
+  moagVersion: string; engine: string; platform: string;
+  timestamp: string; fingerprint: string; filed: boolean;
+}
+
+function classifyMoagIssue(stderr: string, exitCode: number): SelfIssueType | null {
+  const s = stderr.toLowerCase();
+  if (s.includes('spawn') && s.includes('enoent')) { return 'engine-not-found'; }
+  if (s.includes('spawn') && (s.includes('eperm') || s.includes('eacces'))) { return 'spawn-error'; }
+  if (s.includes('context length') || s.includes('context window') || s.includes('too many tokens')) { return 'context-overflow'; }
+  if (s.includes('authentication') || s.includes('unauthorized') || s.includes('api key') || s.includes('401')) { return 'auth-failure'; }
+  if (s.includes('syntaxerror') && s.includes('json')) { return 'parse-error'; }
+  if (exitCode === 124 || (s.includes('timed out') && !s.includes('task timed out'))) { return 'timeout'; }
+  return null;
+}
+
+function getSelfIssueLogPath(): string | null {
+  const d = getMoagDir(); return d ? path.join(d, 'self-issues.jsonl') : null;
+}
+
+function logMoagSelfIssue(type: SelfIssueType, message: string, detail: string): void {
+  try {
+    const logPath = getSelfIssueLogPath();
+    if (!logPath) { return; }
+    const moagDir = path.dirname(logPath);
+    if (!fs.existsSync(moagDir)) { fs.mkdirSync(moagDir, { recursive: true }); }
+    const fingerprint = type + ':' + detail.substring(0, 60).replace(/\s+/g, ' ').trim();
+    if (fs.existsSync(logPath)) {
+      const cutoff = Date.now() - 86400000;
+      const recent = fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean)
+        .map((l: string) => { try { return JSON.parse(l) as SelfIssue; } catch { return null; } })
+        .filter((e: SelfIssue | null): e is SelfIssue => !!e && new Date(e.timestamp).getTime() > cutoff);
+      if (recent.some((e: SelfIssue) => e.fingerprint === fingerprint)) { return; }
+    }
+    const extVersion = (vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON as { version?: string } | undefined)?.version ?? 'unknown';
+    const issue: SelfIssue = {
+      id: 'si-' + Date.now(), type, message, detail, moagVersion: extVersion,
+      engine: vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('defaultEngine', 'claude'),
+      platform: process.platform, timestamp: new Date().toISOString(), fingerprint, filed: false,
+    };
+    fs.appendFileSync(logPath, JSON.stringify(issue) + '\n', 'utf-8');
+    const all = fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean);
+    if (all.length > 50) { fs.writeFileSync(logPath, all.slice(-50).join('\n') + '\n', 'utf-8'); }
+  } catch { /* best-effort */ }
+}
+
+function readUnfiledSelfIssues(): SelfIssue[] {
+  try {
+    const logPath = getSelfIssueLogPath();
+    if (!logPath || !fs.existsSync(logPath)) { return []; }
+    return fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean)
+      .map((l: string) => { try { return JSON.parse(l) as SelfIssue; } catch { return null; } })
+      .filter((e: SelfIssue | null): e is SelfIssue => !!e && !e.filed);
+  } catch { return []; }
+}
+
+function markSelfIssuesFiled(ids: string[]): void {
+  try {
+    const logPath = getSelfIssueLogPath();
+    if (!logPath || !fs.existsSync(logPath)) { return; }
+    const updated = fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean)
+      .map((l: string) => {
+        try { const e = JSON.parse(l) as SelfIssue; if (ids.includes(e.id)) { e.filed = true; } return JSON.stringify(e); }
+        catch { return l; }
+      });
+    fs.writeFileSync(logPath, updated.join('\n') + '\n', 'utf-8');
+  } catch { /* best-effort */ }
+}
+
+async function cmdReviewSelfIssues(): Promise<void> {
+  const issues = readUnfiledSelfIssues();
+  if (issues.length === 0) {
+    vscode.window.showInformationMessage('No unfiled MOAG self-issues collected yet.');
+    return;
+  }
+  const items = issues.map(issue => ({
+    label: '$(bug) ' + issue.message,
+    description: new Date(issue.timestamp).toLocaleString(),
+    detail: issue.type + ' · engine: ' + issue.engine + ' · v' + issue.moagVersion,
+    issue, picked: true,
+  }));
+  const selected = await vscode.window.showQuickPick(items, {
+    canPickMany: true,
+    placeHolder: issues.length + ' MOAG issue' + (issues.length > 1 ? 's' : '') + ' collected — select to file on GitHub',
+    title: 'MOAG Self-Issues',
+  });
+  if (!selected || selected.length === 0) { return; }
+  const { execSync } = require('child_process') as typeof import('child_process');
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  try { execSync('gh --version', { cwd, timeout: 5000, stdio: 'ignore' }); }
+  catch { vscode.window.showWarningMessage('Install GitHub CLI (gh) to file issues. https://cli.github.com'); return; }
+  const repo = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('issueRepo', '').trim() || MOAG_REPO;
+  const extVersion = (vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON as { version?: string } | undefined)?.version ?? 'unknown';
+  const filedIds: string[] = [];
+  for (const item of selected) {
+    const { issue } = item;
+    const title = '[auto] ' + issue.message + ' [v' + issue.moagVersion + ' / ' + issue.type + ']';
+    const body = [
+      '## Auto-collected MOAG Issue',
+      '**Type:** `' + issue.type + '`  **Detected:** ' + new Date(issue.timestamp).toLocaleString(),
+      '', '## Environment', '| | |', '|---|---|',
+      '| **MOAG** | v' + issue.moagVersion + ' |',
+      '| **Engine** | ' + issue.engine + ' |',
+      '| **Platform** | ' + issue.platform + ' |',
+      '', '## Detail', '```', issue.detail.substring(0, 500), '```',
+      '---', '*Auto-collected by MOAG v' + extVersion + ' self-issue monitor*',
+    ].join('\n');
+    try {
+      const tmpPath = path.join(require('os').tmpdir(), 'moag-si-' + Date.now() + '.md');
+      fs.writeFileSync(tmpPath, body, 'utf-8');
+      const safeTitle = title.replace(/"/g, '\\"');
+      const result = execSync(
+        'gh issue create --repo "' + repo + '" --title "' + safeTitle + '" --body-file "' + tmpPath + '" --label bug',
+        { cwd, timeout: 20000, encoding: 'utf-8' }
+      ).trim();
+      filedIds.push(issue.id);
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+      const url = result.split('\n').pop() || '';
+      if (url) {
+        vscode.window.showInformationMessage('Filed: ' + url, 'View').then((a: string | undefined) => {
+          if (a === 'View') { vscode.env.openExternal(vscode.Uri.parse(url)); }
+        });
+      }
+    } catch (err) {
+      vscode.window.showErrorMessage('Failed: ' + (err instanceof Error ? err.message.substring(0, 150) : String(err)));
+    }
+  }
+  if (filedIds.length > 0) { markSelfIssuesFiled(filedIds); }
+}
+
+
+// ─── Embedded report panel (replaces showInputBox for bug/feedback flows) ───
+
+function buildReportPanelHtml(opts: {
+  mode: 'bug' | 'feedback';
+  title: string;
+  subtitle: string;
+  placeholder: string;
+  contextHtml: string;
+}): string {
+  const { mode, title, subtitle, placeholder, contextHtml } = opts;
+  const btnLabel = mode === 'bug' ? 'File Issue &rarr;' : 'Share Feedback &rarr;';
+  const icon = mode === 'bug' ? '🐛' : '📊';
+  return `<!DOCTYPE html><html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);color:var(--vscode-foreground);background:var(--vscode-editor-background);display:flex;flex-direction:column;height:100vh;overflow:hidden}
+  .header{padding:20px 24px 12px;border-bottom:1px solid var(--vscode-widget-border,#333)}
+  h1{font-size:1.3em;font-weight:600;margin-bottom:6px}
+  .subtitle{color:var(--vscode-descriptionForeground);font-size:.88em;line-height:1.5}
+  .body{flex:1;padding:16px 24px;display:flex;flex-direction:column;gap:12px;overflow:auto}
+  label{font-size:.85em;font-weight:600;color:var(--vscode-foreground);opacity:.8}
+  textarea{flex:1;min-height:120px;resize:none;padding:10px 12px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,#555);border-radius:4px;font-family:inherit;font-size:inherit;line-height:1.5}
+  textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
+  .context-box{background:var(--vscode-textBlockQuote-background,#1e1e2e);border-left:3px solid var(--vscode-textBlockQuote-border,#444);padding:10px 14px;border-radius:0 4px 4px 0;font-size:.82em;line-height:1.7;color:var(--vscode-descriptionForeground)}
+  .context-box strong{color:var(--vscode-foreground)}
+  .footer{padding:12px 24px;border-top:1px solid var(--vscode-widget-border,#333);display:flex;justify-content:flex-end}
+  .file-btn{padding:8px 22px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;cursor:pointer;font-size:.9em;font-weight:600}
+  .file-btn:hover{background:var(--vscode-button-hoverBackground)}
+  .file-btn:disabled{opacity:.5;cursor:not-allowed}
+</style></head><body>
+<div class="header">
+  <h1>${icon} ${title}</h1>
+  <p class="subtitle">${subtitle}</p>
+</div>
+<div class="body">
+  <div>
+    <label>Description (optional)</label>
+    <textarea id="desc" placeholder="${placeholder}" style="margin-top:6px;width:100%"></textarea>
+  </div>
+  <div class="context-box"><strong>Auto-included:</strong><br>${contextHtml}</div>
+</div>
+<div class="footer">
+  <button class="file-btn" id="fileBtn">${btnLabel}</button>
+</div>
+<script>
+  var vscode = acquireVsCodeApi();
+  var desc = document.getElementById('desc');
+  var fileBtn = document.getElementById('fileBtn');
+  fileBtn.addEventListener('click', function() {
+    fileBtn.disabled = true;
+    fileBtn.textContent = 'Filing\\u2026';
+    vscode.postMessage({ type: 'submitReport', description: desc.value.trim() });
+  });
+  desc.focus();
+</script></body></html>`;
+}
+
+async function openReportPanel(
+  mode: 'bug' | 'feedback',
+  prefillText?: string,
+  frictionReport?: RunFrictionReport | null,
+  targetRepo?: string,
+): Promise<void> {
+  const { execSync } = require('child_process') as typeof import('child_process');
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  try { execSync('gh --version', { cwd, timeout: 5000, stdio: 'ignore' }); }
+  catch { vscode.window.showWarningMessage('Install GitHub CLI (gh) to file issues. https://cli.github.com'); return; }
+
+  const extVersion = (vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON as { version?: string } | undefined)?.version ?? 'unknown';
+  const detectedEngines = extensionContext?.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []) ?? [];
+  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('defaultEngine', 'claude');
+
+  let contextHtml = `MOAG v${extVersion} &nbsp;·&nbsp; VS Code v${vscode.version} &nbsp;·&nbsp; ${process.platform} &nbsp;·&nbsp; engine: ${defaultEngine}`;
+  if (detectedEngines.length > 0) { contextHtml += ` (installed: ${detectedEngines.join(', ')})`; }
+
+  let panelTitle: string, subtitle: string, placeholder: string;
+
+  if (mode === 'bug') {
+    panelTitle = 'Report MOAG Issue';
+    subtitle = `Files to <code>${MOAG_REPO}</code> with environment info attached automatically.`;
+    placeholder = 'e.g. task hung, wrong output, crashed on start...';
+    const friction = frictionReport ?? readLastFrictionReport();
+    if (friction) {
+      contextHtml += `<br>Recent run: ${friction.summary.failed} failed · ${friction.summary.escalated} escalated · engine: ${friction.engine}`;
+    }
+    if (prefillText) {
+      const snippet = prefillText.split('\n').filter(l => l.trim()).slice(0, 5).join('<br>');
+      contextHtml += `<br><em>Error output: ${snippet}</em>`;
+    }
+  } else {
+    panelTitle = 'Share Run Feedback';
+    const fc = frictionReport?.friction.length ?? 0;
+    subtitle = `${fc} friction point${fc !== 1 ? 's' : ''} on <strong>${frictionReport?.projectType ?? 'unknown project'}</strong> — files to <code>${targetRepo ?? MOAG_REPO}</code>.`;
+    placeholder = 'What was confusing, slow, or broke unexpectedly? (optional)';
+    if (frictionReport) {
+      contextHtml += `<br>${frictionReport.summary.total} tasks · ${frictionReport.summary.failed} failed · ${frictionReport.summary.escalated} escalated · ${frictionReport.summary.durationMs > 0 ? Math.round(frictionReport.summary.durationMs / 60000) + 'm' : 'n/a'}`;
+      const cats = Object.entries(frictionReport.errorCategories).map(([k, v]) => `${k}(${v})`).join(', ');
+      if (cats) { contextHtml += ` · errors: ${cats}`; }
+    }
+  }
+
+  const panel = vscode.window.createWebviewPanel(
+    'moagReportIssue', `MOAG — ${panelTitle}`, vscode.ViewColumn.One,
+    { enableScripts: true, retainContextWhenHidden: false },
+  );
+  panel.webview.html = buildReportPanelHtml({ mode, title: panelTitle, subtitle, placeholder, contextHtml });
+
+  panel.webview.onDidReceiveMessage(async (message) => {
+    if (message.type !== 'submitReport') { return; }
+    panel.dispose();
+    const description = message.description as string;
+
+    if (mode === 'bug') {
+      const autoTitle = `MOAG bug report [v${extVersion} / ${new Date().toISOString().substring(0, 10)}]`;
+      const errLines = (prefillText ?? '').split('\n').filter(l => l.trim()).slice(0, 30).join('\n');
+      const friction = frictionReport ?? readLastFrictionReport();
+      const frictionSuffix = friction
+        ? `\n\n**Recent run friction:**\n- ${friction.summary.failed} failed · ${friction.summary.escalated} escalated · engine: ${friction.engine}\n- Error patterns: ${Object.entries(friction.errorCategories).map(([k, v]) => `${k}(${v})`).join(', ') || 'none'}`
+        : '';
+      const bodyParts = [
+        '## Environment', '| | |', '|---|---|',
+        `| **MOAG** | v${extVersion} |`,
+        `| **VS Code** | v${vscode.version} |`,
+        `| **Platform** | ${process.platform} |`,
+        `| **Engine** | ${defaultEngine} (detected: ${detectedEngines.join(', ') || 'none'}) |`,
+        errLines ? `\n## Error Output\n\`\`\`\n${errLines}\n\`\`\`` : '',
+      ].filter(Boolean).join('\n');
+      const fullBody = [description, bodyParts + frictionSuffix].filter(Boolean).join('\n\n');
+      const repo = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('issueRepo', '').trim() || MOAG_REPO;
+      const tmpPath = path.join(os.tmpdir(), `moag-bug-${Date.now()}.md`);
+      try {
+        fs.writeFileSync(tmpPath, fullBody, 'utf-8');
+        const url = execSync(`gh issue create --repo "${repo}" --title "${autoTitle.replace(/"/g, '\\"')}" --body-file "${tmpPath}" --label bug`, { cwd, timeout: 20000, encoding: 'utf-8' }).trim().split('\n').pop() || '';
+        const action = await vscode.window.showInformationMessage(`Issue filed: ${url}`, 'View Issue');
+        if (action === 'View Issue' && url) { vscode.env.openExternal(vscode.Uri.parse(url)); }
+      } catch (err) { vscode.window.showErrorMessage(`Failed to create issue: ${err instanceof Error ? err.message.substring(0, 200) : String(err)}`); }
+      finally { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
+
+    } else {
+      if (!frictionReport) { return; }
+      const fc = frictionReport.friction.length;
+      const title = `Session feedback: ${fc} friction point${fc !== 1 ? 's' : ''} on ${frictionReport.projectType} [${frictionReport.date.substring(0, 10)}]`;
+      const body = buildFrictionIssueBody(frictionReport, description);
+      const repo = targetRepo ?? MOAG_REPO;
+      const tmpPath = path.join(os.tmpdir(), `moag-feedback-${Date.now()}.md`);
+      try {
+        fs.writeFileSync(tmpPath, body, 'utf-8');
+        const url = execSync(`gh issue create --repo "${repo}" --title "${title.replace(/"/g, '\\"')}" --body-file "${tmpPath}" --label feedback`, { cwd, timeout: 20000, encoding: 'utf-8' }).trim().split('\n').pop() || '';
+        const action = await vscode.window.showInformationMessage(`Feedback filed: ${url}`, 'View Issue');
+        if (action === 'View Issue' && url) { vscode.env.openExternal(vscode.Uri.parse(url)); }
+      } catch {
+        try {
+          fs.writeFileSync(tmpPath, body, 'utf-8');
+          const url = execSync(`gh issue create --repo "${repo}" --title "${title.replace(/"/g, '\\"')}" --body-file "${tmpPath}"`, { cwd, timeout: 20000, encoding: 'utf-8' }).trim().split('\n').pop() || '';
+          const action = await vscode.window.showInformationMessage(`Feedback filed: ${url}`, 'View Issue');
+          if (action === 'View Issue' && url) { vscode.env.openExternal(vscode.Uri.parse(url)); }
+        } catch (e2) { vscode.window.showErrorMessage(`Failed to file feedback: ${e2 instanceof Error ? e2.message.substring(0, 200) : String(e2)}`); }
+      } finally { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
+    }
+  });
+}
+
+async function cmdShareRunFeedback(): Promise<void> {
+  const { execSync } = require('child_process') as typeof import('child_process');
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+
+  const report = readLastFrictionReport();
+  if (!report) {
+    vscode.window.showInformationMessage('No recent friction data found. Run a plan first.');
+    return;
+  }
+
+  // 3-tier repo resolution: setting → git remote → MOAG repo
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  let repo = cfg.get<string>('issueRepo', '').trim();
+  if (!repo) {
+    try {
+      const remote = execSync('git remote get-url origin', { cwd, timeout: 5000 }).toString().trim();
+      const m = remote.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+      if (m) { repo = `${m[1]}/${m[2]}`; }
+    } catch { /* no remote */ }
+  }
+  if (!repo) { repo = MOAG_REPO; }
+
+  await openReportPanel('feedback', undefined, report, repo);
+}
+
+async function cmdReportIssue(prefillText?: string): Promise<void> {
+  await openReportPanel('bug', prefillText);
+}
+
+// ─── GitHub Integration: plan from open issues ───
+
+async function cmdPlanFromOpenIssues(): Promise<void> {
+  const { execSync } = require('child_process') as typeof import('child_process');
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) { UserMsg.showError(UserMsg.noWorkspace()); return; }
+  const cwd = workspaceFolder.uri.fsPath;
+
+  try {
+    execSync('gh --version', { cwd, timeout: 5000, stdio: 'ignore' });
+  } catch {
+    vscode.window.showWarningMessage('Install GitHub CLI (gh) to use Plan from Open Issues. https://cli.github.com');
+    return;
+  }
+
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  let repo = cfg.get<string>('issueRepo', '').trim();
+  if (!repo) {
+    try {
+      const remote = execSync('git remote get-url origin', { cwd, timeout: 5000 }).toString().trim();
+      const m = remote.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+      if (m) { repo = `${m[1]}/${m[2]}`; }
+    } catch { /* no remote */ }
+  }
+  if (!repo) {
+    const input = await vscode.window.showInputBox({
+      prompt: 'GitHub repo to load issues from (owner/repo)',
+      placeHolder: 'e.g. myorg/moag',
+    });
+    if (!input?.trim()) { return; }
+    repo = input.trim();
+  }
+
+  const labelInput = await vscode.window.showInputBox({
+    prompt: 'Label filter (leave blank for all open issues)',
+    placeHolder: 'e.g. bug',
+    value: 'bug',
+  });
+  if (labelInput === undefined) { return; }
+
+  let issues: Array<{ number: number; title: string; body: string }> = [];
+  try {
+    const labelFlag = labelInput.trim() ? `--label "${labelInput.trim()}"` : '';
+    const json = execSync(
+      `gh issue list --repo "${repo}" ${labelFlag} --state open --json number,title,body --limit 20`,
+      { cwd, timeout: 20000, encoding: 'utf-8' },
+    );
+    issues = JSON.parse(json);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Failed to fetch issues: ${msg.substring(0, 200)}`);
+    return;
+  }
+
+  if (issues.length === 0) {
+    vscode.window.showInformationMessage(`No open issues found on ${repo}${labelInput.trim() ? ` with label "${labelInput.trim()}"` : ''}.`);
+    return;
+  }
+
+  const issuesSummary = issues.map(i =>
+    `#${i.number}: ${i.title}\n${(i.body ?? '').substring(0, 400)}`,
+  ).join('\n\n---\n\n');
+
+  const rawIdea = `Fix the following open GitHub issues on ${repo}:\n\n${issuesSummary}`;
+  const defaultEngine = cfg.get<EngineId>('defaultEngine', 'claude' as EngineId);
+  const projectAnalysis = analyzeProject(cwd);
+  const projectContext = formatAnalysis(projectAnalysis);
+
+  let planName = `Fix ${issues.length} issue${issues.length > 1 ? 's' : ''} — ${repo}`;
+  let playlists: Array<{ name: string; engine?: string; tasks: Array<{ name: string; prompt: string }> }> = [];
+
+  try {
+    const engine = getEngine(defaultEngine);
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: `Generating plan from ${issues.length} issues...` },
+      async (_progress, token) => {
+        const abortController = new AbortController();
+        token.onCancellationRequested(() => abortController.abort());
+        const result = await engine.runTask({
+          prompt: PLAN_GENERATION_PROMPT_LARGE + '\n\nProject context:\n' + projectContext + '\n\nUser description:\n' + rawIdea,
+          cwd,
+          signal: abortController.signal,
+        });
+        if (result.exitCode === 0 && result.stdout.trim()) {
+          const parsed = parsePlanResponse(result.stdout);
+          if (parsed) {
+            planName = parsed.name || planName;
+            if (parsed.playlists?.length) { playlists = parsed.playlists; }
+            else if (parsed.tasks?.length) { playlists = [{ name: 'Tasks', tasks: parsed.tasks }]; }
+          }
+        }
+      },
+    );
+  } catch { /* fall through */ }
+
+  if (playlists.length === 0) {
+    playlists = issues.map(i => ({
+      name: `#${i.number}: ${i.title.substring(0, 50)}`,
+      tasks: [{ name: i.title.substring(0, 60), prompt: `Fix GitHub issue #${i.number}: ${i.title}\n\n${i.body ?? ''}` }],
+    }));
+  }
+
+  currentPlan = createEmptyPlan(planName);
+  currentPlan.description = `From ${issues.length} open issues on ${repo}`;
+  currentPlan.sourceIssues = issues.map(i => ({ repo, number: i.number, title: i.title }));
   currentPlan.playlists = playlists.map(pl => {
     const playlist = createPlaylist(pl.name);
     for (const t of pl.tasks) { playlist.tasks.push(createTask(t.name, t.prompt)); }
@@ -3655,7 +4682,1329 @@ async function cmdPlanFromGitHubIssue(): Promise<void> {
   });
   currentPlanPath = getNewPlanSavePath() || path.join(cwd, `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`);
   saveAndRefresh();
-  vscode.window.showInformationMessage(`Plan created from issue #${issueNumber}: "${planName}" — ${playlists.reduce((s, p) => s + p.tasks.length, 0)} tasks.`);
+  const taskTotal = playlists.reduce((s, p) => s + p.tasks.length, 0);
+  vscode.window.showInformationMessage(
+    `Plan created from ${issues.length} issues: "${planName}" — ${taskTotal} task${taskTotal !== 1 ? 's' : ''}.`,
+    'Open Dashboard',
+  ).then(action => { if (action === 'Open Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); } });
+}
+
+// ─── GitHub Integration: close source issues after successful plan run ───
+
+async function cmdCloseSourceIssues(sourceIssues: Array<{ repo: string; number: number; title: string }>): Promise<void> {
+  const { execSync } = require('child_process') as typeof import('child_process');
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+
+  try { execSync('gh --version', { cwd, timeout: 5000, stdio: 'ignore' }); }
+  catch { vscode.window.showWarningMessage('Install GitHub CLI (gh) to close issues. https://cli.github.com'); return; }
+
+  const items = sourceIssues.map(i => ({
+    label: `$(issues) #${i.number}: ${i.title}`,
+    description: i.repo,
+    issue: i,
+    picked: true,
+  }));
+  const selected = await vscode.window.showQuickPick(items, {
+    canPickMany: true,
+    title: 'Close Resolved Issues',
+    placeHolder: 'Select issues to close on GitHub',
+  });
+  if (!selected || selected.length === 0) { return; }
+
+  const commentBody = `Resolved by MOAG automated plan. All tasks completed successfully.`;
+  const closed: string[] = [];
+  for (const item of selected) {
+    const { issue } = item;
+    try {
+      execSync(`gh issue comment ${issue.number} --repo "${issue.repo}" --body "${commentBody}"`, { cwd, timeout: 15000, stdio: 'ignore' });
+      execSync(`gh issue close ${issue.number} --repo "${issue.repo}"`, { cwd, timeout: 15000, stdio: 'ignore' });
+      closed.push(`#${issue.number}`);
+    } catch (err) {
+      vscode.window.showErrorMessage(`Failed to close #${issue.number}: ${err instanceof Error ? err.message.substring(0, 100) : String(err)}`);
+    }
+  }
+  if (closed.length > 0) {
+    vscode.window.showInformationMessage(`Closed ${closed.join(', ')} on GitHub.`);
+  }
+}
+
+// ─── Plan from PRD ───
+
+async function handlePrdChatAnswer(payload: { answer: string; step: number; answers: string[] }): Promise<void> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) { return; }
+  const cwd = workspaceFolder.uri.fsPath;
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  const defaultEngine = cfg.get<EngineId>('defaultEngine', 'claude' as EngineId);
+
+  // Guard: check if any engine is available before attempting AI call
+  const detectedEngines = extensionContext?.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []) ?? [];
+  if (detectedEngines.length === 0) {
+    promptViewProvider?.postMessage({
+      type: 'prdError',
+      error: 'No AI engine is set up yet. Open the MOAG Setup Guide to install one (Claude Code, Codex, Gemini, or Ollama).',
+      action: { label: 'Open Setup Guide', command: 'agentTaskPlayer.setupGuide' },
+    });
+    return;
+  }
+
+  const engine = getEngine(defaultEngine);
+
+  const analysis = analyzeProject(cwd);
+  const stackContext = formatAnalysis(analysis);
+
+  const postToSidebar = (msg: Record<string, unknown>) => promptViewProvider?.postMessage(msg);
+
+  if (payload.step === 1) {
+    // Step 1: user described the feature — ask one follow-up question
+    const prompt = `A developer wants to build a new feature. They described it as:
+"${payload.answer}"
+
+The codebase uses: ${stackContext}
+
+Ask ONE focused follow-up question (under 30 words) to get the most important missing info needed to write acceptance criteria. Focus on: UI presence, key user actions, edge cases, or integrations. Do NOT number the question or add preamble — just the question itself.`;
+
+    try {
+      const result = await engine.runTask({ prompt, cwd, signal: new AbortController().signal });
+      const question = (result.stdout || '').trim() || 'Any specific acceptance criteria or edge cases to include?';
+      postToSidebar({ type: 'prdMoagQuestion', question });
+    } catch {
+      postToSidebar({ type: 'prdError', error: 'Could not reach AI engine' });
+    }
+
+  } else {
+    // Step 2: enough context — generate full PRD then open panel
+    const [desc, followUp] = payload.answers;
+    const prompt = `You are a senior product manager. Generate a structured PRD in Markdown based on this conversation:
+
+Feature description: "${desc}"
+Follow-up answer: "${followUp || 'N/A'}"
+Codebase: ${stackContext}
+
+Write the PRD with these sections:
+## Feature: <name>
+## Overview
+<1-2 sentences>
+## Goals
+- bullet points
+## Acceptance Criteria
+AC1: ...
+AC2: ...
+AC3: ...
+## Technical Notes
+<relevant notes based on the codebase context>
+
+Return ONLY the PRD markdown. No preamble, no explanation.`;
+
+    try {
+      const result = await engine.runTask({ prompt, cwd, signal: new AbortController().signal });
+      const prdText = (result.stdout || '').trim();
+      if (!prdText) {
+        postToSidebar({ type: 'prdError', error: 'AI returned empty PRD' });
+        return;
+      }
+      // Tell the sidebar the chat phase is done
+      postToSidebar({ type: 'prdConvertReady' });
+      // Open the PRD panel pre-filled with the generated PRD
+      await openPrdPanel(prdText);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      postToSidebar({ type: 'prdError', error: msg.substring(0, 120) });
+    }
+  }
+}
+
+async function cmdSavePrdToPlan(prdText: string): Promise<void> {
+  const plan = getActivePlan();
+  if (!plan) {
+    vscode.window.showWarningMessage('No active plan — open or create a plan first.');
+    return;
+  }
+  plan.prdSource = prdText;
+  if (currentPlanPath) { savePlan(plan, currentPlanPath); }
+  if (promptViewProvider) { syncPromptProviderSidebar(promptViewProvider); }
+  vscode.window.showInformationMessage('PRD saved to plan — use "Verify Against PRD" after your test playlist runs.');
+}
+
+async function cmdOpenPrdFromPlan(): Promise<void> {
+  const plan = getActivePlan();
+  if (plan?.prdSource) {
+    await openPrdPanel(plan.prdSource);
+    return;
+  }
+  const detectedRel = detectPrdFileInWorkspace();
+  if (detectedRel) {
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+    const fsLib = require('fs') as typeof import('fs');
+    const pathLib = require('path') as typeof import('path');
+    const text = fsLib.readFileSync(pathLib.join(cwd, detectedRel), 'utf-8');
+    await openPrdPanel(text);
+    return;
+  }
+  // Nothing found — fall through to the file picker
+  await cmdPlanFromPRD();
+}
+
+async function openPrdPanel(prefill = '', versions?: { version: string; text: string; createdAt: string }[]): Promise<void> {
+  const plan = getActivePlan();
+  const resolvedVersions = versions ?? plan?.prdVersions ?? [];
+  const panel = vscode.window.createWebviewPanel(
+    'moagPrdInput',
+    'MOAG — Generate Plan from PRD',
+    vscode.ViewColumn.One,
+    { enableScripts: true, retainContextWhenHidden: false },
+  );
+  panel.webview.html = buildPrdPanelHtml(prefill, resolvedVersions);
+  panel.webview.onDidReceiveMessage(async (message) => {
+    if (message.type === 'openPrdFile') {
+      const uris = await vscode.window.showOpenDialog({
+        canSelectMany: false, filters: { 'PRD files': ['md', 'txt'] }, title: 'Open PRD file',
+      });
+      if (uris?.[0]) {
+        const fsLib = require('fs') as typeof import('fs');
+        panel.webview.postMessage({ type: 'prdFileContent', text: fsLib.readFileSync(uris[0].fsPath, 'utf-8') });
+      }
+    } else if (message.type === 'savePrdFile') {
+      const saveUri = await vscode.window.showSaveDialog({
+        filters: { 'Markdown': ['md'], 'Text': ['txt'] },
+        defaultUri: vscode.Uri.file(
+          (vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '') + '/prd.md',
+        ),
+        title: 'Save PRD as file',
+      });
+      if (saveUri) {
+        const fsLib = require('fs') as typeof import('fs');
+        fsLib.writeFileSync(saveUri.fsPath, message.text as string, 'utf-8');
+        vscode.window.showInformationMessage(`PRD saved: ${saveUri.fsPath}`);
+      }
+    } else if (message.type === 'loadFromGitHubIssue') {
+      const input = await vscode.window.showInputBox({
+        prompt: 'GitHub issue URL or #number',
+        placeHolder: 'https://github.com/owner/repo/issues/123  or  #123',
+      });
+      if (!input) { return; }
+      const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+      let owner = '', issueRepo = '', issueNumber = '';
+      const urlMatch = input.match(/github\.com\/([^/]+)\/([^/]+)\/issues\/(\d+)/);
+      if (urlMatch) { [, owner, issueRepo, issueNumber] = urlMatch; }
+      else {
+        const numMatch = input.match(/#?(\d+)/);
+        if (numMatch) {
+          issueNumber = numMatch[1];
+          try {
+            const { execSync } = require('child_process') as typeof import('child_process');
+            const remote = execSync('git remote get-url origin', { cwd, timeout: 5000 }).toString().trim();
+            const rm = remote.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
+            if (rm) { [, owner, issueRepo] = rm; }
+          } catch { /* ignore */ }
+        }
+      }
+      if (!owner || !issueRepo || !issueNumber) {
+        vscode.window.showWarningMessage('Could not parse GitHub issue. Use format: https://github.com/owner/repo/issues/123');
+        return;
+      }
+      let issueTitle = '', issueBody = '';
+      try {
+        const { execSync } = require('child_process') as typeof import('child_process');
+        const json = execSync(`gh issue view ${issueNumber} --repo ${owner}/${issueRepo} --json title,body`, { cwd, timeout: 15000 }).toString();
+        const parsed = JSON.parse(json);
+        issueTitle = parsed.title || ''; issueBody = parsed.body || '';
+      } catch {
+        try {
+          const https = require('https') as typeof import('https');
+          const data = await new Promise<string>((resolve, reject) => {
+            const req = https.get(`https://api.github.com/repos/${owner}/${issueRepo}/issues/${issueNumber}`, {
+              headers: { 'User-Agent': 'MOAG-VSCode', Accept: 'application/vnd.github+json' },
+            }, (res: import('http').IncomingMessage) => {
+              let body = ''; res.on('data', (c: Buffer) => { body += c.toString(); }); res.on('end', () => resolve(body));
+            }); req.on('error', reject); req.setTimeout(10000, () => { req.destroy(); reject(new Error('timeout')); });
+          });
+          const parsed = JSON.parse(data); issueTitle = parsed.title || ''; issueBody = parsed.body || '';
+        } catch { vscode.window.showErrorMessage('Failed to fetch GitHub issue.'); return; }
+      }
+      if (!issueTitle) { vscode.window.showWarningMessage('Issue not found or empty.'); return; }
+      const formatted = `# ${issueTitle}\n\n${issueBody}`;
+      panel.webview.postMessage({
+        type: 'prdFromIssueLoaded',
+        text: formatted,
+        sourceIssue: { repo: `${owner}/${issueRepo}`, number: parseInt(issueNumber, 10), title: issueTitle },
+      });
+    } else if (message.type === 'generatePlanFromPrd') {
+      const si = message.sourceIssue as { repo: string; number: number; title: string } | null;
+      panel.dispose();
+      await generatePlanFromPrdText(message.prdText as string);
+      if (si && currentPlan) { currentPlan.sourceIssues = [si]; saveAndRefresh(); }
+    } else if (message.type === 'prdAiImprove') {
+      await handlePrdAiImprove(message.text as string, (result) => panel.webview.postMessage({ type: 'prdAiImproveResult', text: result }));
+    } else if (message.type === 'prdAiDraft') {
+      panel.dispose();
+      await cmdPlanFromPRD();
+    } else if (message.type === 'openPrdInBrowser') {
+      await openPrdInBrowser(message.text as string);
+    } else if (message.type === 'savePrdVersion') {
+      const saved = savePrdVersionToActivePlan(message.text as string, message.version as string);
+      panel.webview.postMessage({ type: 'prdVersionSaved', versions: saved.versions, version: saved.version });
+    }
+  });
+  // Pre-fill after panel loads
+  if (prefill) {
+    setTimeout(() => panel.webview.postMessage({ type: 'prdFileContent', text: prefill }), 400);
+  }
+}
+
+function gatherProjectContext(cwd: string): string {
+  const parts: string[] = [];
+  try {
+    const pkgPath = path.join(cwd, 'package.json');
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as Record<string, unknown>;
+      const deps = Object.keys({ ...(pkg.dependencies as object ?? {}), ...(pkg.devDependencies as object ?? {}) }).slice(0, 25);
+      if (pkg.name) { parts.push(`Project name: ${pkg.name}`); }
+      if (pkg.description) { parts.push(`Description: ${pkg.description}`); }
+      if (deps.length) { parts.push(`Key dependencies: ${deps.join(', ')}`); }
+    }
+  } catch { /* ignore */ }
+  try {
+    const readmePath = path.join(cwd, 'README.md');
+    if (fs.existsSync(readmePath)) {
+      parts.push(`README (first 800 chars):\n${fs.readFileSync(readmePath, 'utf-8').slice(0, 800)}`);
+    }
+  } catch { /* ignore */ }
+  try {
+    const entries = fs.readdirSync(cwd).filter(e => !e.startsWith('.') && e !== 'node_modules' && e !== 'dist' && e !== 'out');
+    parts.push(`Workspace top-level: ${entries.join(', ')}`);
+  } catch { /* ignore */ }
+  try {
+    const srcPath = path.join(cwd, 'src');
+    if (fs.existsSync(srcPath) && fs.statSync(srcPath).isDirectory()) {
+      parts.push(`src/ contains: ${fs.readdirSync(srcPath).slice(0, 30).join(', ')}`);
+    }
+  } catch { /* ignore */ }
+  return parts.join('\n') || '(workspace context unavailable)';
+}
+
+function getProjectMeta(): { name: string; stack: string } {
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+  const wsName = vscode.workspace.workspaceFolders?.[0]?.name ?? '';
+  try {
+    const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf-8')) as Record<string, unknown>;
+    const deps = { ...(pkg.dependencies as object ?? {}), ...(pkg.devDependencies as object ?? {}) } as Record<string, unknown>;
+    const tags: string[] = [];
+    if (deps['typescript'] || deps['ts-node']) { tags.push('TypeScript'); }
+    if (deps['next']) { tags.push('Next.js'); }
+    else if (deps['react']) { tags.push('React'); }
+    if (deps['vue']) { tags.push('Vue'); }
+    if (deps['express']) { tags.push('Express'); }
+    if (deps['@types/vscode'] || (pkg.engines as Record<string, unknown>)?.['vscode']) { tags.push('VS Code Ext'); }
+    if (deps['tailwindcss']) { tags.push('Tailwind'); }
+    return { name: (pkg.name as string) || wsName, stack: tags.slice(0, 3).join(' · ') };
+  } catch {
+    return { name: wsName, stack: '' };
+  }
+}
+
+async function handlePrdAiImprove(text: string, onResult: (improved: string) => void): Promise<void> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  const defaultEngine = cfg.get<EngineId>('defaultEngine', 'claude' as EngineId);
+  const engine = getEngine(defaultEngine);
+
+  // If text is short or looks like an instruction rather than a PRD, generate from project context
+  const looksLikePrd = text.trim().length > 400 || /^#{1,3}\s|acceptance criteria|AC[0-9]*[:.]/im.test(text);
+  let prompt: string;
+
+  if (!looksLikePrd) {
+    const projectCtx = gatherProjectContext(cwd);
+    const instruction = text.trim() || 'Generate a PRD for this project';
+    prompt = `You are a senior product manager. The developer asks: "${instruction}"
+
+Using the project context below, write a complete Product Requirements Document (PRD) in Markdown.
+
+Use this structure:
+# [Feature / Product Name]
+
+## Overview
+[1-2 sentence summary]
+
+## Goals
+- ...
+
+## User Stories
+- As a ..., I want ..., so that ...
+
+## Acceptance Criteria
+- AC1: ...
+- AC2: ...
+- [ ] (use checkbox format for testable criteria)
+
+## Technical Notes
+[Constraints, APIs, key implementation details]
+
+## Out of Scope
+[What this PRD explicitly does NOT cover]
+
+Project context:
+${projectCtx}
+
+Return ONLY the PRD markdown. No preamble, no explanation.`;
+  } else {
+    prompt = `You are a senior product manager. Improve the following PRD: sharpen ambiguous acceptance criteria, add missing edge cases, fill gaps in technical notes, and clarify the overview. Return ONLY the improved PRD markdown — keep the same structure, no preamble.\n\nPRD:\n${text}`;
+  }
+
+  try {
+    const result = await engine.runTask({ prompt, cwd, signal: new AbortController().signal });
+    const improved = result.stdout.trim();
+    onResult(improved || text);
+  } catch (err) {
+    vscode.window.showErrorMessage(`AI improve failed: ${err instanceof Error ? err.message : String(err)}`);
+    onResult(text);
+  }
+}
+
+async function openPrdInBrowser(text: string): Promise<void> {
+  const plan = getActivePlan();
+  const moagDir = ensureMoagDir();
+  if (!moagDir) { vscode.window.showErrorMessage('Could not create .moag directory.'); return; }
+  const html = buildPrdBrowserHtml(text, plan?.name ?? 'PRD', plan?.prdVersions ?? []);
+  const outPath = path.join(moagDir, 'prd-preview.html');
+  fs.writeFileSync(outPath, html, 'utf-8');
+  await vscode.env.openExternal(vscode.Uri.file(outPath));
+}
+
+function savePrdVersionToActivePlan(text: string, version: string): { versions: { version: string; text: string; createdAt: string }[]; version: string } {
+  const plan = getActivePlan();
+  const newEntry = { version, text, createdAt: new Date().toISOString() };
+  if (plan) {
+    plan.prdVersions = [...(plan.prdVersions ?? []), newEntry];
+    plan.prdSource = text;
+    if (currentPlanPath) { savePlan(plan, currentPlanPath); }
+    if (promptViewProvider) { syncPromptProviderSidebar(promptViewProvider); }
+    vscode.window.showInformationMessage(`PRD saved as ${version}`);
+    return { versions: plan.prdVersions, version };
+  }
+  return { versions: [newEntry], version };
+}
+
+function buildPrdBrowserHtml(prdText: string, planName: string, versions: { version: string; createdAt: string }[]): string {
+  const safe = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const rendered = safe(prdText)
+    .replace(/^## (.+)$/gm, '</p><h2>$1</h2><p>')
+    .replace(/^### (.+)$/gm, '</p><h3>$1</h3><p>')
+    .replace(/^# (.+)$/gm, '</p><h1>$1</h1><p>')
+    .replace(/^- \[ \] (.+)$/gm, '</p><li class="ac">&#9744; $1</li><p>')
+    .replace(/^- \[x\] (.+)$/gm, '</p><li class="ac done">&#9745; $1</li><p>')
+    .replace(/^- (.+)$/gm, '</p><li>$1</li><p>')
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>')
+    .replace(/\n\n/g, '</p><p>')
+    .replace(/\n/g, '<br>');
+  const versionsHtml = versions.length > 0
+    ? `<div class="versions">${versions.map(v => `<span class="vpill">${safe(v.version)}</span>`).join('')}</div>`
+    : '';
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PRD — ${safe(planName)}</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; max-width: 820px; margin: 0 auto; padding: 40px 32px; background: #1e1e1e; color: #d4d4d4; line-height: 1.7; }
+  h1 { font-size: 24px; color: #e8e8e8; border-bottom: 2px solid #0078d4; padding-bottom: 12px; margin: 0 0 20px; }
+  h2 { font-size: 18px; color: #e0e0e0; margin: 28px 0 10px; }
+  h3 { font-size: 15px; color: #ccc; margin: 18px 0 6px; }
+  p { margin: 6px 0; } li { margin: 3px 0 3px 20px; }
+  li.ac { list-style: none; margin-left: 0; font-family: 'Cascadia Code', monospace; font-size: 13px; }
+  li.done { opacity: 0.55; text-decoration: line-through; }
+  code { background: #2d2d2d; padding: 2px 6px; border-radius: 3px; font-size: 12px; }
+  strong { color: #e0e0e0; }
+  .meta { font-size: 12px; color: #555; margin-bottom: 20px; }
+  .versions { margin-bottom: 16px; }
+  .vpill { background: rgba(0,120,212,0.2); border: 1px solid rgba(0,120,212,0.4); color: #4fc3f7; border-radius: 12px; padding: 2px 10px; font-size: 11px; margin-right: 6px; }
+</style>
+</head>
+<body>
+<div class="meta">Generated by MOAG &mdash; ${new Date().toLocaleString()}</div>
+${versionsHtml}
+<p>${rendered}</p>
+</body>
+</html>`;
+}
+
+function cmdShowSetupGuide(ctx: vscode.ExtensionContext): void {
+  const detected = ctx.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []);
+  const has = (id: string) => detected.includes(id as EngineId);
+
+  const engineRows = [
+    {
+      id: 'claude',
+      name: 'Claude Code',
+      tag: 'Recommended',
+      install: 'npm install -g @anthropic-ai/claude-code',
+      auth: 'Requires Anthropic account — run <code>claude</code> to sign in',
+      url: 'https://docs.anthropic.com/claude-code',
+    },
+    {
+      id: 'codex',
+      name: 'Codex CLI',
+      tag: 'OpenAI',
+      install: 'npm install -g @openai/codex',
+      auth: 'Set <code>OPENAI_API_KEY</code> environment variable',
+      url: 'https://github.com/openai/codex',
+    },
+    {
+      id: 'gemini',
+      name: 'Gemini CLI',
+      tag: 'Google',
+      install: 'npm install -g @google/gemini-cli',
+      auth: 'Requires Google account — run <code>gemini</code> to sign in',
+      url: 'https://github.com/google-gemini/gemini-cli',
+    },
+    {
+      id: 'ollama',
+      name: 'Ollama',
+      tag: 'Local · No API key',
+      install: 'Download from ollama.com, then: ollama pull llama3',
+      auth: 'Runs fully local — no API key required',
+      url: 'https://ollama.com',
+    },
+  ];
+
+  const rowsHtml = engineRows.map(e => `
+    <div class="engine-row ${has(e.id) ? 'ok' : 'missing'}">
+      <div class="engine-status">${has(e.id) ? '&#10003;' : '&#10007;'}</div>
+      <div class="engine-info">
+        <div class="engine-name">${e.name} <span class="engine-tag">${e.tag}</span>${has(e.id) ? ' <span class="engine-found">Found</span>' : ''}</div>
+        ${!has(e.id) ? `<div class="engine-install"><code>${e.install}</code></div>` : ''}
+        <div class="engine-auth">${e.auth}</div>
+      </div>
+      ${!has(e.id) ? `<a class="engine-link" href="${e.url}" target="_blank">Docs &#8599;</a>` : ''}
+    </div>`).join('');
+
+  const allGood = detected.length > 0;
+  const panel = vscode.window.createWebviewPanel(
+    'moagSetupGuide', 'MOAG — Setup Guide', vscode.ViewColumn.One,
+    { enableScripts: true },
+  );
+
+  panel.webview.html = `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MOAG Setup Guide</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; background: #1e1e1e; color: #cccccc; min-height: 100vh; display: flex; flex-direction: column; }
+.hero { padding: 32px 40px 20px; border-bottom: 1px solid #333; }
+.hero h1 { font-size: 22px; font-weight: 700; color: #e8e8e8; margin-bottom: 6px; }
+.hero p { color: #888; line-height: 1.5; max-width: 560px; }
+.status-banner { margin: 0 40px; margin-top: 20px; padding: 10px 16px; border-radius: 6px; font-size: 12px; font-weight: 600; }
+.status-banner.good { background: rgba(78,201,176,0.12); border: 1px solid rgba(78,201,176,0.3); color: #4ec9b0; }
+.status-banner.warn { background: rgba(255,180,0,0.1); border: 1px solid rgba(255,180,0,0.25); color: #ffb400; }
+.section { padding: 24px 40px; }
+.section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: #666; margin-bottom: 14px; }
+.engine-row { display: flex; align-items: flex-start; gap: 14px; padding: 14px 16px; border: 1px solid #2d2d2d; border-radius: 8px; margin-bottom: 10px; background: #252525; }
+.engine-row.ok { border-color: rgba(78,201,176,0.25); background: rgba(78,201,176,0.04); }
+.engine-row.missing { border-color: #333; }
+.engine-status { font-size: 18px; line-height: 1; margin-top: 2px; flex-shrink: 0; }
+.engine-row.ok .engine-status { color: #4ec9b0; }
+.engine-row.missing .engine-status { color: #555; }
+.engine-info { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+.engine-name { font-size: 13px; font-weight: 600; color: #e0e0e0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.engine-tag { font-size: 10px; font-weight: 500; color: #888; background: #333; padding: 1px 6px; border-radius: 10px; }
+.engine-found { font-size: 10px; font-weight: 700; color: #4ec9b0; background: rgba(78,201,176,0.12); padding: 1px 7px; border-radius: 10px; }
+.engine-install { font-size: 11px; background: #1a1a1a; border: 1px solid #3a3a3a; border-radius: 4px; padding: 5px 10px; margin-top: 4px; color: #ce9178; }
+.engine-install code { font-family: 'Cascadia Code', 'Consolas', monospace; }
+.engine-auth { font-size: 11px; color: #777; line-height: 1.4; }
+.engine-auth code { color: #9cdcfe; font-family: monospace; }
+.engine-link { font-size: 11px; color: #4fc3f7; text-decoration: none; white-space: nowrap; margin-top: 2px; flex-shrink: 0; }
+.engine-link:hover { text-decoration: underline; }
+.tip-box { background: #252525; border-left: 3px solid #0078d4; border-radius: 0 6px 6px 0; padding: 10px 14px; font-size: 12px; color: #999; line-height: 1.5; margin-bottom: 12px; }
+.tip-box code { color: #9cdcfe; font-family: monospace; }
+.footer { padding: 20px 40px 32px; display: flex; gap: 12px; align-items: center; }
+.btn-primary { padding: 9px 22px; background: #0078d4; color: #fff; border: none; border-radius: 5px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.btn-primary:hover { background: #026ec1; }
+.btn-secondary { padding: 9px 18px; background: transparent; color: #aaa; border: 1px solid #444; border-radius: 5px; font-size: 12px; cursor: pointer; }
+.btn-secondary:hover { border-color: #666; color: #ccc; }
+</style></head>
+<body>
+<div class="hero">
+  <h1>&#128640; MOAG Setup Guide</h1>
+  <p>MOAG needs at least one AI coding CLI installed on your machine to run tasks, draft PRDs, and verify results.</p>
+</div>
+${allGood
+    ? `<div class="status-banner good">&#10003;&nbsp; ${detected.length} engine${detected.length > 1 ? 's' : ''} detected — you're ready to go!</div>`
+    : `<div class="status-banner warn">&#9888;&nbsp; No AI engine found. Install at least one from the list below.</div>`}
+<div class="section">
+  <div class="section-title">AI Engines</div>
+  ${rowsHtml}
+</div>
+<div class="section" style="padding-top:0">
+  <div class="section-title">After installing</div>
+  <div class="tip-box">Open a terminal and run <code>claude</code> (or the relevant CLI) once to complete authentication, then click <strong>Re-check engines</strong> below.</div>
+  <div class="tip-box">MOAG uses the CLI that matches your <strong>agentTaskPlayer.defaultEngine</strong> setting. You can change it in VS Code Settings.</div>
+</div>
+<div class="footer">
+  <button class="btn-primary" id="recheckBtn">Re-check engines</button>
+  <button class="btn-secondary" id="doneBtn">Start using MOAG</button>
+</div>
+<script>
+  var vscode = acquireVsCodeApi();
+  document.getElementById('recheckBtn').addEventListener('click', function() {
+    vscode.postMessage({ type: 'recheck' });
+  });
+  document.getElementById('doneBtn').addEventListener('click', function() {
+    vscode.postMessage({ type: 'done' });
+  });
+</script>
+</body></html>`;
+
+  panel.webview.onDidReceiveMessage(async (msg) => {
+    if (msg.type === 'recheck') {
+      panel.dispose();
+      await vscode.commands.executeCommand('agentTaskPlayer.detectEngines');
+      cmdShowSetupGuide(ctx);
+    } else if (msg.type === 'done') {
+      panel.dispose();
+    }
+  });
+}
+
+async function cmdPlanFromPRD(): Promise<void> {
+  await openPrdPanel();
+}
+
+// kept for direct invocation from old entry points
+function buildPrdPanelHtml(prefill = '', versions: { version: string; text: string; createdAt: string }[] = []): string {
+  const escapedPrefill = prefill.replace(/`/g, '\\`').replace(/\$/g, '\\$');
+  const versionsJson = JSON.stringify(versions).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Generate Plan from PRD</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    font-size: 13px; background: #1e1e1e; color: #cccccc;
+    height: 100vh; display: flex; flex-direction: column; overflow: hidden;
+  }
+  .header { padding: 20px 32px 12px; border-bottom: 1px solid #333; flex-shrink: 0; }
+  .header h1 { font-size: 18px; font-weight: 600; color: #e0e0e0; margin-bottom: 6px; }
+  .header p { font-size: 12px; color: #888; line-height: 1.5; }
+  .version-bar {
+    display: none; align-items: center; gap: 8px;
+    padding: 10px 32px 0; flex-shrink: 0; font-size: 12px; color: #888;
+  }
+  .version-bar.visible { display: flex; }
+  .version-select {
+    background: #2d2d2d; border: 1px solid #444; color: #ccc;
+    border-radius: 4px; padding: 4px 8px; font-size: 12px; cursor: pointer;
+  }
+  .version-save-btn {
+    padding: 4px 12px; background: transparent; border: 1px solid #444;
+    color: #888; border-radius: 4px; cursor: pointer; font-size: 11px;
+  }
+  .version-save-btn:hover { border-color: #5a9e5a; color: #9dcc9d; }
+  .body {
+    flex: 1; display: flex; flex-direction: column;
+    padding: 14px 32px 0; gap: 10px; min-height: 0;
+  }
+  .tip {
+    font-size: 11px; color: #666; background: #252525;
+    border-left: 3px solid #0078d4; padding: 8px 12px;
+    border-radius: 0 4px 4px 0; line-height: 1.5; flex-shrink: 0;
+  }
+  .tip strong { color: #999; }
+  .textarea-wrap { position: relative; flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  textarea {
+    flex: 1; resize: none; background: #2d2d2d; color: #d4d4d4;
+    border: 1px solid #444; border-radius: 6px; padding: 14px 16px;
+    font-size: 13px; font-family: 'Cascadia Code','Fira Code','Consolas',monospace;
+    line-height: 1.6; outline: none; min-height: 0;
+  }
+  textarea:focus { border-color: #0078d4; }
+  .ai-btn {
+    position: absolute; bottom: 10px; right: 12px;
+    font-size: 11px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+    background: rgba(0,120,212,0.15); border: 1px solid rgba(0,120,212,0.4); color: #4fc3f7;
+  }
+  .ai-btn:hover { background: rgba(0,120,212,0.28); }
+  .ai-btn:disabled { opacity: 0.5; cursor: default; }
+  .footer {
+    display: flex; align-items: center; justify-content: space-between;
+    flex-shrink: 0; padding: 10px 32px 24px; gap: 12px;
+  }
+  .footer-left { display: flex; align-items: center; gap: 10px; }
+  .browse-btn, .save-btn, .browser-btn {
+    padding: 8px 14px; background: transparent; border: 1px solid #555;
+    color: #aaa; border-radius: 5px; cursor: pointer; font-size: 12px;
+  }
+  .browse-btn:hover, .browser-btn:hover { border-color: #0078d4; color: #d4d4d4; }
+  .save-btn:hover { border-color: #5a9e5a; color: #9dcc9d; }
+  .char-count { font-size: 11px; color: #666; }
+  .generate-btn {
+    padding: 9px 24px; background: #0078d4; color: #fff; border: none;
+    border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 600; min-width: 160px;
+  }
+  .generate-btn:disabled { opacity: 0.4; cursor: default; }
+  .generate-btn:not(:disabled):hover { background: #026ec1; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>&#128196; Generate Plan from PRD</h1>
+  <p>Paste your PRD below. MOAG will generate a Design &rarr; Development &rarr; Testing plan automatically.</p>
+</div>
+<div class="version-bar" id="versionBar">
+  <span>Version:</span>
+  <select id="versionSelect" class="version-select"></select>
+  <button id="versionSaveBtn" class="version-save-btn" type="button">Save as v1.0</button>
+</div>
+<div class="body">
+  <div class="tip">
+    <strong>Tip:</strong> Include acceptance criteria (<code>AC1: ...</code> or <code>- [ ] ...</code>) so MOAG builds a TEST CRITERIA checklist during the testing phase.
+  </div>
+  <div class="textarea-wrap">
+    <textarea id="prd" placeholder="Paste your PRD here...
+
+## Feature: User login
+
+### Acceptance Criteria
+AC1: User can log in with email and password
+AC2: Invalid credentials show a clear error message
+AC3: Successful login redirects to dashboard"></textarea>
+    <button class="ai-btn" id="aiBtn" type="button">&#10024; Draft with AI</button>
+  </div>
+</div>
+<div class="footer">
+  <div class="footer-left">
+    <button class="browse-btn" id="browseBtn">Browse .md / .txt&hellip;</button>
+    <button class="browse-btn" id="issueBtn" title="Load content from a GitHub issue">&#128279; From Issue</button>
+    <button class="save-btn" id="saveBtn">Save as .md</button>
+    <button class="browser-btn" id="browserBtn" title="Open PRD in browser">&#127758; Open in Browser</button>
+    <span class="char-count" id="charCount">0 chars</span>
+  </div>
+  <button class="generate-btn" id="generateBtn" disabled>Generate Plan &rarr;</button>
+</div>
+<script>
+  var vscode = acquireVsCodeApi();
+  var ta = document.getElementById('prd');
+  var charCount = document.getElementById('charCount');
+  var generateBtn = document.getElementById('generateBtn');
+  var aiBtn = document.getElementById('aiBtn');
+  var versionBar = document.getElementById('versionBar');
+  var versionSelect = document.getElementById('versionSelect');
+  var versionSaveBtn = document.getElementById('versionSaveBtn');
+  var versions = ${versionsJson};
+  var sourceIssue = null;
+
+  function updateCount() {
+    var len = ta.value.length;
+    charCount.textContent = len + ' chars';
+    generateBtn.disabled = len < 20;
+  }
+  function updateAiBtn() {
+    aiBtn.textContent = ta.value.trim().length > 20 ? '\\u2728 Improve with AI' : '\\u2728 Draft with AI';
+  }
+  function renderVersionBar() {
+    if (versions.length > 0) {
+      versionBar.classList.add('visible');
+      versionSelect.innerHTML = versions.map(function(v) {
+        var d = new Date(v.createdAt).toLocaleDateString();
+        return '<option value="' + v.version + '">' + v.version + ' (' + d + ')</option>';
+      }).join('');
+      versionSaveBtn.textContent = 'Save as v' + (versions.length + 1) + '.0';
+    } else {
+      versionBar.classList.remove('visible');
+    }
+  }
+  renderVersionBar();
+
+  ta.value = \`${escapedPrefill}\`;
+  updateCount();
+  updateAiBtn();
+
+  ta.addEventListener('input', function() { updateCount(); updateAiBtn(); });
+
+  versionSelect.addEventListener('change', function() {
+    var ver = versions.find(function(v) { return v.version === versionSelect.value; });
+    if (ver) { ta.value = ver.text; updateCount(); updateAiBtn(); }
+  });
+
+  versionSaveBtn.addEventListener('click', function() {
+    var text = ta.value.trim();
+    if (!text) { return; }
+    var nextVersion = 'v' + (versions.length + 1) + '.0';
+    vscode.postMessage({ type: 'savePrdVersion', text: text, version: nextVersion });
+  });
+
+  aiBtn.addEventListener('click', function() {
+    var text = ta.value.trim();
+    if (text.length > 20) {
+      aiBtn.disabled = true;
+      aiBtn.textContent = 'Improving\\u2026';
+      vscode.postMessage({ type: 'prdAiImprove', text: text });
+    } else {
+      vscode.postMessage({ type: 'prdAiDraft' });
+    }
+  });
+
+  document.getElementById('browseBtn').addEventListener('click', function() {
+    vscode.postMessage({ type: 'openPrdFile' });
+  });
+
+  document.getElementById('issueBtn').addEventListener('click', function() {
+    vscode.postMessage({ type: 'loadFromGitHubIssue' });
+  });
+
+  document.getElementById('saveBtn').addEventListener('click', function() {
+    var text = ta.value.trim();
+    if (!text) { return; }
+    vscode.postMessage({ type: 'savePrdFile', text: text });
+  });
+
+  document.getElementById('browserBtn').addEventListener('click', function() {
+    var text = ta.value.trim();
+    if (!text) { return; }
+    vscode.postMessage({ type: 'openPrdInBrowser', text: text });
+  });
+
+  generateBtn.addEventListener('click', function() {
+    var text = ta.value.trim();
+    if (!text) { return; }
+    generateBtn.disabled = true;
+    generateBtn.textContent = 'Generating\\u2026';
+    vscode.postMessage({ type: 'generatePlanFromPrd', prdText: text, sourceIssue: sourceIssue });
+  });
+
+  window.addEventListener('message', function(e) {
+    if (e.data.type === 'prdFileContent') {
+      ta.value = e.data.text || ''; updateCount(); updateAiBtn(); ta.focus();
+      sourceIssue = null;
+    } else if (e.data.type === 'prdFromIssueLoaded') {
+      ta.value = e.data.text || ''; updateCount(); updateAiBtn(); ta.focus();
+      sourceIssue = e.data.sourceIssue || null;
+    } else if (e.data.type === 'prdAiImproveResult') {
+      ta.value = e.data.text || ta.value; updateCount(); updateAiBtn();
+      aiBtn.disabled = false; updateAiBtn();
+    } else if (e.data.type === 'prdVersionSaved') {
+      versions = e.data.versions || versions;
+      renderVersionBar();
+      if (e.data.version) { versionSelect.value = e.data.version; }
+    }
+  });
+
+  ta.focus();
+</script>
+</body>
+</html>`;}
+
+
+async function generatePlanFromPrdText(prdText: string): Promise<void> {
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) { UserMsg.showError(UserMsg.noWorkspace()); return; }
+  const cwd = workspaceFolder.uri.fsPath;
+
+  if (!prdText) {
+    vscode.window.showWarningMessage('PRD text is empty — plan generation cancelled.');
+    return;
+  }
+
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  const defaultEngine = cfg.get<EngineId>('defaultEngine', 'claude' as EngineId);
+
+  const prdPrompt = `You are a senior engineering lead. Given the Product Requirements Document (PRD) below, generate a structured JSON execution plan for an AI coding agent.
+
+The plan MUST have up to three playlists in this order:
+1. "Design" — UI/UX specs, component sketches, API contract decisions. OMIT this playlist if the PRD mentions no user interface or front-end work.
+2. "Development" — implementation tasks (backend, frontend, infrastructure, migrations, etc.)
+3. "Testing" — test writing, QA, edge-case coverage, accessibility checks (set "testPhase": true)
+
+Rules:
+- Each task must have: "id" (unique string e.g. "task-1"), "name" (short title), "prompt" (detailed enough for Claude Code to execute autonomously — include file paths, acceptance criteria, patterns to follow), "status": "pending"
+- Task type rules — include optional "type" field (defaults to "agent"):
+  - "agent"       AI coding tasks (most tasks)
+  - "command"     Shell commands (test runners, builds). Set "command" field to the exact shell command (e.g., "npm test", "pytest", "go test ./..."). The Testing playlist MUST include at least one "command" task running the test suite.
+  - "visual-test" Browser UI verification via screenshot + vision. For web/frontend projects only.
+- Each playlist must have: "id" (unique string), "name" (string), "testPhase" (boolean — true only for Testing), "tasks" (array)
+- The root plan object must have: "version": "1.0", "name" (brief feature name derived from the PRD), "description" (one sentence), "playlists" (array)
+- Return ONLY valid JSON. No markdown code fences, no explanation, no preamble.
+- Keep tasks focused and atomic — one concern per task.
+
+PRD:
+${prdText}`;
+
+  const planHolder: { json: string } = { json: '' };
+
+  try {
+    const engine = getEngine(defaultEngine);
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: 'Generating plan from PRD...' },
+      async (_progress, token) => {
+        const abortController = new AbortController();
+        token.onCancellationRequested(() => abortController.abort());
+        const result = await engine.runTask({
+          prompt: prdPrompt,
+          cwd,
+          signal: abortController.signal,
+        });
+        if (result.exitCode === 0 && result.stdout.trim()) {
+          planHolder.json = result.stdout.trim();
+        }
+      },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`PRD plan generation failed: ${msg.substring(0, 200)}`);
+    return;
+  }
+
+  if (!planHolder.json) {
+    vscode.window.showErrorMessage('AI did not return a plan. Try again or check your API key / engine settings.');
+    return;
+  }
+
+  // Strip markdown fences if the AI ignored the instruction
+  const planJson = planHolder.json.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+
+  let parsed: { version?: string; name?: string; playlists?: unknown[] };
+  try {
+    parsed = JSON.parse(planJson);
+  } catch {
+    vscode.window.showErrorMessage('AI returned invalid JSON. Try again.');
+    return;
+  }
+
+  if (!parsed.version || !parsed.name || !Array.isArray(parsed.playlists) || parsed.playlists.length === 0) {
+    vscode.window.showErrorMessage('Generated plan is missing required fields (version, name, playlists).');
+    return;
+  }
+
+  (parsed as Record<string, unknown>).prdSource = prdText;
+
+  // Hydrate → inject missing test runner → dehydrate back so the JSON file has the task
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const hydratedPrd = hydratePlan(parsed as any);
+    injectTestTaskIfMissing(hydratedPrd, cwd);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const dehydrated = dehydratePlan(hydratedPrd) as any;
+    dehydrated.prdSource = prdText;
+    parsed = dehydrated;
+  } catch { /* best-effort — proceed with unmodified parsed if hydration fails */ }
+
+  const moagDir = ensureMoagDir();
+  if (!moagDir) {
+    vscode.window.showErrorMessage('Could not create .moag directory.');
+    return;
+  }
+
+  const taskCount = (parsed.playlists as Array<{ tasks?: unknown[] }>).reduce((s, pl) => s + (pl.tasks?.length ?? 0), 0);
+  const playlistCount = (parsed.playlists as unknown[]).length;
+
+  // Guard against duplicates — use a deterministic path based on plan name
+  const safeName = (parsed.name as string).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '').slice(0, 40);
+  const canonicalPath = path.join(moagDir, `${safeName}.agent-plan.json`);
+  let planPath = canonicalPath;
+
+  if (fs.existsSync(canonicalPath)) {
+    const existing = (() => { try { return JSON.parse(fs.readFileSync(canonicalPath, 'utf-8')) as { name?: string; playlists?: unknown[] }; } catch { return null; } })();
+    const existingTasks = existing?.playlists
+      ? (existing.playlists as Array<{ tasks?: unknown[] }>).reduce((s, pl) => s + (pl.tasks?.length ?? 0), 0)
+      : 0;
+    const choice = await vscode.window.showWarningMessage(
+      `A plan "${existing?.name ?? safeName}" already exists (${existingTasks} tasks). Replace it with the new plan (${taskCount} tasks)?`,
+      { modal: false },
+      'Replace',
+      'Keep Both',
+    );
+    if (!choice) { return; }
+    if (choice === 'Keep Both') {
+      planPath = path.join(moagDir, `${safeName}-${Date.now()}.agent-plan.json`);
+    }
+  }
+
+  fs.writeFileSync(planPath, JSON.stringify(parsed, null, 2), 'utf-8');
+
+  const action = await vscode.window.showInformationMessage(
+    `Plan generated — ${taskCount} task${taskCount !== 1 ? 's' : ''} across ${playlistCount} playlist${playlistCount !== 1 ? 's' : ''}`,
+    'Open Plan',
+  );
+  if (action === 'Open Plan') {
+    void vscode.commands.executeCommand('agentTaskPlayer.runPlanFile', planPath);
+  }
+}
+
+// ─── PRD Verification ───
+
+async function cmdVerifyAgainstPrd(): Promise<void> {
+  const plan = getActivePlan();
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
+
+  // Resolve PRD text: plan.prdSource → disk detection → file picker
+  let prdText = plan?.prdSource ?? '';
+  if (!prdText) {
+    const detectedRel = detectPrdFileInWorkspace();
+    if (detectedRel) {
+      try { prdText = fs.readFileSync(path.join(cwd, detectedRel), 'utf-8'); } catch { /* ignore */ }
+    }
+  }
+  if (!prdText) {
+    const uris = await vscode.window.showOpenDialog({
+      canSelectMany: false,
+      filters: { 'PRD files': ['md', 'txt'] },
+      title: 'Select PRD file for verification',
+    });
+    if (!uris?.[0]) { return; }
+    try { prdText = fs.readFileSync(uris[0].fsPath, 'utf-8'); } catch { return; }
+  }
+  const activePlan = plan ?? { name: 'Unnamed Plan', playlists: [] };
+  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
+
+  // Collect last 20 history entries for the current runId (or all recent)
+  const runId = runner.currentRunId;
+  const allEntries = historyStore.getAll();
+  const entries = (runId
+    ? allEntries.filter(e => e.runId === runId)
+    : allEntries).slice(0, 20);
+
+  // Group by taskId to aggregate attempts
+  const byTask = new Map<string, typeof entries>();
+  for (const e of entries) {
+    const group = byTask.get(e.taskId) ?? [];
+    group.push(e);
+    byTask.set(e.taskId, group);
+  }
+
+  // Build results summary for the prompt
+  const resultLines: string[] = [];
+  for (const [, group] of byTask) {
+    const taskName = group[0].taskName;
+    const passed = group.filter(e => e.status === 'completed').length;
+    const failed = group.filter(e => e.status === 'failed' || e.status === 'blocked').length;
+    const escalated = group.filter(e => escalatedTaskIds.has(e.taskId)).length;
+    const lastFailed = [...group].reverse().find(e => e.status === 'failed' || e.status === 'blocked');
+    const stderrSnippet = lastFailed
+      ? (lastFailed.result.stderr || lastFailed.result.stdout || '')
+          .split('\n').map(l => l.trim()).find(l => l.length > 0)?.substring(0, 200) ?? ''
+      : '';
+    resultLines.push(
+      `Task: ${taskName} | passed=${passed} failed=${failed} escalated=${escalated}` +
+      (stderrSnippet ? ` | error: ${stderrSnippet}` : ''),
+    );
+  }
+  const resultsText = resultLines.length > 0 ? resultLines.join('\n') : 'No task history found.';
+
+  const verifyPrompt = `Given this PRD:\n${prdText}\n\nAnd these test results:\n${resultsText}\n\nDoes the implementation satisfy the PRD acceptance criteria? Reply with JSON only: { "passed": boolean, "score": number (0-100), "gaps": string[], "suggestion": string }`;
+
+  let verifyResult: { passed: boolean; score: number; gaps: string[]; suggestion: string } | null = null;
+
+  try {
+    const engine = getEngine(defaultEngine);
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: 'Verifying against PRD...' },
+      async (_progress, token) => {
+        const abortController = new AbortController();
+        token.onCancellationRequested(() => abortController.abort());
+        const result = await engine.runTask({ prompt: verifyPrompt, cwd, signal: abortController.signal });
+        if (result.stdout.trim()) {
+          const raw = result.stdout.trim()
+            .replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+          verifyResult = JSON.parse(raw);
+        }
+      },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`PRD verification failed: ${msg.substring(0, 200)}`);
+    return;
+  }
+
+  if (!verifyResult) {
+    vscode.window.showErrorMessage('AI did not return a verification result. Try again.');
+    return;
+  }
+
+  const result = verifyResult as { passed: boolean; score: number; gaps: string[]; suggestion: string };
+
+  // Build HTML report
+  const timestamp = Date.now();
+  const dateStr = new Date(timestamp).toLocaleString();
+  const score = result.score ?? 0;
+  const scoreBadgeColor = score >= 80 ? '#28a745' : score >= 50 ? '#f0ad4e' : '#dc3545';
+  const gaps: string[] = Array.isArray(result.gaps) ? result.gaps : [];
+  const suggestion = result.suggestion ?? '';
+
+  // Render PRD source as formatted text with acceptance criteria highlighted
+  const escapedPrd = prdText
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/^(#{1,3} .+)$/gm, '<strong>$1</strong>')
+    .replace(/\n/g, '<br>');
+
+  // Render right column: acceptance criteria vs gaps
+  const criteriaLines = prdText
+    .split('\n')
+    .filter(l => /acceptance criteria|must|shall|should|given|when|then/i.test(l) && l.trim().length > 5)
+    .slice(0, 20);
+
+  const criteriaHtml = criteriaLines.map(line => {
+    const escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const isGap = gaps.some(g => g.toLowerCase().split(' ').some(w => w.length > 4 && line.toLowerCase().includes(w)));
+    return `<div class="criterion ${isGap ? 'fail' : 'pass'}">
+      <span class="icon">${isGap ? '✗' : '✓'}</span>
+      <span>${escaped}</span>
+    </div>`;
+  }).join('');
+
+  // Test run summary table
+  const tableRows = [...byTask.entries()].map(([, group]) => {
+    const taskName = group[0].taskName;
+    const attempts = group.length;
+    const lastEntry = group[group.length - 1];
+    const status = lastEntry.status;
+    const errSnippet = (lastEntry.result.stderr || lastEntry.result.stdout || '')
+      .split('\n').map(l => l.trim()).find(l => l.length > 0)?.substring(0, 120) ?? '—';
+    const statusColor = status === 'completed' ? '#28a745' : status === 'failed' ? '#dc3545' : '#6c757d';
+    return `<tr>
+      <td>${taskName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
+      <td style="color:${statusColor}">${status}</td>
+      <td>${attempts}</td>
+      <td style="font-size:0.8em;color:#999">${errSnippet.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
+    </tr>`;
+  }).join('');
+
+  const bannerHtml = result.passed
+    ? `<div class="banner pass-banner">All criteria satisfied — ready to commit</div>`
+    : `<div class="banner fail-banner">Gaps found — fix required before commit</div>`;
+
+  const actionBtn = result.passed
+    ? `<button onclick="navigator.clipboard.writeText('MOAG: Commit &amp; Push').then(()=>this.title='Copied!');" title="Paste in VS Code command palette">Commit &amp; Push</button>`
+    : `<button onclick="navigator.clipboard.writeText('MOAG: Generate Fix Tasks').then(()=>this.title='Copied!');" title="Paste in VS Code command palette">Generate Fix Tasks</button>`;
+
+  const gapsHtml = gaps.length > 0
+    ? `<ul>${gaps.map(g => `<li>${g.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</li>`).join('')}</ul>`
+    : '<p style="color:#28a745">No gaps detected.</p>';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MOAG — PRD Verification Report</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px; background: #1e1e1e; color: #d4d4d4; }
+  .header { display: flex; align-items: center; gap: 16px; padding: 16px 24px; background: #252526; border-bottom: 1px solid #3c3c3c; flex-wrap: wrap; }
+  .header .logo { font-weight: 700; font-size: 1.1em; color: #0078d4; letter-spacing: 0.04em; }
+  .header .plan-name { flex: 1; font-size: 1em; color: #ccc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .score-badge { padding: 4px 14px; border-radius: 12px; font-weight: 700; font-size: 1em; color: #fff; background: ${scoreBadgeColor}; }
+  .header .date { font-size: 0.8em; color: #888; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border-bottom: 1px solid #3c3c3c; }
+  .col { padding: 20px 24px; border-right: 1px solid #3c3c3c; }
+  .col:last-child { border-right: none; }
+  .col h2 { font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.06em; color: #888; margin-bottom: 14px; }
+  .prd-text { font-size: 0.88em; line-height: 1.7; color: #c8c8c8; max-height: 320px; overflow-y: auto; }
+  .criterion { display: flex; gap: 8px; align-items: flex-start; padding: 5px 0; border-bottom: 1px solid #2d2d2d; font-size: 0.88em; line-height: 1.5; }
+  .criterion.pass .icon { color: #28a745; font-weight: bold; }
+  .criterion.fail .icon { color: #dc3545; font-weight: bold; }
+  .section { padding: 20px 24px; border-bottom: 1px solid #3c3c3c; }
+  .section h2 { font-size: 0.85em; text-transform: uppercase; letter-spacing: 0.06em; color: #888; margin-bottom: 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88em; }
+  th { text-align: left; padding: 6px 10px; color: #888; font-weight: 600; border-bottom: 1px solid #3c3c3c; }
+  td { padding: 7px 10px; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  .gaps { margin-top: 8px; }
+  .gaps ul { padding-left: 18px; }
+  .gaps li { margin: 4px 0; color: #f0ad4e; font-size: 0.88em; }
+  .callout { background: #252526; border-left: 3px solid #0078d4; padding: 14px 18px; font-size: 0.9em; color: #c8c8c8; line-height: 1.6; margin: 0 24px 20px; border-radius: 0 4px 4px 0; }
+  .banner { text-align: center; padding: 12px 24px; font-weight: 700; font-size: 1em; }
+  .pass-banner { background: #1a3a1a; color: #28a745; border-bottom: 1px solid #3c3c3c; }
+  .fail-banner { background: #3a1a1a; color: #dc3545; border-bottom: 1px solid #3c3c3c; }
+  .action-row { display: flex; gap: 12px; justify-content: center; padding: 16px 24px; background: #252526; border-top: 1px solid #3c3c3c; }
+  button { padding: 8px 20px; border-radius: 4px; border: none; background: #0078d4; color: #fff; font-size: 0.9em; cursor: pointer; font-weight: 600; }
+  button:hover { background: #005fa3; }
+</style>
+</head>
+<body>
+<div class="header">
+  <span class="logo">MOAG</span>
+  <span class="plan-name">${(activePlan.name ?? 'Unnamed Plan').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>
+  <span class="score-badge">${score}/100</span>
+  <span class="date">${dateStr}</span>
+</div>
+${bannerHtml}
+<div class="two-col">
+  <div class="col">
+    <h2>PRD Requirements</h2>
+    <div class="prd-text">${escapedPrd}</div>
+  </div>
+  <div class="col">
+    <h2>Verification Results</h2>
+    ${criteriaHtml || '<p style="color:#888;font-size:0.88em">No acceptance criteria extracted.</p>'}
+    <div class="gaps" style="margin-top:14px">
+      <strong style="font-size:0.8em;color:#888;text-transform:uppercase;letter-spacing:.05em">Gaps</strong>
+      ${gapsHtml}
+    </div>
+  </div>
+</div>
+<div class="section">
+  <h2>Test Run Summary</h2>
+  <table>
+    <thead><tr><th>Task</th><th>Status</th><th>Attempts</th><th>Error Snippet</th></tr></thead>
+    <tbody>${tableRows || '<tr><td colspan="4" style="color:#888">No history entries.</td></tr>'}</tbody>
+  </table>
+</div>
+<div class="callout">${suggestion.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') || 'No suggestion provided.'}</div>
+<div class="action-row">${actionBtn}</div>
+</body>
+</html>`;
+
+  const moagDir = ensureMoagDir();
+  if (!moagDir) {
+    vscode.window.showErrorMessage('Could not create .moag directory for report.');
+    return;
+  }
+  const reportPath = path.join(moagDir, `verification-${timestamp}.html`);
+  fs.writeFileSync(reportPath, html, 'utf-8');
+  await vscode.env.openExternal(vscode.Uri.file(reportPath));
+
+  if (result.passed) {
+    const action = await vscode.window.showInformationMessage(
+      `PRD verified (${score}/100) — report opened in browser`,
+      'Commit & Push',
+    );
+    if (action === 'Commit & Push') {
+      void cmdSuggestCommit();
+    }
+  } else {
+    const action = await vscode.window.showWarningMessage(
+      `Verification failed (${score}/100) — report opened in browser`,
+      'Generate Fix Tasks',
+    );
+    if (action === 'Generate Fix Tasks') {
+      void cmdGenerateFixTasks(activePlan as Plan, result);
+    }
+  }
+}
+
+async function cmdSuggestCommit(): Promise<void> {
+  const plan = currentPlan;
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
+
+  if (!plan) {
+    vscode.window.showWarningMessage('No active plan. Open a plan before committing.');
+    return;
+  }
+
+  const { execSync } = require('child_process') as typeof import('child_process');
+
+  let diffStat = '';
+  try {
+    diffStat = execSync('git diff --stat HEAD', { cwd, timeout: 30_000 }).toString().trim();
+  } catch {
+    diffStat = '(could not retrieve diff stat)';
+  }
+
+  const prdSnippet = plan.prdSource ? plan.prdSource.substring(0, 150).replace(/\n/g, ' ') : '';
+  const prdLine = prdSnippet ? `\n${prdSnippet}` : '';
+  const defaultMessage =
+    `feat: ${plan.name}\n\nImplemented via MOAG PRD workflow.${prdLine}\n\nFiles changed:\n${diffStat}`;
+
+  const message = await vscode.window.showInputBox({
+    prompt: 'Commit message (edit if needed)',
+    value: defaultMessage,
+    ignoreFocusOut: true,
+  });
+
+  if (!message) { return; }
+
+  try {
+    execSync(`git add -A && git commit -m "${message.replace(/"/g, '\\"')}"`, {
+      cwd,
+      timeout: 30_000,
+      shell: true as unknown as string,
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Commit failed: ${msg.substring(0, 300)}`);
+    return;
+  }
+
+  const action = await vscode.window.showInformationMessage('Committed. Push to remote?', 'Push');
+  if (action !== 'Push') { return; }
+
+  try {
+    execSync('git push', { cwd, timeout: 30_000 });
+    vscode.window.showInformationMessage('Pushed successfully.');
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Push failed: ${msg.substring(0, 300)}`);
+  }
+}
+
+async function cmdGenerateFixTasks(plan: Plan, verifyResult: PrdVerificationResult): Promise<void> {
+  if (!verifyResult.gaps || verifyResult.gaps.length === 0) {
+    vscode.window.showInformationMessage('No gaps to fix.');
+    return;
+  }
+
+  const iterations = plan.fixIterations ?? 0;
+  if (iterations >= 3) {
+    vscode.window.showErrorMessage('Max fix iterations (3) reached. Manual intervention required.');
+    return;
+  }
+
+  plan.fixIterations = iterations + 1;
+  const iterationN = plan.fixIterations;
+
+  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
+
+  const fixPrompt = `Given these PRD gaps found during verification:\n${verifyResult.gaps.map((g, i) => `${i + 1}. ${g}`).join('\n')}\n\nAI suggestion: ${verifyResult.suggestion}\n\nGenerate fix tasks as JSON array. Each task: { "name": string, "prompt": string }. Reply with JSON only.`;
+
+  let fixTasks: Array<{ name: string; prompt: string }> = [];
+  try {
+    const engine = getEngine(defaultEngine);
+    await vscode.window.withProgress(
+      { location: vscode.ProgressLocation.Window, title: 'Generating fix tasks...' },
+      async (_progress, token) => {
+        const abortController = new AbortController();
+        token.onCancellationRequested(() => abortController.abort());
+        const result = await engine.runTask({ prompt: fixPrompt, cwd, signal: abortController.signal });
+        if (result.stdout.trim()) {
+          const raw = result.stdout.trim()
+            .replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
+          fixTasks = JSON.parse(raw);
+        }
+      },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(`Fix task generation failed: ${msg.substring(0, 200)}`);
+    return;
+  }
+
+  if (!Array.isArray(fixTasks) || fixTasks.length === 0) {
+    vscode.window.showWarningMessage('No fix tasks generated. Try again.');
+    return;
+  }
+
+  const fixPlaylist: Playlist = {
+    id: `pl-fix-${Date.now()}`,
+    name: `Fix — Iteration ${iterationN}`,
+    autoplay: true,
+    testPhase: false,
+    tasks: fixTasks.map(t => createTask(t.name, t.prompt)),
+  };
+
+  plan.playlists.push(fixPlaylist);
+  saveAndRefresh();
+  vscode.window.showInformationMessage(`Fix playlist added — ${fixTasks.length} task${fixTasks.length !== 1 ? 's' : ''}. Click Play to continue.`);
 }
 
 // ─── Smart Task Decomposition ───
@@ -3905,7 +6254,6 @@ async function cmdRetryTask(item?: PlanTreeItem | TaskLocation): Promise<void> {
     return;
   }
 
-  vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   initializeSingleTaskExecution();
   runner.playTask(currentPlan, playlistIndex, taskIndex).catch(err => {
     UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
@@ -3985,11 +6333,174 @@ async function cmdRetryTaskWithNote(item?: PlanTreeItem | TaskLocation): Promise
     return;
   }
 
-  vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   initializeSingleTaskExecution();
   runner.playTask(currentPlan, playlistIndex, taskIndex).catch(err => {
     UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
   });
+}
+
+// ─── Smart Fix ──────────────────────────────────────────────────────────────
+
+const NOISE_PATTERNS_FIX = [
+  /^reading prompt from stdin/i,
+  /^─+\s*(command|response)\s*─+/i,
+  /^github copilot/i,
+  /^claude code/i,
+  /^── /,
+];
+
+function buildSmartFixPrompt(task: Task, latest: HistoryEntry | undefined): string {
+  const errorOutput = latest
+    ? [latest.result.stderr, latest.result.stdout].filter(Boolean).join('\n')
+    : '';
+  const errorLines = errorOutput
+    .split(/\r?\n/)
+    .map(l => l.trim())
+    .filter(l => l.length > 0 && !NOISE_PATTERNS_FIX.some(p => p.test(l)))
+    .slice(0, 6);
+
+  const classification = latest ? classifyFailure(latest.result.stderr, latest.result.stdout) : null;
+  const category = classification?.category ?? 'unknown';
+
+  const lines: string[] = [`Fix: ${task.name}`, ``, `Failed with: ${category}`];
+
+  if (errorLines.length > 0) {
+    lines.push(``, ...errorLines);
+  }
+
+  lines.push(``, `Identify the root cause and fix it without repeating the same approach.`);
+
+  return lines.join('\n');
+}
+
+async function cmdShowSmartFix(item?: PlanTreeItem | TaskLocation): Promise<void> {
+  if (!currentPlan || !promptViewProvider) { return; }
+
+  let playlistIndex: number;
+  let taskIndex: number;
+  if (item instanceof PlanTreeItem && item.kind === 'task' && item.taskIndex !== undefined) {
+    playlistIndex = item.playlistIndex;
+    taskIndex = item.taskIndex;
+  } else if (isTaskLocation(item)) {
+    playlistIndex = item.playlistIndex;
+    taskIndex = item.taskIndex;
+  } else {
+    return;
+  }
+
+  const task = currentPlan.playlists[playlistIndex]?.tasks[taskIndex];
+  if (!task) { return; }
+
+  const entries = historyStore.getForTask(task.id);
+  const latest = entries[0];
+  const fixPrompt = buildSmartFixPrompt(task, latest);
+  promptViewProvider.fillComposer(fixPrompt, undefined, { playlistIndex, taskIndex });
+}
+
+async function cmdRetryTaskWithPrompt(item?: { playlistIndex: number; taskIndex: number; prompt: string }): Promise<void> {
+  if (!currentPlan || !item) { return; }
+  if (runner.state !== RunnerState.Idle) {
+    vscode.window.showWarningMessage('Runner is busy. Stop it first before retrying.');
+    return;
+  }
+  const { playlistIndex, taskIndex, prompt } = item;
+  const task = currentPlan.playlists[playlistIndex]?.tasks[taskIndex];
+  if (!task) { return; }
+  if (task.status !== TaskStatus.Failed && task.status !== TaskStatus.Blocked) {
+    vscode.window.showInformationMessage('Only failed or blocked tasks can be fixed.');
+    return;
+  }
+
+  if (task.ownerNote) {
+    task.ownerNote = `${task.ownerNote}\n\n${prompt}`;
+  } else {
+    task.ownerNote = prompt;
+  }
+  task.status = TaskStatus.Pending;
+  saveAndRefresh();
+
+  if (!await preflightEngineCheck(currentPlan, playlistIndex, taskIndex)) {
+    return;
+  }
+
+  initializeSingleTaskExecution();
+  runner.playTask(currentPlan, playlistIndex, taskIndex).catch(err => {
+    UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
+  });
+}
+
+async function cmdFixAllFailed(): Promise<void> {
+  if (!currentPlan) { return; }
+  if (runner.state !== RunnerState.Idle) {
+    vscode.window.showWarningMessage('Runner is busy — stop it before running Fix All.');
+    return;
+  }
+
+  const failedTasks: Array<{ playlistIndex: number; taskIndex: number }> = [];
+  currentPlan.playlists.forEach((playlist, pi) => {
+    (playlist.tasks || []).forEach((task, ti) => {
+      if (task.status === TaskStatus.Failed || task.status === TaskStatus.Blocked) {
+        failedTasks.push({ playlistIndex: pi, taskIndex: ti });
+      }
+    });
+  });
+
+  if (failedTasks.length === 0) {
+    vscode.window.showInformationMessage('No failed tasks to fix.');
+    return;
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `Re-execute ${failedTasks.length} failed task${failedTasks.length === 1 ? '' : 's'} with their auto-fix context?`,
+    { modal: false },
+    'Re-execute All',
+  );
+  if (choice !== 'Re-execute All') { return; }
+
+  // Reset all failed tasks to pending and run the plan from the first failed playlist
+  const firstFailedPlaylist = failedTasks[0].playlistIndex;
+  for (const { playlistIndex, taskIndex } of failedTasks) {
+    const task = currentPlan.playlists[playlistIndex]?.tasks[taskIndex];
+    if (task) { task.status = TaskStatus.Pending; }
+  }
+  saveAndRefresh();
+
+  if (!await preflightEngineCheck(currentPlan, firstFailedPlaylist, failedTasks[0].taskIndex)) {
+    return;
+  }
+  initializeSingleTaskExecution();
+  runner.play(currentPlan, firstFailedPlaylist).catch(err => {
+    UserMsg.showError(UserMsg.retryFailed(err instanceof Error ? err.message : String(err)));
+  });
+}
+
+async function cmdAddTaskFromPrompt(args?: { text?: string }): Promise<void> {
+  const text = args?.text?.trim();
+  if (!text) { return; }
+
+  if (!currentPlan || !currentPlanPath) {
+    vscode.window.showWarningMessage('No plan is open. Open or create a plan first.');
+    return;
+  }
+
+  // Generate a task name from the first line (max 60 chars)
+  const firstLine = text.split('\n')[0].trim();
+  const taskName = firstLine.length > 60 ? firstLine.slice(0, 57) + '…' : firstLine;
+
+  // Add to the last playlist (or create one)
+  if (currentPlan.playlists.length === 0) {
+    currentPlan.playlists.push(createPlaylist('Queue'));
+  }
+  const playlist = currentPlan.playlists[currentPlan.playlists.length - 1];
+  const task = createTask(taskName, text);
+  playlist.tasks = playlist.tasks || [];
+  playlist.tasks.push(task);
+
+  saveAndRefresh();
+
+  // Clear the composer
+  promptViewProvider?.fillComposer('');
+  vscode.window.showInformationMessage(`Task "${taskName}" added to "${playlist.name}".`);
 }
 
 function cmdMoveUp(item?: PlanTreeItem): void {
@@ -4146,9 +6657,10 @@ async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIn
     for (const t of playlist.tasks) { t.status = TaskStatus.Pending; }
   }
 
+  if (!await showProfilePicker()) { return; }
+
   saveAndRefresh();
   DashboardPanel.currentPanel?.clearTimeline();
-  vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   initializeMultiTaskExecution(playlist.tasks.length);
   runner.playPlaylist(activePlan, item.playlistIndex).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
@@ -4182,7 +6694,6 @@ async function cmdPlayTask(item?: PlanTreeItem | { kind?: string; playlistIndex:
     return;
   }
 
-  vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   initializeSingleTaskExecution();
   runner.playTask(activePlan, item.playlistIndex, item.taskIndex).catch(err => {
     vscode.window.showErrorMessage(`Task failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -4274,7 +6785,6 @@ async function cmdRunSelected(item?: PlanTreeItem, selectedItems?: PlanTreeItem[
   }
   saveAndRefresh();
 
-  vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   DashboardPanel.currentPanel?.clearTimeline();
   initializeMultiTaskExecution(taskList.length);
   runner.playTasks(currentPlan, taskList).catch(err => {
@@ -4449,7 +6959,6 @@ async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
     5000,
   );
 
-  vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
   runner.play(plan).catch(err => {
     UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
   });
@@ -5065,6 +7574,9 @@ async function cmdSetTaskStatus(item?: PlanTreeItem): Promise<void> {
   if (!pick) { return; }
 
   task.status = pick.value;
+  if ((pick.value === TaskStatus.Completed || pick.value === TaskStatus.Pending) && currentPlan) {
+    unblockDependents(task.id, currentPlan);
+  }
   saveAndRefresh();
   vscode.window.showInformationMessage(`"${task.name}" → ${pick.value}`);
 }
@@ -5089,6 +7601,25 @@ async function cmdSetPlaylistStatus(item?: PlanTreeItem): Promise<void> {
   }
   saveAndRefresh();
   vscode.window.showInformationMessage(`All tasks in "${playlist.name}" → ${pick.value}`);
+}
+
+async function cmdSetTestPhase(item?: PlanTreeItem): Promise<void> {
+  if (!currentPlan || !item || item.kind !== 'playlist') { return; }
+
+  const playlist = currentPlan.playlists[item.playlistIndex];
+  const current = playlist.testPhase ?? false;
+  const picks = [
+    { label: '$(beaker) Mark as Test Phase', value: true, description: 'Sandbox auto-launches and TTT check runs when this playlist starts' },
+    { label: '$(circle-slash) Remove Test Phase', value: false, description: 'Normal playlist — no sandbox auto-launch' },
+  ];
+  const pick = await vscode.window.showQuickPick(picks, {
+    placeHolder: `"${playlist.name}" test phase: currently ${current ? 'ON' : 'OFF'}`,
+  });
+  if (pick === undefined) { return; }
+
+  playlist.testPhase = pick.value;
+  saveAndRefresh();
+  vscode.window.showInformationMessage(`"${playlist.name}" test phase: ${pick.value ? 'ON — sandbox will auto-launch when this playlist runs' : 'OFF'}`);
 }
 
 async function cmdUndoTask(treeItem?: PlanTreeItem): Promise<void> {
@@ -5351,6 +7882,26 @@ async function cmdSwitchProfile(): Promise<void> {
   vscode.window.showInformationMessage(`Execution profile: ${pick.profileName}`);
 }
 
+/** Show a profile picker before a run. Updates workspace config with the chosen profile. Returns false if cancelled. */
+async function showProfilePicker(): Promise<boolean> {
+  const current = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('executionProfile', 'auto');
+  const items = PROFILE_META.map(p => ({
+    label: `${p.icon} ${p.label}`,
+    description: p.description + (p.name === current ? '  ← current' : ''),
+    profileName: p.name,
+    picked: p.name === current,
+  }));
+  const pick = await vscode.window.showQuickPick(items, {
+    placeHolder: 'Choose execution profile for this run',
+    matchOnDescription: true,
+  });
+  if (!pick) { return false; }
+  if (pick.profileName !== current) {
+    await vscode.workspace.getConfiguration('agentTaskPlayer').update('executionProfile', pick.profileName, vscode.ConfigurationTarget.Workspace);
+  }
+  return true;
+}
+
 async function cmdReviewChanges(): Promise<void> {
   const runId = runner.currentRunId;
   const allEntries = historyStore.getAll();
@@ -5484,7 +8035,6 @@ function onWatchedFileChanged(relativePath: string): void {
     if (matchingTasks.length === 1) {
       first.task.status = TaskStatus.Pending;
       saveAndRefresh();
-      vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
       runner.playTask(plan, first.playlistIndex, first.taskIndex).catch(err => {
         vscode.window.showErrorMessage(`Task failed: ${err instanceof Error ? err.message : String(err)}`);
       });
@@ -5492,7 +8042,6 @@ function onWatchedFileChanged(relativePath: string): void {
       const taskList = matchingTasks.map(m => ({ playlistIndex: m.playlistIndex, taskIndex: m.taskIndex }));
       for (const m of matchingTasks) { m.task.status = TaskStatus.Pending; }
       saveAndRefresh();
-      vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
       runner.playTasks(plan, taskList).catch(err => {
         UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
       });

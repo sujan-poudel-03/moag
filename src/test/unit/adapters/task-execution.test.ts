@@ -404,12 +404,17 @@ describe('Claude Task Execution', () => {
     const { ClaudeAdapter } = proxyquire('../../../adapters/claude-adapter', {
       vscode: vscodeMock,
       './base-cli': { runCli },
+      fs: { mkdirSync: () => {}, existsSync: () => false, writeFileSync: () => {}, unlinkSync: () => {} },
+      path: require('path'),
     });
     const adapter = new ClaudeAdapter();
     const outputFn = sinon.stub();
     await adapter.runTask({ prompt: 'test', cwd: '/tmp', onOutput: outputFn });
 
-    assert.equal(calls[0].onOutput, outputFn, 'should pass onOutput through');
+    // onOutput is wrapped for permission-prompt detection but must forward to original
+    assert.ok(calls[0].onOutput, 'should have onOutput set');
+    calls[0].onOutput('hello', 'stdout');
+    assert.ok(outputFn.calledWith('hello', 'stdout'), 'should pass onOutput through');
   });
 });
 
@@ -951,7 +956,7 @@ describe('Runner Task Execution — engine integration', () => {
       await runner.play(plan);
 
       assert.equal(task1.status, TaskStatus.Failed);
-      assert.equal(task2.status, TaskStatus.Skipped);
+      assert.equal(task2.status, TaskStatus.Blocked);
       // Codex engine should never have been called
       assert.ok(!enginesUsed.includes('codex'));
     });

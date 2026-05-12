@@ -54,8 +54,10 @@ describe('captureScreenshot', () => {
   it('invokes playwright for web projects and returns path on success', async () => {
     const cwd = tmpCwd();
     let spawnedArgs: string[] = [];
-    const spawnStub = sinon.stub().callsFake((cmd: string, args: string[]) => {
+    let spawnOpts: { cwd?: string } | undefined;
+    const spawnStub = sinon.stub().callsFake((cmd: string, args: string[], opts: { cwd?: string }) => {
       spawnedArgs = [cmd, ...args];
+      spawnOpts = opts;
       const outputPath = args[args.length - 1];
       return makeFakeSpawnProc(0, outputPath);
     });
@@ -71,7 +73,33 @@ describe('captureScreenshot', () => {
     assert.ok(result?.includes('screenshot-'));
     assert.ok(spawnedArgs.some(a => a.includes('playwright')), 'should invoke playwright');
     assert.ok(spawnedArgs.includes('http://localhost:3000'), 'should pass URL to playwright');
+    assert.equal(spawnOpts?.cwd, cwd, 'should run playwright from workspace cwd');
     assert.ok(fs.existsSync(result!));
+  });
+
+  it('prefers local playwright binary from workspace cwd', async () => {
+    const cwd = tmpCwd();
+    const binDir = path.join(cwd, 'node_modules', '.bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const localBin = path.join(binDir, process.platform === 'win32' ? 'playwright.cmd' : 'playwright');
+    fs.writeFileSync(localBin, 'echo playwright');
+
+    let spawnedCmd = '';
+    const spawnStub = sinon.stub().callsFake((cmd: string, args: string[]) => {
+      spawnedCmd = cmd;
+      const outputPath = args[args.length - 1];
+      return makeFakeSpawnProc(0, outputPath);
+    });
+
+    const { captureScreenshot } = loadScreenshot({ spawnStub });
+    const result = await captureScreenshot({
+      projectType: 'web',
+      url: 'http://localhost:3000',
+      cwd,
+    });
+
+    assert.ok(result, 'should return a path');
+    assert.equal(spawnedCmd, localBin, 'should use local playwright binary');
   });
 
   it('returns null when playwright exits non-zero', async () => {

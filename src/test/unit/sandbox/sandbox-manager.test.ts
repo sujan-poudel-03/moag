@@ -177,7 +177,7 @@ describe('SandboxManager', () => {
     await mgr.launch(root);
     fakeProc.emit('exit', 127);
 
-    assert.equal(mgr.state.status, 'stopped');
+    assert.equal(mgr.state.status, 'error');
     assert.ok(mgr.state.error?.includes('127'));
   });
 
@@ -227,5 +227,54 @@ describe('SandboxManager', () => {
     mgr.setLastScreenshotPath('/tmp/shot.png');
     assert.equal(mgr.state.lastScreenshotPath, '/tmp/shot.png');
     assert.ok(stateSpy.calledOnce);
+  });
+
+  it('launches with sandbox.command override instead of project auto-detection', async () => {
+    const fakeProc = makeFakeProc();
+    const spawnStub = sinon.stub().returns(fakeProc);
+    const { SandboxManager } = loadManager(spawnStub);
+    const mgr = new SandboxManager();
+    const root = makeTempProject({ 'README.md': 'no package' });
+
+    await mgr.launch(root, { command: 'npm run dev', port: 3200 });
+
+    assert.equal(spawnStub.callCount, 1);
+    assert.equal(mgr.state.projectInfo?.framework, 'Custom');
+    assert.equal(mgr.state.projectInfo?.defaultPort, 3200);
+    const [cmd, args] = spawnStub.firstCall.args as [string, string[]];
+    assert.equal(cmd, 'npm');
+    assert.deepEqual(args, ['run', 'dev']);
+  });
+
+  it('launches sandbox.targets and stop() kills both primary and background processes', async () => {
+    const primaryProc = makeFakeProc();
+    const bgProc = makeFakeProc();
+    const spawnStub = sinon.stub();
+    spawnStub.onCall(0).returns(bgProc);      // background target(s) launched first
+    spawnStub.onCall(1).returns(primaryProc); // primary web target
+
+    const { SandboxManager } = loadManager(spawnStub);
+    const mgr = new SandboxManager();
+    const root = makeTempProject({ 'README.md': 'monorepo style test' });
+
+    await mgr.launch(root, {
+      targets: [
+        { name: 'Frontend', cwd: 'apps/web', command: 'npm run web:dev', port: 3001 },
+        { name: 'API', cwd: 'apps/api', command: 'npm run api:dev', port: 4100 },
+      ],
+    });
+
+    assert.equal(spawnStub.callCount, 2);
+    assert.equal(mgr.state.projectInfo?.framework, 'Frontend');
+
+    // Verify per-target cwd resolution
+    const bgOpts = spawnStub.firstCall.args[2] as { cwd: string };
+    const primaryOpts = spawnStub.secondCall.args[2] as { cwd: string };
+    assert.equal(bgOpts.cwd, path.join(root, 'apps', 'api'));
+    assert.equal(primaryOpts.cwd, path.join(root, 'apps', 'web'));
+
+    mgr.stop();
+    assert.ok(primaryProc.kill.calledOnce);
+    assert.ok(bgProc.kill.calledOnce);
   });
 });
