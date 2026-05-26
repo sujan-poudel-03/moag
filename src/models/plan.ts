@@ -199,6 +199,7 @@ export function hydratePlan(file: PlanFile, sourceName = 'plan'): Plan {
     playlists: file.playlists.map(p => hydratePlaylist(p, sourceName)),
   };
   if (file.sourceIssues?.length) { plan.sourceIssues = file.sourceIssues; }
+  if (file.prdSource) { plan.prdSource = file.prdSource; }
   // Ensure all task/playlist IDs are unique; fix duplicates or missing IDs
   ensureUniqueIds(plan);
   return plan;
@@ -229,6 +230,9 @@ function hydratePlaylist(p: PlanFilePlaylist, sourceName: string): Playlist {
     autoplay: p.autoplay ?? true,
     autoplayDelay: p.autoplayDelay,
     parallel: p.parallel,
+    aiRules: p.aiRules,
+    testPhase: p.testPhase,
+    prdContext: p.prdContext,
     tasks: p.tasks.map(t => hydrateTask(t, sourceName)),
   };
 }
@@ -258,6 +262,8 @@ function hydrateTask(t: PlanFileTask, sourceName: string): Task {
     skipIf: t.skipIf ? { taskId: t.skipIf.taskId, status: t.skipIf.status as TaskStatus } : undefined,
     consensus: t.consensus,
     validation: normalizeTaskValidation(t.validation, sourceName, t.id || t.name || '<unknown-task>'),
+    sourceIssueNumber: t.sourceIssueNumber,
+    sourceIssueRepo: t.sourceIssueRepo,
     status: (t.status as TaskStatus) || TaskStatus.Pending,
   };
 }
@@ -285,11 +291,12 @@ export function dehydratePlan(plan: Plan): PlanFile {
     result.variables = plan.variables;
   }
   if (plan.sourceIssues?.length) { result.sourceIssues = plan.sourceIssues; }
+  if (plan.prdSource) { result.prdSource = plan.prdSource; }
   return result;
 }
 
 function dehydratePlaylist(p: Playlist): PlanFilePlaylist {
-  return {
+  const result: PlanFilePlaylist = {
     id: p.id,
     name: p.name,
     engine: p.engine,
@@ -298,6 +305,10 @@ function dehydratePlaylist(p: Playlist): PlanFilePlaylist {
     parallel: p.parallel,
     tasks: p.tasks.map(dehydrateTask),
   };
+  if (p.aiRules)    { result.aiRules = p.aiRules; }
+  if (p.testPhase)  { result.testPhase = p.testPhase; }
+  if (p.prdContext) { result.prdContext = p.prdContext; }
+  return result;
 }
 
 function dehydrateTask(t: Task): PlanFileTask {
@@ -332,6 +343,8 @@ function dehydrateTask(t: Task): PlanFileTask {
       contextBudget: t.validation.contextBudget,
     };
   }
+  if (t.sourceIssueNumber !== undefined) { result.sourceIssueNumber = t.sourceIssueNumber; }
+  if (t.sourceIssueRepo) { result.sourceIssueRepo = t.sourceIssueRepo; }
   // Only persist non-pending statuses to keep plan files clean
   if (t.status && t.status !== TaskStatus.Pending) {
     result.status = t.status;

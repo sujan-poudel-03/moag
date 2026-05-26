@@ -13,5 +13,8 @@
   "agentTaskPlayer.context.maxOutputPerTask": 800,
   "agentTaskPlayer.context.maxContextChars": 8000,
   "agentTaskPlayer.context.maxFileContextChars": 4000,
-  "agentTaskPlayer.testTool": "sandbox"
+  "agentTaskPlayer.testTool": "sandbox",
+  "agentTaskPlayer.issueRepo": "sujan-poudel-03/moag",
+  "agentTaskPlayer.issueSync.label": "moag",
+  "agentTaskPlayer.issueSync.enabled": true
 }

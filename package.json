@@ -1021,6 +1021,27 @@
           "default": "",
           "description": "GitHub repo (owner/repo) where MOAG bug reports are filed via the Report Bug button. Example: myorg/moag. Leave blank to prompt each time."
         },
+        "agentTaskPlayer.issueSync.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "When true, MOAG polls GitHub for new issues with the configured label and automatically adds them as tasks to the active plan."
+        },
+        "agentTaskPlayer.issueSync.pollIntervalMs": {
+          "type": "number",
+          "default": 300000,
+          "minimum": 60000,
+          "description": "How often (in milliseconds) to poll GitHub for new issues. Minimum 60 000 ms (1 minute). Default is 300 000 ms (5 minutes)."
+        },
+        "agentTaskPlayer.issueSync.label": {
+          "type": "string",
+          "default": "moag",
+          "description": "GitHub issue label that triggers auto-import. Only issues with this label are pulled into the plan."
+        },
+        "agentTaskPlayer.issueSync.postComments": {
+          "type": "boolean",
+          "default": true,
+          "description": "When true, MOAG posts progress comments to GitHub issues as tasks start, complete, or fail."
+        },
         "agentTaskPlayer.testTool": {
           "type": "string",
           "enum": ["claude-chrome", "sandbox", "playwright", "cypress", "custom", "manual"],

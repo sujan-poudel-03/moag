@@ -106,6 +106,10 @@ export interface Task {
   consensus?: { engines: EngineId[]; strategy: 'first-pass' | 'best-diff' };
   /** Optional validation target/profile/budget overrides for validate tasks */
   validation?: TaskValidationSettings;
+  /** GitHub issue number this task was generated from (used for two-way sync) */
+  sourceIssueNumber?: number;
+  /** GitHub repo (owner/repo) for the source issue */
+  sourceIssueRepo?: string;
   /** Runtime status (not persisted in the plan file) */
   status: TaskStatus;
 }
@@ -343,6 +347,8 @@ export interface PlanFile {
   variables?: Record<string, string>;
   /** GitHub issues this plan was generated from */
   sourceIssues?: Array<{ repo: string; number: number; title: string }>;
+  /** Full original PRD text from which this plan was generated */
+  prdSource?: string;
   /** Optional plan-level validation defaults */
   validation?: {
     targets?: ValidationTarget[];
@@ -359,6 +365,10 @@ export interface PlanFilePlaylist {
   autoplay: boolean;
   autoplayDelay?: number;
   parallel?: boolean;
+  aiRules?: string;
+  testPhase?: boolean;
+  /** PRD slice relevant to this playlist's tasks — used by per-version verify */
+  prdContext?: string;
   tasks: PlanFileTask[];
 }
 
@@ -391,6 +401,10 @@ export interface PlanFileTask {
   consensus?: { engines: EngineId[]; strategy: 'first-pass' | 'best-diff' };
   /** Optional validation target/profile/budget overrides */
   validation?: TaskValidationSettings;
+  /** GitHub issue number this task was generated from */
+  sourceIssueNumber?: number;
+  /** GitHub repo (owner/repo) for the source issue */
+  sourceIssueRepo?: string;
   /** Persisted execution status (omitted or 'pending' means not yet run) */
   status?: string;
 }

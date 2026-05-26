@@ -94,6 +94,11 @@ let executionTasksCompleted = 0;
 let executionTasksFailed = 0;
 let executionStartTime = 0;
 
+// ─── GitHub issue sync polling state ───
+let issuePollInterval: ReturnType<typeof setInterval> | null = null;
+const issueSyncKnownNumbers = new Set<string>(); // "repo#number" keys already imported into plan
+let issueSyncLastPoll: string | null = null; // ISO timestamp of last poll
+
 // ─── Friction tracking (cleared at run start) ───
 const escalatedTaskIds = new Set<string>();
 
@@ -330,6 +335,7 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
       progress: { done, total },
       aiRules: playlist.aiRules,
       testPhase: playlist.testPhase,
+      prdContext: playlist.prdContext,
       tasks: tasks.map((task) => {
         const taskEntries = historyStore.getForTask(task.id);
         const latestEntry = taskEntries[0];
@@ -348,6 +354,8 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
           tokenUsage: latestEntry?.result.tokenUsage
             ? { totalTokens: latestEntry.result.tokenUsage.totalTokens, estimatedCost: latestEntry.result.tokenUsage.estimatedCost }
             : undefined,
+          sourceIssueNumber: task.sourceIssueNumber,
+          sourceIssueRepo: task.sourceIssueRepo,
         };
       }),
     };
@@ -1478,6 +1486,13 @@ export function activate(context: vscode.ExtensionContext): void {
     statusBarItem.text = `$(sync~spin) ATP: Task ${executionTasksCompleted}/${executionTaskCount} — ${shortName}`;
     startProgressNotification();
     updateProgressNotification(`Task ${executionTasksCompleted}/${executionTaskCount}: ${shortName}`);
+
+    // GitHub two-way sync: post "working on" comment
+    if (task.sourceIssueNumber && task.sourceIssueRepo) {
+      postIssueComment(task.sourceIssueRepo, task.sourceIssueNumber,
+        `▶ Working on: **${task.name}**`);
+      applyIssueLabel(task.sourceIssueRepo, task.sourceIssueNumber, 'moag:in-progress');
+    }
   });
 
   runner.on('task-output', (task, chunk, stream) => {
@@ -1547,6 +1562,13 @@ export function activate(context: vscode.ExtensionContext): void {
     promptViewProvider?.postLiveOutputEnd(task.id, task.status);
     schedulePromptProviderSidebarSync();
 
+    // GitHub two-way sync: post completion comment
+    if (task.sourceIssueNumber && task.sourceIssueRepo) {
+      const nFiles = historyStore.getForTask(task.id)[0]?.changedFiles?.length ?? 0;
+      postIssueComment(task.sourceIssueRepo, task.sourceIssueNumber,
+        `✓ **${task.name}** — ${nFiles} file${nFiles !== 1 ? 's' : ''} changed`);
+    }
+
     // Auto-capture screenshot after each task if sandbox is running
     const sbState = sandboxManager?.state;
     if (sbState?.status === 'running' && sbState.url) {
@@ -1594,6 +1616,14 @@ export function activate(context: vscode.ExtensionContext): void {
     notifyTaskFailed(task);
     promptViewProvider?.postLiveOutputEnd(task.id, task.status);
     schedulePromptProviderSidebarSync();
+
+    // GitHub two-way sync: post failure comment
+    if (task.sourceIssueNumber && task.sourceIssueRepo) {
+      const errLine = result.stderr.split('\n').find(l => l.trim())?.substring(0, 200) ?? `exit ${result.exitCode}`;
+      postIssueComment(task.sourceIssueRepo, task.sourceIssueNumber,
+        `✗ **${task.name}** failed — ${errLine}`);
+    }
+
     // Silently log MOAG infrastructure failures (spawn errors, auth, context overflow, etc.)
     const issueType = classifyMoagIssue(result.stderr, result.exitCode);
     if (issueType) {
@@ -1880,6 +1910,87 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.planFromGitHubIssue', cmdPlanFromGitHubIssue),
     vscode.commands.registerCommand('agentTaskPlayer.reportIssue', cmdReportIssue),
     vscode.commands.registerCommand('agentTaskPlayer.planFromOpenIssues', cmdPlanFromOpenIssues),
+    vscode.commands.registerCommand('agentTaskPlayer.ghSyncPollNow', () => {
+      const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+      const label = cfg.get<string>('issueSync.label', 'moag');
+      void pollGitHubIssues(label).then(() => {
+        vscode.window.showInformationMessage('GitHub issues poll complete.');
+        if (promptViewProvider) { schedulePromptProviderSidebarSync(); }
+      });
+    }),
+    vscode.commands.registerCommand('agentTaskPlayer.ghSyncConfigure', async (args?: { repo?: string; label?: string; enabled?: boolean }) => {
+      const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+      const target = vscode.ConfigurationTarget.Workspace;
+      if (args?.repo !== undefined) {
+        await cfg.update('issueRepo', args.repo, target);
+      }
+      if (args?.label !== undefined) {
+        await cfg.update('issueSync.label', args.label, target);
+      }
+      if (args?.enabled !== undefined) {
+        await cfg.update('issueSync.enabled', args.enabled, target);
+      }
+      startIssuePolling(context);
+      if (promptViewProvider) { schedulePromptProviderSidebarSync(); }
+    }),
+    vscode.commands.registerCommand('agentTaskPlayer.ghSyncConfigureInteractive', async () => {
+      const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+      const currentRepo = cfg.get<string>('issueRepo') || '';
+      const currentLabel = cfg.get<string>('issueSync.label') || 'moag';
+      const currentEnabled = cfg.get<boolean>('issueSync.enabled') ?? false;
+
+      if (currentRepo) {
+        // Already connected — show quick pick to manage
+        const pick = await vscode.window.showQuickPick([
+          { label: currentEnabled ? '$(debug-pause) Disable sync' : '$(play) Enable sync', action: 'toggle' },
+          { label: '$(refresh) Poll now', action: 'poll' },
+          { label: '$(edit) Change repo / label', action: 'change' },
+          { label: '$(trash) Disconnect', action: 'disconnect' },
+        ], { title: `GitHub Sync — ${currentRepo}`, placeHolder: 'Choose an action' });
+        if (!pick) { return; }
+        if (pick.action === 'toggle') {
+          await cfg.update('issueSync.enabled', !currentEnabled, vscode.ConfigurationTarget.Workspace);
+          startIssuePolling(context);
+        } else if (pick.action === 'poll') {
+          void vscode.commands.executeCommand('agentTaskPlayer.ghSyncPollNow');
+        } else if (pick.action === 'disconnect') {
+          await cfg.update('issueRepo', '', vscode.ConfigurationTarget.Workspace);
+          await cfg.update('issueSync.enabled', false, vscode.ConfigurationTarget.Workspace);
+          startIssuePolling(context);
+        } else {
+          // fall through to change flow below
+          void vscode.commands.executeCommand('agentTaskPlayer.ghSyncConfigureInteractive');
+          return;
+        }
+        if (promptViewProvider) { schedulePromptProviderSidebarSync(); }
+        return;
+      }
+
+      // No repo — prompt to connect
+      const repo = await vscode.window.showInputBox({
+        title: 'Connect GitHub Issues Sync',
+        prompt: 'Enter repository in owner/repo format',
+        placeHolder: 'e.g. acme/my-app',
+        value: currentRepo,
+        validateInput: v => v && v.includes('/') ? undefined : 'Must be owner/repo',
+      });
+      if (!repo) { return; }
+
+      const label = await vscode.window.showInputBox({
+        title: 'Issue label to track',
+        prompt: 'Only issues with this label will be imported as tasks',
+        placeHolder: 'moag',
+        value: currentLabel,
+      });
+      if (label === undefined) { return; }
+
+      await cfg.update('issueRepo', repo.trim(), vscode.ConfigurationTarget.Workspace);
+      await cfg.update('issueSync.label', (label.trim() || 'moag'), vscode.ConfigurationTarget.Workspace);
+      await cfg.update('issueSync.enabled', true, vscode.ConfigurationTarget.Workspace);
+      startIssuePolling(context);
+      if (promptViewProvider) { schedulePromptProviderSidebarSync(); }
+      vscode.window.showInformationMessage(`GitHub sync connected to ${repo.trim()} — polling for "${label.trim() || 'moag'}" issues.`);
+    }),
     vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context)),
     vscode.commands.registerCommand('agentTaskPlayer.planFromPrd', cmdPlanFromPRD),
     vscode.commands.registerCommand('agentTaskPlayer.generatePlanFromPrdText', (prdText: string) => generatePlanFromPrdText(prdText)),
@@ -2013,7 +2124,17 @@ export function activate(context: vscode.ExtensionContext): void {
     .catch(() => undefined);
 
   // Auto-load plan if one exists in workspace, then restore pause state
-  autoLoadPlan().then(() => restorePauseState(context));
+  autoLoadPlan().then(() => {
+    restorePauseState(context);
+    startIssuePolling(context);
+  });
+
+  // Restart polling when issueSync settings change
+  context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
+    if (e.affectsConfiguration('agentTaskPlayer.issueSync')) {
+      startIssuePolling(context);
+    }
+  }));
 
   // Watch for plan file changes — auto-reload on external edits
   planFileWatcher = vscode.workspace.createFileSystemWatcher('**/{.moag/*.json,*.agent-plan.json}');
@@ -2091,6 +2212,7 @@ export function deactivate(): void {
   runner?.stop();
   runner?.stopAllServices();
   sandboxManager?.stop();
+  stopIssuePolling();
   if (devReloadTimer) { clearTimeout(devReloadTimer); devReloadTimer = null; }
   devReloadWatcher?.close();
   devReloadWatcher = null;
@@ -3160,6 +3282,7 @@ async function createPlanFromIdea(
   currentPlan.playlists = playlists.map(pl => {
     const playlist = createPlaylist(pl.name, pl.engine as EngineId | undefined);
     if ((pl as ParsedPlanPlaylist).testPhase) { playlist.testPhase = true; }
+    if ((pl as ParsedPlanPlaylist).prdContext) { playlist.prdContext = (pl as ParsedPlanPlaylist).prdContext; }
     for (const t of pl.tasks) {
       const task = createTask(t.name, t.prompt);
       const pt = t as ParsedPlanTask;
@@ -3382,6 +3505,7 @@ Respond with ONLY valid JSON (no markdown fences, no commentary) in this exact f
     {
       "name": "Phase name (e.g., Setup, Core, Features, Testing)",
       "testPhase": false,
+      "prdContext": "Quote the PRD slice that governs this playlist's tasks. For Testing playlists, copy the full acceptance criteria verbatim.",
       "tasks": [
         {
           "name": "Short task name",
@@ -3413,7 +3537,7 @@ Plan structure rules:
 - Do NOT create placeholder or "TODO later" tasks — only include what should be built now`;
 
 interface ParsedPlanTask { name: string; prompt: string; type?: string; command?: string }
-interface ParsedPlanPlaylist { name: string; engine?: string; testPhase?: boolean; tasks: ParsedPlanTask[] }
+interface ParsedPlanPlaylist { name: string; engine?: string; testPhase?: boolean; prdContext?: string; tasks: ParsedPlanTask[] }
 interface ParsedPlan { name: string; tasks?: ParsedPlanTask[]; playlists?: ParsedPlanPlaylist[] }
 
 /** Try to extract structured plan from AI response */
@@ -3445,10 +3569,11 @@ function parsePlanResponse(raw: string): ParsedPlan | null {
     if (Array.isArray(parsed.playlists) && parsed.playlists.length > 0) {
       const playlists: ParsedPlanPlaylist[] = parsed.playlists
         .filter((pl: { name?: string; tasks?: unknown[] }) => pl.name && Array.isArray(pl.tasks) && pl.tasks.length > 0)
-        .map((pl: { name: string; engine?: string; testPhase?: boolean; tasks: Array<{ name?: string; prompt?: string; type?: string; command?: string }> }) => ({
+        .map((pl: { name: string; engine?: string; testPhase?: boolean; prdContext?: string; tasks: Array<{ name?: string; prompt?: string; type?: string; command?: string }> }) => ({
           name: pl.name,
           engine: pl.engine,
           testPhase: pl.testPhase === true,
+          prdContext: typeof pl.prdContext === 'string' ? pl.prdContext.substring(0, 4000) : undefined,
           tasks: pl.tasks
             .filter(t => t.name && (t.prompt || t.type === 'command'))
             .map(t => ({
@@ -4086,6 +4211,7 @@ async function cmdPlanFromGitHubIssue(): Promise<void> {
   currentPlan.playlists = playlists.map(pl => {
     const playlist = createPlaylist(pl.name);
     if ((pl as ParsedPlanPlaylist).testPhase) { playlist.testPhase = true; }
+    if ((pl as ParsedPlanPlaylist).prdContext) { playlist.prdContext = (pl as ParsedPlanPlaylist).prdContext; }
     for (const t of pl.tasks) {
       const task = createTask(t.name, t.prompt);
       const pt = t as ParsedPlanTask;
@@ -4507,14 +4633,39 @@ async function openReportPanel(
         errLines ? `\n## Error Output\n\`\`\`\n${errLines}\n\`\`\`` : '',
       ].filter(Boolean).join('\n');
       const fullBody = [description, bodyParts + frictionSuffix].filter(Boolean).join('\n\n');
-      const repo = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('issueRepo', '').trim() || MOAG_REPO;
+      const cfgForReport = vscode.workspace.getConfiguration('agentTaskPlayer');
+      const repo = cfgForReport.get<string>('issueRepo', '').trim() || MOAG_REPO;
+      const syncLabel = cfgForReport.get<string>('issueSync.label', '').trim() || 'moag';
       const tmpPath = path.join(os.tmpdir(), `moag-bug-${Date.now()}.md`);
+      // Verify gh is available and authenticated (exit code 0 = ok, non-zero = not auth'd, ENOENT = not installed)
+      try {
+        execSync('gh auth status', { cwd, timeout: 8000, stdio: 'ignore' });
+      } catch (authErr) {
+        const msg = authErr instanceof Error ? authErr.message : String(authErr);
+        if (msg.includes('ENOENT') || msg.includes('not found') || msg.includes('not recognized')) {
+          vscode.window.showErrorMessage('GitHub CLI (gh) is not installed. Install from https://cli.github.com');
+        } else {
+          vscode.window.showErrorMessage('GitHub CLI (gh) is not authenticated. Run "gh auth login" in a terminal first.');
+        }
+        return;
+      }
       try {
         fs.writeFileSync(tmpPath, fullBody, 'utf-8');
-        const url = execSync(`gh issue create --repo "${repo}" --title "${autoTitle.replace(/"/g, '\\"')}" --body-file "${tmpPath}" --label bug`, { cwd, timeout: 20000, encoding: 'utf-8' }).trim().split('\n').pop() || '';
+        // Ensure labels exist (idempotent)
+        try { execSync(`gh label create bug --repo "${repo}" --color d73a4a --description "Something isn't working" --force`, { cwd, timeout: 8000, encoding: 'utf-8' }); } catch { /* already exists */ }
+        try { execSync(`gh label create "${syncLabel}" --repo "${repo}" --color 0075ca --description "MOAG task sync" --force`, { cwd, timeout: 8000, encoding: 'utf-8' }); } catch { /* already exists */ }
+        const ghCmd = `gh issue create --repo "${repo}" --title "${autoTitle.replace(/"/g, '\\"')}" --body-file "${tmpPath}" --label bug --label "${syncLabel}"`;
+        const rawOut = execSync(ghCmd, { cwd, timeout: 20000, encoding: 'utf-8' });
+        const url = rawOut.trim().split('\n').filter(l => l.includes('github.com')).pop() || rawOut.trim().split('\n').pop() || '';
+        if (!url.includes('github.com')) {
+          vscode.window.showErrorMessage(`Issue creation returned unexpected output: ${rawOut.substring(0, 200)}`);
+          return;
+        }
         const action = await vscode.window.showInformationMessage(`Issue filed: ${url}`, 'View Issue');
-        if (action === 'View Issue' && url) { vscode.env.openExternal(vscode.Uri.parse(url)); }
-      } catch (err) { vscode.window.showErrorMessage(`Failed to create issue: ${err instanceof Error ? err.message.substring(0, 200) : String(err)}`); }
+        if (action === 'View Issue') { vscode.env.openExternal(vscode.Uri.parse(url)); }
+        // Immediately poll so the new issue appears as a task without waiting for the interval
+        void vscode.commands.executeCommand('agentTaskPlayer.ghSyncPollNow');
+      } catch (err) { vscode.window.showErrorMessage(`Failed to create issue: ${err instanceof Error ? err.message.substring(0, 300) : String(err)}`); }
       finally { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
 
     } else {
@@ -4728,6 +4879,114 @@ async function cmdCloseSourceIssues(sourceIssues: Array<{ repo: string; number: 
   }
 }
 
+// ─── GitHub Issue Sync: Auto-polling ───
+
+function stopIssuePolling(): void {
+  if (issuePollInterval !== null) {
+    clearInterval(issuePollInterval);
+    issuePollInterval = null;
+  }
+}
+
+function startIssuePolling(context: vscode.ExtensionContext): void {
+  stopIssuePolling();
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  if (!cfg.get<boolean>('issueSync.enabled', false)) { return; }
+  const intervalMs = Math.max(60_000, cfg.get<number>('issueSync.pollIntervalMs', 300_000));
+  const label = cfg.get<string>('issueSync.label', 'moag');
+
+  // Seed known numbers from current plan to avoid re-importing existing tasks
+  issueSyncKnownNumbers.clear();
+  const plan = getActivePlan();
+  if (plan?.sourceIssues) {
+    for (const si of plan.sourceIssues) {
+      issueSyncKnownNumbers.add(`${si.repo}#${si.number}`);
+    }
+  }
+  // Also seed from tasks that already have sourceIssueNumber
+  plan?.playlists.forEach(pl => pl.tasks.forEach(t => {
+    if (t.sourceIssueNumber && t.sourceIssueRepo) {
+      issueSyncKnownNumbers.add(`${t.sourceIssueRepo}#${t.sourceIssueNumber}`);
+    }
+  }));
+
+  void pollGitHubIssues(label);
+  issuePollInterval = setInterval(() => { void pollGitHubIssues(label); }, intervalMs);
+  context.subscriptions.push({ dispose: stopIssuePolling });
+}
+
+async function pollGitHubIssues(label: string): Promise<void> {
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  const repo = cfg.get<string>('issueRepo', '').trim();
+  if (!repo) { return; }
+
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  const { execSync } = require('child_process') as typeof import('child_process');
+  try { execSync('gh --version', { cwd, timeout: 5000, stdio: 'ignore' }); }
+  catch { return; }
+
+  let issues: Array<{ number: number; title: string; body: string }> = [];
+  try {
+    const labelFlag = label ? ` --label "${label}"` : '';
+    const json = execSync(`gh issue list --repo "${repo}" --state open${labelFlag} --json number,title,body --limit 50`, { cwd, timeout: 15_000 }).toString();
+    issues = JSON.parse(json);
+  } catch { return; }
+
+  const newIssues = issues.filter(i => !issueSyncKnownNumbers.has(`${repo}#${i.number}`));
+  if (newIssues.length === 0) { return; }
+
+  const plan = getActivePlan();
+  if (!plan) { return; }
+
+  // Find or create "GitHub Issues" playlist
+  let targetPlaylist = plan.playlists.find(pl => pl.name === 'GitHub Issues');
+  if (!targetPlaylist) {
+    targetPlaylist = createPlaylist('GitHub Issues');
+    plan.playlists.push(targetPlaylist);
+  }
+
+  for (const issue of newIssues) {
+    const key = `${repo}#${issue.number}`;
+    issueSyncKnownNumbers.add(key);
+    const task = createTask(
+      issue.title.substring(0, 60),
+      `Fix GitHub issue #${issue.number}: ${issue.title}\n\n${issue.body ?? ''}`,
+    );
+    task.sourceIssueNumber = issue.number;
+    task.sourceIssueRepo = repo;
+    targetPlaylist.tasks.push(task);
+    if (!plan.sourceIssues) { plan.sourceIssues = []; }
+    plan.sourceIssues.push({ repo, number: issue.number, title: issue.title });
+  }
+
+  issueSyncLastPoll = new Date().toISOString();
+  const trackedCount = issueSyncKnownNumbers.size;
+  promptViewProvider?.setIssueSyncState(issueSyncLastPoll, trackedCount);
+  if (newIssues.length > 0) {
+    saveAndRefresh();
+    vscode.window.showInformationMessage(
+      `${newIssues.length} new issue${newIssues.length > 1 ? 's' : ''} from ${repo} added to plan.`,
+    );
+  }
+}
+
+// ─── GitHub Issue Sync: Comment + Label helpers ───
+
+function postIssueComment(repo: string, issueNumber: number, body: string): void {
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  if (!cfg.get<boolean>('issueSync.postComments', true)) { return; }
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  const { exec } = require('child_process') as typeof import('child_process');
+  const safeBody = body.replace(/"/g, '\\"').replace(/\n/g, '\\n').substring(0, 500);
+  exec(`gh issue comment ${issueNumber} --repo "${repo}" --body "${safeBody}"`, { cwd, timeout: 15_000 }, () => {});
+}
+
+function applyIssueLabel(repo: string, issueNumber: number, label: string): void {
+  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+  const { exec } = require('child_process') as typeof import('child_process');
+  exec(`gh issue edit ${issueNumber} --repo "${repo}" --add-label "${label}"`, { cwd, timeout: 15_000 }, () => {});
+}
+
 // ─── Plan from PRD ───
 
 async function handlePrdChatAnswer(payload: { answer: string; step: number; answers: string[] }): Promise<void> {
@@ -4826,7 +5085,11 @@ async function cmdSavePrdToPlan(prdText: string): Promise<void> {
   vscode.window.showInformationMessage('PRD saved to plan — use "Verify Against PRD" after your test playlist runs.');
 }
 
-async function cmdOpenPrdFromPlan(): Promise<void> {
+async function cmdOpenPrdFromPlan(args?: { prdOverride?: string }): Promise<void> {
+  if (args?.prdOverride) {
+    await openPrdPanel(args.prdOverride);
+    return;
+  }
   const plan = getActivePlan();
   if (plan?.prdSource) {
     await openPrdPanel(plan.prdSource);
@@ -5644,8 +5907,15 @@ async function cmdVerifyAgainstPrd(): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
 
-  // Resolve PRD text: plan.prdSource → disk detection → file picker
+  // Resolve PRD text: active playlist prdContext → plan.prdSource → disk detection → file picker
   let prdText = plan?.prdSource ?? '';
+  // Prefer the active (or next incomplete) playlist's own prdContext slice
+  const activePl = plan?.playlists.find(pl =>
+    pl.tasks.some(t => t.status === TaskStatus.Running),
+  ) ?? plan?.playlists.find(pl =>
+    pl.tasks.some(t => t.status !== TaskStatus.Completed),
+  );
+  if (activePl?.prdContext) { prdText = activePl.prdContext; }
   if (!prdText) {
     const detectedRel = detectPrdFileInWorkspace();
     if (detectedRel) {

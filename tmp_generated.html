@@ -1,777 +1,51 @@
-﻿import * as vscode from 'vscode';
-import { designSystemCssTokens } from './design-system';
-
-export interface PromptInputSubmitRequest {
-  prompt: string;
-  engineId?: string;
-  imageData?: string; // base64 data URI (e.g. data:image/png;base64,...)
-  activeFilePath?: string; // absolute path of the active editor file to inject into context
-}
-
-export interface PromptEngineOption {
-  id: string;
-  label: string;
-}
-
-export interface PromptSidebarListItem {
-  id: string;
-  kind: 'thread' | 'run' | 'plan' | 'history';
-  title: string;
-  subtitle: string;
-  status?: string;
-  planName?: string;
-  playlistName?: string;
-}
-
-export interface PromptSidebarPlanGroup {
-  id: string;
-  name: string;
-  playlistStatus: string;
-  progress: { done: number; total: number };
-  tasks: Array<{
-    id: string;
-    name: string;
-    status: string;
-    failureReason?: string;
-    errorCategory?: string;
-    errorLines?: string[];
-    attemptCount?: number;
-    tokenUsage?: { totalTokens?: number; estimatedCost?: number };
-    sourceIssueNumber?: number;
-    sourceIssueRepo?: string;
-  }>;
-  aiRules?: string;
-  testPhase?: boolean;
-  prdContext?: string;
-}
-
-export interface PromptSidebarChatMessage {
-  id: string;
-  role: 'user' | 'assistant';
-  author: string;
-  text: string;
-  status?: 'pending' | 'running' | 'completed' | 'failed' | 'blocked' | 'skipped';
-  changedFilesCount?: number;
-  durationMs?: number;
-  verificationPassed?: boolean;
-  exitCode?: number;
-  tokenUsage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number; estimatedCost?: number };
-}
-
-export interface PromptSidebarRunnerState {
-  state: 'idle' | 'playing' | 'paused' | 'stopping';
-}
-
-export interface AiRuleSidebarItem {
-  id: string;
-  name: string;
-  category: string;
-  scope: 'global' | 'workspace';
-  enabled: boolean;
-  charCount: number;
-}
-
-export type RulesAction =
-  | { type: 'add' }
-  | { type: 'openLibrary' }
-  | { type: 'toggle'; id: string; scope: 'global' | 'workspace' }
-  | { type: 'edit'; id: string; scope: 'global' | 'workspace' }
-  | { type: 'delete'; id: string; scope: 'global' | 'workspace' };
-
-export class PromptInputViewProvider implements vscode.WebviewViewProvider {
-  public static readonly viewType = 'agentTaskPlayer.promptView';
-
-  private static _ghAuthUserCache: { user: string | null; ts: number } = { user: null, ts: 0 };
-  static _getGhAuthUser(): string | null {
-    const now = Date.now();
-    if (now - PromptInputViewProvider._ghAuthUserCache.ts < 30_000) {
-      return PromptInputViewProvider._ghAuthUserCache.user;
-    }
-    try {
-      const { execSync } = require('child_process') as typeof import('child_process');
-      const out = execSync('gh auth status', { timeout: 5000, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
-      const stderr = (out as unknown as { stderr?: string }).stderr ?? out;
-      const m = String(stderr || out).match(/Logged in to \S+ account (\S+)/);
-      const user = m ? m[1] : (String(out).includes('Logged in') ? 'authenticated' : null);
-      PromptInputViewProvider._ghAuthUserCache = { user, ts: now };
-      return user;
-    } catch {
-      // gh auth status exits with code 1 when not authenticated — capture stderr from the error
-      try {
-        const { execSync } = require('child_process') as typeof import('child_process');
-        // Try again piping stderr to see the message
-        const result = execSync('gh auth status 2>&1', { timeout: 5000, encoding: 'utf-8', shell: 'powershell.exe' });
-        const m = String(result).match(/Logged in to \S+ account (\S+)/);
-        const user = m ? m[1] : null;
-        PromptInputViewProvider._ghAuthUserCache = { user, ts: now };
-        return user;
-      } catch {
-        PromptInputViewProvider._ghAuthUserCache = { user: null, ts: now };
-        return null;
-      }
-    }
-  }
-
-  private _view?: vscode.WebviewView;
-  private _engines: PromptEngineOption[] = [];
-  private _selectedEngineId?: string;
-  private _chatItems: PromptSidebarListItem[] = [];
-  private _planItems: PromptSidebarListItem[] = [];
-  private _historyItems: PromptSidebarListItem[] = [];
-  private _chatTitle = 'New Chat';
-  private _chatMessages: PromptSidebarChatMessage[] = [];
-  private _activeThreadId = '';
-  private _runnerState: PromptSidebarRunnerState['state'] = 'idle';
-  private _planGroups: PromptSidebarPlanGroup[] = [];
-  private _planAiRules = '';
-  private _activePlanName = '';
-  private _activePlaylistName = '';
-  private _planPrdSource = '';
-  private _detectedPrdFilePath = '';
-  private _planPrdVersions: { version: string; text: string; createdAt: string }[] = [];
-  private _planFixIterations = 0;
-  private _prdProjectMeta: { name: string; stack: string } = { name: '', stack: '' };
-  private _sandboxState: unknown = null;
-  private _issueSyncLastPoll: string | null = null;
-  private _issueSyncTrackedCount: number | null = null;
-  private _aiRules: AiRuleSidebarItem[] = [];
-  private _liveOutputBuffer = new Map<string, string>();
-  private _liveFlushTimer: ReturnType<typeof setInterval> | null = null;
-  private _activeFile: { name: string; path: string } | null = null;
-
-  constructor(
-    private readonly _extensionUri: vscode.Uri,
-    private readonly _onSubmit: (request: PromptInputSubmitRequest) => Promise<boolean>,
-    private readonly _onOpenItem: (id: string, kind: 'thread' | 'run' | 'plan' | 'history') => void,
-    private readonly _onGeneratePlan?: (prompt: string) => Promise<void>,
-    private readonly _onRulesAction?: (action: RulesAction) => void,
-  ) {}
-
-  resolveWebviewView(
-    webviewView: vscode.WebviewView,
-    _context: vscode.WebviewViewResolveContext,
-    _token: vscode.CancellationToken,
-  ): void {
-    this._view = webviewView;
-    webviewView.webview.options = { enableScripts: true };
-    webviewView.webview.html = this._getHtml();
-
-    webviewView.webview.onDidReceiveMessage(async (message) => {
-      if (message.type === 'ready') {
-        this._syncState();
-        return;
-      }
-
-      if (message.type === 'openItem') {
-        const id = typeof message.id === 'string' ? message.id : '';
-        const kind = message.kind === 'run' || message.kind === 'plan' || message.kind === 'history'
-          ? message.kind
-          : 'thread';
-        if (id) {
-          this._onOpenItem(id, kind);
-        }
-        return;
-      }
-
-      if (message.type === 'showDashboard') {
-        void vscode.commands.executeCommand('agentTaskPlayer.showDashboard');
-        return;
-      }
-
-      if (message.type === 'reviewChanges') {
-        void vscode.commands.executeCommand('agentTaskPlayer.reviewChanges');
-        return;
-      }
-
-      if (message.type === 'openSettings') {
-        const query = typeof message.query === 'string' ? message.query : 'agentTaskPlayer';
-        void vscode.commands.executeCommand('workbench.action.openSettings', query);
-        return;
-      }
-
-      if (message.type === 'ghSyncPollNow') {
-        void vscode.commands.executeCommand('agentTaskPlayer.ghSyncPollNow');
-        return;
-      }
-
-      if (message.type === 'ghSyncConfigure') {
-        // No repo in message = triggered from header pill → open interactive input flow
-        if (message.repo === undefined) {
-          void vscode.commands.executeCommand('agentTaskPlayer.ghSyncConfigureInteractive');
-          return;
-        }
-        const repo = typeof message.repo === 'string' ? message.repo : '';
-        const label = typeof message.label === 'string' ? message.label : 'moag';
-        const enabled = !!message.enabled;
-        void vscode.commands.executeCommand('agentTaskPlayer.ghSyncConfigure', { repo, label, enabled });
-        return;
-      }
-
-      if (message.type === 'ghSyncToggleEnabled') {
-        void vscode.commands.executeCommand('agentTaskPlayer.ghSyncConfigure', {
-          enabled: !!message.enabled,
-        });
-        return;
-      }
-
-      if (message.type === 'newThread') {
-        void vscode.commands.executeCommand('agentTaskPlayer.newThread');
-        return;
-      }
-
-      if (message.type === 'switchPlan') {
-        void vscode.commands.executeCommand('agentTaskPlayer.switchPlan');
-        return;
-      }
-
-      if (message.type === 'newPlan') {
-        void vscode.commands.executeCommand('agentTaskPlayer.newPlan');
-        return;
-      }
-
-      if (message.type === 'planFromPrd') {
-        void vscode.commands.executeCommand('agentTaskPlayer.planFromPrd');
-        return;
-      }
-
-      if (message.type === 'newPlanFromTemplate') {
-        void vscode.commands.executeCommand('agentTaskPlayer.newPlanFromTemplate');
-        return;
-      }
-
-      if (message.type === 'openPrdFromPlan') {
-        void vscode.commands.executeCommand('agentTaskPlayer.openPrdFromPlan');
-        return;
-      }
-
-      if (message.type === 'prdAiImprove') {
-        void vscode.commands.executeCommand('agentTaskPlayer.prdAiImprove', message.text as string);
-        return;
-      }
-
-      if (message.type === 'openPrdInBrowser') {
-        void vscode.commands.executeCommand('agentTaskPlayer.openPrdInBrowser', message.text as string);
-        return;
-      }
-
-      if (message.type === 'savePrdVersion') {
-        void vscode.commands.executeCommand('agentTaskPlayer.savePrdVersion', { text: message.text as string, version: message.version as string });
-        return;
-      }
-
-      if (message.type === 'setTestTool') {
-        const value = typeof message.value === 'string' ? message.value : 'manual';
-        void vscode.workspace.getConfiguration('agentTaskPlayer').update('testTool', value, vscode.ConfigurationTarget.Workspace);
-        return;
-      }
-
-      if (message.type === 'addTask') {
-        void vscode.commands.executeCommand('agentTaskPlayer.addTask');
-        return;
-      }
-
-      if (message.type === 'playPlan') {
-        void vscode.commands.executeCommand('agentTaskPlayer.play');
-        return;
-      }
-
-      if (message.type === 'playPlaylist') {
-        const playlistIndex = Number(message.playlistIndex);
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.playPlaylist', {
-            kind: 'playlist',
-            playlistIndex,
-          });
-        }
-        return;
-      }
-
-      if (message.type === 'playTask') {
-        const playlistIndex = Number(message.playlistIndex);
-        const taskIndex = Number(message.taskIndex);
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.playTask', {
-            kind: 'task',
-            playlistIndex,
-            taskIndex,
-          });
-        }
-        return;
-      }
-
-      if (message.type === 'retryTask') {
-        const playlistIndex = Number(message.playlistIndex);
-        const taskIndex = Number(message.taskIndex);
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.retryTask', {
-            kind: 'task',
-            playlistIndex,
-            taskIndex,
-          });
-        }
-        return;
-      }
-
-      if (message.type === 'retryTaskWithNote') {
-        const playlistIndex = Number(message.playlistIndex);
-        const taskIndex = Number(message.taskIndex);
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.retryTaskWithNote', {
-            kind: 'task',
-            playlistIndex,
-            taskIndex,
-          });
-        }
-        return;
-      }
-
-      if (message.type === 'pauseRun') {
-        void vscode.commands.executeCommand('agentTaskPlayer.pause');
-        return;
-      }
-
-      if (message.type === 'runSelectedPlaylists') {
-        const rawItems = Array.isArray(message.items) ? message.items : [];
-        const selectedItems = rawItems
-          .map((item: unknown) => {
-            const it = item as { kind?: string; playlistIndex?: unknown; taskIndex?: unknown };
-            const playlistIndex = Number(it.playlistIndex);
-            const taskIndex = it.taskIndex === undefined ? undefined : Number(it.taskIndex);
-            if (Number.isNaN(playlistIndex) || playlistIndex < 0) {
-              return null;
-            }
-            if (it.kind === 'task') {
-              if (taskIndex === undefined || Number.isNaN(taskIndex) || taskIndex < 0) {
-                return null;
-              }
-              return { kind: 'task', playlistIndex, taskIndex };
-            }
-            return { kind: 'playlist', playlistIndex };
-          })
-          .filter((item: unknown): item is { kind: 'playlist' | 'task'; playlistIndex: number; taskIndex?: number } => !!item);
-        if (selectedItems.length > 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.runSelected', selectedItems[0], selectedItems);
-        }
-        return;
-      }
-
-      if (message.type === 'submit' && message.text?.trim()) {
-        this.setBusy(true);
-        try {
-          const submitted = await this._onSubmit({
-            prompt: message.text.trim(),
-            engineId: typeof message.engineId === 'string' ? message.engineId : undefined,
-            imageData: typeof message.imageData === 'string' ? message.imageData : undefined,
-            activeFilePath: typeof message.activeFilePath === 'string' ? message.activeFilePath : undefined,
-          });
-          if (submitted) {
-            this.clear();
-          }
-        } finally {
-          this.setBusy(false);
-        }
-      }
-
-      if (message.type === 'generatePlan' && message.text?.trim()) {
-        this.setBusy(true);
-        try {
-          await this._onGeneratePlan?.(message.text.trim());
-          this.clear();
-        } finally {
-          this.setBusy(false);
-        }
-        return;
-      }
-
-      if (message.type === 'previewTask') {
-        const playlistIndex = Number(message.playlistIndex);
-        const taskIndex = Number(message.taskIndex);
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.previewTaskPrompt', { playlistIndex, taskIndex });
-        }
-        return;
-      }
-
-      if (message.type === 'saveTaskEdit') {
-        const playlistIndex = Number(message.playlistIndex);
-        const taskIndex = Number(message.taskIndex);
-        const name = typeof message.name === 'string' ? message.name.trim() : '';
-        const prompt = typeof message.prompt === 'string' ? message.prompt : '';
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0 && name) {
-          void vscode.commands.executeCommand('agentTaskPlayer.saveTaskEdit', { playlistIndex, taskIndex, name, prompt });
-        }
-        return;
-      }
-
-      if (message.type === 'savePlaylistRules') {
-        const playlistIndex = Number(message.playlistIndex);
-        const rules = typeof message.rules === 'string' ? message.rules : '';
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.savePlaylistRules', { playlistIndex, rules });
-        }
-        return;
-      }
-
-      if (message.type === 'savePlanRules') {
-        const rules = typeof message.rules === 'string' ? message.rules : '';
-        void vscode.commands.executeCommand('agentTaskPlayer.savePlanRules', { rules });
-        return;
-      }
-
-      if (message.type === 'showPlaylistPrdContext') {
-        const prdText = typeof message.prdContext === 'string' ? message.prdContext : '';
-        void vscode.commands.executeCommand('agentTaskPlayer.openPrdFromPlan', { prdOverride: prdText });
-        return;
-      }
-
-      if (message.type === 'openExternalUrl') {
-        const url = typeof message.url === 'string' ? message.url : '';
-        if (url.startsWith('https://')) {
-          void vscode.env.openExternal(vscode.Uri.parse(url));
-        }
-        return;
-      }
-
-      if (message.type === 'showSmartFix') {
-        const playlistIndex = Number(message.playlistIndex);
-        const taskIndex = Number(message.taskIndex);
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0) {
-          void vscode.commands.executeCommand('agentTaskPlayer.showSmartFix', { playlistIndex, taskIndex });
-        }
-        return;
-      }
-
-      if (message.type === 'retryTaskWithPrompt') {
-        const playlistIndex = Number(message.playlistIndex);
-        const taskIndex = Number(message.taskIndex);
-        const prompt = typeof message.prompt === 'string' ? message.prompt : '';
-        if (!Number.isNaN(playlistIndex) && playlistIndex >= 0 && !Number.isNaN(taskIndex) && taskIndex >= 0 && prompt) {
-          void vscode.commands.executeCommand('agentTaskPlayer.retryTaskWithPrompt', { playlistIndex, taskIndex, prompt });
-        }
-        return;
-      }
-
-      if (message.type === 'fixAllFailed') {
-        void vscode.commands.executeCommand('agentTaskPlayer.fixAllFailed');
-        return;
-      }
-
-      if (message.type === 'reportIssue') {
-        void vscode.commands.executeCommand('agentTaskPlayer.reportIssue');
-        return;
-      }
-
-      if (message.type === 'addToPlan') {
-        const text = typeof message.text === 'string' ? message.text : '';
-        if (text) {
-          void vscode.commands.executeCommand('agentTaskPlayer.addTaskFromPrompt', { text });
-        }
-        return;
-      }
-
-      if (message.type === 'launchSandbox') {
-        void vscode.commands.executeCommand('agentTaskPlayer.launchSandbox');
-        return;
-      }
-      if (message.type === 'stopSandbox') {
-        void vscode.commands.executeCommand('agentTaskPlayer.stopSandbox');
-        return;
-      }
-      if (message.type === 'takeScreenshot') {
-        void vscode.commands.executeCommand('agentTaskPlayer.takeScreenshot');
-        return;
-      }
-      if (message.type === 'openSandboxBrowser') {
-        const url = typeof message.url === 'string' ? message.url : '';
-        if (url) {
-          void vscode.commands.executeCommand('simpleBrowser.api.open', url);
-        }
-        return;
-      }
-
-      if (message.type === 'addRule') {
-        this._onRulesAction?.({ type: 'add' });
-        return;
-      }
-      if (message.type === 'openRulesLibrary') {
-        this._onRulesAction?.({ type: 'openLibrary' });
-        return;
-      }
-      if (message.type === 'toggleRule') {
-        const id = typeof message.id === 'string' ? message.id : '';
-        const scope = message.scope === 'workspace' ? 'workspace' : 'global';
-        if (id) { this._onRulesAction?.({ type: 'toggle', id, scope }); }
-        return;
-      }
-      if (message.type === 'editRule') {
-        const id = typeof message.id === 'string' ? message.id : '';
-        const scope = message.scope === 'workspace' ? 'workspace' : 'global';
-        if (id) { this._onRulesAction?.({ type: 'edit', id, scope }); }
-        return;
-      }
-      if (message.type === 'deleteRule') {
-        const id = typeof message.id === 'string' ? message.id : '';
-        const scope = message.scope === 'workspace' ? 'workspace' : 'global';
-        if (id) { this._onRulesAction?.({ type: 'delete', id, scope }); }
-        return;
-      }
-      if (message.type === 'tttCriterionChecked') {
-        console.log('[TTT] criterion checked:', message.index, message.checked);
-        return;
-      }
-      if (message.type === 'tttAllCriteriaVerified' || message.type === 'verifyAgainstPrd') {
-        vscode.commands.executeCommand('agentTaskPlayer.verifyAgainstPrd');
-        return;
-      }
-
-      if (message.type === 'openPrdFile') {
-        vscode.window.showOpenDialog({
-          canSelectMany: false,
-          filters: { 'PRD files': ['md', 'txt'] },
-          title: 'Open PRD file'
-        }).then(uris => {
-          if (uris && uris[0]) {
-            const text = require('fs').readFileSync(uris[0].fsPath, 'utf-8');
-            this._view?.webview.postMessage({ type: 'prdFileContent', text });
-          }
-        });
-        return;
-      }
-
-      if (message.type === 'generatePlanFromPrd') {
-        const prdText = typeof message.prdText === 'string' ? message.prdText.trim() : '';
-        if (prdText) {
-          void vscode.commands.executeCommand('agentTaskPlayer.generatePlanFromPrdText', prdText);
-        }
-        return;
-      }
-
-      if (message.type === 'savePrdToPlan') {
-        const prdText = typeof message.prdText === 'string' ? message.prdText.trim() : '';
-        if (prdText) {
-          void vscode.commands.executeCommand('agentTaskPlayer.savePrdToPlan', prdText);
-        }
-        return;
-      }
-
-      if (message.type === 'prdAnswer') {
-        void vscode.commands.executeCommand(
-          'agentTaskPlayer.prdChatAnswer',
-          { answer: message.answer, step: message.step, answers: message.answers },
-        );
-        return;
-      }
-
-      if (message.type === 'runCommand') {
-        if (typeof message.command === 'string') {
-          void vscode.commands.executeCommand(message.command);
-        }
-        return;
-      }
-    });
-  }
-
-  setEngines(engines: PromptEngineOption[], selectedEngineId?: string): void {
-    this._engines = engines;
-    this._selectedEngineId = selectedEngineId;
-    this._syncState();
-  }
-
-  setSidebarState(
-    chatItems: PromptSidebarListItem[],
-    planItems: PromptSidebarListItem[],
-    historyItems: PromptSidebarListItem[],
-    chatTitle: string,
-    chatMessages: PromptSidebarChatMessage[],
-    activeThreadId: string,
-    runnerState: PromptSidebarRunnerState['state'],
-    planGroups: PromptSidebarPlanGroup[],
-    activePlanName: string,
-    activePlaylistName: string,
-  ): void {
-    this._chatItems = chatItems;
-    this._planItems = planItems;
-    this._historyItems = historyItems;
-    this._chatTitle = chatTitle || 'New Chat';
-    this._chatMessages = chatMessages;
-    this._activeThreadId = activeThreadId;
-    this._runnerState = runnerState;
-    this._planGroups = planGroups;
-    this._activePlanName = activePlanName || '';
-    this._activePlaylistName = activePlaylistName || '';
-    this._syncState();
-  }
-
-  setBusy(busy: boolean): void {
-    this._view?.webview.postMessage({ type: 'setBusy', busy });
-  }
-
-  postSessionCost(costUsd: number, tokensIn = 0, tokensOut = 0): void {
-    this._view?.webview.postMessage({ type: 'sessionCost', cost: costUsd, tokensIn, tokensOut });
-  }
-
-  clear(): void {
-    this._view?.webview.postMessage({ type: 'clear' });
-  }
-
-  private _syncState(): void {
-    this._view?.webview.postMessage({
-      type: 'syncState',
-      engines: this._engines,
-      selectedEngineId: this._selectedEngineId,
-      chatItems: this._chatItems,
-      planItems: this._planItems,
-      historyItems: this._historyItems,
-      chatTitle: this._chatTitle,
-      chatMessages: this._chatMessages,
-      planGroups: this._planGroups,
-      activeThreadId: this._activeThreadId,
-      runnerState: this._runnerState,
-      activePlanName: this._activePlanName,
-      activePlaylistName: this._activePlaylistName,
-      sandboxState: this._serializeSandboxState(this._sandboxState),
-      activeFile: this._activeFile,
-      aiRules: this._aiRules,
-      planAiRules: this._planAiRules,
-      planPrdSource: this._planPrdSource,
-      detectedPrdFilePath: this._detectedPrdFilePath,
-      planPrdVersions: this._planPrdVersions,
-      planFixIterations: this._planFixIterations,
-      prdProjectMeta: this._prdProjectMeta,
-      testTool: vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('testTool', 'manual'),
-      issueSyncEnabled: vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('issueSync.enabled', false),
-      issueSyncRepo: vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('issueRepo', ''),
-      issueSyncIntervalMs: vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('issueSync.pollIntervalMs', 300000),
-      issueSyncLastPoll: this._issueSyncLastPoll,
-      issueSyncTrackedCount: this._issueSyncTrackedCount,
-      ghAuthUser: PromptInputViewProvider._getGhAuthUser(),
-    });
-  }
-
-  setPlanAiRules(rules: string): void {
-    this._planAiRules = rules;
-  }
-
-  setPlanPrdSource(prdSource: string): void {
-    this._planPrdSource = prdSource;
-    this._syncState();
-  }
-
-  setDetectedPrdFilePath(filePath: string): void {
-    this._detectedPrdFilePath = filePath;
-    this._syncState();
-  }
-
-  setPlanPrdVersions(versions: { version: string; text: string; createdAt: string }[]): void {
-    this._planPrdVersions = versions;
-    this._syncState();
-  }
-
-  setPlanFixIterations(n: number): void {
-    this._planFixIterations = n;
-  }
-
-  setIssueSyncState(lastPoll: string | null, trackedCount: number | null): void {
-    this._issueSyncLastPoll = lastPoll;
-    this._issueSyncTrackedCount = trackedCount;
-    this._syncState();
-  }
-
-  setPrdProjectMeta(meta: { name: string; stack: string }): void {
-    this._prdProjectMeta = meta;
-  }
-
-  showPrdInputScreen(): void {
-    this._view?.webview.postMessage({ type: 'showPrdInputScreen' });
-  }
-
-  postMessage(msg: Record<string, unknown>): void {
-    this._view?.webview.postMessage(msg);
-  }
-
-  /** Push sandbox state to the sidebar webview */
-  postSandboxState(state: unknown): void {
-    this._sandboxState = state;
-    this._view?.webview.postMessage({ type: 'sandbox-state', sandboxState: this._serializeSandboxState(state) });
-  }
-
-  private _serializeSandboxState(state: unknown): unknown {
-    if (!state || typeof state !== 'object') { return state; }
-    const s = state as Record<string, unknown>;
-    if (!s.lastScreenshotPath || typeof s.lastScreenshotPath !== 'string' || !this._view) { return state; }
-    try {
-      return { ...s, lastScreenshotPath: this._view.webview.asWebviewUri(vscode.Uri.file(s.lastScreenshotPath)).toString() };
-    } catch {
-      return state;
-    }
-  }
-
-  /** Push AI rules state to the sidebar webview */
-  postRulesState(rules: AiRuleSidebarItem[]): void {
-    this._aiRules = rules;
-    this._view?.webview.postMessage({ type: 'rules-state', rules });
-  }
-
-  /** Signal that a task has started — creates a live output block in the chat feed */
-  postLiveOutputStart(taskId: string, taskName: string): void {
-    this._liveOutputBuffer.delete(taskId);
-    this._view?.webview.postMessage({ type: 'live-output-start', taskId, taskName });
-  }
-
-  /**
-   * Buffer a raw output chunk and flush to the webview at 120ms intervals.
-   * Skipped entirely when the sidebar is not visible — zero cost during normal execution
-   * where the user is watching the Dashboard instead.
-   * Buffer is capped at 3K chars per task to prevent large DOM dumps on flush.
-   */
-  postLiveOutputChunk(taskId: string, text: string): void {
-    if (!this._view?.visible) { return; }
-    const current = this._liveOutputBuffer.get(taskId) ?? '';
-    if (current.length < 3000) {
-      this._liveOutputBuffer.set(taskId, current + text);
-    }
-
-    if (!this._liveFlushTimer) {
-      this._liveFlushTimer = setInterval(() => {
-        if (this._liveOutputBuffer.size === 0) {
-          clearInterval(this._liveFlushTimer!);
-          this._liveFlushTimer = null;
-          return;
-        }
-        if (!this._view?.visible) { return; }
-        for (const [id, buffered] of this._liveOutputBuffer) {
-          this._view?.webview.postMessage({ type: 'live-output-chunk', taskId: id, text: buffered });
-          this._liveOutputBuffer.delete(id);
-        }
-      }, 120);
-    }
-  }
-
-  /** Push the currently active editor file to the sidebar — shows as an injectable context pill */
-  postActiveFile(file: { name: string; path: string } | null): void {
-    this._activeFile = file;
-    this._view?.webview.postMessage({ type: 'active-file', file });
-  }
-
-  /** Signal that a task finished — updates the live block badge then lets syncState replace it */
-  postLiveOutputEnd(taskId: string, status: string): void {
-    this._liveOutputBuffer.delete(taskId);
-    this._view?.webview.postMessage({ type: 'live-output-end', taskId, status });
-  }
-
-  /** Pre-fill the composer textarea with a Smart Fix prompt and focus it */
-  fillComposer(text: string, label?: string, fixRef?: { playlistIndex: number; taskIndex: number }): void {
-    this._view?.webview.postMessage({ type: 'fillComposer', text, label: label ?? '', fixRef: fixRef ?? null });
-  }
-
-  private _getHtml(): string {
-    return /* html */ `<!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    ${designSystemCssTokens()}
+    
+    :root {
+      --ds-font-family: var(--vscode-font-family);
+      --ds-font-size: var(--vscode-font-size);
+      --ds-editor-font: var(--vscode-editor-font-family, monospace);
+
+      --ds-bg: var(--vscode-editor-background);
+      --ds-surface: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+      --ds-fg: var(--vscode-editor-foreground);
+      --ds-muted: var(--vscode-descriptionForeground);
+      --ds-border: var(--vscode-panel-border, rgba(128,128,128,0.25));
+      --ds-hover: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
+      --ds-focus: var(--vscode-focusBorder, #007acc);
+
+      --ds-input-bg: var(--vscode-input-background);
+      --ds-input-fg: var(--vscode-input-foreground);
+      --ds-input-border: var(--vscode-input-border, var(--ds-border));
+
+      --ds-btn-bg: var(--vscode-button-background);
+      --ds-btn-fg: var(--vscode-button-foreground);
+      --ds-btn-hover: var(--vscode-button-hoverBackground);
+      --ds-btn-secondary-bg: var(--vscode-button-secondaryBackground, transparent);
+      --ds-btn-secondary-fg: var(--vscode-button-secondaryForeground, var(--ds-fg));
+
+      --ds-success: var(--vscode-testing-iconPassed, #4caf50);
+      --ds-warning: var(--vscode-editorWarning-foreground, #cca700);
+      --ds-error: var(--vscode-testing-iconFailed, #f44747);
+      --ds-info: var(--vscode-textLink-foreground, #4fa3ff);
+
+      --ds-radius-sm: 4px;
+      --ds-radius-md: 8px;
+      --ds-radius-pill: 999px;
+
+      --ds-space-1: 4px;
+      --ds-space-2: 8px;
+      --ds-space-3: 12px;
+      --ds-space-4: 16px;
+
+      --ds-motion-fast: 120ms;
+      --ds-motion-med: 180ms;
+    }
+  
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       height: 100vh;
@@ -800,12 +74,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       cursor: pointer;
       border-bottom: 2px solid transparent;
       display: inline-flex;
-      flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 2px;
-      width: auto;
-      padding: 0 10px;
+      width: 36px;
+      padding: 0;
       flex-shrink: 0;
     }
     .tab.active {
@@ -814,18 +86,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
     .tab:hover:not(.active) { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.07)); }
     .tab-icon {
-      width: 14px; height: 14px; flex-shrink: 0;
+      width: 15px; height: 15px; flex-shrink: 0;
       fill: currentColor; display: block; opacity: 0.7;
     }
     .tab.active .tab-icon { opacity: 1; }
-    .tab-label {
-      font-size: 9px;
-      text-transform: uppercase;
-      letter-spacing: 0.4px;
-      line-height: 1;
-      opacity: 0.75;
-    }
-    .tab.active .tab-label { opacity: 1; }
     .topbar-actions {
       display: inline-flex; align-items: center; gap: 1px; flex-shrink: 0; padding: 4px 0;
     }
@@ -863,20 +127,20 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       overflow: hidden;
       padding: 8px;
     }
-    .list { display: none; flex-direction: column; gap: 2px; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+    .list { display: none; flex-direction: column; gap: 4px; min-height: 0; overflow-y: auto; overflow-x: hidden; }
     .list.active { display: flex; flex: 1; }
     .item {
       width: 100%;
       border: none;
       background: transparent;
       text-align: left;
-      padding: 4px 8px;
-      border-radius: 6px;
+      padding: 7px 8px;
+      border-radius: 8px;
       cursor: pointer;
       color: inherit;
       display: flex;
       flex-direction: column;
-      gap: 1px;
+      gap: 3px;
     }
     .item:hover { background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1)); }
     .item.running-item {
@@ -909,27 +173,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       padding-left: 13px;
     }
     .item-meta-files { color: #4caf50; }
-    .history-item {
-      display: flex; align-items: flex-start; gap: 7px;
-      padding: 5px 8px; width: 100%; text-align: left;
-      border: none; background: transparent; cursor: pointer;
-      color: var(--vscode-foreground);
-      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.08));
-    }
-    .history-item:hover { background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.07)); }
-    .history-icon {
-      width: 16px; height: 16px; border-radius: 50%;
-      display: inline-flex; align-items: center; justify-content: center;
-      flex-shrink: 0; margin-top: 1px;
-    }
-    .history-icon.completed { background: rgba(115,201,145,0.18); color: #73c991; }
-    .history-icon.failed { background: rgba(241,76,76,0.15); color: #f14c4c; }
-    .history-icon.running { background: rgba(79,163,255,0.15); color: #4fa3ff; }
-    .history-icon.default { background: var(--vscode-panel-border, rgba(128,128,128,0.2)); color: var(--vscode-descriptionForeground); }
-    .history-body { flex: 1; min-width: 0; }
-    .history-title { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
-    .history-breadcrumb { font-size: 9px; color: var(--vscode-descriptionForeground); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; opacity: 0.75; }
-    .history-age { font-size: 9px; color: var(--vscode-descriptionForeground); flex-shrink: 0; opacity: 0.6; align-self: center; }
     .item-tip {
       font-size: 11px; color: var(--vscode-descriptionForeground);
       padding: 8px 10px; border-radius: 6px;
@@ -1092,138 +335,30 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     .plan-live-line.old { opacity: 0.4; }
     .plan-live-line.mid { opacity: 0.7; }
 
-    .chat-screen { display: none; flex-direction: column; gap: 0; min-height: 0; overflow-y: auto; overflow-x: hidden; }
+    .chat-screen { display: none; flex-direction: column; gap: 10px; min-height: 0; overflow-y: auto; overflow-x: hidden; }
     .chat-screen.active { display: flex; flex: 1; }
-    .prd-input-screen {
-      display: none; flex-direction: column; flex: 1; padding: 0;
-      background: var(--vscode-sideBar-background, #1e1e1e);
-      position: absolute; inset: 35px 0 0 0; z-index: 50;
-    }
-    .prd-input-screen.active { display: flex; }
-    .prd-input-header {
-      display: flex; align-items: center; gap: 8px;
-      padding: 8px 10px 6px;
-      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
-      flex-shrink: 0;
-    }
-    .prd-back-btn {
-      background: none; border: none; cursor: pointer;
-      color: var(--vscode-descriptionForeground); padding: 2px 4px; border-radius: 3px;
-      font-size: 13px; line-height: 1; display: flex; align-items: center;
-    }
-    .prd-back-btn:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
-    .prd-input-title {
-      font-size: 11px; font-weight: 600; text-transform: uppercase;
-      letter-spacing: 0.5px; color: var(--vscode-foreground);
-    }
-    .prd-input-body {
-      flex: 1; display: flex; flex-direction: column; gap: 8px;
-      padding: 10px; overflow: hidden;
-    }
-    .prd-input-hint {
-      font-size: 11px; color: var(--vscode-descriptionForeground); line-height: 1.4;
-    }
-    .prd-textarea {
-      resize: none; width: 100%; box-sizing: border-box;
-      background: var(--vscode-input-background, #3c3c3c);
-      color: var(--vscode-input-foreground, #cccccc);
-      border: 1px solid var(--vscode-input-border, #555);
-      border-radius: 4px; padding: 8px; font-size: 11px;
-      font-family: var(--vscode-editor-font-family, monospace);
-      line-height: 1.5; outline: none;
-      min-height: 80px; max-height: 220px; overflow-y: auto;
-    }
-    .prd-textarea:focus { border-color: var(--vscode-focusBorder, #0078d4); }
-    .prd-input-footer {
-      display: flex; align-items: center; justify-content: space-between;
-      gap: 8px; flex-shrink: 0; padding-top: 2px;
-    }
-    .prd-browse-btn {
-      font-size: 11px; padding: 5px 10px;
-      background: transparent;
-      border: 1px solid var(--vscode-button-border, #555);
-      color: var(--vscode-descriptionForeground); border-radius: 4px; cursor: pointer;
-    }
-    .prd-browse-btn:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
-    .prd-generate-btn {
-      font-size: 11px; padding: 5px 14px;
-      background: var(--vscode-button-background, #0078d4);
-      color: var(--vscode-button-foreground, #fff);
-      border: none; border-radius: 4px; cursor: pointer; font-weight: 600;
-    }
-    .prd-generate-btn:disabled { opacity: 0.45; cursor: default; }
-    .prd-generate-btn:not(:disabled):hover { background: var(--vscode-button-hoverBackground, #026ec1); }
-    .prd-char-count { font-size: 10px; color: var(--vscode-descriptionForeground); }
-    .prd-version-bar {
-      display: none; align-items: center; gap: 6px; flex-shrink: 0;
-      padding: 0 10px 6px; font-size: 10px; color: var(--vscode-descriptionForeground);
-    }
-    .prd-version-bar.visible { display: flex; }
-    .prd-version-select {
-      font-size: 10px; padding: 2px 6px; border-radius: 3px; cursor: pointer;
-      background: var(--vscode-dropdown-background, #3c3c3c);
-      color: var(--vscode-dropdown-foreground, #ccc);
-      border: 1px solid var(--vscode-dropdown-border, #555);
-    }
-    .prd-version-save-btn {
-      font-size: 10px; padding: 2px 8px; border-radius: 3px; cursor: pointer;
-      background: transparent; border: 1px solid var(--vscode-button-border, #555);
-      color: var(--vscode-descriptionForeground);
-    }
-    .prd-version-save-btn:hover { border-color: var(--vscode-focusBorder); color: var(--vscode-foreground); }
-    .prd-textarea-wrap { flex-shrink: 0; }
-    .prd-ai-btn {
-      font-size: 10px; padding: 4px 10px; border-radius: 3px; cursor: pointer;
-      background: rgba(0,120,212,0.15); border: 1px solid rgba(0,120,212,0.4);
-      color: var(--vscode-textLink-foreground, #4fc3f7); white-space: nowrap;
-    }
-    .prd-ai-btn:hover { background: rgba(0,120,212,0.28); }
-    .prd-ai-btn:disabled { opacity: 0.5; cursor: default; }
-    .prd-project-card {
-      display: flex; align-items: center; gap: 5px; flex-shrink: 0;
-      padding: 5px 8px; border-radius: 4px;
-      background: rgba(255,255,255,0.04);
-      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
-      font-size: 10px;
-    }
-    .prd-project-name { font-weight: 600; color: var(--vscode-foreground); }
-    .prd-project-stack { color: var(--vscode-descriptionForeground); }
-    .prd-chips-row { display: flex; flex-wrap: wrap; gap: 4px; flex-shrink: 0; }
-    .prd-chip {
-      font-size: 10px; padding: 2px 9px; border-radius: 10px; cursor: pointer;
-      background: transparent;
-      border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.3));
-      color: var(--vscode-descriptionForeground); white-space: nowrap;
-    }
-    .prd-chip:hover { border-color: rgba(0,120,212,0.6); color: var(--vscode-foreground); }
-    .prd-browser-btn {
-      font-size: 11px; padding: 5px 9px;
-      background: transparent; border: 1px solid var(--vscode-button-border, #555);
-      color: var(--vscode-descriptionForeground); border-radius: 4px; cursor: pointer;
-    }
-    .prd-browser-btn:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
     .history-tools {
       display: none;
       align-items: center;
-      flex-wrap: nowrap;
-      gap: 4px;
-      margin-bottom: 6px;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-bottom: 8px;
       padding: 0 2px;
     }
     .history-tools.active { display: flex; }
+    .tool-label {
+      font-size: 10px;
+      color: var(--vscode-descriptionForeground);
+      text-transform: uppercase;
+    }
     .tool-select {
-      height: 22px;
+      height: 20px;
       padding: 0 4px;
       border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
       border-radius: 4px;
       background: var(--vscode-dropdown-background, var(--vscode-input-background));
       color: var(--vscode-dropdown-foreground, var(--vscode-input-foreground));
       font-size: 10px;
-      max-width: 96px;
-      font-family: var(--vscode-font-family);
-    }
-    .history-status-chips {
-      display: inline-flex; gap: 3px; margin-left: auto;
     }
     .group-head {
       width: 100%;
@@ -1278,55 +413,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       background: rgba(128,128,128,0.04);
     }
     .plan-overview.active { display: block; }
-    .plan-overview-title-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 6px;
-      margin-bottom: 4px;
-    }
     .plan-overview-title {
       font-size: 11px;
       font-weight: 600;
       color: var(--vscode-foreground);
-      margin-bottom: 0;
-      min-width: 0;
-      flex: 1;
+      margin-bottom: 4px;
     }
-    .gh-sync-header-indicator {
-      display: flex;
-      align-items: center;
-      gap: 4px;
-      cursor: pointer;
-      padding: 2px 6px;
-      border-radius: 10px;
-      background: rgba(255,255,255,0.05);
-      border: 1px solid rgba(255,255,255,0.08);
-      flex-shrink: 0;
-      max-width: 120px;
-    }
-    .gh-sync-header-indicator:hover { background: rgba(255,255,255,0.1); }
-    .gh-sync-header-dot {
-      width: 6px;
-      height: 6px;
-      border-radius: 50%;
-      background: var(--vscode-descriptionForeground);
-      flex-shrink: 0;
-    }
-    .gh-sync-header-dot.active { background: #3fb950; }
-    .gh-sync-header-label {
-      font-size: 10px;
-      color: var(--vscode-descriptionForeground);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .gh-sync-header-connect { color: var(--vscode-textLink-foreground); }
-    .gh-sync-auth-row { display: flex; align-items: center; gap: 5px; padding: 4px 0 2px 0; margin-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.06); }
-    .gh-sync-auth-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--vscode-descriptionForeground); flex-shrink: 0; }
-    .gh-sync-auth-dot.ok { background: #3fb950; }
-    .gh-sync-auth-label { font-size: 10px; color: var(--vscode-descriptionForeground); }
-    .gh-sync-auth-warn { color: #f85149; }
     .plan-overview-meta {
       font-size: 10px;
       color: var(--vscode-descriptionForeground);
@@ -1376,8 +468,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       background: linear-gradient(90deg, #4fa3ff 0%, #3ebf6a 100%);
       transition: width 180ms ease;
     }
-    .plan-overview-fill.has-failed { background: linear-gradient(90deg, #4fa3ff 0%, #e09d4a 100%); }
-    .plan-overview-meta-failed { color: #e09d4a; font-size: 10px; margin-top: 1px; }
     .plan-queue {
       display: none;
       margin-bottom: 8px;
@@ -1442,37 +532,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       margin-bottom: 8px;
     }
     .plan-tools.active { display: flex; }
-    .plan-tools.plan-state-running { border-left: 2px solid #4caf50; padding-left: 6px; }
-    .plan-tools.plan-state-paused { border-left: 2px solid #cca700; padding-left: 6px; }
-    .plan-tools.plan-state-stopping { border-left: 2px solid #f0a040; padding-left: 6px; }
-    .plan-tools.plan-state-failed { border-left: 2px solid var(--vscode-testing-iconFailed, #f14c4c); padding-left: 6px; }
-    .plan-tools.plan-state-completed { border-left: 2px solid var(--vscode-testing-iconPassed, #73c991); padding-left: 6px; }
-    .workflow-stepper {
-      display: flex; align-items: center; gap: 0;
-      padding: 2px 0 4px; overflow: hidden; flex-wrap: nowrap;
-    }
-    .workflow-step {
-      display: inline-flex; align-items: center; gap: 3px;
-      font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px;
-      color: var(--vscode-descriptionForeground); opacity: 0.35;
-      white-space: nowrap; flex-shrink: 0;
-    }
-    .workflow-step.done { opacity: 0.55; color: var(--vscode-testing-iconPassed, #73c991); }
-    .workflow-step.active { opacity: 1; color: var(--vscode-foreground); font-weight: 600; }
-    .workflow-step-dot {
-      width: 13px; height: 13px; border-radius: 50%;
-      background: var(--vscode-panel-border, rgba(128,128,128,0.25));
-      display: inline-flex; align-items: center; justify-content: center;
-      font-size: 7px; font-weight: 700; flex-shrink: 0;
-      color: var(--vscode-descriptionForeground);
-    }
-    .workflow-step.done .workflow-step-dot { background: var(--vscode-testing-iconPassed, #73c991); color: #fff; }
-    .workflow-step.active .workflow-step-dot { background: var(--vscode-button-background); color: var(--vscode-button-foreground); }
-    .workflow-step-sep {
-      width: 8px; height: 1px; flex-shrink: 0;
-      background: var(--vscode-panel-border, rgba(128,128,128,0.25));
-      margin: 0 1px;
-    }
     .plan-tools-row {
       display: flex;
       align-items: center;
@@ -1614,23 +673,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       background: rgba(128,128,128,0.06);
     }
     .plan-runner-badge:not(.running):not(.paused):not(.stopping) { display: none; }
-    .plan-prd-badge {
-      display: none;
-      align-items: center;
-      gap: 3px;
-      font-size: 9px;
-      border: 1px solid rgba(0,120,212,0.45);
-      border-radius: 999px;
-      padding: 1px 7px;
-      text-transform: uppercase;
-      letter-spacing: 0.2px;
-      color: #5cb3f0;
-      background: rgba(0,120,212,0.1);
-      cursor: pointer;
-      white-space: nowrap;
-    }
-    .plan-prd-badge.visible { display: inline-flex; }
-    .plan-prd-badge:hover { background: rgba(0,120,212,0.2); border-color: rgba(0,120,212,0.7); }
     .plan-runner-badge.running {
       color: #4caf50;
       border-color: rgba(76,175,80,0.5);
@@ -1659,17 +701,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       flex-wrap: wrap;
       justify-content: flex-end;
     }
-    #planRulesSection { display: none; }
-    #planRulesSection.active { display: block; }
-    #tttCriteriaSection { display: none; padding: 6px 8px 4px; border-bottom: 1px solid var(--vscode-widget-border, #333); }
-    #tttCriteriaSection.active { display: block; }
-    .ttt-header { font-size: 10px; font-weight: 700; letter-spacing: .06em; color: var(--vscode-descriptionForeground); margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
-    .ttt-header-badge { background: #0078d4; color: #fff; font-size: 9px; padding: 1px 5px; border-radius: 8px; }
-    .ttt-criterion { display: flex; align-items: flex-start; gap: 6px; padding: 2px 0; font-size: 12px; cursor: pointer; }
-    .ttt-criterion input[type=checkbox] { margin-top: 2px; flex-shrink: 0; cursor: pointer; }
-    .ttt-criterion.checked span { text-decoration: line-through; color: var(--vscode-descriptionForeground); }
-    #tttVerifyBtn { display: none; margin-top: 6px; width: 100%; background: #0078d4; color: #fff; border: none; border-radius: 3px; padding: 5px 0; font-size: 12px; cursor: pointer; }
-    #tttVerifyBtn:hover { background: #106ebe; }
     .plan-list-heading {
       display: none;
       font-size: 11px;
@@ -1752,89 +783,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       opacity: 0.5;
       cursor: default;
     }
-    .plan-menu-item-prd {
-      border-top: 1px solid var(--vscode-widget-border, #444);
-      color: var(--vscode-textLink-foreground, #4fc3f7);
-      margin-top: 2px;
-    }
-    .plan-menu-item-prd:hover {
-      color: var(--vscode-textLink-activeForeground, #74d7fb);
-    }
-    .chat-empty-prd-btn {
-      display: inline-block;
-      padding: 5px 12px;
-      font-size: 11px;
-      background: transparent;
-      border: 1px solid var(--vscode-button-border, #555);
-      color: var(--vscode-textLink-foreground, #4fc3f7);
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    .chat-empty-prd-btn:hover {
-      background: rgba(0,122,204,0.1);
-      border-color: var(--vscode-focusBorder);
-    }
-    .chat-empty-start-prd-btn {
-      display: inline-block;
-      padding: 5px 12px;
-      font-size: 11px;
-      background: var(--vscode-button-background, #0078d4);
-      border: none;
-      color: var(--vscode-button-foreground, #fff);
-      border-radius: 4px;
-      cursor: pointer;
-      font-weight: 600;
-    }
-    .chat-empty-start-prd-btn:hover { background: var(--vscode-button-hoverBackground, #026ec1); }
-    .prd-mode-header {
-      display: none; align-items: center; justify-content: space-between;
-      padding: 5px 10px 4px;
-      background: rgba(0,120,212,0.08);
-      border-bottom: 1px solid rgba(0,120,212,0.25);
-      flex-shrink: 0;
-    }
-    .prd-mode-header.active { display: flex; }
-    .prd-mode-badge {
-      font-size: 10px; font-weight: 700; letter-spacing: 0.6px;
-      color: #4fc3f7; text-transform: uppercase;
-      display: flex; align-items: center; gap: 5px;
-    }
-    .prd-mode-badge::before {
-      content: ''; display: inline-block; width: 7px; height: 7px;
-      border-radius: 50%; background: #4fc3f7;
-    }
-    .prd-mode-cancel {
-      font-size: 10px; background: none; border: none;
-      color: var(--vscode-descriptionForeground); cursor: pointer; padding: 2px 6px;
-      border-radius: 3px;
-    }
-    .prd-mode-cancel:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground); }
-    .prd-msg { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px; }
-    .prd-msg.prd-bot { background: rgba(0,120,212,0.06); border-left: 2px solid #0078d4; }
-    .prd-msg.prd-user { align-items: flex-end; }
-    .prd-msg-author { font-size: 9px; font-weight: 700; text-transform: uppercase;
-      letter-spacing: 0.5px; color: var(--vscode-descriptionForeground); margin-bottom: 2px; }
-    .prd-msg-text { font-size: 12px; line-height: 1.5; color: var(--vscode-foreground); white-space: pre-wrap; }
-    .prd-msg.prd-user .prd-msg-text {
-      background: rgba(128,128,128,0.1); border-radius: 6px 6px 0 6px;
-      padding: 6px 10px; max-width: 90%; font-size: 11px;
-    }
-    .prd-convert-wrap { padding: 12px 10px 6px; display: flex; flex-direction: column; gap: 6px; }
-    .prd-convert-note { font-size: 11px; color: var(--vscode-descriptionForeground); }
-    .prd-convert-btn {
-      padding: 8px 16px; background: #0078d4; color: #fff;
-      border: none; border-radius: 5px; cursor: pointer; font-weight: 600; font-size: 12px;
-      display: flex; align-items: center; gap: 6px; align-self: flex-start;
-    }
-    .prd-convert-btn:hover { background: #026ec1; }
-    .prd-typing { display: flex; align-items: center; gap: 4px; padding: 10px 10px; }
-    .prd-typing span {
-      width: 5px; height: 5px; border-radius: 50%;
-      background: #4fc3f7; animation: prd-bounce 1.2s infinite;
-    }
-    .prd-typing span:nth-child(2) { animation-delay: 0.2s; }
-    .prd-typing span:nth-child(3) { animation-delay: 0.4s; }
-    @keyframes prd-bounce { 0%,60%,100%{transform:translateY(0)} 30%{transform:translateY(-5px)} }
     .plan-check {
       display: inline-flex;
       align-items: center;
@@ -1934,56 +882,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
     .plan-group-rules-btn:hover { opacity: 1; background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1)); }
     .plan-group-rules-btn.has-rules { opacity: 1; color: var(--vscode-focusBorder, #4fa3ff); }
-    .prd-pill-btn {
-      height: 16px; padding: 0 5px;
-      border: none; border-radius: 999px;
-      background: rgba(79,163,255,0.15);
-      color: var(--vscode-textLink-foreground, #4fa3ff);
-      font-size: 9px; font-weight: 600; letter-spacing: .03em;
-      cursor: pointer; flex-shrink: 0;
-      display: inline-flex; align-items: center; gap: 3px;
-      opacity: 0.8;
-    }
-    .prd-pill-btn:hover { opacity: 1; background: rgba(79,163,255,0.25); }
-    .issue-badge {
-      display: inline-flex; align-items: center;
-      margin-left: 4px; padding: 0 4px;
-      height: 14px; border-radius: 999px;
-      background: rgba(79,163,255,0.12);
-      color: var(--vscode-textLink-foreground, #4fa3ff);
-      font-size: 9px; font-weight: 600;
-      cursor: pointer; flex-shrink: 0;
-      vertical-align: middle;
-    }
-    .issue-badge:hover { background: rgba(79,163,255,0.25); text-decoration: underline; }
-    .gh-sync-status-dot {
-      width: 7px; height: 7px; border-radius: 50%;
-      background: var(--vscode-descriptionForeground);
-      flex-shrink: 0; margin-left: auto;
-    }
-    .gh-sync-status-dot.active { background: #4caf50; box-shadow: 0 0 4px rgba(76,175,80,0.6); }
-    .gh-sync-status-dot.error  { background: #f44747; }
-    .gh-sync-repo { font-size: 10px; font-weight: 600; color: var(--vscode-textLink-foreground, #4fa3ff); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
-    .gh-sync-last { font-size: 10px; color: var(--vscode-descriptionForeground); }
-    .gh-sync-count { font-size: 10px; color: var(--vscode-descriptionForeground); }
-    .gh-sync-input-row, .gh-sync-label-row { flex-direction: column; align-items: stretch; gap: 3px; }
-    .gh-sync-label-row { flex-direction: row; align-items: center; gap: 6px; }
-    .gh-sync-input {
-      background: var(--vscode-input-background);
-      border: 1px solid var(--vscode-input-border, rgba(128,128,128,0.3));
-      color: var(--vscode-input-foreground);
-      font-size: 11px; padding: 3px 6px; border-radius: 3px;
-      width: 100%; box-sizing: border-box; font-family: inherit;
-    }
-    .gh-sync-input:focus { outline: 1px solid var(--vscode-focusBorder, #4fa3ff); border-color: transparent; }
-    .gh-sync-input-sm { width: 70px; flex-shrink: 0; }
-    .gh-sync-toggle-wrap { display: flex; align-items: center; margin-left: auto; }
-    .gh-sync-toggle-label { display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
-    .gh-sync-toggle-label input[type="checkbox"] { width: 28px; height: 14px; appearance: none; background: var(--vscode-input-border, rgba(128,128,128,0.3)); border-radius: 999px; cursor: pointer; position: relative; flex-shrink: 0; transition: background 0.15s; }
-    .gh-sync-toggle-label input[type="checkbox"]:checked { background: #4caf50; }
-    .gh-sync-toggle-label input[type="checkbox"]::after { content: ''; position: absolute; width: 10px; height: 10px; border-radius: 50%; background: white; top: 2px; left: 2px; transition: left 0.15s; }
-    .gh-sync-toggle-label input[type="checkbox"]:checked::after { left: 16px; }
-    .gh-sync-toggle-text { font-size: 9px; color: var(--vscode-descriptionForeground); min-width: 18px; }
     .rules-edit-panel {
       padding: 6px 8px 8px;
       border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
@@ -2049,15 +947,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     .plan-selection-mode .plan-group-row > input[type="checkbox"] {
       display: inline-block;
     }
-    .selection-mode-hint {
-      display: none;
-      font-size: 9px;
-      color: var(--vscode-focusBorder, #4fa3ff);
-      opacity: 0.8;
-      margin-left: 4px;
-    }
-    .plan-selection-mode + * .selection-mode-hint,
-    .selection-active .selection-mode-hint { display: inline; }
     .task-main {
       flex: 1;
       min-width: 0;
@@ -2069,7 +958,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       cursor: pointer;
       display: inline-flex;
       flex-direction: column;
-      gap: 1px;
+      gap: 2px;
     }
     .task-actions {
       display: inline-flex;
@@ -2197,7 +1086,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       display: inline-flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1;
     }
     .sidebar-rules-hd-btn:hover { color: var(--vscode-foreground); background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1)); }
-    .sidebar-rules-body { padding: 4px 0 6px; max-height: 160px; overflow-y: auto; }
+    .sidebar-rules-body { padding: 4px 0 6px; }
     .sidebar-rules-body.collapsed { display: none; }
     .sidebar-rules-list { display: flex; flex-direction: column; gap: 1px; }
     .sidebar-rules-empty { font-size: 11px; color: var(--vscode-descriptionForeground); padding: 4px 2px; }
@@ -2248,119 +1137,27 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
     .sidebar-sandbox-badge.running { border-color: rgba(76,175,80,0.5); color: #4caf50; background: rgba(76,175,80,0.1); }
     .sidebar-sandbox-badge.starting { border-color: rgba(204,167,0,0.5); color: #cca700; background: rgba(204,167,0,0.1); }
-    .sidebar-sandbox-body { padding: 3px 0 4px; }
+    .sidebar-sandbox-body { padding: 6px 0; }
     .sidebar-sandbox-body.collapsed { display: none; }
-    .sidebar-sandbox-row { display: flex; align-items: center; gap: 4px; padding: 1px 0; flex-wrap: nowrap; overflow: hidden; }
+    .sidebar-sandbox-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; flex-wrap: wrap; }
     .sidebar-sandbox-dot { width: 6px; height: 6px; border-radius: 50%; background: rgba(128,128,128,0.4); flex-shrink: 0; }
     .sidebar-sandbox-dot.running { background: #4caf50; }
     .sidebar-sandbox-dot.starting { background: #cca700; animation: sbPulse 1.2s ease-in-out infinite; }
     .sidebar-sandbox-dot.error { background: #f44747; }
     @keyframes sbPulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
-    .sidebar-sandbox-status { font-size: 9px; color: var(--vscode-descriptionForeground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
-    .sidebar-sandbox-framework { font-size: 9px; font-weight: 600; flex-shrink: 0; }
+    .sidebar-sandbox-status { font-size: 10px; color: var(--vscode-descriptionForeground); }
+    .sidebar-sandbox-framework { font-size: 10px; font-weight: 600; }
     .sidebar-sandbox-url {
-      font-size: 9px; color: var(--vscode-textLink-foreground, #3794ff);
-      text-decoration: none; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      font-size: 10px; color: var(--vscode-textLink-foreground, #3794ff);
+      text-decoration: none; cursor: pointer;
     }
     .sidebar-sandbox-url:hover { text-decoration: underline; }
-    .sidebar-sandbox-actions { display: flex; gap: 3px; padding: 2px 0; flex-wrap: wrap; }
-    .sb-tool-row { margin-top: 2px; gap: 6px; }
-    .sb-tool-label { font-size: 9px; color: var(--vscode-descriptionForeground); flex-shrink: 0; white-space: nowrap; }
-    .sb-tool-select { flex: 1; font-size: 9px; background: var(--vscode-dropdown-background, #3c3c3c); color: var(--vscode-dropdown-foreground, #ccc); border: 1px solid var(--vscode-dropdown-border, #555); border-radius: 3px; padding: 1px 3px; cursor: pointer; min-width: 0; }
-    .sb-ttt-hint { font-size: 9px; padding: 2px 0; }
-    .sb-ttt-hint.ok { color: #4caf50; }
-    .sb-ttt-hint.warn { color: #cca700; }
-
-    /* ── Test & Verify panel ── */
-    #tavPanel {
-      display: none; flex-direction: column; flex-shrink: 0;
-      border-top: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
-    }
-    #tavPanel.active { display: flex; }
-    .tav-header {
-      display: flex; align-items: center; justify-content: space-between;
-      padding: 5px 10px 4px; cursor: pointer; user-select: none;
-    }
-    .tav-header:hover { background: rgba(128,128,128,0.06); }
-    .tav-title {
-      font-size: 9px; font-weight: 700; letter-spacing: 0.6px;
-      text-transform: uppercase; color: var(--vscode-descriptionForeground);
-      display: flex; align-items: center; gap: 5px;
-    }
-    .tav-state-badge {
-      font-size: 8px; padding: 1px 6px; border-radius: 999px; font-weight: 600;
-      border: 1px solid rgba(128,128,128,0.3); color: var(--vscode-descriptionForeground);
-      text-transform: uppercase; letter-spacing: 0.3px;
-    }
-    .tav-state-badge.running { color: #4caf50; border-color: rgba(76,175,80,0.5); background: rgba(76,175,80,0.1); }
-    .tav-state-badge.done { color: #73c991; border-color: rgba(115,201,145,0.5); background: rgba(115,201,145,0.08); }
-    .tav-state-badge.warn { color: #cca700; border-color: rgba(204,167,0,0.4); background: rgba(204,167,0,0.08); }
-    .tav-body {
-      display: flex; flex-direction: column; gap: 0;
-      padding: 0 10px 8px; overflow: hidden;
-    }
-    .tav-body.collapsed { display: none; }
-    .tav-row {
-      display: flex; align-items: center; gap: 6px;
-      padding: 3px 0; min-height: 22px;
-    }
-    .tav-row + .tav-row { border-top: 1px solid rgba(128,128,128,0.07); }
-    .tav-label {
-      font-size: 10px; color: var(--vscode-descriptionForeground);
-      flex-shrink: 0; min-width: 72px;
-    }
-    .tav-select {
-      flex: 1; font-size: 10px;
-      background: var(--vscode-dropdown-background, #3c3c3c);
-      color: var(--vscode-dropdown-foreground, #ccc);
-      border: 1px solid var(--vscode-dropdown-border, #555);
-      border-radius: 3px; padding: 2px 4px; cursor: pointer; min-width: 0;
-    }
-    .tav-sb-row { gap: 5px; }
-    .tav-sb-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; background: rgba(128,128,128,0.3); }
-    .tav-sb-dot.running { background: #4caf50; }
-    .tav-sb-dot.starting { background: #cca700; animation: sbPulse 1.2s ease-in-out infinite; }
-    .tav-sb-dot.error { background: #f44747; }
-    .tav-sb-status { font-size: 10px; flex: 1; color: var(--vscode-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .tav-sb-url { font-size: 10px; color: #4caf50; text-decoration: none; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-    .tav-sb-url:hover { text-decoration: underline; }
-    .tav-btn {
-      font-size: 10px; padding: 2px 8px; border-radius: 3px; cursor: pointer; flex-shrink: 0;
-      border: 1px solid var(--vscode-button-border, rgba(128,128,128,0.4));
-      background: var(--vscode-button-secondaryBackground, rgba(128,128,128,0.15));
-      color: var(--vscode-button-secondaryForeground, #ccc);
-    }
-    .tav-btn:hover { opacity: 0.85; }
-    .tav-btn.primary { background: #0078d4; border-color: #0078d4; color: #fff; }
-    .tav-btn.primary:hover { background: #026ec1; }
-    .tav-hint {
-      font-size: 10px; color: var(--vscode-descriptionForeground);
-      font-style: italic; flex: 1;
-    }
-    .tav-hint.warn { color: #cca700; font-style: normal; }
-    .tav-hint.ok { color: #4caf50; font-style: normal; }
-    .tav-prd-val { font-size: 10px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    .tav-criteria-wrap { display: flex; flex-direction: column; gap: 2px; padding: 3px 0 2px; max-height: 120px; overflow-y: auto; }
-    .tav-criterion { display: flex; align-items: flex-start; gap: 5px; padding: 1px 0; }
-    .tav-criterion input[type=checkbox] { margin-top: 1px; flex-shrink: 0; accent-color: #4caf50; }
-    .tav-criterion-text { font-size: 10px; line-height: 1.4; color: var(--vscode-foreground); }
-    .tav-criterion.checked .tav-criterion-text { text-decoration: line-through; color: var(--vscode-descriptionForeground); }
-    .tav-verify-btn {
-      margin-top: 5px; padding: 5px 0; background: #0078d4; color: #fff;
-      border: none; border-radius: 4px; font-size: 11px; font-weight: 600;
-      cursor: pointer; width: 100%; text-align: center;
-    }
-    .tav-verify-btn:hover { background: #026ec1; }
-    .tav-verify-btn:disabled { opacity: 0.4; cursor: default; }
-    .tav-fix-iter { margin-top: 4px; font-size: 10px; color: var(--vscode-descriptionForeground); text-align: center; padding: 2px 0; }
-    .tav-fix-iter.active { color: #e09d4a; font-weight: 600; }
-    .tav-chevron { font-size: 9px; color: var(--vscode-descriptionForeground); transition: transform 0.15s; }
-    .tav-header.collapsed .tav-chevron { transform: rotate(-90deg); }
+    .sidebar-sandbox-actions { display: flex; gap: 4px; padding: 4px 0; }
     .sb-btn {
       border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
       background: transparent; color: var(--vscode-descriptionForeground);
-      border-radius: 999px; padding: 1px 6px; font-size: 9px;
-      cursor: pointer; text-transform: uppercase; white-space: nowrap;
+      border-radius: 999px; padding: 2px 8px; font-size: 9px;
+      cursor: pointer; text-transform: uppercase;
     }
     .sb-btn:hover { color: var(--vscode-foreground); border-color: var(--vscode-focusBorder); }
     .sb-btn.primary {
@@ -2368,7 +1165,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       border-color: transparent;
     }
     .sb-btn.primary:hover { background: var(--vscode-button-hoverBackground); }
-    .sb-thumb { width: 100%; max-height: 100px; object-fit: contain; border-radius: 3px; margin-top: 4px; display: none; border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2)); cursor: pointer; }
 
     .thread-chip {
       border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.2));
@@ -2388,9 +1184,26 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       color: var(--vscode-foreground);
       background: rgba(0,122,204,0.1);
     }
-    .chat-header { display: none; }
+    .chat-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 2px 2px 6px;
+      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.14));
+    }
+    .chat-title {
+      font-size: 11px;
+      font-weight: 600;
+      color: var(--vscode-descriptionForeground);
+      text-transform: none;
+      letter-spacing: 0.2px;
+      min-width: 0;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
 
-    .chat-feed { display: flex; flex-direction: column; justify-content: flex-end; gap: 0; padding: 0; flex: 1; }
+    .chat-feed { display: flex; flex-direction: column; gap: 0; padding: 0; }
     .msg {
       width: 100%; display: flex; flex-direction: column; gap: 0;
       padding: 8px 10px;
@@ -2720,9 +1533,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       display: flex; align-items: center; justify-content: center; padding: 0;
     }
     textarea {
-      width: 100%;
-      min-height: 36px;
-      max-height: 200px;
+      flex: 1;
+      min-height: 80px;
+      max-height: 220px;
       resize: none;
       border: none;
       outline: none;
@@ -2731,9 +1544,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       font-family: var(--vscode-font-family);
       font-size: 13px;
       line-height: 1.45;
-      padding: 6px 10px;
-      overflow-y: hidden;
-      box-sizing: border-box;
+      padding: 8px 10px;
+      overflow-y: auto;
     }
     textarea::placeholder { color: var(--vscode-input-placeholderForeground); }
     textarea:disabled { opacity: 0.6; cursor: not-allowed; }
@@ -2797,7 +1609,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       background: var(--vscode-list-hoverBackground, rgba(128,128,128,0.1));
     }
     .gen-plan-btn:disabled { opacity: 0.45; cursor: not-allowed; }
-    .composer-prd-btn.has-prd { color: #4fc3f7; border-color: rgba(79,195,247,0.4); }
     .add-to-plan-btn {
       height: 24px; padding: 0 7px; font-size: 11px;
       background: transparent; color: var(--vscode-descriptionForeground);
@@ -2828,51 +1639,19 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     /* context bar → minimal status footer */
     .context-bar { display: flex; align-items: center; gap: 4px; padding: 1px 2px 0; flex-wrap: nowrap; overflow: hidden; }
     .ctx-chip { font-size: 9px; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
-    .composer-hint { font-size: 9px; color: var(--vscode-descriptionForeground); opacity: 0.45; padding: 0 2px 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .composer-hint.fix-mode { opacity: 1; color: #4fa3ff; }
-    /* Smart Fix prominence bar */
-    .plan-status-bar {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 4px;
-      padding: 4px 8px;
-      border-bottom: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.15));
-      background: var(--vscode-sideBar-background, transparent);
-    }
-    .plan-filter-chips { display: flex; align-items: center; gap: 3px; }
-    .status-chip {
-      height: 18px; padding: 0 7px; font-size: 9px; font-weight: 600;
-      background: transparent; color: var(--vscode-descriptionForeground);
-      border: 1px solid rgba(128,128,128,0.25); border-radius: 999px;
-      cursor: pointer; white-space: nowrap; text-transform: uppercase; letter-spacing: 0.3px;
-    }
-    .status-chip:hover { background: rgba(128,128,128,0.1); }
-    .status-chip.active { background: rgba(79,163,255,0.15); color: #4fa3ff; border-color: rgba(79,163,255,0.4); }
-    .status-chip[data-plan-filter="failed"].active { background: rgba(244,71,71,0.12); color: #f44747; border-color: rgba(244,71,71,0.3); }
-    .plan-fix-bar-btn {
-      height: 20px; padding: 0 9px; font-size: 9px; font-weight: 700;
-      background: rgba(244,71,71,0.18); color: #f14c4c;
-      border: 1px solid rgba(244,71,71,0.5); border-radius: 999px;
-      cursor: pointer; white-space: nowrap; flex-shrink: 0;
-    }
-    .plan-fix-bar-btn:hover { background: rgba(244,71,71,0.32); }
   </style>
 </head>
 <body>
   <div class="topbar">
     <div class="tabs">
-      <button class="tab active" data-tab="chat" type="button" title="Chat">
+      <button class="tab active" data-tab="chat" type="button" title="Prompt">
         <svg class="tab-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M1 3c0-.6.4-1 1-1h12c.6 0 1 .4 1 1v8c0 .6-.4 1-1 1H9l-2 2-2-2H2c-.6 0-1-.4-1-1V3z"/></svg>
-        <span class="tab-label">Chat</span>
       </button>
       <button class="tab" data-tab="plan" type="button" title="Plan">
         <svg class="tab-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M3 4h1v1H3V4zm3 0h7v1H6V4zm-3 4h1v1H3V8zm3 0h7v1H6V8zm-3 4h1v1H3v-1zm3 0h7v1H6v-1z"/></svg>
-        <span class="tab-label">Plan</span>
       </button>
       <button class="tab" data-tab="history" type="button" title="History">
         <svg class="tab-icon" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M8 2a6 6 0 1 0 0 12A6 6 0 0 0 8 2zm0 1a5 5 0 1 1 0 10A5 5 0 0 1 8 3zm-.5 2v3.75l2.75 1.5-.5.87L7 9.5V5h.5z"/></svg>
-        <span class="tab-label">History</span>
       </button>
     </div>
     <div class="topbar-actions">
@@ -2883,9 +1662,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       <button class="topbar-btn" id="dashboardBtn" title="Show Dashboard" aria-label="Show Dashboard">
         <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M2 2h5v5H2V2zm7 0h5v5H9V2zm-7 7h5v5H2V9zm7 0h5v5H9V9z"/></svg>
       </button>
-      <button class="topbar-btn" id="reportIssueBtn" title="Report a MOAG bug to GitHub" aria-label="Report Bug">
-        <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg" fill="currentColor"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 1a6 6 0 1 1 0 12A6 6 0 0 1 8 2zm-.5 3.5h1v4h-1zm0 5h1v1h-1z"/></svg>
-      </button>
       <button class="topbar-btn" id="settingsBtn" title="Settings" aria-label="Settings">
         <svg viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg"><path d="M9.1 4.4L8.6 2H7.4l-.5 2.4-.7.3-2-1.3-.9.8 1.3 2-.2.7-2.4.5v1.2l2.4.5.3.8-1.3 2 .8.8 2-1.3.8.3.4 2.3h1.2l.5-2.4.8-.3 2 1.3.8-.8-1.3-2 .3-.8 2.3-.4V7.4l-2.4-.5-.3-.8 1.3-2-.8-.8-2 1.3-.7-.2zM9.4 8A1.4 1.4 0 1 1 6.6 8 1.4 1.4 0 0 1 9.4 8z"/></svg>
       </button>
@@ -2893,61 +1669,14 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
   </div>
 
   <div class="content">
-    <div id="prdInputScreen" class="prd-input-screen">
-      <div class="prd-input-header">
-        <button id="prdBackBtn" class="prd-back-btn" type="button" title="Cancel" aria-label="Cancel">&#8592;</button>
-        <span id="prdInputTitle" class="prd-input-title">Generate Plan from PRD</span>
-      </div>
-      <div class="prd-version-bar" id="prdVersionBar">
-        <span>Version:</span>
-        <select id="prdVersionSelect" class="prd-version-select"></select>
-        <button id="prdVersionSaveBtn" class="prd-version-save-btn" type="button">Save as v1.0</button>
-      </div>
-      <div class="prd-input-body">
-        <div id="prdProjectCard" class="prd-project-card" style="display:none">
-          <span>&#128230;</span>
-          <span id="prdProjectName" class="prd-project-name"></span>
-          <span id="prdProjectStack" class="prd-project-stack"></span>
-        </div>
-        <div id="prdInputHint" class="prd-input-hint">Paste a PRD or describe what you want to build &mdash; MOAG will generate a Design &rarr; Development &rarr; Testing plan.</div>
-        <div class="prd-textarea-wrap">
-          <textarea id="prdTextarea" class="prd-textarea" placeholder="Paste your PRD here, or describe what to build:&#10;&#10;Example: &quot;Build a REST API with auth, CRUD, and tests&quot;&#10;&#10;Or paste a full PRD document with Acceptance Criteria..."></textarea>
-        </div>
-        <div id="prdChipsRow" class="prd-chips-row">
-          <button class="prd-chip" data-prompt="Build a REST API with authentication, CRUD endpoints, input validation, and unit tests">REST API</button>
-          <button class="prd-chip" data-prompt="Build a SaaS web app with user authentication, dashboard, settings page, and billing integration">SaaS App</button>
-          <button class="prd-chip" data-prompt="Build a mobile app with authentication, push notifications, offline support, and onboarding flow">Mobile App</button>
-          <button class="prd-chip" data-prompt="Add comprehensive tests: unit tests for core modules, integration tests for key workflows, and coverage reporting">Add Tests</button>
-        </div>
-        <div class="prd-input-footer">
-          <div style="display:flex;align-items:center;gap:6px">
-            <button id="prdBrowseBtn" class="prd-browse-btn" type="button">Browse file&hellip;</button>
-            <span id="prdCharCount" class="prd-char-count">0 chars</span>
-          </div>
-          <div style="display:flex;align-items:center;gap:6px">
-            <button id="prdAiBtn" class="prd-ai-btn" type="button">&#10024; Draft with AI</button>
-            <button id="prdGenerateBtn" class="prd-generate-btn" type="button" disabled>Generate Plan &rarr;</button>
-          </div>
-        </div>
-      </div>
-    </div>
     <div id="chatScreen" class="chat-screen active">
-      <div id="prdModeHeader" class="prd-mode-header">
-        <span class="prd-mode-badge">PRD Draft in progress</span>
-        <button id="prdModeCancelBtn" class="prd-mode-cancel" type="button">Cancel</button>
-      </div>
       <div class="chat-header">
         <div id="chatTitle" class="chat-title">NEW CHAT</div>
       </div>
       <div id="chatFeed" class="chat-feed"></div>
       <div id="chatEmpty" class="item-tip" style="display:none">
         <strong>New conversation</strong> — type a prompt below to start.<br>
-        Use the <strong>Plan</strong> tab to queue tasks or <strong>History</strong> to revisit past runs.<br><br>
-        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:4px">
-          <button id="chatStartPrdBtn" class="chat-empty-start-prd-btn" type="button">&#128172; Draft PRD with AI</button>
-          <button id="chatEmptyPrdBtn" class="chat-empty-prd-btn" type="button">&#128196; I have a PRD</button>
-          <button id="chatEmptyTemplateBtn" class="chat-empty-prd-btn" type="button">&#x1F4CB; Start from template</button>
-        </div>
+        Use the <strong>Plan</strong> tab to queue tasks or <strong>History</strong> to revisit past runs.
       </div>
     </div>
     <div id="planTools" class="plan-tools">
@@ -2956,7 +1685,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           <span id="planActiveName" class="plan-active-name">Ad hoc</span>
           <span id="planExecCounter" class="plan-exec-counter">0/0</span>
           <span id="planRunnerBadge" class="plan-runner-badge">IDLE</span>
-          <button id="planOpenPrdBtn" class="plan-prd-badge" type="button" title="Open source PRD">&#128196; PRD</button>
         </div>
         <div class="plan-tools-right">
           <div class="plan-tool-group">
@@ -2975,21 +1703,24 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
                 <button id="planAddTaskBtn" class="plan-menu-item" type="button">Add Task</button>
                 <button id="planSwitchBtn" class="plan-menu-item" type="button">Switch Plan</button>
                 <button id="planNewBtn" class="plan-menu-item" type="button">New Plan</button>
-                <button id="planFromTemplateBtn" class="plan-menu-item" type="button">&#x1F4CB; New from Template</button>
-                <button id="planFromPrdBtn" class="plan-menu-item plan-menu-item-prd" type="button">&#128196; Generate from PRD</button>
+              </div>
+            </div>
+          </div>
+          <div class="plan-tool-group filter-right">
+            <div class="plan-filter-wrap">
+              <button id="planFilterBtn" class="plan-tool-btn icon-only" type="button" title="Filters" aria-label="Filters">⚙</button>
+              <div id="planFilterMenu" class="plan-filter-menu">
+                <div id="planFilterChips" class="plan-filter">
+                  <span class="plan-filter-label">Status</span>
+                  <button type="button" class="chip active" data-plan-filter="all">All</button>
+                  <button type="button" class="chip" data-plan-filter="pending">Pending</button>
+                  <button type="button" class="chip" data-plan-filter="completed">Completed</button>
+                  <button type="button" class="chip" data-plan-filter="failed">Failed</button>
+                </div>
               </div>
             </div>
           </div>
         </div>
-      </div>
-      <div id="planStatusBar" class="plan-status-bar">
-        <div id="planFilterChips" class="plan-filter-chips">
-          <button type="button" class="status-chip active" data-plan-filter="all">All</button>
-          <button type="button" class="status-chip" data-plan-filter="pending">Pending</button>
-          <button type="button" class="status-chip" data-plan-filter="completed">Completed</button>
-          <button type="button" class="status-chip" data-plan-filter="failed">Failed</button>
-        </div>
-        <button id="planFixAllBarBtn" class="plan-fix-bar-btn" type="button" style="display:none">Fix All</button>
       </div>
       <div id="planSearchBar" class="plan-search-bar">
         <input id="planSearchInput" class="plan-search-input" type="text" placeholder="Search tasks or playlists">
@@ -2997,13 +1728,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
     <div id="planOverview" class="plan-overview">
-      <div class="plan-overview-title-row">
-        <div id="planOverviewTitle" class="plan-overview-title">Plan Progress</div>
-        <div id="ghSyncHeaderIndicator" class="gh-sync-header-indicator" style="display:none"></div>
-      </div>
+      <div id="planOverviewTitle" class="plan-overview-title">Optimization Plan Progress</div>
       <div id="planOverviewMeta" class="plan-overview-meta">0/0 playlists, 0/0 tasks completed</div>
       <div class="plan-overview-bar"><div id="planOverviewFill" class="plan-overview-fill"></div></div>
-      <div id="planOverviewFailedMeta" class="plan-overview-meta-failed" style="display:none"></div>
       <div id="planOverviewRunning" class="plan-overview-running"><span class="dot"></span><span id="planOverviewRunningText" class="text"></span></div>
     </div>
     <div id="planQueue" class="plan-queue">
@@ -3018,68 +1745,29 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div id="planLivePanel" class="plan-live-panel" style="display:none"></div>
     <div id="planRulesSection"></div>
-    <div id="tttCriteriaSection" style="display:none">
-      <div id="tttCriteriaList"></div>
-      <button id="tttVerifyBtn" type="button" style="display:none"></button>
-    </div>
-    <div id="planListHeading" class="plan-list-heading"><input id="planListSelectModeCb" type="checkbox" aria-label="Enable selection mode" title="Enable selection mode — check tasks/playlists for bulk actions (Run Selected, etc.)"><span>All Tasks</span><button id="planHeadingCollapseBtn" class="plan-tool-btn" type="button" title="Collapse All" aria-label="Collapse All">Collapse All</button></div>
+    <div id="planListHeading" class="plan-list-heading"><input id="planListSelectModeCb" type="checkbox" aria-label="Enable selection mode"><span>All Tasks</span><button id="planHeadingCollapseBtn" class="plan-tool-btn" type="button" title="Collapse All" aria-label="Collapse All">Collapse All</button></div>
     <div id="planList" class="list"></div>
     <div id="historyTools" class="history-tools">
-      <select id="historyGroupBy" class="tool-select" title="Group by">
-        <option value="none">Flat</option>
-        <option value="plan">By plan</option>
-        <option value="playlist">By playlist</option>
+      <span class="tool-label">View</span>
+      <select id="historyViewMode" class="tool-select">
+        <option value="default">Default</option>
+        <option value="executed">Executed</option>
       </select>
-      <div class="history-status-chips" id="historyStatusChips">
+      <span class="tool-label">Group</span>
+      <select id="historyGroupBy" class="tool-select">
+        <option value="none">None</option>
+        <option value="plan">Plan</option>
+        <option value="playlist">Playlist</option>
+      </select>
+      <span class="tool-label">Status</span>
+      <div class="chip-row" id="historyStatusChips">
         <button type="button" class="chip active" data-status="all">All</button>
-        <button type="button" class="chip" data-status="completed">Passed</button>
+        <button type="button" class="chip" data-status="completed">Completed</button>
         <button type="button" class="chip" data-status="failed">Failed</button>
       </div>
     </div>
     <div id="historyList" class="list"></div>
     <div id="listEmpty" class="empty"></div>
-  </div>
-
-  <!-- Test & Verify panel — full-width, PLAN tab only -->
-  <div id="tavPanel">
-    <div class="tav-header" id="tavHeader">
-      <span class="tav-title">&#x1F9EA; Test &amp; Verify</span>
-      <span style="display:flex;align-items:center;gap:6px">
-        <span class="tav-state-badge" id="tavStateBadge">Idle</span>
-        <span class="tav-chevron">&#x25BC;</span>
-      </span>
-    </div>
-    <div class="tav-body" id="tavBody">
-      <div class="tav-row">
-        <span class="tav-label">Test runner</span>
-        <select id="tavTestTool" class="tav-select">
-          <option value="manual">Manual</option>
-          <option value="sandbox">Sandbox (auto-launch)</option>
-          <option value="playwright">Playwright</option>
-          <option value="cypress">Cypress</option>
-          <option value="claude-chrome">Claude + Chrome</option>
-        </select>
-      </div>
-      <div class="tav-row tav-sb-row" id="tavSbRow">
-        <span class="tav-sb-dot" id="tavSbDot"></span>
-        <span class="tav-sb-status" id="tavSbStatus">Sandbox not started</span>
-        <a class="tav-sb-url" id="tavSbUrl" style="display:none"></a>
-        <button class="tav-btn primary" id="tavLaunch" type="button">Launch</button>
-        <button class="tav-btn" id="tavStop" type="button" style="display:none">Stop</button>
-        <button class="tav-btn" id="tavScreenshot" type="button" style="display:none" title="Take screenshot">&#x1F4F7;</button>
-      </div>
-      <div class="tav-row" id="tavPrdRow">
-        <span class="tav-label">PRD source</span>
-        <span class="tav-prd-val" id="tavPrdVal">None linked</span>
-        <button class="tav-btn" id="tavOpenPrd" type="button">Open</button>
-      </div>
-      <div id="tavHintRow" class="tav-row" style="display:none">
-        <span class="tav-hint" id="tavHint"></span>
-      </div>
-      <div id="tavCriteriaWrap" class="tav-criteria-wrap" style="display:none"></div>
-      <button class="tav-verify-btn" id="tavVerifyBtn" type="button" disabled>Verify Against PRD &#x2192;</button>
-      <div class="tav-fix-iter" id="tavFixIter" style="display:none"></div>
-    </div>
   </div>
 
   <!-- Extras strip: AI Rules + Sandbox side-by-side (visible per-tab) -->
@@ -3102,12 +1790,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       </div>
     </div>
     <div id="sidebarSandbox" class="extras-seg">
-      <button class="sidebar-sandbox-toggle" id="sbToggle" type="button">
+      <button class="sidebar-sandbox-toggle collapsed" id="sbToggle" type="button">
         <span class="sidebar-sandbox-icon">&#x25BC;</span>
         <span class="sidebar-sandbox-label">Sandbox</span>
         <span class="sidebar-sandbox-badge" id="sbBadge"></span>
       </button>
-      <div class="sidebar-sandbox-body" id="sbBody">
+      <div class="sidebar-sandbox-body collapsed" id="sbBody">
         <div class="sidebar-sandbox-row">
           <span class="sidebar-sandbox-dot" id="sbDot"></span>
           <span class="sidebar-sandbox-status" id="sbStatus">Not started</span>
@@ -3116,74 +1804,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         <div class="sidebar-sandbox-row">
           <a class="sidebar-sandbox-url" id="sbUrl" style="display:none;"></a>
         </div>
-        <div class="sidebar-sandbox-row sb-tool-row">
-          <span class="sb-tool-label">Test Tool</span>
-          <select id="sbTestTool" class="sb-tool-select">
-            <option value="manual">Manual</option>
-            <option value="sandbox">Sandbox (auto-launch)</option>
-            <option value="playwright">Playwright</option>
-            <option value="cypress">Cypress</option>
-            <option value="claude-chrome">Claude + Chrome</option>
-          </select>
-        </div>
-        <div class="sidebar-sandbox-row" id="sbTttHintRow" style="display:none">
-          <span class="sb-ttt-hint" id="sbTttHint"></span>
-        </div>
         <div class="sidebar-sandbox-actions">
           <button class="sb-btn primary" id="sbLaunch" type="button">Launch</button>
           <button class="sb-btn" id="sbStop" type="button" style="display:none;">Stop</button>
           <button class="sb-btn" id="sbScreenshot" type="button">Screenshot</button>
-        </div>
-        <img class="sb-thumb" id="sbThumb" alt="screenshot" />
-      </div>
-    </div>
-
-    <div id="ghSyncSection" class="extras-seg">
-      <button class="sidebar-sandbox-toggle" id="ghSyncToggle" type="button">
-        <span class="sidebar-sandbox-icon">&#x25BC;</span>
-        <span class="sidebar-sandbox-label">GitHub Sync</span>
-        <span class="gh-sync-status-dot" id="ghSyncDot"></span>
-      </button>
-      <div class="sidebar-sandbox-body" id="ghSyncBody">
-        <!-- Not-configured state -->
-        <div id="ghSyncSetup">
-          <div class="sidebar-sandbox-row">
-            <span class="gh-sync-last">Connect a GitHub repo to auto-import issues as tasks.</span>
-          </div>
-          <div class="sidebar-sandbox-row gh-sync-input-row">
-            <input id="ghSyncRepoInput" class="gh-sync-input" type="text" placeholder="owner/repo" spellcheck="false" />
-          </div>
-          <div class="sidebar-sandbox-row gh-sync-label-row">
-            <span class="gh-sync-last">Label to watch:</span>
-            <input id="ghSyncLabelInput" class="gh-sync-input gh-sync-input-sm" type="text" placeholder="moag" value="moag" spellcheck="false" />
-          </div>
-          <div class="sidebar-sandbox-actions">
-            <button class="sb-btn primary" id="ghSyncConnect" type="button">Connect</button>
-          </div>
-        </div>
-        <!-- gh auth status — always visible -->
-        <div id="ghSyncAuthStatus" class="gh-sync-auth-row"></div>
-        <!-- Connected state -->
-        <div id="ghSyncConnected" style="display:none">
-          <div class="sidebar-sandbox-row">
-            <span class="gh-sync-repo" id="ghSyncRepo"></span>
-            <span class="gh-sync-toggle-wrap">
-              <label class="gh-sync-toggle-label">
-                <input type="checkbox" id="ghSyncEnabledToggle" />
-                <span class="gh-sync-toggle-text" id="ghSyncToggleLabel">Off</span>
-              </label>
-            </span>
-          </div>
-          <div class="sidebar-sandbox-row">
-            <span class="gh-sync-last" id="ghSyncLast">Never polled</span>
-          </div>
-          <div class="sidebar-sandbox-row">
-            <span class="gh-sync-count" id="ghSyncCount"></span>
-          </div>
-          <div class="sidebar-sandbox-actions">
-            <button class="sb-btn primary" id="ghSyncPollNow" type="button">Poll Now</button>
-            <button class="sb-btn" id="ghSyncDisconnect" type="button">Disconnect</button>
-          </div>
         </div>
       </div>
     </div>
@@ -3198,7 +1822,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         </div>
       </div>
       <div class="textarea-row">
-        <textarea id="prompt" placeholder="Describe a task..." rows="1"></textarea>
+        <textarea id="prompt" placeholder="Describe a task for the AI agent..." rows="5"></textarea>
       </div>
       <div class="file-pill-row" id="filePillRow" style="display:none">
         <div class="file-pill" id="filePill">
@@ -3217,14 +1841,15 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
             <svg viewBox="0 0 16 16" fill="currentColor"><path d="M8 1l1.2 3.8L13 6l-3.8 1.2L8 11l-1.2-3.8L3 6l3.8-1.2L8 1z"/><circle cx="13" cy="2" r="1"/><circle cx="3" cy="13" r="1"/></svg>
             Plan
           </button>
-          <button id="composerPrdBtn" class="gen-plan-btn composer-prd-btn" type="button" title="Add or update PRD for this project" style="display:none">&#128196; PRD</button>
           <select id="engine"></select>
           <span id="promptCharCount" class="char-count">0</span>
         </div>
         <div class="composer-toolbar-right">
-          <button id="addToPlanBtn" class="add-to-plan-btn" type="button" title="Add to queue (Shift+Enter)" aria-keyshortcuts="Shift+Enter" style="display:none;width:0;padding:0;border:0;overflow:hidden"></button>
-          <button id="send" class="run-btn" type="button" title="Execute (Ctrl+Enter)" aria-keyshortcuts="Control+Enter">
-            Execute
+          <button id="addToPlanBtn" class="add-to-plan-btn" type="button" title="Save as new task in the active plan (without executing)">
+            + Queue
+          </button>
+          <button id="send" class="run-btn" type="button" title="Run (Ctrl+Enter)">
+            Run
             <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="flex-shrink:0"><path d="M3 2l10 6-10 6V2z"/></svg>
           </button>
         </div>
@@ -3236,7 +1861,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       <span id="ctxRunner" class="ctx-chip">IDLE</span>
       <span id="ctxCost" class="ctx-chip" style="display:none;">$0.00</span>
     </div>
-    <div id="composerHint" class="composer-hint">Ctrl+Enter execute · Shift+Enter queue</div>
   </div>
 
   <script>
@@ -3260,70 +1884,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     let attachedImage = null;
     let activeFile = null; // { name, path } | null
     let activeFileDismissed = false;
-    let pendingFixRef = null; // { playlistIndex, taskIndex } — set when Fix fills composer; routes Execute to task retry
-    // PRD draft mode state
-    var prdMode = false;
-    var prdStep = 0; // 1 = waiting for feature description, 2 = waiting for follow-up answer
-    var prdAnswers = []; // collected answers from user
-
-    function appendPrdMessage(role, text) {
-      if (!chatFeedEl) { return; }
-      var wrap = document.createElement('div');
-      wrap.className = 'prd-msg ' + (role === 'bot' ? 'prd-bot' : 'prd-user');
-      var author = document.createElement('div');
-      author.className = 'prd-msg-author';
-      author.textContent = role === 'bot' ? 'MOAG' : 'You';
-      var msg = document.createElement('div');
-      msg.className = 'prd-msg-text';
-      msg.textContent = text;
-      wrap.appendChild(author);
-      wrap.appendChild(msg);
-      chatFeedEl.appendChild(wrap);
-      chatFeedEl.scrollTop = chatFeedEl.scrollHeight;
-    }
-
-    function showPrdTyping() {
-      if (!chatFeedEl) { return null; }
-      var el = document.createElement('div');
-      el.className = 'prd-typing';
-      el.innerHTML = '<span></span><span></span><span></span>';
-      chatFeedEl.appendChild(el);
-      chatFeedEl.scrollTop = chatFeedEl.scrollHeight;
-      return el;
-    }
-
-    function startPrdMode() {
-      prdMode = true;
-      prdStep = 1;
-      prdAnswers = [];
-      if (prdModeHeaderEl) { prdModeHeaderEl.classList.add('active'); }
-      if (sendEl) { sendEl.innerHTML = 'Answer <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="flex-shrink:0"><path d="M3 2l10 6-10 6V2z"/></svg>'; }
-      if (chatEmptyEl) { chatEmptyEl.style.display = 'none'; }
-      if (chatFeedEl) { chatFeedEl.textContent = ''; }
-      appendPrdMessage('bot', 'What are you building? Describe the feature in plain terms — what it does, who uses it, and what problem it solves.');
-      promptEl.placeholder = 'Describe your feature...';
-      promptEl.focus();
-    }
-
-    function exitPrdMode() {
-      prdMode = false;
-      prdStep = 0;
-      prdAnswers = [];
-      if (prdModeHeaderEl) { prdModeHeaderEl.classList.remove('active'); }
-      if (sendEl) { sendEl.innerHTML = 'Execute <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="flex-shrink:0"><path d="M3 2l10 6-10 6V2z"/></svg>'; }
-      promptEl.placeholder = 'Describe a task for the AI agent...';
-      renderChat(chatTitleEl ? chatTitleEl.textContent || 'New Chat' : 'New Chat', chatMessages);
-    }
-    function updateComposerHint() {
-      if (!composerHintEl) { return; }
-      if (pendingFixRef) {
-        composerHintEl.textContent = 'Execute will retry the task with this fix context';
-        composerHintEl.classList.add('fix-mode');
-      } else {
-        composerHintEl.textContent = 'Ctrl+Enter execute · Shift+Enter queue';
-        composerHintEl.classList.remove('fix-mode');
-      }
-    }
     const tabEls = Array.from(document.querySelectorAll('.tab'));
     const chatScreenEl = document.getElementById('chatScreen');
     const chatTitleEl = document.getElementById('chatTitle');
@@ -3333,19 +1893,13 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const planActiveNameEl = document.getElementById('planActiveName');
     const planExecCounterEl = document.getElementById('planExecCounter');
     const planRunnerBadgeEl = document.getElementById('planRunnerBadge');
-    const planOpenPrdBtnEl = document.getElementById('planOpenPrdBtn');
-    const planFilterBtnEl = null; // removed — filter now always visible in status bar
-    const planFilterMenuEl = null; // removed
+    const planFilterBtnEl = document.getElementById('planFilterBtn');
+    const planFilterMenuEl = document.getElementById('planFilterMenu');
     const planSelectModeCbEl = document.getElementById('planSelectModeCb');
     const planFilterChipsEl = document.getElementById('planFilterChips');
     const planRunSelectedBtnEl = document.getElementById('planRunSelectedBtn');
     const planRunPendingBtnEl = document.getElementById('planRunPendingBtn');
     const planFixAllBtnEl = document.getElementById('planFixAllBtn');
-    const planFixBarEl = null; // removed — merged into planStatusBar
-    const planFixLabelEl = null; // removed
-    const planFixAllBarBtnEl = document.getElementById('planFixAllBarBtn');
-    const reportIssueBtnEl = document.getElementById('reportIssueBtn');
-    const composerHintEl = document.getElementById('composerHint');
     const planSearchBtnEl = document.getElementById('planSearchBtn');
     const planSearchBarEl = document.getElementById('planSearchBar');
     const planSearchInputEl = document.getElementById('planSearchInput');
@@ -3357,38 +1911,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const planPlayBtnEl = document.getElementById('planPlayBtn');
     const planAddTaskBtnEl = document.getElementById('planAddTaskBtn');
     const planNewBtnEl = document.getElementById('planNewBtn');
-    const planFromPrdBtnEl = document.getElementById('planFromPrdBtn');
-    const planFromTemplateBtnEl = document.getElementById('planFromTemplateBtn');
-    const chatEmptyPrdBtnEl = document.getElementById('chatEmptyPrdBtn');
-    const chatEmptyTemplateBtnEl = document.getElementById('chatEmptyTemplateBtn');
-    const chatStartPrdBtnEl = document.getElementById('chatStartPrdBtn');
-    const prdModeHeaderEl = document.getElementById('prdModeHeader');
-    const prdModeCancelBtnEl = document.getElementById('prdModeCancelBtn');
-    const prdInputScreenEl = document.getElementById('prdInputScreen');
-    const prdBackBtnEl = document.getElementById('prdBackBtn');
-    const prdInputTitleEl = document.getElementById('prdInputTitle');
-    const prdInputHintEl = document.getElementById('prdInputHint');
-    const prdTextareaEl = document.getElementById('prdTextarea');
-    const prdBrowseBtnEl = document.getElementById('prdBrowseBtn');
-    const prdGenerateBtnEl = document.getElementById('prdGenerateBtn');
-    const prdCharCountEl = document.getElementById('prdCharCount');
-    const prdVersionBarEl = document.getElementById('prdVersionBar');
-    const prdVersionSelectEl = document.getElementById('prdVersionSelect');
-    const prdVersionSaveBtnEl = document.getElementById('prdVersionSaveBtn');
-    const prdAiBtnEl = document.getElementById('prdAiBtn');
-    const prdProjectCardEl = document.getElementById('prdProjectCard');
-    const prdProjectNameEl = document.getElementById('prdProjectName');
-    const prdProjectStackEl = document.getElementById('prdProjectStack');
-    const prdChipsRowEl = document.getElementById('prdChipsRow');
-    var prdVersions = [];
-    const composerPrdBtnEl = document.getElementById('composerPrdBtn');
     const planToggleTasksBtnEl = document.getElementById('planToggleTasksBtn');
     const planToggleExpandBtnEl = document.getElementById('planToggleExpandBtn');
     const planSwitchBtnEl = document.getElementById('planSwitchBtn');
     const planOverviewEl = document.getElementById('planOverview');
     const planOverviewTitleEl = document.getElementById('planOverviewTitle');
     const planOverviewMetaEl = document.getElementById('planOverviewMeta');
-    const planOverviewFailedMetaEl = document.getElementById('planOverviewFailedMeta');
     const planOverviewFillEl = document.getElementById('planOverviewFill');
     const planOverviewRunningEl = document.getElementById('planOverviewRunning');
     const planOverviewRunningTextEl = document.getElementById('planOverviewRunningText');
@@ -3398,14 +1926,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const planQueueDotsEl = document.getElementById('planQueueDots');
     const planLivePanelEl = document.getElementById('planLivePanel');
     const planRulesSectionEl = document.getElementById('planRulesSection');
-    const tttCriteriaSectionEl = document.getElementById('tttCriteriaSection');
-    const tttCriteriaListEl = document.getElementById('tttCriteriaList');
-    const tttVerifyBtnEl = document.getElementById('tttVerifyBtn');
     const planListHeadingEl = document.getElementById('planListHeading');
     const planListSelectModeCbEl = document.getElementById('planListSelectModeCb');
     const planHeadingCollapseBtnEl = document.getElementById('planHeadingCollapseBtn');
     const planListEl = document.getElementById('planList');
     const historyToolsEl = document.getElementById('historyTools');
+    const historyViewModeEl = document.getElementById('historyViewMode');
     const historyGroupByEl = document.getElementById('historyGroupBy');
     const historyStatusChipsEl = document.getElementById('historyStatusChips');
     const historyListEl = document.getElementById('historyList');
@@ -3420,24 +1946,17 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     let planItems = [];
     let planGroups = [];
     let planAiRules = '';
-    let planPrdSource = '';
-    let detectedPrdFilePath = '';
-    let testTool = 'manual';
-    let planFixIterations = 0;
-    let prdProjectMeta = { name: '', stack: '' };
-    let tttCriteriaChecked = [];
     let historyItems = [];
     let activeThreadId = '';
     let chatMessages = [];
     let runnerState = 'idle';
+    let historyViewMode = 'default';
     let historyGroupBy = 'none';
     let historyStatusFilter = 'all';
     let collapsedHistoryGroups = {};
     let collapsedPlanGroups = {};
     let planTasksVisible = true;
     let planFilterMode = 'all';
-    let planListScrollTop = 0;
-    let planListScrollInitialized = false;
     let planSearchQuery = '';
     let selectionMode = false;
     let selectedPlaylists = {};
@@ -3448,35 +1967,32 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     let liveTaskId = '';
     let liveTaskName = '';
     let liveOutputLines = [];
-    const ICON_COLLAPSED = '\u25B6';
-    const ICON_EXPANDED = '\u25BC';
-    const ICON_COMPLETED = '\u2713';
-    const ICON_RUNNING = '\u25B6';
-    const ICON_FAILED = '\u2715';
+    const ICON_COLLAPSED = '▶';
+    const ICON_EXPANDED = '▼';
+    const ICON_COMPLETED = '✓';
+    const ICON_RUNNING = '▶';
+    const ICON_FAILED = '✕';
     const ICON_BLOCKED = '!';
-    const ICON_SKIPPED = '\u21BB';
-    const ICON_PENDING = '\u25CB';
-    const ICON_PLAY = '\u23F5';
-    const ICON_PAUSE = '\u23F8';
-    const ICON_RUN_PENDING = '\u25F7';
-    const ICON_STOP = '\u23F9';
-    const ICON_MENU = '\u22EF';
-    const ICON_FILTER = '\u25BE';
-    const ICON_LAYOUT = '\u21F5';
-    const ICON_ARROW_RIGHT = '\u2192';
-    const ICON_DOT = '\u2022';
+    const ICON_SKIPPED = '↻';
+    const ICON_PENDING = '○';
+    const ICON_PLAY = '⏵';
+    const ICON_PAUSE = '⏸';
+    const ICON_RUN_PENDING = '◷';
+    const ICON_STOP = '⏹';
+    const ICON_MENU = '⋯';
+    const ICON_FILTER = '▾';
+    const ICON_LAYOUT = '⇵';
+    const ICON_ARROW_RIGHT = '→';
+    const ICON_DOT = '•';
 
     function autoResize() {
       promptEl.style.height = 'auto';
-      const h = Math.min(Math.max(promptEl.scrollHeight + 1, 36), 200);
-      promptEl.style.height = h + 'px';
-      promptEl.style.overflowY = h >= 200 ? 'auto' : 'hidden';
+      promptEl.style.height = Math.min(Math.max(promptEl.scrollHeight, 80), 220) + 'px';
     }
 
     function updateActionState() {
       const charCount = promptEl.value.length;
-      promptCharCountEl.textContent = charCount === 0 ? '' : charCount === 1 ? '1 char' : charCount + ' chars';
-      promptCharCountEl.style.display = charCount === 0 ? 'none' : '';
+      promptCharCountEl.textContent = charCount === 1 ? '1 character' : charCount + ' characters';
       const hasText = !!promptEl.value.trim();
       sendEl.disabled = busy || !hasText;
       if (generatePlanBtnEl) { generatePlanBtnEl.disabled = busy || !hasText; }
@@ -3559,6 +2075,14 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       return status === '' || status === 'pending' || status === 'queued' || status === 'todo';
     }
 
+    function isExecutedHistory(item) {
+      const status = normalizeStatus(item);
+      if (!status) {
+        return true;
+      }
+      return status === 'completed' || status === 'failed' || status === 'blocked' || status === 'skipped';
+    }
+
     function statusMatchesFilter(item) {
       const status = normalizeStatus(item);
       if (historyStatusFilter === 'all') {
@@ -3573,24 +2097,11 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       return true;
     }
 
-    function historyStatusIcon(status) {
-      const s = String(status || '').toLowerCase();
-      if (s === 'completed') {
-        return { cls: 'completed', svg: '<svg viewBox="0 0 16 16" width="9" height="9" fill="currentColor"><path d="M13.5 3.5l-7 7-3-3-.7.7 3.7 3.7 7.7-7.7z"/></svg>' };
-      }
-      if (s === 'failed' || s === 'blocked') {
-        return { cls: 'failed', svg: '<svg viewBox="0 0 16 16" width="9" height="9" fill="currentColor"><path d="M9 1H7v8h2zm-1 10a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/></svg>' };
-      }
-      if (s === 'running') {
-        return { cls: 'running', svg: '<svg viewBox="0 0 16 16" width="9" height="9" fill="currentColor"><path d="M3 2l10 6-10 6V2z"/></svg>' };
-      }
-      return { cls: 'default', svg: '<svg viewBox="0 0 16 16" width="9" height="9" fill="currentColor"><circle cx="8" cy="8" r="3"/></svg>' };
-    }
-
     function renderHistoryList() {
       historyListEl.textContent = '';
       const base = Array.isArray(historyItems) ? historyItems : [];
-      const filtered = base.filter(statusMatchesFilter);
+      const byView = historyViewMode === 'executed' ? base.filter(isExecutedHistory) : base;
+      const filtered = byView.filter(statusMatchesFilter);
       const groups = buildHistoryGroups(filtered);
 
       groups.forEach((items, label) => {
@@ -3617,18 +2128,11 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           const item = items[hi];
           const btn = document.createElement('button');
           btn.type = 'button';
-          const subParts = (item.subtitle || '').split('  -  ');
-          const breadcrumb = subParts[0] || '';
-          const age = subParts.length >= 2 ? subParts[subParts.length - 1].trim() : '';
-          const hIcon = historyStatusIcon(item.status);
-          btn.className = 'history-item';
+          btn.className = 'item';
+          const dc = itemDotClass(item, hi);
           btn.innerHTML =
-            '<span class="history-icon ' + hIcon.cls + '">' + hIcon.svg + '</span>' +
-            '<span class="history-body">' +
-              '<span class="history-title">' + escHtml(item.title || 'Untitled') + '</span>' +
-              (breadcrumb ? '<span class="history-breadcrumb">' + escHtml(breadcrumb) + '</span>' : '') +
-            '</span>' +
-            (age ? '<span class="history-age">' + escHtml(age) + '</span>' : '');
+            '<span class="item-title"><span class="item-dot' + (dc ? ' ' + dc : '') + '"></span>' + escHtml(item.title || 'Untitled') + '</span>' +
+            (item.subtitle ? '<span class="item-meta">' + escHtml(item.subtitle) + '</span>' : '');
           btn.addEventListener('click', () => {
             if (item.id) {
               vscode.postMessage({ type: 'openItem', id: item.id, kind: item.kind || 'history' });
@@ -3726,72 +2230,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       planRulesSectionEl.appendChild(wrapper);
     }
 
-    function parsePrdCriteria(prdText) {
-      if (!prdText) { return []; }
-      var lines = prdText.split('\\n');
-      var criteria = [];
-      var inCriteriaBlock = false;
-      for (var li = 0; li < lines.length; li++) {
-        var trimmed = lines[li].trim();
-        if (trimmed.toLowerCase().indexOf('acceptance criteria') !== -1 || trimmed.toLowerCase().indexOf('## criteria') !== -1) { inCriteriaBlock = true; continue; }
-        if (inCriteriaBlock && /^#{1,3} /.test(trimmed) && trimmed.toLowerCase().indexOf('criteria') === -1) { inCriteriaBlock = false; }
-        var cbm = trimmed.match(/^-[ ]*\\[[ x]\\][ ]*(.+)/i);
-        if (cbm) { criteria.push(cbm[1].trim()); continue; }
-        var acm = trimmed.match(/^ac[0-9]*[:.] *(.+)/i);
-        if (acm) { criteria.push(acm[1].trim()); continue; }
-        if (inCriteriaBlock && (trimmed.charAt(0) === '-' || trimmed.charAt(0) === '*' || /^[0-9]/.test(trimmed)) && trimmed.length > 8) {
-          criteria.push(trimmed.replace(/^[-*0-9.]+[ ]*/, '').trim());
-        }
-      }
-      return criteria.filter(Boolean).slice(0, 20);
-    }
-
-    function renderTttCriteria() {
-      if (!tttCriteriaSectionEl || !tttCriteriaListEl || !tttVerifyBtnEl) { return; }
-      const hasTestPhase = Array.isArray(planGroups) && planGroups.some(function(g) {
-        return g.testPhase && (g.playlistStatus === 'running' || g.playlistStatus === 'paused');
-      });
-      if (!hasTestPhase || !planPrdSource) {
-        tttCriteriaSectionEl.classList.remove('active');
-        return;
-      }
-      const criteria = parsePrdCriteria(planPrdSource);
-      if (criteria.length === 0) {
-        tttCriteriaSectionEl.classList.remove('active');
-        return;
-      }
-      if (tttCriteriaChecked.length !== criteria.length) {
-        tttCriteriaChecked = new Array(criteria.length).fill(false);
-      }
-      tttCriteriaSectionEl.classList.add('active');
-      tttCriteriaListEl.textContent = '';
-      criteria.forEach(function(text, i) {
-        var row = document.createElement('label');
-        row.className = 'ttt-criterion' + (tttCriteriaChecked[i] ? ' checked' : '');
-        var cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = !!tttCriteriaChecked[i];
-        cb.addEventListener('change', function() {
-          tttCriteriaChecked[i] = cb.checked;
-          row.classList.toggle('checked', cb.checked);
-          vscode.postMessage({ type: 'tttCriterionChecked', index: i, checked: cb.checked });
-          var allDone = tttCriteriaChecked.length > 0 && tttCriteriaChecked.every(Boolean);
-          tttVerifyBtnEl.style.display = allDone ? 'block' : 'none';
-        });
-        var span = document.createElement('span');
-        span.textContent = text;
-        row.appendChild(cb);
-        row.appendChild(span);
-        tttCriteriaListEl.appendChild(row);
-      });
-      var allDone = tttCriteriaChecked.length > 0 && tttCriteriaChecked.every(Boolean);
-      tttVerifyBtnEl.style.display = allDone ? 'block' : 'none';
-    }
-
     function renderPlanGroups(targetEl, groups) {
       renderPlanRulesSection();
-      renderTttCriteria();
-      const savedScrollTop = planListScrollTop;
       targetEl.textContent = '';
       targetEl.classList.toggle('plan-selection-mode', selectionMode);
       const list = Array.isArray(groups) ? groups : [];
@@ -3968,18 +2408,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
 
         row.appendChild(select);
         row.appendChild(toggle);
-        if (group.prdContext) {
-          const prdBtn = document.createElement('button');
-          prdBtn.type = 'button';
-          prdBtn.className = 'prd-pill-btn';
-          prdBtn.title = 'View PRD slice for this playlist';
-          prdBtn.innerHTML = '&#128196; PRD';
-          prdBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            vscode.postMessage({ type: 'showPlaylistPrdContext', prdContext: group.prdContext });
-          });
-          row.appendChild(prdBtn);
-        }
         row.appendChild(rulesBtn);
         row.appendChild(play);
         header.appendChild(row);
@@ -3999,7 +2427,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           taskBtn.className = 'item';
           taskBtn.style.paddingLeft = '20px';
           const status = String(task.status || 'pending').toLowerCase();
-          taskBtn.dataset.status = status;
           const failureReason = (status === 'failed' || status === 'blocked')
             ? String(task.failureReason || '').trim()
             : '';
@@ -4053,9 +2480,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           const attemptBadge = (task.attemptCount && task.attemptCount > 1)
             ? '<span class="attempt-badge">(' + task.attemptCount + ' attempts)</span>'
             : '';
-          const issueBadge = task.sourceIssueNumber
-            ? '<span class="issue-badge" data-repo="' + escHtml(task.sourceIssueRepo || '') + '" data-number="' + escHtml(String(task.sourceIssueNumber)) + '" title="GitHub issue #' + task.sourceIssueNumber + '">#' + task.sourceIssueNumber + '</span>'
-            : '';
           const errLines = Array.isArray(task.errorLines) ? task.errorLines : [];
           const errorLinesHtml = isFailedLike && errLines.length > 0
             ? '<div class="error-lines">' + errLines.slice(0, 3).map((l) => '<div class="error-line">' + escHtml(l) + '</div>').join('') + '</div>'
@@ -4064,7 +2488,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
             '<div class="task-row">' +
               '<input type="checkbox" class="task-check"' + (selectedTasks[taskKey] ? ' checked' : '') + '>' +
               '<button type="button" class="task-main">' +
-                '<span class="item-title"><span class="item-dot"></span>' + escHtml(task.name || 'Untitled task') + issueBadge + errorCatBadge + attemptBadge + '</span>' +
+                '<span class="item-title"><span class="item-dot"></span>' + escHtml(task.name || 'Untitled task') + errorCatBadge + attemptBadge + '</span>' +
                 '<span class="item-subtitle">' + escHtml(statusLabel) + '</span>' +
                 (failureReason ? '<span class="item-subtitle error" title="' + escHtml(failureReason) + '">' + escHtml(failureReason) + '</span>' : '') +
                 errorLinesHtml +
@@ -4086,15 +2510,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           mainBtn?.addEventListener('click', () => {
             if (task.id) {
               vscode.postMessage({ type: 'openItem', id: task.id, kind: 'plan' });
-            }
-          });
-          const issueBadgeEl = taskBtn.querySelector('.issue-badge');
-          issueBadgeEl?.addEventListener('click', (event) => {
-            event.stopPropagation();
-            const repo = issueBadgeEl.getAttribute('data-repo') || '';
-            const num = issueBadgeEl.getAttribute('data-number') || '';
-            if (repo && num) {
-              vscode.postMessage({ type: 'openExternalUrl', url: 'https://github.com/' + repo + '/issues/' + num });
             }
           });
           const check = taskBtn.querySelector('.task-check');
@@ -4182,20 +2597,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           : 'No tasks to display.';
         targetEl.appendChild(empty);
       }
-      // Restore scroll: on first load auto-scroll to first active/pending task; otherwise restore saved position
-      if (!planListScrollInitialized) {
-        planListScrollInitialized = true;
-        requestAnimationFrame(() => {
-          const activeEl = targetEl.querySelector('.item[data-status="running"]')
-            || targetEl.querySelector('.item[data-status="failed"]')
-            || targetEl.querySelector('.item[data-status="pending"]');
-          if (activeEl) {
-            activeEl.scrollIntoView({ block: 'center' });
-          }
-        });
-      } else if (savedScrollTop > 0) {
-        requestAnimationFrame(() => { targetEl.scrollTop = savedScrollTop; });
-      }
     }
 
     function renderPlanOverview(groups) {
@@ -4207,35 +2608,14 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         return;
       }
       const playlistTotal = list.length;
-      const playlistDone = list.filter((group) => {
-        const s = String(group.playlistStatus || '').toLowerCase();
-        return s === 'completed' || s === 'failed';
-      }).length;
+      const playlistDone = list.filter((group) => String(group.playlistStatus || '').toLowerCase() === 'completed').length;
       const taskTotal = list.reduce((sum, group) => sum + (group.progress?.total || 0), 0);
-      // completed = truly completed (or skipped), failed = failed/blocked
-      const taskCompleted = list.reduce((sum, group) => {
-        const tasks = Array.isArray(group?.tasks) ? group.tasks : [];
-        return sum + tasks.filter((t) => { const s = String(t?.status || '').toLowerCase(); return s === 'completed' || s === 'skipped'; }).length;
-      }, 0);
-      const taskFailed = list.reduce((sum, group) => {
-        const tasks = Array.isArray(group?.tasks) ? group.tasks : [];
-        return sum + tasks.filter((t) => { const s = String(t?.status || '').toLowerCase(); return s === 'failed' || s === 'blocked'; }).length;
-      }, 0);
-      const pct = taskTotal > 0 ? Math.round(((taskCompleted + taskFailed) / taskTotal) * 100) : 0;
+      const taskDone = list.reduce((sum, group) => sum + (group.progress?.done || 0), 0);
+      const pct = taskTotal > 0 ? Math.round((taskDone / taskTotal) * 100) : 0;
 
-      const planLabel = (activePlanName || '').replace(/^MOAG\s*[-:]\s*/i, '').trim() || 'Plan';
-      planOverviewTitleEl.textContent = planLabel + ' Progress';
-      planOverviewMetaEl.textContent = playlistDone + '/' + playlistTotal + ' playlists, ' + taskCompleted + '/' + taskTotal + ' tasks completed';
+      planOverviewTitleEl.textContent = 'Optimization Plan Progress';
+      planOverviewMetaEl.textContent = playlistDone + '/' + playlistTotal + ' playlists, ' + taskDone + '/' + taskTotal + ' tasks processed';
       planOverviewFillEl.style.width = pct + '%';
-      planOverviewFillEl.classList.toggle('has-failed', taskFailed > 0);
-      if (planOverviewFailedMetaEl) {
-        if (taskFailed > 0) {
-          planOverviewFailedMetaEl.textContent = '⚠ ' + taskFailed + ' task' + (taskFailed === 1 ? '' : 's') + ' failed — use "Fix All" to retry';
-          planOverviewFailedMetaEl.style.display = '';
-        } else {
-          planOverviewFailedMetaEl.style.display = 'none';
-        }
-      }
 
       let runningPlaylistName = '';
       let runningTaskName = '';
@@ -4372,6 +2752,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       planManageBtnEl.innerHTML = iconMarkup('menu');
       planManageBtnEl.title = 'More Actions';
       planManageBtnEl.setAttribute('aria-label', 'More Actions');
+      planFilterBtnEl.innerHTML = iconMarkup('filter');
+      planFilterBtnEl.title = 'Filters';
+      planFilterBtnEl.setAttribute('aria-label', 'Filters');
       const searchLabel = planSearchQuery ? ('Search: ' + planSearchQuery) : 'Search tasks';
       planSearchBtnEl.title = searchLabel;
       planSearchBtnEl.classList.toggle('active', !!planSearchQuery);
@@ -4444,55 +2827,12 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           return s === 'failed' || s === 'blocked';
         }).length;
       }, 0);
-      const planState = runnerState === 'playing' ? 'running'
-        : runnerState === 'paused' ? 'paused'
-        : runnerState === 'stopping' ? 'stopping'
-        : failedTaskCount > 0 ? 'failed'
-        : (taskDone === taskTotal && taskTotal > 0) ? 'completed'
-        : 'idle';
-      planToolsEl.classList.remove('plan-state-idle', 'plan-state-running', 'plan-state-paused', 'plan-state-stopping', 'plan-state-failed', 'plan-state-completed');
-      planToolsEl.classList.add('plan-state-' + planState);
-      const workflowOrder = ['chat', 'plan', 'review', 'execute', 'fix', 'done'];
-      const workflowStep = planState === 'running' || planState === 'paused' || planState === 'stopping' ? 'execute'
-        : planState === 'failed' ? 'fix'
-        : planState === 'completed' ? 'done'
-        : taskTotal > 0 ? 'review'
-        : 'plan';
-      const workflowStepperEl = document.getElementById('workflowStepper');
-      if (workflowStepperEl) {
-        const activeIdx = workflowOrder.indexOf(workflowStep);
-        workflowStepperEl.querySelectorAll('[data-step]').forEach((el) => {
-          const idx = workflowOrder.indexOf(el.getAttribute('data-step') || '');
-          el.classList.remove('active', 'done');
-          if (idx === activeIdx) { el.classList.add('active'); }
-          else if (idx < activeIdx) { el.classList.add('done'); }
-        });
-      }
       if (planFixAllBtnEl) {
-        planFixAllBtnEl.style.display = 'none';
-      }
-      // Fix All button in the status bar
-      if (planFixAllBarBtnEl) {
-        if (failedTaskCount > 0) {
-          planFixAllBarBtnEl.textContent = 'Fix All (' + failedTaskCount + ')';
-          planFixAllBarBtnEl.style.display = '';
-          planFixAllBarBtnEl.disabled = runnerState === 'playing';
-        } else {
-          planFixAllBarBtnEl.style.display = 'none';
-        }
+        planFixAllBtnEl.style.display = failedTaskCount > 0 ? '' : 'none';
+        planFixAllBtnEl.textContent = 'Fix All (' + failedTaskCount + ')';
+        planFixAllBtnEl.disabled = runnerState === 'playing';
       }
       planStopBtnEl.disabled = runnerState !== 'playing';
-      if (planOpenPrdBtnEl) {
-        const hasPrd = !!(planPrdSource || detectedPrdFilePath);
-        planOpenPrdBtnEl.classList.toggle('visible', hasPrd);
-        const prdLabel = detectedPrdFilePath
-          ? ('&#128196; ' + detectedPrdFilePath.split(/[\\/]/).pop())
-          : '&#128196; PRD';
-        planOpenPrdBtnEl.innerHTML = prdLabel;
-        planOpenPrdBtnEl.title = detectedPrdFilePath
-          ? ('Open PRD: ' + detectedPrdFilePath)
-          : (planPrdSource ? 'Open source PRD' : '');
-      }
       planFilterChipsEl.querySelectorAll('[data-plan-filter]').forEach((chip) => {
         const on = (chip.getAttribute('data-plan-filter') || 'all') === planFilterMode;
         chip.classList.toggle('active', on);
@@ -4527,7 +2867,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         return '<span class="msg-type-dot code-change"></span>';
       }
       const text = String(displayText || '').trim();
-      const looksLikeRunStatus = /^done\./i.test(text) || /^run failed\./i.test(text) || /^task failed\./i.test(text);
+      const looksLikeRunStatus = /^done./i.test(text) || /^run failed./i.test(text) || /^task failed./i.test(text);
       if (looksLikeRunStatus) {
         return '<span class="msg-type-dot run-status"></span>';
       }
@@ -4589,8 +2929,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       const parts = [];
       const bt = String.fromCharCode(96);
       const fence = bt + bt + bt;
-      const escapedFence = fence.replace(/[-/\\\\^$*+?.()|[\\]{}]/g, '\\\\$&');
-      const regex = new RegExp(escapedFence + '([a-zA-Z0-9_-]+)?\\\\n?([\\\\s\\\\S]*?)' + escapedFence, 'g');
+      const escapedFence = fence.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
+      const regex = new RegExp(escapedFence + '([a-zA-Z0-9_-]+)?\\n?([\\s\\S]*?)' + escapedFence, 'g');
       let lastIndex = 0;
       let match;
 
@@ -4618,9 +2958,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       const bt = String.fromCharCode(96);
       const inlineCodeRegex = new RegExp(bt + '([^' + bt + ']+)' + bt, 'g');
       html = html.replace(inlineCodeRegex, '<code>$1</code>');
-      html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
-      html = html.replace(/\\*([^*]+)\\*/g, '<em>$1</em>');
-      html = html.replace(/\\n/g, '<br>');
+      html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+      html = html.replace(/\n/g, '<br>');
       return html;
     }
 
@@ -4629,7 +2969,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       if (!raw.includes('[CONTEXT START]')) {
         return raw;
       }
-      const lines = raw.split(/\\r?\\n/).map((line) => line.trim()).filter((line) => line.length > 0);
+      const lines = raw.split(/\r?\n/).map((line) => line.trim()).filter((line) => line.length > 0);
       return lines.length > 0 ? lines[lines.length - 1] : 'Prompt submitted';
     }
 
@@ -4643,14 +2983,14 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         );
       }
       const text = messageText || '';
-      const lines = text.split(/\\r?\\n/);
+      const lines = text.split(/\r?\n/);
       const shouldCollapse = text.length > 800 || lines.length > 18;
       const fullHtml = markdownToHtml(text);
       if (!shouldCollapse) {
         return '<div class="msg-text">' + fullHtml + '</div>';
       }
 
-      const preview = lines.slice(0, 8).join('\\n');
+      const preview = lines.slice(0, 8).join('\n');
       const previewHtml = markdownToHtml(preview);
       return (
         '<div class="msg-text" data-collapsible="1">' +
@@ -4762,7 +3102,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
               addMoreItem('Review Diff', () => vscode.postMessage({ type: 'reviewChanges' }));
             }
             addMoreItem('Use as playlist template', () => {
-              const seed = 'Create a playlist + tasks from this:\\n' + displayText.slice(0, 1200);
+              const seed = 'Create a playlist + tasks from this:\n' + displayText.slice(0, 1200);
               promptEl.value = seed;
               autoResize();
                       updateActionState();
@@ -4794,8 +3134,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
 
     function renderContextBar() {
-      const planLabel = (activePlanName || 'Ad hoc').replace(/^MOAG\s*[-:]\s*/i, '').trim();
-      const planTrunc = planLabel.length > 20 ? planLabel.slice(0, 19) + '\u2026' : planLabel;
+      const planLabel = (activePlanName || 'Ad hoc').replace(/^MOAGs*[-:]s*/i, '').trim();
+      const planTrunc = planLabel.length > 20 ? planLabel.slice(0, 19) + '…' : planLabel;
       const planSvg = '<svg viewBox="0 0 16 16" style="width:10px;height:10px;fill:currentColor;flex-shrink:0"><path d="M3 3h10v1H3V3zm0 4h10v1H3V7zm0 4h7v1H3v-1z"/></svg>';
       ctxPlanEl.innerHTML = planSvg + ' ' + escHtml(planTrunc);
       const stateColor = runnerState === 'playing' ? '#4caf50' : runnerState === 'paused' ? '#cca700' : 'currentColor';
@@ -4813,7 +3153,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       planListEl.classList.toggle('active', activeTab === 'plan');
       planToolsEl.classList.toggle('active', activeTab === 'plan');
       planOverviewEl.classList.toggle('active', activeTab === 'plan' && planGroups.length > 0);
-      planRulesSectionEl?.classList.toggle('active', activeTab === 'plan');
       if (activeTab !== 'plan') {
         planQueueEl.classList.remove('active');
       }
@@ -4821,15 +3160,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       historyListEl.classList.toggle('active', activeTab === 'history');
       historyToolsEl.classList.toggle('active', activeTab === 'history');
       sbSectionEl.classList.toggle('active', activeTab === 'plan');
-      rulesSectionEl.classList.toggle('active', activeTab === 'plan');
-
-      // PRD button in composer toolbar: visible in chat tab only
-      if (composerPrdBtnEl) {
-        composerPrdBtnEl.style.display = showChat ? '' : 'none';
-        composerPrdBtnEl.classList.toggle('has-prd', !!planPrdSource);
-        composerPrdBtnEl.title = planPrdSource ? 'Update PRD linked to this plan' : 'Add PRD to this plan';
-        composerPrdBtnEl.innerHTML = planPrdSource ? '&#128196; PRD &#10003;' : '&#128196; PRD';
-      }
+      rulesSectionEl.classList.toggle('active', activeTab === 'plan' || activeTab === 'chat');
 
       if (showChat) {
         listEmptyEl.classList.remove('active');
@@ -4868,30 +3199,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       if (!text || sendEl.disabled) {
         return;
       }
-      // PRD draft mode — route to guided Q&A instead of normal execution
-      if (prdMode) {
-        appendPrdMessage('user', text);
-        promptEl.value = '';
-        promptEl.style.height = '';
-        var typing = showPrdTyping();
-        prdAnswers.push(text);
-        vscode.postMessage({ type: 'prdAnswer', answer: text, step: prdStep, answers: prdAnswers });
-        prdStep++;
-        return;
-      }
       setActiveTab('chat');
-      if (pendingFixRef) {
-        const ref = pendingFixRef;
-        pendingFixRef = null;
-        updateComposerHint();
-        vscode.postMessage({
-          type: 'retryTaskWithPrompt',
-          playlistIndex: ref.playlistIndex,
-          taskIndex: ref.taskIndex,
-          prompt: text,
-        });
-        return;
-      }
       const injectPath = (activeFile && !activeFileDismissed) ? activeFile.path : undefined;
       vscode.postMessage({
         type: 'submit',
@@ -4945,10 +3253,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
         event.preventDefault();
         submit();
-      } else if (event.key === 'Enter' && (event.altKey || event.shiftKey)) {
-        event.preventDefault();
-        const text = promptEl.value.trim();
-        if (text) { vscode.postMessage({ type: 'addToPlan', text }); }
       }
     });
     settingsBtnEl.addEventListener('click', () => vscode.postMessage({ type: 'openSettings' }));
@@ -5049,13 +3353,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     planFixAllBtnEl?.addEventListener('click', () => {
       vscode.postMessage({ type: 'fixAllFailed' });
     });
-    planFixAllBarBtnEl?.addEventListener('click', () => {
-      vscode.postMessage({ type: 'fixAllFailed' });
-    });
-    reportIssueBtnEl?.addEventListener('click', () => {
-      vscode.postMessage({ type: 'reportIssue' });
-    });
-    planListEl.addEventListener('scroll', () => { planListScrollTop = planListEl.scrollTop; }, { passive: true });
     planStopBtnEl.addEventListener('click', () => {
       planManageMenuEl.classList.remove('open');
       vscode.postMessage({ type: 'pauseRun' });
@@ -5106,152 +3403,20 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     });
     planAddTaskBtnEl.addEventListener('click', () => vscode.postMessage({ type: 'addTask' }));
     planNewBtnEl.addEventListener('click', () => vscode.postMessage({ type: 'newPlan' }));
-    var prdScreenMode = 'generate'; // 'generate' | 'update'
-    function openPrdInputScreen(mode) {
-      prdScreenMode = mode;
-      planManageMenuEl?.classList.remove('open');
-      if (mode === 'update') {
-        if (prdInputTitleEl) { prdInputTitleEl.textContent = planPrdSource ? 'Update PRD' : 'Add PRD'; }
-        if (prdInputHintEl) { prdInputHintEl.innerHTML = planPrdSource
-          ? 'Edit your PRD below — changes will be saved to the current plan and used for TTT criteria and Verify.'
-          : 'Paste your PRD below to link it to the current plan. Use <strong>Verify Against PRD</strong> in the Test &amp; Verify panel after your test playlist runs.'; }
-        if (prdGenerateBtnEl) { prdGenerateBtnEl.textContent = 'Save to Plan'; }
-        if (prdTextareaEl && planPrdSource) {
-          prdTextareaEl.value = planPrdSource;
-          var len = planPrdSource.length;
-          if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
-          if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
-        }
-      } else {
-        if (prdInputTitleEl) { prdInputTitleEl.textContent = 'Generate Plan from PRD'; }
-        if (prdInputHintEl) { prdInputHintEl.innerHTML = 'Paste a PRD or describe what you want to build &mdash; MOAG will generate a Design &rarr; Development &rarr; Testing plan.'; }
-        if (prdGenerateBtnEl) { prdGenerateBtnEl.textContent = 'Generate Plan →'; }
-        if (prdTextareaEl) { prdTextareaEl.value = ''; prdTextareaEl.style.height = '80px'; }
-        if (prdCharCountEl) { prdCharCountEl.textContent = '0 chars'; }
-        if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = true; }
-        if (prdChipsRowEl) { prdChipsRowEl.style.display = 'flex'; }
-        renderPrdProjectCard();
-      }
-      if (prdInputScreenEl) { prdInputScreenEl.classList.add('active'); }
-      setTimeout(() => { prdTextareaEl?.focus(); }, 50);
-    }
-    function showPrdInputScreen() { openPrdInputScreen('generate'); }
-    function hidePrdInputScreen() {
-      if (prdInputScreenEl) { prdInputScreenEl.classList.remove('active'); }
-    }
-    planFromPrdBtnEl?.addEventListener('click', showPrdInputScreen);
-    planFromTemplateBtnEl?.addEventListener('click', () => {
-      planManageMenuEl?.classList.remove('open');
-      vscode.postMessage({ type: 'newPlanFromTemplate' });
-    });
-    chatEmptyTemplateBtnEl?.addEventListener('click', () => vscode.postMessage({ type: 'newPlanFromTemplate' }));
-    planOpenPrdBtnEl?.addEventListener('click', () => {
-      vscode.postMessage({ type: 'openPrdFromPlan' });
-    });
-    chatEmptyPrdBtnEl?.addEventListener('click', showPrdInputScreen);
-    chatStartPrdBtnEl?.addEventListener('click', () => { setActiveTab('chat'); startPrdMode(); });
-    composerPrdBtnEl?.addEventListener('click', () => openPrdInputScreen('update'));
-    prdModeCancelBtnEl?.addEventListener('click', exitPrdMode);
-    prdBackBtnEl?.addEventListener('click', hidePrdInputScreen);
-    function updatePrdAiBtn() {
-      if (!prdAiBtnEl || !prdTextareaEl) { return; }
-      var t = prdTextareaEl.value.trim();
-      var looksLikePrd = t.length > 400 || /^#{1,3}\s|acceptance criteria|AC[0-9]*[:.]/im.test(t);
-      prdAiBtnEl.textContent = looksLikePrd ? '✨ Improve with AI' : '✨ Draft with AI';
-    }
-    function renderPrdProjectCard() {
-      if (!prdProjectCardEl || !prdProjectNameEl || !prdProjectStackEl) { return; }
-      if (prdProjectMeta && prdProjectMeta.name) {
-        prdProjectNameEl.textContent = prdProjectMeta.name;
-        prdProjectStackEl.textContent = prdProjectMeta.stack ? '· ' + prdProjectMeta.stack : '';
-        prdProjectCardEl.style.display = 'flex';
-      } else {
-        prdProjectCardEl.style.display = 'none';
-      }
-    }
-    function autoResizePrdTextarea() {
-      if (!prdTextareaEl) { return; }
-      prdTextareaEl.style.height = 'auto';
-      var h = Math.min(Math.max(prdTextareaEl.scrollHeight, 80), 220);
-      prdTextareaEl.style.height = h + 'px';
-    }
-    if (prdChipsRowEl) {
-      prdChipsRowEl.querySelectorAll('.prd-chip').forEach(function(chip) {
-        chip.addEventListener('click', function() {
-          var prompt = chip.getAttribute('data-prompt');
-          if (prdTextareaEl && prompt) {
-            prdTextareaEl.value = prompt;
-            prdTextareaEl.dispatchEvent(new Event('input'));
-            prdTextareaEl.focus();
-          }
-        });
-      });
-    }
-    function updatePrdVersionBar(vers) {
-      prdVersions = vers || [];
-      if (!prdVersionBarEl || !prdVersionSelectEl || !prdVersionSaveBtnEl) { return; }
-      if (prdVersions.length > 0) {
-        prdVersionBarEl.classList.add('visible');
-        prdVersionSelectEl.innerHTML = prdVersions.map(function(v) {
-          var d = new Date(v.createdAt).toLocaleDateString();
-          return '<option value="' + v.version + '">' + v.version + ' (' + d + ')</option>';
-        }).join('');
-        prdVersionSaveBtnEl.textContent = 'Save as v' + (prdVersions.length + 1) + '.0';
-      } else {
-        prdVersionBarEl.classList.remove('visible');
-        prdVersionSaveBtnEl.textContent = 'Save as v1.0';
-      }
-    }
-    prdTextareaEl?.addEventListener('input', function() {
-      var len = prdTextareaEl.value.length;
-      if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
-      if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
-      if (prdChipsRowEl) { prdChipsRowEl.style.display = len > 0 ? 'none' : 'flex'; }
-      autoResizePrdTextarea();
-      updatePrdAiBtn();
-    });
-    prdVersionSelectEl?.addEventListener('change', function() {
-      var ver = prdVersions.find(function(v) { return v.version === prdVersionSelectEl.value; });
-      if (ver && prdTextareaEl) {
-        prdTextareaEl.value = ver.text;
-        var len = ver.text.length;
-        if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
-        if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
-        updatePrdAiBtn();
-      }
-    });
-    prdVersionSaveBtnEl?.addEventListener('click', function() {
-      var text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
-      if (!text) { return; }
-      var nextVersion = 'v' + (prdVersions.length + 1) + '.0';
-      vscode.postMessage({ type: 'savePrdVersion', text: text, version: nextVersion });
-    });
-    prdAiBtnEl?.addEventListener('click', function() {
-      var text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
-      if (!text) { vscode.postMessage({ type: 'planFromPrd' }); return; }
-      var looksLikePrd = text.length > 400 || /^#{1,3}\s|acceptance criteria|AC[0-9]*[:.]/im.test(text);
-      prdAiBtnEl.disabled = true;
-      prdAiBtnEl.textContent = looksLikePrd ? 'Improving…' : 'Drafting PRD…';
-      vscode.postMessage({ type: 'prdAiImprove', text: text });
-    });
-    prdBrowseBtnEl?.addEventListener('click', () => vscode.postMessage({ type: 'openPrdFile' }));
-    prdGenerateBtnEl?.addEventListener('click', function() {
-      var text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
-      if (!text) { return; }
-      hidePrdInputScreen();
-      if (prdScreenMode === 'update') {
-        planPrdSource = text;
-        renderTavPanel();
-        vscode.postMessage({ type: 'savePrdToPlan', prdText: text });
-      } else {
-        vscode.postMessage({ type: 'generatePlanFromPrd', prdText: text });
-      }
-    });
     planManageBtnEl.addEventListener('click', (event) => {
       event.stopPropagation();
       planManageMenuEl.classList.toggle('open');
+      planFilterMenuEl.classList.remove('open');
     });
     planManageMenuEl.addEventListener('click', (event) => {
+      event.stopPropagation();
+    });
+    planFilterBtnEl.addEventListener('click', (event) => {
+      event.stopPropagation();
+      planFilterMenuEl.classList.toggle('open');
+      planManageMenuEl.classList.remove('open');
+    });
+    planFilterMenuEl.addEventListener('click', (event) => {
       event.stopPropagation();
     });
     planFilterChipsEl.querySelectorAll('[data-plan-filter]').forEach((chip) => {
@@ -5260,6 +3425,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         planFilterMode = (next === 'pending' || next === 'completed' || next === 'failed') ? next : 'all';
         renderPlanGroups(planListEl, planGroups);
         renderPlanTools();
+        planFilterMenuEl.classList.remove('open');
       });
     });
     planAddTaskBtnEl.addEventListener('click', () => {
@@ -5291,6 +3457,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     });
     planSwitchBtnEl.addEventListener('click', () => {
       vscode.postMessage({ type: 'switchPlan' });
+    });
+    historyViewModeEl.addEventListener('change', () => {
+      historyViewMode = historyViewModeEl.value === 'executed' ? 'executed' : 'default';
+      renderHistoryList();
     });
     historyGroupByEl.addEventListener('change', () => {
       const next = historyGroupByEl.value;
@@ -5428,32 +3598,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     const sbLaunchEl = document.getElementById('sbLaunch');
     const sbStopEl = document.getElementById('sbStop');
     const sbScreenshotEl = document.getElementById('sbScreenshot');
-    const sbTestToolEl = document.getElementById('sbTestTool');
-    const sbTttHintRowEl = document.getElementById('sbTttHintRow');
-    const sbTttHintEl = document.getElementById('sbTttHint');
-    // TAV panel elements
-    const tavPanelEl = document.getElementById('tavPanel');
-    const tavHeaderEl = document.getElementById('tavHeader');
-    const tavBodyEl = document.getElementById('tavBody');
-    const tavStateBadgeEl = document.getElementById('tavStateBadge');
-    const tavTestToolEl = document.getElementById('tavTestTool');
-    const tavSbDotEl = document.getElementById('tavSbDot');
-    const tavSbStatusEl = document.getElementById('tavSbStatus');
-    const tavSbUrlEl = document.getElementById('tavSbUrl');
-    const tavLaunchEl = document.getElementById('tavLaunch');
-    const tavStopEl = document.getElementById('tavStop');
-    const tavScreenshotEl = document.getElementById('tavScreenshot');
-    const tavPrdValEl = document.getElementById('tavPrdVal');
-    const tavOpenPrdEl = document.getElementById('tavOpenPrd');
-    const tavHintRowEl = document.getElementById('tavHintRow');
-    const tavHintEl = document.getElementById('tavHint');
-    const tavCriteriaWrapEl = document.getElementById('tavCriteriaWrap');
-    const tavVerifyBtnEl = document.getElementById('tavVerifyBtn');
-    const tavFixIterEl = document.getElementById('tavFixIter');
-    let tavCollapsed = false;
-    let tavSandboxState = null;
-    let tavCriteriaChecked = [];
-    let sbCollapsed = false;
+    let sbCollapsed = true;
 
     sbToggleEl.addEventListener('click', () => {
       sbCollapsed = !sbCollapsed;
@@ -5463,238 +3608,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     sbLaunchEl.addEventListener('click', () => vscode.postMessage({ type: 'launchSandbox' }));
     sbStopEl.addEventListener('click', () => vscode.postMessage({ type: 'stopSandbox' }));
     sbScreenshotEl.addEventListener('click', () => vscode.postMessage({ type: 'takeScreenshot' }));
-    tttVerifyBtnEl?.addEventListener('click', () => vscode.postMessage({ type: 'tttAllCriteriaVerified' }));
-
-    // ─── GitHub Sync Panel ───
-    const ghSyncHeaderIndicatorEl = document.getElementById('ghSyncHeaderIndicator');
-    const ghSyncSectionEl = document.getElementById('ghSyncSection');
-    const ghSyncToggleEl = document.getElementById('ghSyncToggle');
-    const ghSyncBodyEl = document.getElementById('ghSyncBody');
-    const ghSyncDotEl = document.getElementById('ghSyncDot');
-    const ghSyncRepoEl = document.getElementById('ghSyncRepo');
-    const ghSyncLastEl = document.getElementById('ghSyncLast');
-    const ghSyncCountEl = document.getElementById('ghSyncCount');
-    const ghSyncRepoInputEl = document.getElementById('ghSyncRepoInput');
-    const ghSyncLabelInputEl = document.getElementById('ghSyncLabelInput');
-    const ghSyncConnectEl = document.getElementById('ghSyncConnect');
-    const ghSyncSetupEl = document.getElementById('ghSyncSetup');
-    const ghSyncConnectedEl = document.getElementById('ghSyncConnected');
-    const ghSyncPollNowEl = document.getElementById('ghSyncPollNow');
-    const ghSyncDisconnectEl = document.getElementById('ghSyncDisconnect');
-    const ghSyncEnabledToggleEl = document.getElementById('ghSyncEnabledToggle');
-    const ghSyncToggleLabelEl = document.getElementById('ghSyncToggleLabel');
-    let ghSyncCollapsed = false;
-
-    ghSyncToggleEl?.addEventListener('click', () => {
-      ghSyncCollapsed = !ghSyncCollapsed;
-      ghSyncToggleEl.classList.toggle('collapsed', ghSyncCollapsed);
-      if (ghSyncBodyEl) { ghSyncBodyEl.classList.toggle('collapsed', ghSyncCollapsed); }
-    });
-    ghSyncConnectEl?.addEventListener('click', () => {
-      const repo = (ghSyncRepoInputEl && ghSyncRepoInputEl.value.trim()) || '';
-      const label = (ghSyncLabelInputEl && ghSyncLabelInputEl.value.trim()) || 'moag';
-      if (!repo) { ghSyncRepoInputEl && ghSyncRepoInputEl.focus(); return; }
-      vscode.postMessage({ type: 'ghSyncConfigure', repo, label, enabled: true });
-    });
-    ghSyncPollNowEl?.addEventListener('click', () => vscode.postMessage({ type: 'ghSyncPollNow' }));
-    ghSyncDisconnectEl?.addEventListener('click', () => {
-      vscode.postMessage({ type: 'ghSyncConfigure', repo: '', label: 'moag', enabled: false });
-    });
-    ghSyncEnabledToggleEl?.addEventListener('change', () => {
-      const enabled = !!ghSyncEnabledToggleEl.checked;
-      vscode.postMessage({ type: 'ghSyncToggleEnabled', enabled });
-    });
-
-    function renderGhSync(state) {
-      const repo = (state && state.issueSyncRepo) || '';
-      const enabled = !!(state && state.issueSyncEnabled);
-      const hasRepo = !!repo;
-
-      // Header indicator — always visible in plan overview regardless of scroll
-      if (ghSyncHeaderIndicatorEl) {
-        if (hasRepo) {
-          const dotCls = enabled ? 'gh-sync-header-dot active' : 'gh-sync-header-dot';
-          const shortRepo = repo.split('/').pop() || repo;
-          ghSyncHeaderIndicatorEl.innerHTML = '<span class="' + dotCls + '"></span><span class="gh-sync-header-label">' + shortRepo + '</span>';
-          ghSyncHeaderIndicatorEl.style.display = '';
-          ghSyncHeaderIndicatorEl.title = (enabled ? 'GitHub sync on — click to manage' : 'GitHub sync off — click to manage') + ' (' + repo + ')';
-        } else {
-          ghSyncHeaderIndicatorEl.innerHTML = '<span class="gh-sync-header-dot"></span><span class="gh-sync-header-label gh-sync-header-connect">Connect GitHub</span>';
-          ghSyncHeaderIndicatorEl.style.display = '';
-          ghSyncHeaderIndicatorEl.title = 'Connect GitHub Issues sync — click to configure';
-        }
-        ghSyncHeaderIndicatorEl.onclick = function() {
-          vscode.postMessage({ type: 'ghSyncConfigure' });
-        };
-      }
-
-      if (!ghSyncSectionEl) { return; }
-
-      if (ghSyncSetupEl)     { ghSyncSetupEl.style.display = hasRepo ? 'none' : ''; }
-      if (ghSyncConnectedEl) { ghSyncConnectedEl.style.display = hasRepo ? '' : 'none'; }
-
-      if (ghSyncDotEl) {
-        ghSyncDotEl.className = 'gh-sync-status-dot' + (hasRepo && enabled ? ' active' : '');
-      }
-      if (ghSyncRepoEl) { ghSyncRepoEl.textContent = repo; }
-      if (ghSyncEnabledToggleEl) { ghSyncEnabledToggleEl.checked = enabled; }
-      if (ghSyncToggleLabelEl)   { ghSyncToggleLabelEl.textContent = enabled ? 'On' : 'Off'; }
-      if (ghSyncLastEl) {
-        const last = state && state.issueSyncLastPoll;
-        ghSyncLastEl.textContent = last
-          ? 'Last polled: ' + new Date(last).toLocaleTimeString()
-          : enabled ? 'Polling every ' + Math.round(((state && state.issueSyncIntervalMs) || 300000) / 60000) + ' min' : 'Sync off — toggle to enable';
-      }
-      if (ghSyncCountEl) {
-        const count = state && state.issueSyncTrackedCount;
-        ghSyncCountEl.textContent = count != null && count > 0 ? count + ' issue' + (count !== 1 ? 's' : '') + ' tracked' : '';
-      }
-      // gh auth status row
-      var ghAuthEl = document.getElementById('ghSyncAuthStatus');
-      if (ghAuthEl) {
-        var authUser = state && state.ghAuthUser;
-        if (authUser) {
-          ghAuthEl.innerHTML = '<span class="gh-sync-auth-dot ok"></span><span class="gh-sync-auth-label">gh: ' + authUser + '</span>';
-          ghAuthEl.title = 'GitHub CLI authenticated as ' + authUser;
-        } else {
-          ghAuthEl.innerHTML = '<span class="gh-sync-auth-dot"></span><span class="gh-sync-auth-label gh-sync-auth-warn">gh not authenticated — run "gh auth login"</span>';
-          ghAuthEl.title = 'GitHub CLI is not authenticated';
-        }
-      }
-    }
-
-    sbTestToolEl?.addEventListener('change', () => {
-      testTool = sbTestToolEl.value;
-      vscode.postMessage({ type: 'setTestTool', value: testTool });
-      renderSandboxTttHint();
-    });
-
-    // TAV panel
-    tavHeaderEl?.addEventListener('click', () => {
-      tavCollapsed = !tavCollapsed;
-      tavHeaderEl.classList.toggle('collapsed', tavCollapsed);
-      if (tavBodyEl) { tavBodyEl.classList.toggle('collapsed', tavCollapsed); }
-    });
-    tavTestToolEl?.addEventListener('change', () => {
-      testTool = tavTestToolEl.value;
-      if (sbTestToolEl) { sbTestToolEl.value = testTool; }
-      vscode.postMessage({ type: 'setTestTool', value: testTool });
-      renderTavPanel();
-    });
-    tavLaunchEl?.addEventListener('click', () => vscode.postMessage({ type: 'launchSandbox' }));
-    tavStopEl?.addEventListener('click', () => vscode.postMessage({ type: 'stopSandbox' }));
-    tavScreenshotEl?.addEventListener('click', () => vscode.postMessage({ type: 'takeScreenshot' }));
-    tavOpenPrdEl?.addEventListener('click', () => vscode.postMessage({ type: 'openPrdFromPlan' }));
-    tavVerifyBtnEl?.addEventListener('click', () => vscode.postMessage({ type: 'verifyAgainstPrd' }));
-
-    function renderTavPanel() {
-      if (!tavPanelEl) { return; }
-      tavPanelEl.classList.toggle('active', activeTab === 'plan');
-      if (activeTab !== 'plan') { return; }
-      if (tavTestToolEl) { tavTestToolEl.value = testTool; }
-
-      // Sandbox state
-      var sbState = tavSandboxState;
-      var sbRunning = sbState && sbState.status === 'running';
-      var sbStarting = sbState && sbState.status === 'starting';
-      var sbActive = sbRunning || sbStarting;
-      if (tavSbDotEl) { tavSbDotEl.className = 'tav-sb-dot ' + (sbState ? (sbState.status || 'stopped') : ''); }
-      if (tavSbStatusEl) {
-        tavSbStatusEl.style.display = sbRunning ? 'none' : '';
-        tavSbStatusEl.textContent = sbStarting ? 'Starting...' : sbState && sbState.error ? sbState.error.substring(0, 50) : 'Not started';
-      }
-      if (tavSbUrlEl) {
-        if (sbRunning && sbState.url) {
-          tavSbUrlEl.textContent = sbState.url;
-          tavSbUrlEl.dataset.url = sbState.url;
-          tavSbUrlEl.style.display = '';
-        } else {
-          tavSbUrlEl.style.display = 'none';
-        }
-      }
-      if (tavLaunchEl) { tavLaunchEl.style.display = sbActive ? 'none' : ''; }
-      if (tavStopEl) { tavStopEl.style.display = sbActive ? '' : 'none'; }
-      if (tavScreenshotEl) { tavScreenshotEl.style.display = sbRunning ? '' : 'none'; }
-
-      // Test phase detection
-      var hasTestPlaylist = Array.isArray(planGroups) && planGroups.some(function(g) { return g.testPhase; });
-      var testPlaylistRunning = Array.isArray(planGroups) && planGroups.some(function(g) {
-        return g.testPhase && (g.playlistStatus === 'running' || g.playlistStatus === 'paused');
-      });
-
-      // State badge
-      var badgeText = testPlaylistRunning ? 'Running' : hasTestPlaylist ? 'Ready' : 'Setup';
-      var badgeClass = testPlaylistRunning ? 'running' : hasTestPlaylist ? 'done' : 'warn';
-      if (tavStateBadgeEl) { tavStateBadgeEl.textContent = badgeText; tavStateBadgeEl.className = 'tav-state-badge ' + badgeClass; }
-
-      // PRD row
-      var hasPrd = !!(planPrdSource);
-      var prdLabel = detectedPrdFilePath ? detectedPrdFilePath.split(/[\\/]/).pop() : (hasPrd ? 'Stored in plan' : 'None linked');
-      if (tavPrdValEl) { tavPrdValEl.textContent = prdLabel; tavPrdValEl.style.color = hasPrd ? '' : 'var(--vscode-descriptionForeground)'; }
-      if (tavOpenPrdEl) { tavOpenPrdEl.style.display = hasPrd ? '' : 'none'; }
-
-      // Hint row
-      var hint = '';
-      var hintClass = '';
-      if (!hasTestPlaylist) {
-        hint = '⚠ No test playlist — right-click a playlist → Toggle Test Phase';
-        hintClass = 'warn';
-      } else if (testTool === 'sandbox' && !sbActive && !testPlaylistRunning) {
-        hint = 'Sandbox will auto-launch when test playlist starts';
-        hintClass = 'ok';
-      } else if (testTool === 'manual' && hasTestPlaylist) {
-        hint = 'Switch to "Sandbox (auto-launch)" to automate this step';
-        hintClass = '';
-      }
-      if (tavHintRowEl) { tavHintRowEl.style.display = hint ? '' : 'none'; }
-      if (tavHintEl) { tavHintEl.textContent = hint; tavHintEl.className = 'tav-hint ' + hintClass; }
-
-      // Criteria — show when test playlist is running AND PRD exists
-      if (tavCriteriaWrapEl) {
-        var showCriteria = testPlaylistRunning && hasPrd;
-        tavCriteriaWrapEl.style.display = showCriteria ? '' : 'none';
-        if (showCriteria) {
-          var criteria = parsePrdCriteria(planPrdSource);
-          if (tavCriteriaChecked.length !== criteria.length) { tavCriteriaChecked = new Array(criteria.length).fill(false); }
-          tavCriteriaWrapEl.innerHTML = '';
-          criteria.forEach(function(text, i) {
-            var row = document.createElement('label');
-            row.className = 'tav-criterion' + (tavCriteriaChecked[i] ? ' checked' : '');
-            var cb = document.createElement('input');
-            cb.type = 'checkbox'; cb.checked = !!tavCriteriaChecked[i];
-            cb.addEventListener('change', function() { tavCriteriaChecked[i] = cb.checked; row.classList.toggle('checked', cb.checked); });
-            var span = document.createElement('span');
-            span.className = 'tav-criterion-text'; span.textContent = text;
-            row.appendChild(cb); row.appendChild(span);
-            tavCriteriaWrapEl.appendChild(row);
-          });
-        }
-      }
-
-      // Verify button
-      if (tavVerifyBtnEl) { tavVerifyBtnEl.disabled = !hasPrd; }
-
-      // Fix iteration counter
-      if (tavFixIterEl) {
-        if (planFixIterations > 0) {
-          tavFixIterEl.textContent = '🔄 Fix loop: iteration ' + planFixIterations + '/3';
-          tavFixIterEl.className = 'tav-fix-iter active';
-          tavFixIterEl.style.display = '';
-        } else {
-          tavFixIterEl.style.display = 'none';
-        }
-      }
-
-      // Hide old sandbox extras-seg when TAV is visible
-      var sbSegEl = document.getElementById('sidebarSandbox');
-      if (sbSegEl) { sbSegEl.style.display = activeTab === 'plan' ? 'none' : ''; }
-    }
     sbUrlEl.addEventListener('click', () => {
       const url = sbUrlEl.dataset.url;
       if (url) { vscode.postMessage({ type: 'openSandboxBrowser', url: url }); }
     });
-
-    var sbThumbEl = document.getElementById('sbThumb');
 
     function renderSidebarSandbox(state) {
       if (!state) { return; }
@@ -5714,117 +3631,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       sbStopEl.style.display = active ? 'inline-block' : 'none';
       sbBadgeEl.textContent = active ? (state.status === 'running' ? 'Running' : 'Starting') : '';
       sbBadgeEl.className = 'sidebar-sandbox-badge ' + (active ? state.status : '');
-      if (sbThumbEl) {
-        if (state.lastScreenshotPath) {
-          sbThumbEl.src = state.lastScreenshotPath;
-          sbThumbEl.style.display = 'block';
-        } else {
-          sbThumbEl.style.display = 'none';
-        }
-      }
-    }
-
-    function renderSandboxTttHint() {
-      if (!sbTestToolEl || !sbTttHintRowEl || !sbTttHintEl) { return; }
-      sbTestToolEl.value = testTool;
-      const hasTestPlaylist = Array.isArray(planGroups) && planGroups.some(function(g) { return g.testPhase; });
-      if (testTool === 'sandbox') {
-        if (hasTestPlaylist) {
-          sbTttHintEl.textContent = '✓ Auto-launches when test playlist runs';
-          sbTttHintEl.className = 'sb-ttt-hint ok';
-        } else {
-          sbTttHintEl.textContent = '⚠ No test playlist — right-click a playlist → Toggle Test Phase';
-          sbTttHintEl.className = 'sb-ttt-hint warn';
-        }
-        sbTttHintRowEl.style.display = '';
-      } else if (testTool === 'manual') {
-        sbTttHintRowEl.style.display = hasTestPlaylist ? '' : 'none';
-        sbTttHintEl.textContent = hasTestPlaylist ? 'Manual — switch to Sandbox for auto-launch' : '';
-        sbTttHintEl.className = 'sb-ttt-hint warn';
-      } else {
-        sbTttHintEl.textContent = hasTestPlaylist ? ('✓ ' + testTool + ' runs via test tasks') : '';
-        sbTttHintEl.className = 'sb-ttt-hint ok';
-        sbTttHintRowEl.style.display = hasTestPlaylist ? '' : 'none';
-      }
     }
 
     window.addEventListener('message', (event) => {
       const msg = event.data;
-      if (msg.type === 'showPrdInputScreen') {
-        if (prdInputScreenEl) { prdInputScreenEl.classList.add('active'); }
-        setTimeout(() => { prdTextareaEl?.focus(); }, 50);
-        return;
-      }
-      if (msg.type === 'prdMoagQuestion') {
-        // Remove typing indicator if present
-        var typingEl = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
-        if (typingEl) { typingEl.remove(); }
-        appendPrdMessage('bot', msg.question);
-        promptEl.placeholder = 'Your answer...';
-        promptEl.focus();
-        return;
-      }
-      if (msg.type === 'prdConvertReady') {
-        var typingEl2 = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
-        if (typingEl2) { typingEl2.remove(); }
-        appendPrdMessage('bot', 'I have enough context to write your PRD. Opening the editor now...');
-        exitPrdMode();
-        return;
-      }
-      if (msg.type === 'prdError') {
-        var typingEl3 = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
-        if (typingEl3) { typingEl3.remove(); }
-        var errWrap = document.createElement('div');
-        errWrap.className = 'prd-msg prd-bot';
-        var errAuthor = document.createElement('div');
-        errAuthor.className = 'prd-msg-author';
-        errAuthor.textContent = 'MOAG';
-        var errText = document.createElement('div');
-        errText.className = 'prd-msg-text';
-        errText.style.color = '#f48771';
-        errText.textContent = msg.error || 'Something went wrong. Please try again.';
-        errWrap.appendChild(errAuthor);
-        errWrap.appendChild(errText);
-        if (msg.action) {
-          var actionBtn = document.createElement('button');
-          actionBtn.className = 'chat-empty-start-prd-btn';
-          actionBtn.style.marginTop = '8px';
-          actionBtn.textContent = msg.action.label;
-          actionBtn.addEventListener('click', function() {
-            vscode.postMessage({ type: 'runCommand', command: msg.action.command });
-          });
-          errWrap.appendChild(actionBtn);
-        }
-        if (chatFeedEl) { chatFeedEl.appendChild(errWrap); chatFeedEl.scrollTop = chatFeedEl.scrollHeight; }
-        prdStep = Math.max(1, prdStep - 1);
-        promptEl.focus();
-        return;
-      }
-      if (msg.type === 'prdFileContent') {
-        if (prdTextareaEl && typeof msg.text === 'string') {
-          prdTextareaEl.value = msg.text;
-          var len = msg.text.length;
-          if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
-          if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
-          prdTextareaEl.focus();
-        }
-        return;
-      }
-      if (msg.type === 'prdAiImproveResult') {
-        if (prdTextareaEl && typeof msg.text === 'string' && msg.text) {
-          prdTextareaEl.value = msg.text;
-          var len2 = msg.text.length;
-          if (prdCharCountEl) { prdCharCountEl.textContent = len2 + ' chars'; }
-          if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len2 < 20; }
-        }
-        if (prdAiBtnEl) { prdAiBtnEl.disabled = false; updatePrdAiBtn(); }
-        return;
-      }
-      if (msg.type === 'prdVersionSaved') {
-        updatePrdVersionBar(msg.versions || []);
-        if (prdVersionSelectEl && msg.version) { prdVersionSelectEl.value = msg.version; }
-        return;
-      }
       if (msg.type === 'setBusy') {
         busy = !!msg.busy;
         promptEl.disabled = busy;
@@ -5844,16 +3654,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         planItems = msg.planItems || [];
         planGroups = msg.planGroups || [];
         planAiRules = msg.planAiRules || '';
-        planPrdSource = msg.planPrdSource || '';
-        detectedPrdFilePath = msg.detectedPrdFilePath || '';
-        updatePrdVersionBar(msg.planPrdVersions || []);
-        testTool = msg.testTool || 'manual';
-        planFixIterations = msg.planFixIterations ?? 0;
-        prdProjectMeta = msg.prdProjectMeta ?? { name: '', stack: '' };
-        renderPrdProjectCard();
         renderPlanRulesSection();
-        renderTttCriteria();
-        renderSandboxTttHint();
         const currentKeys = new Set((planGroups || []).map((g, i) => g.id || ('playlist-' + i)));
         Object.keys(selectedPlaylists).forEach((key) => {
           if (!currentKeys.has(key)) {
@@ -5876,13 +3677,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         historyItems = msg.historyItems || [];
         activeThreadId = msg.activeThreadId || '';
         chatMessages = msg.chatMessages || [];
-        const incomingPlanName = msg.activePlanName || '';
-        if (incomingPlanName !== activePlanName) {
-          planListScrollInitialized = false;
-          planListScrollTop = 0;
-          tttCriteriaChecked = [];
-        }
-        activePlanName = incomingPlanName;
+        activePlanName = msg.activePlanName || '';
         activePlaylistName = msg.activePlaylistName || '';
         // Chat tab is conversation-first; no session strip row.
         renderPlanGroups(planListEl, planGroups);
@@ -5890,18 +3685,13 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         renderPlanQueue(planGroups);
         renderPlanTools();
         renderHistoryList();
-        if (!prdMode) { renderChat(msg.chatTitle || 'New Chat', chatMessages); }
+        renderChat(msg.chatTitle || 'New Chat', chatMessages);
         renderRunnerChip(msg.runnerState || 'idle');
         renderContextBar();
         setActiveTab(activeTab);
         engineEl.disabled = busy || engineEl.options.length === 0 || engineEl.value === '';
         updateActionState();
-        if (msg.sandboxState) {
-          renderSidebarSandbox(msg.sandboxState);
-          tavSandboxState = msg.sandboxState;
-        }
-        renderTavPanel();
-        renderGhSync(msg);
+        if (msg.sandboxState) { renderSidebarSandbox(msg.sandboxState); }
         if (msg.aiRules !== undefined) { renderSidebarRules(msg.aiRules); }
         if (msg.activeFile !== undefined) { activeFile = msg.activeFile || null; updateFilePill(); }
       } else if (msg.type === 'rules-state') {
@@ -5914,8 +3704,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         updateFilePill();
       } else if (msg.type === 'sandbox-state') {
         renderSidebarSandbox(msg.sandboxState);
-        tavSandboxState = msg.sandboxState;
-        renderTavPanel();
       } else if (msg.type === 'sessionCost') {
         const cost = typeof msg.cost === 'number' ? msg.cost : 0;
         const tokensIn = typeof msg.tokensIn === 'number' ? msg.tokensIn : 0;
@@ -5969,7 +3757,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         }
         // Update plan-tab live panel — split incoming text into lines, keep last 4
         if (msg.taskId === liveTaskId && msg.text) {
-          var newLines = msg.text.split('\\n');
+          var newLines = msg.text.split('\n');
           liveOutputLines = liveOutputLines.concat(newLines).filter((l) => l.trim()).slice(-4);
           renderLivePanel();
         }
@@ -5979,15 +3767,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           promptEl.value = msg.text || '';
           autoResize();
           updateActionState();
-          pendingFixRef = msg.fixRef || null;
-          updateComposerHint();
-          if (msg.text) {
-            if (runnerState === 'idle') {
-              setActiveTab('chat');
-              promptEl.focus();
-              promptEl.setSelectionRange(promptEl.value.length, promptEl.value.length);
-            }
-          }
+          promptEl.focus();
+          promptEl.setSelectionRange(promptEl.value.length, promptEl.value.length);
         }
 
       } else if (msg.type === 'live-output-end') {
@@ -6024,7 +3805,4 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     promptEl.focus();
   </script>
 </body>
-</html>`;
-  }
-}
-
+</html>
