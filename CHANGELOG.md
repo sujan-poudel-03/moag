@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.9.10] - 2026-05-27
+
+### GitHub Two-Way Auto-Sync
+
+- **Connect GitHub** — link a GitHub repo to your workspace via the "Connect GitHub" pill in the Plan tab header; configures issue polling, label filtering, and sync state in one guided flow
+- **Auto-poll for new issues** — MOAG polls the connected repo on a configurable interval (default 5 min); any new issue matching the sync label is automatically added as a task in a "GitHub Issues" playlist — no manual "Plan from Issue" step required
+- **Progress comments posted back** — when a task starts, MOAG posts `▶ Working on: <task>` to the source issue; on completion `✓ Done — N files changed`; on failure `✗ <task> failed — <first error line>`
+- **Label automation** — `moag:in-progress` label applied when task starts; `moag:done` when all tasks for the issue complete; all labels created automatically if missing
+- **`ghSyncConfigureInteractive` command** — keyboard-friendly QuickPick menu to toggle sync on/off, poll immediately, change repo/label, or disconnect; accessible from the header pill or command palette
+- **`ghSyncPollNow` command** — manually trigger a poll from the toolbar overflow menu at any time
+- **Auth indicator** — GitHub Sync panel shows a green dot + username when `gh` is authenticated; red warning when not set up; 30 s cache avoids repeated subprocess calls
+- **`sourceIssueNumber` / `sourceIssueRepo` on tasks** — issue traceability stored on each task; plan serialized and reloaded without data loss; `#N` badge shown on task rows with click-to-open in browser
+- **Report Issue → sync loop** — bug reports filed via "Report Bug" button use the connected repo (not a hardcoded URL), apply both `bug` and sync labels automatically, and trigger an immediate poll so the filed issue appears as a task within seconds
+
+### Per-Version PRD
+
+- **`prdContext` per playlist** — plan generation now extracts and stores a PRD slice for each playlist (the acceptance criteria governing that version sprint); persisted in `plan.json` and restored on reload
+- **Verify uses playlist PRD** — `Verify Against PRD` now prefers the active playlist's own `prdContext` over the global `prdSource`; test playlists verify against their specific acceptance criteria, not the whole 29 KB PRD
+- **PRD pill on playlist header** — playlists with a `prdContext` show a `PRD` badge in the Plan tab; click opens the PRD slice in the existing PRD viewer panel
+- **Plan generation prompt updated** — generation prompt now instructs the model to quote the PRD slice governing each playlist; test playlists must include `type:"command"` and `type:"visual-test"` tasks (not all `type:"agent"`)
+
+### Fixes
+
+- **`gh.cmd` interceptor removed** — a stale test stub in the project root was intercepting all `gh` CLI calls via Windows CWD-before-PATH resolution, causing all GitHub operations to silently return a fake URL (`issues/999`); deleted
+- **Auth check fixed** — `gh auth status` check now uses exit code (not stdout content) since `gh` writes to stderr; eliminates false "not authenticated" errors for users who are correctly logged in
+
 ## [0.9.9] - 2026-05-12
 
 ### Browser-Level Visual Testing

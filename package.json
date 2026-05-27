@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
   "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
-  "version": "0.9.9",
+  "version": "0.9.10",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
