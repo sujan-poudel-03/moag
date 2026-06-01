@@ -35,7 +35,10 @@ import { detectAndConfigureEngines, detectEngines, redetectEngines } from './eng
 import { analyzeProject, formatAnalysis } from './context/project-analyzer';
 import {
   buildContext, getContextSettings, runRetrievalCascade, ContextBudgetUsage,
+  setActiveKG, getActiveKG, buildKG, setWeightsMoagDir, invalidateWeightsCache,
 } from './context/context-builder';
+import { analyzeWeights, saveWeights } from './context/weights';
+import { rebuildKGForFile } from './context/knowledge-graph';
 import { RunSessionStore, RunSession } from './models/run-session';
 import * as UserMsg from './utils/user-messages';
 import { SessionsTreeProvider, SessionsTreeItem } from './ui/sessions-tree';
@@ -1481,6 +1484,27 @@ export function activate(context: vscode.ExtensionContext): void {
     DashboardPanel.currentPanel?.startTaskCard(task, playlist, fullPrompt);
     promptViewProvider?.postLiveOutputStart(task.id, task.name);
 
+    // Push Context Memory info to Dashboard so user sees what the agent knows
+    const taskWithMeta = task as Task & {
+      _budgetUsage?: { totalCharsUsed: number; totalCharsBudget: number; sectionsDropped: number; sectionBreakdown?: Record<string, number> };
+      _retrievedFiles?: string[];
+    };
+    if (taskWithMeta._budgetUsage) {
+      const bd = taskWithMeta._budgetUsage;
+      const sections = Object.entries(bd.sectionBreakdown ?? {})
+        .map(([name, chars]) => ({ name, chars: chars as number }))
+        .sort((a, b) => b.chars - a.chars);
+      DashboardPanel.currentPanel?.postContextMemory({
+        taskId: task.id,
+        taskName: task.name,
+        sections,
+        totalCharsUsed: bd.totalCharsUsed,
+        totalCharsBudget: bd.totalCharsBudget,
+        sectionsDropped: bd.sectionsDropped,
+        retrievedFiles: taskWithMeta._retrievedFiles ?? [],
+      });
+    }
+
     // Show real progress in status bar and notification
     const shortName = task.name.length > 40 ? task.name.substring(0, 37) + '...' : task.name;
     statusBarItem.text = `$(sync~spin) ATP: Task ${executionTasksCompleted}/${executionTaskCount} — ${shortName}`;
@@ -1557,6 +1581,23 @@ export function activate(context: vscode.ExtensionContext): void {
       }
     }
     notifyTaskCompleted(task);
+
+    // Auto-analyze context weights at key data thresholds
+    {
+      const instrumented = historyStore.getAll().filter(e => e.contextBudgetUsage);
+      const n = instrumented.length;
+      if ([20, 50, 100, 200].includes(n)) {
+        const moagDirForWeights = getMoagDir();
+        if (moagDirForWeights) {
+          try {
+            const w = analyzeWeights(instrumented);
+            saveWeights(moagDirForWeights, w);
+            invalidateWeightsCache();
+          } catch { /* non-critical */ }
+        }
+      }
+    }
+
     const { tokensIn, tokensOut } = runner.getSessionTokens();
     promptViewProvider?.postSessionCost(runner.getSessionCost(), tokensIn, tokensOut);
     promptViewProvider?.postLiveOutputEnd(task.id, task.status);
@@ -2007,6 +2048,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand('agentTaskPlayer.suggestCommit', cmdSuggestCommit),
     vscode.commands.registerCommand('agentTaskPlayer.shareRunFeedback', cmdShareRunFeedback),
+    vscode.commands.registerCommand('agentTaskPlayer.runContextEval', cmdRunContextEval),
+    vscode.commands.registerCommand('agentTaskPlayer.analyzeContextWeights', cmdAnalyzeContextWeights),
     vscode.commands.registerCommand('agentTaskPlayer.reviewSelfIssues', cmdReviewSelfIssues),
     vscode.commands.registerCommand('agentTaskPlayer.createPR', createPRFromRun),
     vscode.commands.registerCommand('agentTaskPlayer.quickAddTask', cmdQuickAddTask),
@@ -2079,6 +2122,38 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     }),
   );
+
+  // ─── Knowledge Graph + Weights: init in background 2s after activation ──────
+  {
+    const kgCwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (kgCwd) {
+      // Point weights loader at .moag/ dir
+      const moagDirForWeights = getMoagDir();
+      if (moagDirForWeights) { setWeightsMoagDir(moagDirForWeights); }
+
+      setTimeout(() => {
+        try { setActiveKG(buildKG(kgCwd)); } catch { /* non-critical */ }
+      }, 2000);
+
+      // Debounce map for file-save KG updates
+      const kgRebuildTimers = new Map<string, ReturnType<typeof setTimeout>>();
+      context.subscriptions.push(
+        vscode.workspace.onDidSaveTextDocument(doc => {
+          if (!/\.(ts|tsx|js|jsx|py|go|rs|java|cs|rb|php)$/.test(doc.uri.fsPath)) { return; }
+          const relPath = path.relative(kgCwd, doc.uri.fsPath).replace(/\\/g, '/');
+          const existing = kgRebuildTimers.get(relPath);
+          if (existing) { clearTimeout(existing); }
+          kgRebuildTimers.set(relPath, setTimeout(() => {
+            kgRebuildTimers.delete(relPath);
+            const kg = getActiveKG();
+            if (kg) {
+              try { rebuildKGForFile(kg, kgCwd, relPath); } catch { /* non-critical */ }
+            }
+          }, 1500));
+        }),
+      );
+    }
+  }
 
   // Show walkthrough on first activation — always, regardless of existing plans
   const hasSeenWalkthrough = context.globalState.get<boolean>('agentTaskPlayer.hasSeenWalkthrough', false);
@@ -3791,6 +3866,9 @@ async function cmdPreviewTaskPrompt(arg?: unknown): Promise<void> {
         `| Context chars used | **${budgetUsage.totalCharsUsed.toLocaleString()} / ${budgetUsage.totalCharsBudget.toLocaleString()}** (${ctxPct}%) |`,
         `| Sections dropped | ${budgetUsage.sectionsDropped} |`,
         `| Semantic retrieval | ${budgetUsage.usedSemanticRetrieval ? `yes — ${budgetUsage.semanticSpansReturned} span${budgetUsage.semanticSpansReturned !== 1 ? 's' : ''}` : 'no'} |`,
+        ...(budgetUsage.sectionBreakdown && Object.keys(budgetUsage.sectionBreakdown).length > 0
+          ? [`| Sections | ${Object.entries(budgetUsage.sectionBreakdown).map(([k, v]) => `${k}: ${v.toLocaleString()}`).join(' · ')} |`]
+          : []),
         `| **Total prompt** | **~${tokenEst.toLocaleString()} tokens · ${totalChars.toLocaleString()} chars** |`,
         ``,
         `---`,
@@ -4325,6 +4403,136 @@ function readLastFrictionReport(): RunFrictionReport | null {
     const age = Date.now() - new Date(report.date).getTime();
     return age < 86_400_000 ? report : null;
   } catch { return null; }
+}
+
+async function cmdRunContextEval(): Promise<void> {
+  const moagDir = getMoagDir();
+  if (!moagDir) { vscode.window.showWarningMessage('No .moag directory found. Open a workspace with a plan first.'); return; }
+
+  // Gather all history entries from historyStore
+  const allEntries = historyStore.getAll?.() ?? [];
+
+  // Compute 7 evaluation metrics from instrumented history
+  const instrumented = allEntries.filter((e: import('./models/types').HistoryEntry) => e.contextBudgetUsage);
+  const total = allEntries.length;
+  const withCtx = instrumented.length;
+
+  const completed = allEntries.filter((e: import('./models/types').HistoryEntry) => e.status === 'completed');
+  const failed    = allEntries.filter((e: import('./models/types').HistoryEntry) => e.status === 'failed');
+  const autoFixed = allEntries.filter((e: import('./models/types').HistoryEntry) => (e as import('./models/types').HistoryEntry & { autoFixed?: boolean }).autoFixed);
+
+  const successRate = total > 0 ? Math.round((completed.length / total) * 100) : 0;
+  const firstAttemptSuccess = total > 0
+    ? Math.round(((completed.length - autoFixed.length) / total) * 100) : 0;
+
+  const ctxEfficiencies = instrumented.map((e: import('./models/types').HistoryEntry) =>
+    e.contextBudgetUsage!.totalCharsBudget > 0
+      ? e.contextBudgetUsage!.totalCharsUsed / e.contextBudgetUsage!.totalCharsBudget
+      : 0,
+  );
+  const avgCtxEfficiency = ctxEfficiencies.length > 0
+    ? Math.round((ctxEfficiencies.reduce((a: number, b: number) => a + b, 0) / ctxEfficiencies.length) * 100) : 0;
+
+  const signalDensities = instrumented
+    .filter((e: import('./models/types').HistoryEntry) => e.contextBudgetUsage!.totalCharsUsed > 0 && (e.changedFiles?.length ?? 0) > 0)
+    .map((e: import('./models/types').HistoryEntry) => (e.changedFiles?.length ?? 0) / e.contextBudgetUsage!.totalCharsUsed * 10000);
+  const avgSignalDensity = signalDensities.length > 0
+    ? (signalDensities.reduce((a: number, b: number) => a + b, 0) / signalDensities.length).toFixed(2) : 'n/a';
+
+  const avgSectionsDropped = instrumented.length > 0
+    ? (instrumented.reduce((a: number, e: import('./models/types').HistoryEntry) => a + (e.contextBudgetUsage!.sectionsDropped), 0) / instrumented.length).toFixed(2)
+    : 'n/a';
+
+  const tokensEntries = allEntries.filter((e: import('./models/types').HistoryEntry) => (e as import('./models/types').HistoryEntry & { tokenUsage?: { inputTokens: number; outputTokens: number; estimatedCostUsd: number } }).tokenUsage);
+  const totalCostUsd = tokensEntries.reduce((a: number, e: import('./models/types').HistoryEntry) => {
+    const tu = (e as import('./models/types').HistoryEntry & { tokenUsage?: { estimatedCostUsd: number } }).tokenUsage;
+    return a + (tu?.estimatedCostUsd ?? 0);
+  }, 0);
+  const costPerSuccess = completed.length > 0 && totalCostUsd > 0
+    ? `$${(totalCostUsd / completed.length).toFixed(4)}` : 'n/a';
+
+  // Read all friction reports for retry rate
+  let avgRetries = 'n/a';
+  try {
+    const logPath = path.join(moagDir, 'feedback.jsonl');
+    if (fs.existsSync(logPath)) {
+      const reports = fs.readFileSync(logPath, 'utf-8').trim().split('\n').filter(Boolean)
+        .map((l: string) => { try { return JSON.parse(l) as RunFrictionReport; } catch { return null; } })
+        .filter(Boolean) as RunFrictionReport[];
+      const allFriction = reports.flatMap((r: RunFrictionReport) => r.friction ?? []);
+      if (allFriction.length > 0) {
+        const totalAttempts = allFriction.reduce((a: number, f: { attempts: number }) => a + f.attempts, 0);
+        avgRetries = (totalAttempts / allFriction.length).toFixed(2);
+      }
+    }
+  } catch { /* best-effort */ }
+
+  // Section breakdown averages
+  const sectionTotals: Record<string, number[]> = {};
+  for (const e of instrumented) {
+    const bd = e.contextBudgetUsage!.sectionBreakdown ?? {};
+    for (const [k, v] of Object.entries(bd)) {
+      if (!sectionTotals[k]) { sectionTotals[k] = []; }
+      sectionTotals[k].push(v as number);
+    }
+  }
+  const sectionAvgRows = Object.entries(sectionTotals)
+    .sort(([, a], [, b]) => b.reduce((x: number, y: number) => x + y, 0) - a.reduce((x: number, y: number) => x + y, 0))
+    .map(([k, vals]) => `| ${k} | ${Math.round(vals.reduce((a: number, b: number) => a + b, 0) / vals.length).toLocaleString()} | ${vals.length} |`)
+    .join('\n');
+
+  const reportLines = [
+    `# MOAG Context Efficiency Report`,
+    ``,
+    `Generated from **${total}** history entries (${withCtx} with context instrumentation).`,
+    ``,
+    `## Evaluation Metrics`,
+    ``,
+    `| Metric | Value |`,
+    `|--------|-------|`,
+    `| Task success rate | ${successRate}% (${completed.length}/${total}) |`,
+    `| First-attempt success | ${firstAttemptSuccess}% |`,
+    `| Context efficiency ratio | ${avgCtxEfficiency}% (chars used / budget) |`,
+    `| Avg signal density | ${avgSignalDensity} (files/10K chars) |`,
+    `| Avg sections dropped | ${avgSectionsDropped} |`,
+    `| Cost per success | ${costPerSuccess} |`,
+    `| Avg retries per task | ${avgRetries} |`,
+    ``,
+    `## Average Chars per Section (instrumented tasks)`,
+    ``,
+    sectionTotals && Object.keys(sectionTotals).length > 0
+      ? `| Section | Avg chars | Tasks |\n|---------|-----------|-------|\n${sectionAvgRows}`
+      : `_No section breakdown data yet — run tasks to populate._`,
+    ``,
+    `## Interpretation`,
+    ``,
+    `- **Context efficiency ratio < 50%**: context budget is oversized — reduce \`maxContextChars\``,
+    `- **Sections dropped > 0**: budget is too tight for some tasks — consider increasing for agent tasks`,
+    `- **Signal density > 1.0**: good — each 10K chars of context drives ≥1 file change`,
+    `- **First-attempt success < 70%**: agents may be getting noisy/irrelevant context`,
+  ];
+
+  const doc = await vscode.workspace.openTextDocument({ content: reportLines.join('\n'), language: 'markdown' });
+  await vscode.window.showTextDocument(doc, { preview: true });
+}
+
+async function cmdAnalyzeContextWeights(): Promise<void> {
+  const moagDir = getMoagDir();
+  if (!moagDir) { vscode.window.showWarningMessage('No .moag directory found.'); return; }
+  const all = historyStore.getAll();
+  const instrumented = all.filter(e => e.contextBudgetUsage);
+  if (instrumented.length < 20) {
+    vscode.window.showInformationMessage(
+      `Need ≥20 instrumented tasks to compute weights (have ${instrumented.length}). Run more tasks first.`,
+    );
+    return;
+  }
+  const weights = analyzeWeights(instrumented);
+  saveWeights(moagDir, weights);
+  invalidateWeightsCache();
+  vscode.window.showInformationMessage(
+    `Context weights updated from ${weights.sampleCount} tasks. Active on next task run.`,
+  );
 }
 
 function buildFrictionIssueBody(report: RunFrictionReport, notes: string): string {

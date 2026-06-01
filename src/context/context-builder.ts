@@ -6,6 +6,28 @@ import * as path from 'path';
 import { Plan, Playlist, Task, TaskStatus, HistoryEntry } from '../models/types';
 import { HistoryStore } from '../history/store';
 import { semanticSearch, formatSpans, SemanticSpan } from './semantic-provider';
+import { KnowledgeGraph, lookupSymbols, buildKG as _buildKG } from './knowledge-graph';
+import { ContextWeights, DEFAULT_WEIGHTS, loadWeights } from './weights';
+
+// ─── KG singleton — set by extension on activate, updated on file-save ───────
+let _activeKG: KnowledgeGraph | null = null;
+export function setActiveKG(kg: KnowledgeGraph | null): void { _activeKG = kg; }
+export function getActiveKG(): KnowledgeGraph | null { return _activeKG; }
+// Re-export buildKG so extension.ts only needs to import from context-builder
+export { _buildKG as buildKG };
+
+// ─── Weights cache — loaded lazily, invalidated after analyzeContextWeights ──
+let _cachedWeights: ContextWeights | null = null;
+let _weightsMoagDir: string | null = null;
+export function setWeightsMoagDir(moagDir: string): void { _weightsMoagDir = moagDir; _cachedWeights = null; }
+export function invalidateWeightsCache(): void { _cachedWeights = null; }
+function getWeights(): ContextWeights {
+  if (_cachedWeights) { return _cachedWeights; }
+  if (_weightsMoagDir) {
+    try { _cachedWeights = loadWeights(_weightsMoagDir); return _cachedWeights; } catch { /* fallback */ }
+  }
+  return DEFAULT_WEIGHTS;
+}
 
 /** Telemetry record for context budget usage — populated by buildContext */
 export interface ContextBudgetUsage {
@@ -19,6 +41,8 @@ export interface ContextBudgetUsage {
   usedSemanticRetrieval: boolean;
   /** Number of high-confidence semantic spans returned */
   semanticSpansReturned: number;
+  /** Chars consumed per retained section (key = section name without "## " prefix) */
+  sectionBreakdown?: Record<string, number>;
 }
 
 /** Toggles and limits for context injection */
@@ -97,6 +121,31 @@ export function getContextSettings(): ContextSettings {
   };
 }
 
+/**
+ * Compute a task-appropriate context budget rather than using the global maximum for all tasks.
+ *
+ * Signals used (no LLM call — all derived from task metadata):
+ * - task.type: command/visual-test tasks need far less context than agent tasks
+ * - task.dependsOn.length: more dependencies → need more prior output context
+ * - task.prompt.length: longer/more detailed prompts signal more complex tasks
+ *
+ * The result replaces `settings.maxContextChars` for this specific task execution.
+ */
+export function adaptiveContextBudget(task: Task, baseBudget: number): number {
+  const typeScale =
+    task.type === 'command'      ? 0.15 :
+    task.type === 'visual-test'  ? 0.30 :
+    1.0;
+
+  // Extra budget per explicit dependency (up to 5 extra × 500 chars = 2,500 max bonus)
+  const depBonus = Math.min((task.dependsOn?.length ?? 0), 5) * 500;
+
+  // Prompt complexity bonus: very long prompts signal multi-step requirements
+  const promptBonus = task.prompt && task.prompt.length > 800 ? 1000 : 0;
+
+  return Math.floor((baseBudget + depBonus + promptBonus) * typeScale);
+}
+
 interface Section {
   priority: number; // lower = higher priority (kept first)
   header: string;
@@ -171,36 +220,48 @@ export function buildContext(options: ContextOptions): string {
     }
   }
 
-  // Merge progress + changed files into one section — both describe prior task outcomes,
-  // no reason to spend two budget slots and two headers on overlapping information.
-  if (settings.cumulativeProgress || settings.changedFiles) {
-    const body = gatherProgressAndFiles(
-      options.historyStore, options.plan, options.playlist, options.task,
-      { progress: settings.cumulativeProgress, changedFiles: settings.changedFiles },
-    );
-    if (body) {
-      sections.push({ priority: 2, header: '## Progress', body });
-    }
-  }
+  // Adjust section priorities based on task type.
+  // command/visual-test tasks don't need code spans — lower their priority so
+  // Output (what the prior task did) surfaces first when budget is tight.
+  const taskType = options.task.type ?? 'agent';
+  const codePriority = (taskType === 'command' || taskType === 'visual-test') ? 5 : 3;
+  const outputPriority = taskType === 'command' ? 2 : 4;
 
   // Ranked spans from retrieval cascade — preferred over whole-file content
   if (options.retrievedSpans && options.retrievedSpans.length > 0) {
     const spanBudget = Math.floor(settings.maxFileContextChars * 0.8);
     const body = formatSpans(options.retrievedSpans, spanBudget);
     if (body) {
-      sections.push({ priority: 3, header: '## Code', body });
+      sections.push({ priority: codePriority, header: '## Code', body });
     }
   } else if (settings.relevantFiles) {
     const body = gatherRelevantFiles(options.task, options.cwd, settings, isFirstTask);
     if (body) {
-      sections.push({ priority: 3, header: '## Files', body });
+      sections.push({ priority: codePriority, header: '## Files', body });
     }
   }
 
+  // Build Output first so we know which task IDs it covers — Progress suppresses those
+  // to avoid showing the same task in two sections.
+  const outputTaskIds = new Set<string>();
   if (settings.priorTaskOutputs) {
-    const body = gatherPriorOutputs(options.historyStore, options.plan, options.playlist, options.task, settings);
+    const body = gatherPriorOutputs(
+      options.historyStore, options.plan, options.playlist, options.task, settings, outputTaskIds,
+    );
     if (body) {
-      sections.push({ priority: 4, header: '## Output', body });
+      sections.push({ priority: outputPriority, header: '## Output', body });
+    }
+  }
+
+  // Merge progress + changed files — suppress tasks already shown in Output.
+  if (settings.cumulativeProgress || settings.changedFiles) {
+    const body = gatherProgressAndFiles(
+      options.historyStore, options.plan, options.playlist, options.task,
+      { progress: settings.cumulativeProgress, changedFiles: settings.changedFiles },
+      outputTaskIds.size > 0 ? outputTaskIds : undefined,
+    );
+    if (body) {
+      sections.push({ priority: 2, header: '## Progress', body });
     }
   }
 
@@ -249,12 +310,16 @@ export function buildContext(options: ContextOptions): string {
   );
 
   if (options.budgetUsage) {
+    const sectionBreakdown = Object.fromEntries(
+      trimmed.map(s => [s.header.replace(/^## /, ''), s.header.length + 1 + s.body.length + 2]),
+    );
     Object.assign(options.budgetUsage, {
       totalCharsUsed,
       totalCharsBudget: settings.maxContextChars,
       sectionsDropped,
       usedSemanticRetrieval,
       semanticSpansReturned,
+      sectionBreakdown,
     } satisfies ContextBudgetUsage);
   }
 
@@ -266,6 +331,8 @@ export function buildContext(options: ContextOptions): string {
  * Run the full retrieval cascade for a task prompt and return ranked spans.
  *
  * Stages (highest priority first):
+ * 0. KG lookup — O(1) symbol index built at workspace open; replaces file-scan for
+ *    known exported symbols (confidence 0.7). Falls through to Stage 1 for unknowns.
  * 1. Symbol/project hints — camelCase/PascalCase identifiers extracted from prompt,
  *    scanned in-process across up to 30 source files (confidence 0.6)
  * 2. rg/glob keyword search — broader token extraction (ALL_CAPS, snake_case, plain
@@ -283,13 +350,27 @@ export async function runRetrievalCascade(
   cwd: string,
   budget: number,
 ): Promise<{ spans: SemanticSpan[]; usedSemantic: boolean }> {
+  // Stage 0 — KG lookup: O(1) for symbols already indexed (confidence 0.7)
+  // Symbols found in KG skip the 30-file scan of Stage 1.
+  let kgSpans: SemanticSpan[] = [];
+  const kg = _activeKG;
+  if (kg) {
+    const symbolMatches = Array.from(task.prompt.matchAll(SYMBOL_HINT_PATTERN), m => m[1]);
+    kgSpans = lookupSymbols(kg, symbolMatches);
+  }
+  const kgCoveredFiles = new Set(kgSpans.map(s => s.filePath));
+
   // Stage 1 — symbol/project hint spans (camelCase/PascalCase, confidence 0.6)
-  const hintSpans = gatherSymbolHintSpans(task.prompt, cwd, budget);
+  // Only run for files not already covered by KG.
+  const hintSpansAll = gatherSymbolHintSpans(task.prompt, cwd, budget);
+  const hintSpans = kgCoveredFiles.size > 0
+    ? hintSpansAll.filter(s => !kgCoveredFiles.has(s.filePath))
+    : hintSpansAll;
 
   // Stage 2 — rg/glob keyword spans (broader coverage, confidence 0.65)
   // Overlapping hint spans in the same files are replaced by the higher-confidence rg spans
   const rgSpans = gatherRgGlobSpans(task.prompt, cwd, budget);
-  const deterministicSpans = mergeSpans(hintSpans, rgSpans);
+  const deterministicSpans = mergeSpans([...kgSpans, ...hintSpans], rgSpans);
 
   // Stage 3 — semantic provider (async, optional, highest quality)
   const semanticSpans = await semanticSearch({
@@ -627,9 +708,30 @@ export function gatherPlanOverview(plan: Plan, currentPlaylist: Playlist, curren
   lines.push('');
 
   // Only emit: completed/failed/blocked tasks + current + next 2 upcoming.
-  // Skipping all other future tasks keeps the overview short regardless of plan size.
+  // Fully-completed playlists are collapsed to one summary line — listing every [done]
+  // task from finished playlists wastes budget with no signal value.
   const LOOKAHEAD = 2;
   for (const pl of plan.playlists) {
+    const isCurrentPlaylist = pl.tasks.some(t => t.id === currentTask.id);
+
+    if (!isCurrentPlaylist && pl.tasks.length > 0) {
+      const nPending = pl.tasks.filter(t =>
+        (t.status ?? TaskStatus.Pending) === TaskStatus.Pending).length;
+
+      if (nPending === 0) {
+        // All done — collapse to one summary line
+        const nDone   = pl.tasks.filter(t => t.status === TaskStatus.Completed).length;
+        const nFailed = pl.tasks.filter(t => t.status === TaskStatus.Failed).length;
+        const extra   = nFailed > 0 ? `, ${nFailed} failed` : '';
+        lines.push(`✓ Playlist "${pl.name}" (${nDone} done${extra})`);
+        continue;
+      }
+      if (nPending === pl.tasks.length) {
+        continue; // all-future playlist — omit entirely
+      }
+    }
+
+    // Current playlist or mixed playlist — show in detail
     const relevantTasks = pl.tasks.filter((t, idx) => {
       const s = t.status ?? TaskStatus.Pending;
       if (s !== TaskStatus.Pending) { return true; } // completed/failed/blocked/skipped/running
@@ -732,6 +834,7 @@ export function gatherProgressAndFiles(
   playlist: Playlist,
   currentTask: Task,
   opts: { progress: boolean; changedFiles: boolean },
+  suppressTaskIds?: Set<string>,
 ): string {
   const allTasks = plan.playlists.flatMap(pl => pl.tasks);
   const lines: string[] = [];
@@ -741,6 +844,8 @@ export function gatherProgressAndFiles(
     if (t.id === currentTask.id) { break; }
     const s = t.status ?? TaskStatus.Pending;
     if (s === TaskStatus.Pending || s === TaskStatus.Running) { continue; }
+    // Skip tasks already shown in full in the Output section — no duplicate
+    if (suppressTaskIds?.has(t.id)) { continue; }
 
     totalEntries++;
     if (totalEntries > MAX_PROGRESS_ENTRIES) { continue; }
@@ -784,6 +889,7 @@ export function scorePriorEntry(
   entry: HistoryEntry,
   currentTask: Task,
   recencyIndex: number,
+  currentPlaylistId?: string,
 ): number {
   if ((currentTask.dependsOn ?? []).includes(entry.taskId)) { return 1.0; }
 
@@ -805,7 +911,17 @@ export function scorePriorEntry(
   // Recency: weak tie-breaker — most recent = highest score
   const recencyScore = 1 / (recencyIndex + 1);
 
-  return 0.5 * tokenScore + 0.4 * fileScore + 0.1 * recencyScore;
+  const base = 0.5 * tokenScore + 0.4 * fileScore + 0.1 * recencyScore;
+
+  // Cross-playlist penalty: outputs from other playlists are rarely relevant
+  // to the current task — push them below same-playlist entries.
+  const samePlaylist = !currentPlaylistId || entry.playlistId === currentPlaylistId;
+  const penalised = samePlaylist ? base : base * 0.4;
+
+  // Outcome-learned task-type multiplier (≈1.0 until enough data accumulates)
+  const weights = getWeights();
+  const typeMultiplier = weights.taskTypeWeights[entry.taskType ?? 'agent'] ?? 1.0;
+  return penalised * typeMultiplier;
 }
 
 /** Extract unique file basenames mentioned in a prompt string */
@@ -825,6 +941,7 @@ export function gatherPriorOutputs(
   playlist: Playlist,
   currentTask: Task,
   settings: ContextSettings,
+  outTaskIds?: Set<string>,
 ): string {
   // Collect candidate task IDs, ordered most-recent-first (closest to current task)
   const playlistTaskIds = playlist.tasks.map(t => t.id);
@@ -878,13 +995,19 @@ export function gatherPriorOutputs(
 
   if (resolved.length === 0) { return ''; }
 
-  // Sort by relevance: explicit deps always first (score 1.0), then by scored relevance
+  // Sort by relevance: explicit deps always first (score 1.0), then by scored relevance.
+  // Cross-playlist entries are penalised (×0.4) — they're rarely relevant once a playlist is done.
   resolved.sort((a, b) =>
-    scorePriorEntry(b.entry, currentTask, b.recencyIndex) -
-    scorePriorEntry(a.entry, currentTask, a.recencyIndex),
+    scorePriorEntry(b.entry, currentTask, b.recencyIndex, playlist.id) -
+    scorePriorEntry(a.entry, currentTask, a.recencyIndex, playlist.id),
   );
 
   const capped = resolved.slice(0, settings.maxPriorTasks ?? 3);
+
+  // Expose selected task IDs so the Progress section can suppress duplicates
+  if (outTaskIds) {
+    for (const { taskId } of capped) { outTaskIds.add(taskId); }
+  }
 
   const parts: string[] = [];
   for (const { taskId, name, entry } of capped) {

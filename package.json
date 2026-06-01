@@ -403,6 +403,18 @@
         "icon": "$(feedback)"
       },
       {
+        "command": "agentTaskPlayer.runContextEval",
+        "title": "Run Context Efficiency Report",
+        "category": "MOAG",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "agentTaskPlayer.analyzeContextWeights",
+        "title": "Analyze Context Weights from History",
+        "category": "MOAG",
+        "icon": "$(symbol-event)"
+      },
+      {
         "command": "agentTaskPlayer.reviewSelfIssues",
         "title": "Review MOAG Self-Issues",
         "category": "MOAG",

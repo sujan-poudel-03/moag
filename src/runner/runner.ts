@@ -26,7 +26,7 @@ import { resolveProfile, resolveValidationProfile, ProfileName, ProfileConfig } 
 import { getEngine } from '../adapters/index';
 import { getValidationAdapters, validationResultToEngineResult } from '../adapters/validation/index';
 import { HistoryStore } from '../history/store';
-import { buildContext, getContextSettings, runRetrievalCascade } from '../context/context-builder';
+import { buildContext, getContextSettings, runRetrievalCascade, adaptiveContextBudget } from '../context/context-builder';
 import { extractSummary } from '../context/memory-extractor';
 import { analyzeProject } from '../context/project-analyzer';
 import { PromptLibraryStore } from '../templates/prompt-library';
@@ -1341,6 +1341,12 @@ export class TaskRunner {
         modelReason: (task as Task & { _modelReason?: string })._modelReason,
         validationTargetResults: (task as Task & { _validationTargetResults?: HistoryEntry['validationTargetResults'] })._validationTargetResults,
         summary: extractSummary(result.stdout, changedFiles.length > 0 ? changedFiles : undefined),
+        contextBudgetUsage: (task as Task & { _budgetUsage?: HistoryEntry['contextBudgetUsage'] })._budgetUsage,
+        tokenUsage: result.tokenUsage ? {
+          inputTokens: result.tokenUsage.inputTokens ?? 0,
+          outputTokens: result.tokenUsage.outputTokens ?? 0,
+          estimatedCostUsd: result.tokenUsage.estimatedCost ?? 0,
+        } : undefined,
       };
       this.historyStore.add(entry);
       this.trackTaskCost(result);
@@ -2337,9 +2343,13 @@ export class TaskRunner {
       // Consume the queue — screenshots attach to the first task after capture
       this._pendingScreenshots = [];
 
-      // Run retrieval cascade: symbol hints → semantic provider
+      // Run retrieval cascade: symbol hints → semantic provider.
+      // Skip for command/visual-test tasks — they don't read source files.
+      const needsCodeContext = task.type !== 'command' && task.type !== 'visual-test';
       const { spans: retrievedSpans, usedSemantic: retrievedSpansUsedSemantic } =
-        await runRetrievalCascade(task, cwd, settings.maxFileContextChars);
+        needsCodeContext
+          ? await runRetrievalCascade(task, cwd, settings.maxFileContextChars)
+          : { spans: [], usedSemantic: false };
 
       const ruleParts: string[] = [];
       const storeRules = this._aiRulesStore?.getEnabledText(cwd) ?? '';
@@ -2352,13 +2362,27 @@ export class TaskRunner {
         ? this.historyStore.getThread(threadMeta._threadId)
             .filter(e => (e.turnIndex ?? 0) < (threadMeta._turnIndex ?? 0))
         : undefined;
+      const effectiveBudget = adaptiveContextBudget(task, settings.maxContextChars);
+      const effectiveSettings = effectiveBudget !== settings.maxContextChars
+        ? { ...settings, maxContextChars: effectiveBudget }
+        : settings;
+      const budgetUsage: import('../context/context-builder').ContextBudgetUsage = {
+        totalCharsUsed: 0, totalCharsBudget: effectiveBudget,
+        sectionsDropped: 0, usedSemanticRetrieval: false, semanticSpansReturned: 0,
+      };
       const ctx = buildContext({
-        plan, playlist, task, cwd, historyStore: this.historyStore, settings,
+        plan, playlist, task, cwd, historyStore: this.historyStore, settings: effectiveSettings,
+        budgetUsage,
         pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
         aiRules: aiRules || undefined,
         priorThread: priorThread?.length ? priorThread : undefined,
         sandboxUrl: (playlist.testPhase && this._sandboxUrl) ? this._sandboxUrl : undefined,
       });
+      // Stash telemetry on task for the history entry and dashboard (same pattern as _modelId)
+      (task as Task & { _budgetUsage?: typeof budgetUsage })._budgetUsage = budgetUsage;
+      // Stash unique retrieved file paths for the Context Memory dashboard panel
+      const retrievedFiles = [...new Set(retrievedSpans.map(s => s.filePath))];
+      (task as Task & { _retrievedFiles?: string[] })._retrievedFiles = retrievedFiles;
       if (ctx) {
         prompt += ctx + '\n\n';
       }

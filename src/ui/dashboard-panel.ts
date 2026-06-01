@@ -209,6 +209,19 @@ export class DashboardPanel {
     this.safePostMessage({ type: 'engine-fallback', fromEngine, toEngine });
   }
 
+  /** Push context memory info to the dashboard for the current task */
+  public postContextMemory(info: {
+    taskId: string;
+    taskName: string;
+    sections: Array<{ name: string; chars: number }>;
+    totalCharsUsed: number;
+    totalCharsBudget: number;
+    sectionsDropped: number;
+    retrievedFiles: string[];
+  }): void {
+    this.safePostMessage({ type: 'context-memory', ...info });
+  }
+
   /** Append output chunk to the live output panel (rate-limited to prevent webview freeze) */
   public appendOutput(text: string, stream: 'stdout' | 'stderr', taskId?: string): void {
     this._outputBuffer.push({ text, stream, taskId });
@@ -957,6 +970,20 @@ export class DashboardPanel {
     .diff-add { background: rgba(78,201,176,0.15); color: inherit; display: block; }
     .diff-hunk { color: var(--dimmed); font-style: italic; display: block; }
 
+    /* ─── Context Memory Panel ─── */
+    .ctx-mem-section { border-top: 1px solid var(--border); flex-shrink: 0; }
+    .ctx-mem-body { padding: 6px 12px 10px; font-size: 11px; }
+    .ctx-mem-task { font-size: 10px; color: var(--vscode-descriptionForeground); margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ctx-mem-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
+    .ctx-mem-bar-wrap { flex: 1; background: rgba(255,255,255,0.06); border-radius: 3px; height: 5px; overflow: hidden; }
+    .ctx-mem-bar { height: 100%; border-radius: 3px; background: var(--vscode-textLink-foreground); }
+    .ctx-mem-name { width: 72px; flex-shrink: 0; color: var(--vscode-foreground); font-weight: 600; }
+    .ctx-mem-chars { width: 52px; flex-shrink: 0; text-align: right; color: var(--vscode-descriptionForeground); }
+    .ctx-mem-total { display: flex; justify-content: space-between; margin-top: 6px; padding-top: 5px; border-top: 1px solid rgba(255,255,255,0.07); color: var(--vscode-descriptionForeground); }
+    .ctx-mem-total-pct { font-weight: 600; color: var(--vscode-foreground); }
+    .ctx-mem-files { margin-top: 4px; color: var(--vscode-descriptionForeground); line-height: 1.5; }
+    .ctx-mem-dropped { color: var(--vscode-editorWarning-foreground); font-size: 10px; margin-top: 3px; }
+
     /* ─── Sandbox Panel ─── */
     .sandbox-section { border-top: 1px solid var(--border); flex-shrink: 0; }
     .sandbox-content { padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 8px; }
@@ -1087,6 +1114,18 @@ export class DashboardPanel {
 
     <!-- COMPLETE: Completed cards -->
     <div class="completed-section" id="completed-section" hidden></div>
+
+    <!-- Context Memory Panel — shows what the agent sees before executing -->
+    <div class="ctx-mem-section" id="ctx-mem-section" hidden>
+      <button class="section-toggle" data-section="ctx-mem" onclick="toggleSection('ctx-mem')">
+        <span class="section-toggle-icon">&#x25BC;</span>
+        <span class="section-toggle-label">Context Memory</span>
+        <span class="section-toggle-count" id="ctx-mem-count"></span>
+      </button>
+      <div class="section-body" id="body-ctx-mem">
+        <div class="ctx-mem-body" id="ctx-mem-body"></div>
+      </div>
+    </div>
 
     <!-- Sandbox Panel — always shown when a workspace is open -->
     <div class="sandbox-section" id="sandbox-section">
@@ -1652,6 +1691,9 @@ export class DashboardPanel {
           }
           break;
         }
+        case 'context-memory':
+          renderContextMemory(msg);
+          break;
         case 'sandbox-state':
           renderSandboxPanel(msg.sandboxState);
           break;
@@ -1671,6 +1713,48 @@ export class DashboardPanel {
         renderSandboxPanel(msg.sandboxState);
       }
     });
+
+    // ─── Context Memory Panel ───
+
+    function renderContextMemory(msg) {
+      var section = document.getElementById('ctx-mem-section');
+      var body = document.getElementById('ctx-mem-body');
+      var count = document.getElementById('ctx-mem-count');
+      if (!section || !body) { return; }
+
+      var sections = msg.sections || [];
+      var totalUsed = msg.totalCharsUsed || 0;
+      var totalBudget = msg.totalCharsBudget || 1;
+      var pct = Math.round((totalUsed / totalBudget) * 100);
+      var dropped = msg.sectionsDropped || 0;
+      var files = msg.retrievedFiles || [];
+
+      section.hidden = false;
+      if (count) { count.textContent = pct + '% used'; }
+
+      var html = '<div class="ctx-mem-task">' + (msg.taskName || '') + '</div>';
+      sections.forEach(function(s) {
+        var sPct = Math.round((s.chars / totalBudget) * 100);
+        html += '<div class="ctx-mem-row">' +
+          '<span class="ctx-mem-name">' + s.name + '</span>' +
+          '<div class="ctx-mem-bar-wrap"><div class="ctx-mem-bar" style="width:' + sPct + '%"></div></div>' +
+          '<span class="ctx-mem-chars">' + s.chars.toLocaleString() + '</span>' +
+          '</div>';
+      });
+      html += '<div class="ctx-mem-total">' +
+        '<span>Total</span>' +
+        '<span class="ctx-mem-total-pct">' + totalUsed.toLocaleString() + ' / ' + totalBudget.toLocaleString() + ' chars (' + pct + '%)</span>' +
+        '</div>';
+      if (dropped > 0) {
+        html += '<div class="ctx-mem-dropped">&#9888; ' + dropped + ' section' + (dropped > 1 ? 's' : '') + ' dropped (budget exceeded)</div>';
+      }
+      if (files.length > 0) {
+        html += '<div class="ctx-mem-files">Retrieved: ' + files.map(function(f) {
+          return f.split(/[/\\]/).pop();
+        }).join(', ') + '</div>';
+      }
+      body.innerHTML = html;
+    }
 
     // ─── Sandbox Panel ───
 
@@ -2277,7 +2361,7 @@ export class DashboardPanel {
       updateTimers();
     }
 
-    const collapsedSections = { completed: false, sandbox: true };
+    const collapsedSections = { completed: false, sandbox: true, 'ctx-mem': false };
 
     function toggleSection(sectionId) {
       collapsedSections[sectionId] = !collapsedSections[sectionId];

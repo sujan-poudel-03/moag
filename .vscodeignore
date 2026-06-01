@@ -16,6 +16,7 @@ examples/**
 media/icon.svg
 *.test.*
 *.vsix
+releases/**
 out/test/**
 .moag/**
 debug.log

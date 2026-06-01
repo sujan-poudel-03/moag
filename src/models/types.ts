@@ -332,6 +332,23 @@ export interface HistoryEntry {
     sectionsDropped: number;
     usedSemanticRetrieval: boolean;
     semanticSpansReturned: number;
+    sectionBreakdown?: Record<string, number>;
+  };
+  /** Token consumption for this task (input + output) */
+  tokenUsage?: {
+    inputTokens: number;
+    outputTokens: number;
+    estimatedCostUsd: number;
+  };
+  /** Snapshot of context settings active during this task — enables reproducibility analysis */
+  contextSettingsSnapshot?: {
+    maxContextChars: number;
+    maxFileContextChars: number;
+    maxPriorTasks: number;
+    maxOutputPerTask: number;
+    planOverview: boolean;
+    priorTaskOutputs: boolean;
+    relevantFiles: boolean;
   };
 }
 
