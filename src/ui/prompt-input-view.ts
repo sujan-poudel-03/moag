@@ -21,6 +21,9 @@ export interface PromptSidebarListItem {
   status?: string;
   planName?: string;
   playlistName?: string;
+  failureReason?: string;
+  filesChanged?: number;
+  taskId?: string;
 }
 
 export interface PromptSidebarPlanGroup {
@@ -930,6 +933,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     .history-title { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
     .history-breadcrumb { font-size: 9px; color: var(--vscode-descriptionForeground); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; opacity: 0.75; }
     .history-age { font-size: 9px; color: var(--vscode-descriptionForeground); flex-shrink: 0; opacity: 0.6; align-self: center; }
+    .history-failure-reason { font-size: 9px; color: var(--vscode-editorError-foreground, #f14c4c); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; }
+    .history-files-changed { font-size: 9px; color: #73c991; margin-top: 1px; display: block; }
+    .history-retry-btn { flex-shrink: 0; align-self: center; font-size: 11px; padding: 1px 5px; border-radius: 3px; cursor: pointer; border: 1px solid rgba(241,76,76,0.4); background: rgba(241,76,76,0.08); color: #f14c4c; margin-left: 2px; }
+    .history-retry-btn:hover { background: rgba(241,76,76,0.18); }
     .item-tip {
       font-size: 11px; color: var(--vscode-descriptionForeground);
       padding: 8px 10px; border-radius: 6px;
@@ -1378,6 +1385,13 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     }
     .plan-overview-fill.has-failed { background: linear-gradient(90deg, #4fa3ff 0%, #e09d4a 100%); }
     .plan-overview-meta-failed { color: #e09d4a; font-size: 10px; margin-top: 1px; }
+    .plan-overview.done .plan-overview-fill { background: var(--ds-success, #3fb950); }
+    .plan-done-banner { display: flex; align-items: center; justify-content: space-between; margin-top: 6px; padding: 5px 8px; border-radius: 6px; background: rgba(63,185,80,0.08); border: 1px solid rgba(63,185,80,0.25); gap: 8px; }
+    .plan-done-check { font-size: 11px; font-weight: 600; color: var(--ds-success, #3fb950); white-space: nowrap; }
+    .plan-done-actions { display: flex; gap: 5px; flex-shrink: 0; }
+    .plan-done-btn { font-size: 10px; padding: 2px 8px; border-radius: 4px; cursor: pointer; border: 1px solid rgba(63,185,80,0.5); background: rgba(63,185,80,0.15); color: var(--ds-success, #3fb950); }
+    .plan-done-btn.ghost { background: transparent; border-color: rgba(255,255,255,0.15); color: var(--vscode-descriptionForeground); }
+    .plan-done-btn:hover { opacity: 0.85; }
     .plan-queue {
       display: none;
       margin-bottom: 8px;
@@ -2828,7 +2842,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     /* context bar → minimal status footer */
     .context-bar { display: flex; align-items: center; gap: 4px; padding: 1px 2px 0; flex-wrap: nowrap; overflow: hidden; }
     .ctx-chip { font-size: 9px; color: var(--vscode-descriptionForeground); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 140px; }
-    .composer-hint { font-size: 9px; color: var(--vscode-descriptionForeground); opacity: 0.45; padding: 0 2px 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .composer-hint { font-size: 11px; color: var(--vscode-descriptionForeground); opacity: 0.75; padding: 0 2px 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .composer-hint.fix-mode { opacity: 1; color: #4fa3ff; }
     /* Smart Fix prominence bar */
     .plan-status-bar {
@@ -2962,7 +2976,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           <div class="plan-tool-group">
             <button id="planPlayBtn" class="plan-tool-btn" type="button" title="Execute Plan" aria-label="Execute Plan">Execute</button>
             <button id="planRunPendingBtn" class="plan-tool-btn" type="button" title="Run Pending" aria-label="Run Pending">Run</button>
-            <button id="planFixAllBtn" class="fix-all-btn" type="button" title="Re-execute all failed tasks" style="display:none">Fix All</button>
+
             <button id="planSearchBtn" class="plan-tool-btn icon-only" type="button" title="Search Tasks" aria-label="Search Tasks"><svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M6.5 1a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11zm4.986 5.5a4.5 4.5 0 1 0-4.986 4.486A4.5 4.5 0 0 0 11.486 6.5zM14 13l-2.5-2.5.707-.707L14.707 12.29z"/></svg></button>
             <button id="planSwitchQuickBtn" class="plan-tool-btn icon-only" type="button" title="Switch Plan" aria-label="Switch Plan"><svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M5 2l-4 4 4 4V7h5V5H5V2zm6 4v3h-5v2h5v3l4-4-4-4z"/></svg></button>
           </div>
@@ -3018,10 +3032,6 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div id="planLivePanel" class="plan-live-panel" style="display:none"></div>
     <div id="planRulesSection"></div>
-    <div id="tttCriteriaSection" style="display:none">
-      <div id="tttCriteriaList"></div>
-      <button id="tttVerifyBtn" type="button" style="display:none"></button>
-    </div>
     <div id="planListHeading" class="plan-list-heading"><input id="planListSelectModeCb" type="checkbox" aria-label="Enable selection mode" title="Enable selection mode — check tasks/playlists for bulk actions (Run Selected, etc.)"><span>All Tasks</span><button id="planHeadingCollapseBtn" class="plan-tool-btn" type="button" title="Collapse All" aria-label="Collapse All">Collapse All</button></div>
     <div id="planList" class="list"></div>
     <div id="historyTools" class="history-tools">
@@ -3222,7 +3232,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           <span id="promptCharCount" class="char-count">0</span>
         </div>
         <div class="composer-toolbar-right">
-          <button id="addToPlanBtn" class="add-to-plan-btn" type="button" title="Add to queue (Shift+Enter)" aria-keyshortcuts="Shift+Enter" style="display:none;width:0;padding:0;border:0;overflow:hidden"></button>
+          <button id="addToPlanBtn" class="add-to-plan-btn" type="button" title="Add to queue (Shift+Enter)" aria-keyshortcuts="Shift+Enter">+ Queue</button>
           <button id="send" class="run-btn" type="button" title="Execute (Ctrl+Enter)" aria-keyshortcuts="Control+Enter">
             Execute
             <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="flex-shrink:0"><path d="M3 2l10 6-10 6V2z"/></svg>
@@ -3621,15 +3631,25 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           const breadcrumb = subParts[0] || '';
           const age = subParts.length >= 2 ? subParts[subParts.length - 1].trim() : '';
           const hIcon = historyStatusIcon(item.status);
-          btn.className = 'history-item';
+          const isFailed = item.status === 'failed' || item.status === 'blocked';
+          btn.className = 'history-item' + (isFailed ? ' failed' : '');
           btn.innerHTML =
             '<span class="history-icon ' + hIcon.cls + '">' + hIcon.svg + '</span>' +
             '<span class="history-body">' +
               '<span class="history-title">' + escHtml(item.title || 'Untitled') + '</span>' +
               (breadcrumb ? '<span class="history-breadcrumb">' + escHtml(breadcrumb) + '</span>' : '') +
+              (isFailed && item.failureReason ? '<span class="history-failure-reason">' + escHtml(item.failureReason) + '</span>' : '') +
+              (item.filesChanged ? '<span class="history-files-changed">' + item.filesChanged + 'f changed</span>' : '') +
             '</span>' +
-            (age ? '<span class="history-age">' + escHtml(age) + '</span>' : '');
-          btn.addEventListener('click', () => {
+            (age ? '<span class="history-age">' + escHtml(age) + '</span>' : '') +
+            (isFailed && item.taskId ? '<button class="history-retry-btn" type="button" title="Retry this task">↺</button>' : '');
+          btn.addEventListener('click', (e) => {
+            // Retry button inside the row — don't open the item
+            if ((e.target as HTMLElement).classList.contains('history-retry-btn')) {
+              e.stopPropagation();
+              if (item.taskId) { vscode.postMessage({ type: 'retryTask', taskId: item.taskId }); }
+              return;
+            }
             if (item.id) {
               vscode.postMessage({ type: 'openItem', id: item.id, kind: item.kind || 'history' });
             }
@@ -3913,7 +3933,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         const play = document.createElement('button');
         play.type = 'button';
         play.className = 'plan-group-play';
-        play.title = groupStatus === 'running' ? 'Pause' : groupStatus === 'completed' ? 'Re-execute' : 'Execute';
+        play.title = groupStatus === 'running' ? 'Pause entire run (not just this playlist)' : groupStatus === 'completed' ? 'Re-execute' : 'Execute';
         play.innerHTML = groupStatus === 'running'
           ? '<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><rect x="3.5" y="2.5" width="3.5" height="11" rx="1"/><rect x="9" y="2.5" width="3.5" height="11" rx="1"/></svg>'
           : groupStatus === 'completed'
@@ -4036,7 +4056,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
             ? '<button type="button" class="task-act-btn task-retry" title="Re-execute unchanged">' + SVG_RETRY + '</button>' +
               '<button type="button" class="smart-fix-btn task-fix" title="Pre-fill composer with error context for guided fix">Fix</button>' +
               editBtnHtml + previewBtnHtml
-            : '<button type="button" class="task-act-btn task-toggle" title="' + (status === 'running' ? 'Pause' : 'Execute') + '">' + (status === 'running' ? SVG_PAUSE : SVG_PLAY) + '</button>' +
+            : '<button type="button" class="task-act-btn task-toggle" title="' + (status === 'running' ? 'Pause entire run (not just this task)' : 'Execute') + '">' + (status === 'running' ? SVG_PAUSE : SVG_PLAY) + '</button>' +
               editBtnHtml + previewBtnHtml;
           const tokenMeta = (() => {
             const u = task.tokenUsage;
@@ -4224,16 +4244,52 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       const pct = taskTotal > 0 ? Math.round(((taskCompleted + taskFailed) / taskTotal) * 100) : 0;
 
       const planLabel = (activePlanName || '').replace(/^MOAG\s*[-:]\s*/i, '').trim() || 'Plan';
-      planOverviewTitleEl.textContent = planLabel + ' Progress';
-      planOverviewMetaEl.textContent = playlistDone + '/' + playlistTotal + ' playlists, ' + taskCompleted + '/' + taskTotal + ' tasks completed';
-      planOverviewFillEl.style.width = pct + '%';
-      planOverviewFillEl.classList.toggle('has-failed', taskFailed > 0);
-      if (planOverviewFailedMetaEl) {
-        if (taskFailed > 0) {
-          planOverviewFailedMetaEl.textContent = '⚠ ' + taskFailed + ' task' + (taskFailed === 1 ? '' : 's') + ' failed — use "Fix All" to retry';
-          planOverviewFailedMetaEl.style.display = '';
-        } else {
-          planOverviewFailedMetaEl.style.display = 'none';
+      const allDone = taskTotal > 0 && taskFailed === 0 && (taskCompleted >= taskTotal);
+
+      if (allDone) {
+        // Auto-collapse sandbox + AI rules sections — they're irrelevant for a completed plan
+        if (!sbCollapsed) {
+          sbCollapsed = true;
+          sbToggleEl?.classList.add('collapsed');
+          sbBodyEl?.classList.add('collapsed');
+        }
+        // ─── Completion ceremony: replace progress bar with done banner ───
+        planOverviewTitleEl.textContent = planLabel;
+        planOverviewMetaEl.textContent = taskTotal + ' tasks · ' + playlistTotal + ' playlists — all done';
+        planOverviewFillEl.style.width = '100%';
+        planOverviewFillEl.classList.remove('has-failed');
+        planOverviewEl.classList.add('done');
+        if (planOverviewFailedMetaEl) { planOverviewFailedMetaEl.style.display = 'none'; }
+        // Show done action row (Create PR / New Sprint)
+        var doneBannerEl = document.getElementById('planDoneBanner');
+        if (!doneBannerEl) {
+          doneBannerEl = document.createElement('div');
+          doneBannerEl.id = 'planDoneBanner';
+          doneBannerEl.className = 'plan-done-banner';
+          doneBannerEl.innerHTML =
+            '<span class="plan-done-check">✓ Plan complete</span>' +
+            '<div class="plan-done-actions">' +
+              '<button class="plan-done-btn" onclick="vscode.postMessage({type:\'createPR\'})">Create PR</button>' +
+              '<button class="plan-done-btn ghost" onclick="vscode.postMessage({type:\'switchPlan\'})">New Sprint</button>' +
+            '</div>';
+          planOverviewEl.appendChild(doneBannerEl);
+        }
+        doneBannerEl.style.display = 'flex';
+      } else {
+        planOverviewTitleEl.textContent = planLabel + ' Progress';
+        planOverviewMetaEl.textContent = playlistDone + '/' + playlistTotal + ' playlists, ' + taskCompleted + '/' + taskTotal + ' tasks completed';
+        planOverviewFillEl.style.width = pct + '%';
+        planOverviewFillEl.classList.toggle('has-failed', taskFailed > 0);
+        planOverviewEl.classList.remove('done');
+        var existingBanner = document.getElementById('planDoneBanner');
+        if (existingBanner) { existingBanner.style.display = 'none'; }
+        if (planOverviewFailedMetaEl) {
+          if (taskFailed > 0) {
+            planOverviewFailedMetaEl.textContent = '⚠ ' + taskFailed + ' task' + (taskFailed === 1 ? '' : 's') + ' failed — use "Fix All" to retry';
+            planOverviewFailedMetaEl.style.display = '';
+          } else {
+            planOverviewFailedMetaEl.style.display = 'none';
+          }
         }
       }
 
@@ -4697,6 +4753,30 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       chatFeedEl.textContent = '';
       const list = Array.isArray(messages) ? messages : [];
       chatEmptyEl.style.display = list.length === 0 ? 'block' : 'none';
+
+      // Update empty-state text based on whether a plan with pending tasks is loaded
+      if (list.length === 0) {
+        const pendingTasks = Array.isArray(planGroups)
+          ? planGroups.reduce(function(n, g) {
+              return n + (Array.isArray(g.tasks) ? g.tasks.filter(function(t) {
+                const s = String(t.status || '').toLowerCase();
+                return !s || s === 'pending';
+              }).length : 0);
+            }, 0)
+          : 0;
+        const planHeader = chatEmptyEl.querySelector('strong');
+        if (planHeader) {
+          if (pendingTasks > 0) {
+            planHeader.textContent = pendingTasks + ' task' + (pendingTasks > 1 ? 's' : '') + ' ready to run';
+            const hint = chatEmptyEl.querySelector('br + br') || chatEmptyEl.querySelector('br');
+            // Replace static hint text
+            const secondText = chatEmptyEl.childNodes[2];
+            if (secondText && secondText.nodeType === Node.TEXT_NODE) { secondText.textContent = ''; }
+          } else {
+            planHeader.textContent = 'New conversation';
+          }
+        }
+      }
 
       for (const msg of list) {
         const wrap = document.createElement('div');
@@ -5714,6 +5794,10 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       sbStopEl.style.display = active ? 'inline-block' : 'none';
       sbBadgeEl.textContent = active ? (state.status === 'running' ? 'Running' : 'Starting') : '';
       sbBadgeEl.className = 'sidebar-sandbox-badge ' + (active ? state.status : '');
+      if (sbScreenshotEl) {
+        sbScreenshotEl.disabled = state.status !== 'running';
+        sbScreenshotEl.title = state.status !== 'running' ? 'Start the sandbox first' : 'Capture screenshot and attach to next agent task';
+      }
       if (sbThumbEl) {
         if (state.lastScreenshotPath) {
           sbThumbEl.src = state.lastScreenshotPath;

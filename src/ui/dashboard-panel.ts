@@ -907,6 +907,19 @@ export class DashboardPanel {
       font-size: 12px;
       color: var(--dimmed);
     }
+    /* ─── Quick Composer ─── */
+    .prompt-composer { margin: 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--sidebar-bg); overflow: hidden; }
+    .prompt-composer-header { font-size: 10px; font-weight: 600; color: var(--dimmed); padding: 7px 10px 4px; text-transform: uppercase; letter-spacing: 0.3px; }
+    .prompt-composer-input { width: 100%; box-sizing: border-box; background: transparent; border: none; border-top: 1px solid var(--border); color: var(--fg); font-size: 12px; padding: 8px 10px; resize: none; outline: none; font-family: var(--vscode-editor-font-family, inherit); line-height: 1.5; }
+    .prompt-composer-toolbar { display: flex; align-items: center; gap: 6px; padding: 5px 8px; border-top: 1px solid var(--border); }
+    .prompt-engine-select { font-size: 10px; background: var(--sidebar-bg); color: var(--fg); border: 1px solid var(--border); border-radius: 3px; padding: 1px 4px; }
+    .prompt-char-count { font-size: 10px; color: var(--dimmed); flex: 1; }
+    .prompt-composer-actions { display: flex; gap: 4px; }
+    .prompt-action-btn { font-size: 10px; padding: 2px 8px; border-radius: 3px; cursor: pointer; }
+    .prompt-action-btn.ghost { border: 1px solid var(--border); background: transparent; color: var(--dimmed); }
+    .prompt-action-btn.primary { border: 1px solid rgba(79,163,255,0.5); background: rgba(79,163,255,0.15); color: var(--vscode-textLink-foreground); }
+    .prompt-action-btn:hover { opacity: 0.85; }
+    .prompt-context-pill { padding: 3px 10px 5px; font-size: 10px; color: var(--dimmed); border-top: 1px solid var(--border); }
 
     /* ─── Result Banner ─── */
     .result-banner {
@@ -965,6 +978,12 @@ export class DashboardPanel {
     .cc-error { font-size: 11px; color: var(--error); padding: 2px 8px 4px 28px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .cc-detail { display: none; border-top: 1px solid var(--border); }
     .completed-card.expanded .cc-detail { display: block; }
+    .cc-chevron { font-size: 9px; color: var(--dimmed); flex-shrink: 0; transform: rotate(90deg); transition: transform 0.15s; }
+    .completed-card.expanded .cc-chevron { transform: rotate(270deg); }
+    .cc-actions { display: flex; gap: 6px; padding: 6px 8px 4px; }
+    .cc-btn { font-size: 10px; padding: 2px 7px; border-radius: 3px; cursor: pointer; border: 1px solid rgba(79,163,255,0.4); background: rgba(79,163,255,0.1); color: var(--vscode-textLink-foreground); }
+    .cc-btn.ghost { border-color: rgba(255,255,255,0.15); background: transparent; color: var(--dimmed); }
+    .cc-btn:hover { opacity: 0.85; }
 
     /* ─── Diff Viewer ─── */
     .diff-add { background: rgba(78,201,176,0.15); color: inherit; display: block; }
@@ -974,6 +993,7 @@ export class DashboardPanel {
     .ctx-mem-section { border-top: 1px solid var(--border); flex-shrink: 0; }
     .ctx-mem-body { padding: 6px 12px 10px; font-size: 11px; }
     .ctx-mem-task { font-size: 10px; color: var(--vscode-descriptionForeground); margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .ctx-mem-stale { font-size: 9px; opacity: 0.5; font-style: italic; }
     .ctx-mem-row { display: flex; align-items: center; gap: 6px; padding: 2px 0; }
     .ctx-mem-bar-wrap { flex: 1; background: rgba(255,255,255,0.06); border-radius: 3px; height: 5px; overflow: hidden; }
     .ctx-mem-bar { height: 100%; border-radius: 3px; background: var(--vscode-textLink-foreground); }
@@ -1101,6 +1121,24 @@ export class DashboardPanel {
       <div class="plan-summary-playlists" id="plan-summary-playlists"></div>
       <div class="plan-summary-total" id="plan-summary-total"></div>
       <button class="plan-summary-play" id="plan-summary-play">▶ Play</button>
+    </div>
+    <!-- Quick composer — visible in idle/no-plan state -->
+    <div class="prompt-composer" id="prompt-composer" hidden>
+      <div class="prompt-composer-header">Run a prompt or generate a plan</div>
+      <textarea id="prompt-input" class="prompt-composer-input" rows="3"
+        placeholder="Describe what you want to build or fix…"></textarea>
+      <div class="prompt-composer-toolbar">
+        <select id="prompt-engine" class="prompt-engine-select"></select>
+        <span id="prompt-char-count" class="prompt-char-count">0</span>
+        <div class="prompt-composer-actions">
+          <button id="prompt-generate-plan" class="prompt-action-btn ghost" title="Generate a plan from this description">Plan</button>
+          <button id="prompt-add-task" class="prompt-action-btn ghost" title="Add as a task to the current plan">Add Task</button>
+          <button id="prompt-submit" class="prompt-action-btn primary" title="Execute now (Ctrl+Enter)">Execute ▶</button>
+        </div>
+      </div>
+      <div id="prompt-context-pill" class="prompt-context-pill" hidden>
+        <span id="prompt-context-note"></span>
+      </div>
     </div>
     <div class="no-plan-message" id="no-plan-message" hidden>
       No plan loaded. Use the sidebar to create a plan or run a prompt.
@@ -1307,9 +1345,13 @@ export class DashboardPanel {
         return;
       }
 
+      var promptComposerSection = document.getElementById('prompt-composer');
+      if (promptComposerSection) { promptComposerSection.hidden = true; }
       if (hasPlan) {
         if (planSummary) { planSummary.hidden = false; }
       } else {
+        // Show quick composer when no plan is loaded
+        if (promptComposerSection) { promptComposerSection.hidden = false; }
         if (noPlanMessage) { noPlanMessage.hidden = false; }
       }
       if (sandboxSection) { sandboxSection.hidden = false; }
@@ -1732,7 +1774,9 @@ export class DashboardPanel {
       section.hidden = false;
       if (count) { count.textContent = pct + '% used'; }
 
-      var html = '<div class="ctx-mem-task">' + (msg.taskName || '') + '</div>';
+      var isStale = runnerState !== 'playing' && runnerState !== 'stopping';
+      var staleLabel = isStale ? ' <span class="ctx-mem-stale">(last run)</span>' : '';
+      var html = '<div class="ctx-mem-task">' + (msg.taskName || '') + staleLabel + '</div>';
       sections.forEach(function(s) {
         var sPct = Math.round((s.chars / totalBudget) * 100);
         html += '<div class="ctx-mem-row">' +
@@ -2161,7 +2205,9 @@ export class DashboardPanel {
           '<span class="cc-name">' + escHtml(entry.taskName) + '</span>' +
           (entry.engine ? '<span class="cc-meta">' + escHtml(entry.engine) + '</span>' : '') +
           '<span class="cc-meta">' + duration + '</span>' +
-          (files > 0 ? '<span class="cc-meta">' + files + 'f</span>' : '');
+          (files > 0 ? '<span class="cc-meta">' + files + 'f</span>' : '') +
+          '<span class="cc-chevron">&#x25BA;</span>';
+        row.title = 'Click to expand';
         row.onclick = function() {
           completedExpandedState[entry.taskId] = !completedExpandedState[entry.taskId];
           card.classList.toggle('expanded', completedExpandedState[entry.taskId]);
@@ -2179,6 +2225,43 @@ export class DashboardPanel {
 
         var detail = document.createElement('div');
         detail.className = 'cc-detail';
+
+        // ─── Action buttons (previously missing — handlers existed but no HTML) ───
+        var actions = document.createElement('div');
+        actions.className = 'cc-actions';
+        if (failed) {
+          var retryBtn = document.createElement('button');
+          retryBtn.className = 'cc-btn';
+          retryBtn.textContent = '↺ Retry';
+          retryBtn.title = 'Re-run this task unchanged';
+          retryBtn.onclick = function(e) {
+            e.stopPropagation();
+            vscode.postMessage({ type: 'retryTask', taskId: entry.taskId });
+          };
+          actions.appendChild(retryBtn);
+        }
+        var viewBtn = document.createElement('button');
+        viewBtn.className = 'cc-btn ghost';
+        viewBtn.textContent = '⊞ Full Output';
+        viewBtn.title = 'Open complete stdout/stderr in editor';
+        viewBtn.onclick = function(e) {
+          e.stopPropagation();
+          vscode.postMessage({ type: 'viewTaskOutput', taskId: entry.taskId });
+        };
+        actions.appendChild(viewBtn);
+        if (entry.changedFiles && entry.changedFiles.length > 0) {
+          var diffBtn = document.createElement('button');
+          diffBtn.className = 'cc-btn ghost';
+          diffBtn.textContent = '± Diff';
+          diffBtn.title = 'Open code diff in editor (' + entry.changedFiles.length + ' files)';
+          diffBtn.onclick = function(e) {
+            e.stopPropagation();
+            vscode.postMessage({ type: 'open-diff', taskId: entry.taskId });
+          };
+          actions.appendChild(diffBtn);
+        }
+        detail.appendChild(actions);
+
         if (entry.output) {
           var outputDiv = document.createElement('pre');
           outputDiv.className = 'terminal-output';

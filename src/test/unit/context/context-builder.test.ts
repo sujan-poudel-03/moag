@@ -24,6 +24,7 @@ const {
   gatherSymbolHintSpans,
   mergeSpans,
   scorePriorEntry,
+  adaptiveContextBudget,
 } = proxyquire('../../../context/context-builder', {
   'vscode': vscodeMock,
   './semantic-provider': {
@@ -759,6 +760,108 @@ describe('Context Builder', () => {
       const result = await runCascadeNoSemantic(task, tmpDir, 50000);
       assert.equal(result.usedSemantic, false);
       assert.equal(result.spans.length, 0);
+    });
+  });
+
+  // ─── gatherPlanOverview — completed playlist collapse ─────────────────────
+
+  describe('gatherPlanOverview — completed playlist collapse', () => {
+    function makeSimpleTask(id: string, name: string, status: string) {
+      return { id, name, status, prompt: 'x', dependsOn: [], type: 'agent' } as Task;
+    }
+
+    function makeMultiPlaylistPlan() {
+      const doneTask1 = makeSimpleTask('d1', 'Scaffold', TaskStatus.Completed);
+      const doneTask2 = makeSimpleTask('d2', 'Config', TaskStatus.Completed);
+      const currentTask = makeSimpleTask('c1', 'Build UI', TaskStatus.Running);
+      const donePlaylist = createPlaylist('Done Playlist');
+      donePlaylist.tasks = [doneTask1, doneTask2];
+      const currentPlaylist = createPlaylist('Current Playlist');
+      currentPlaylist.tasks = [currentTask];
+      const plan = createEmptyPlan('Multi-Playlist Plan');
+      plan.playlists = [donePlaylist, currentPlaylist];
+      return { plan, donePlaylist, currentPlaylist, currentTask };
+    }
+
+    it('collapses a fully-completed playlist to one summary line', () => {
+      const { plan, donePlaylist, currentPlaylist, currentTask } = makeMultiPlaylistPlan();
+      const result = gatherPlanOverview(plan, currentPlaylist, currentTask);
+      assert.ok(result.includes('✓ Playlist "Done Playlist" (2 done)'),
+        'completed playlist should be collapsed');
+      assert.ok(!result.includes('Scaffold'), 'individual task names should not appear');
+      assert.ok(!result.includes('Config'), 'individual task names should not appear');
+    });
+
+    it('includes failed count in collapsed summary', () => {
+      const { plan, currentPlaylist, currentTask } = makeMultiPlaylistPlan();
+      plan.playlists[0].tasks[1].status = TaskStatus.Failed;
+      const result = gatherPlanOverview(plan, currentPlaylist, currentTask);
+      assert.ok(result.includes('1 done, 1 failed'));
+    });
+
+    it('shows the current playlist in full detail with YOU ARE HERE marker', () => {
+      const { plan, currentPlaylist, currentTask } = makeMultiPlaylistPlan();
+      const result = gatherPlanOverview(plan, currentPlaylist, currentTask);
+      assert.ok(result.includes('Build UI'), 'current task should be shown by name');
+      assert.ok(result.includes('YOU ARE HERE'));
+    });
+
+    it('omits all-pending future playlists', () => {
+      const { plan, currentPlaylist, currentTask } = makeMultiPlaylistPlan();
+      const futurePlaylist = createPlaylist('Future Sprint');
+      futurePlaylist.tasks = [makeSimpleTask('f1', 'Future Task', TaskStatus.Pending)];
+      plan.playlists.push(futurePlaylist);
+      const result = gatherPlanOverview(plan, currentPlaylist, currentTask);
+      assert.ok(!result.includes('Future Task'));
+      assert.ok(!result.includes('Future Sprint'));
+    });
+  });
+
+  // ─── adaptiveContextBudget ────────────────────────────────────────────────
+
+  describe('adaptiveContextBudget', () => {
+    const BASE = 12000;
+
+    it('command tasks get 15% of base budget', () => {
+      const task = { type: 'command', dependsOn: [], prompt: 'run tests' } as Partial<Task>;
+      const result = adaptiveContextBudget(task, BASE);
+      assert.equal(result, Math.floor(BASE * 0.15));
+    });
+
+    it('visual-test tasks get 30% of base budget', () => {
+      const task = { type: 'visual-test', dependsOn: [], prompt: 'check ui' } as Partial<Task>;
+      const result = adaptiveContextBudget(task, BASE);
+      assert.equal(result, Math.floor(BASE * 0.30));
+    });
+
+    it('agent tasks get full base budget', () => {
+      const task = { type: 'agent', dependsOn: [], prompt: 'implement feature' } as Partial<Task>;
+      const result = adaptiveContextBudget(task, BASE);
+      assert.equal(result, BASE);
+    });
+
+    it('adds 500 chars per explicit dependency', () => {
+      const task = { type: 'agent', dependsOn: ['t1', 't2', 't3'], prompt: 'x' } as Partial<Task>;
+      const result = adaptiveContextBudget(task, BASE);
+      assert.equal(result, BASE + 3 * 500);
+    });
+
+    it('caps dependency bonus at 5 deps (2500 chars max)', () => {
+      const task = { type: 'agent', dependsOn: ['t1','t2','t3','t4','t5','t6','t7'], prompt: 'x' } as Partial<Task>;
+      const result = adaptiveContextBudget(task, BASE);
+      assert.equal(result, BASE + 5 * 500);
+    });
+
+    it('adds 1000 bonus for prompts longer than 800 chars', () => {
+      const task = { type: 'agent', dependsOn: [], prompt: 'x'.repeat(900) } as Partial<Task>;
+      const result = adaptiveContextBudget(task, BASE);
+      assert.equal(result, BASE + 1000);
+    });
+
+    it('applies both dep bonus and prompt bonus together for agent tasks', () => {
+      const task = { type: 'agent', dependsOn: ['a','b'], prompt: 'z'.repeat(850) } as Partial<Task>;
+      const result = adaptiveContextBudget(task, BASE);
+      assert.equal(result, BASE + 2 * 500 + 1000);
     });
   });
 });

@@ -50,6 +50,7 @@ import { captureScreenshot } from './sandbox/screenshot';
 
 // ─── Shared state ───
 
+let moagOutputChannel: vscode.OutputChannel | null = null;
 let currentPlan: Plan | null = null;
 let currentPlanPath: string | null = null;
 let planDirty = false;
@@ -273,6 +274,16 @@ function getPromptSidebarHistoryItems(): PromptSidebarListItem[] {
   return historyStore.getAll().slice(0, 80).map((entry) => {
     const planName = entry.runId ? (runSessionStore.get(entry.runId)?.planName ?? 'Ad hoc') : 'Ad hoc';
     const playlistName = entry.playlistName || 'Unassigned';
+    const isFailed = entry.status === 'failed' || entry.status === 'blocked';
+    // Extract first meaningful error line for failed tasks
+    let failureReason: string | undefined;
+    if (isFailed) {
+      const merged = [entry.result?.stderr, entry.result?.stdout].filter(Boolean).join('\n');
+      const lines = merged.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+      const noise = [/^reading prompt from stdin/i, /^─+\s*(command|response)\s*─+/i, /^claude code/i];
+      failureReason = lines.find(l => !noise.some(p => p.test(l)))?.substring(0, 120);
+    }
+    const filesChanged = entry.changedFiles?.length ?? 0;
     return {
       id: entry.threadId ?? entry.id,
       kind: 'history',
@@ -281,6 +292,9 @@ function getPromptSidebarHistoryItems(): PromptSidebarListItem[] {
       status: entry.status,
       planName,
       playlistName,
+      failureReason,
+      filesChanged: filesChanged > 0 ? filesChanged : undefined,
+      taskId: entry.taskId,
     };
   });
 }
@@ -1249,6 +1263,26 @@ async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<voi
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
 
+  // ── Output Channel + Global Error Capture ────────────────────────────────
+  moagOutputChannel = vscode.window.createOutputChannel('MOAG');
+  context.subscriptions.push(moagOutputChannel);
+
+  process.on('uncaughtException', (err: Error) => {
+    appendErrorLog({
+      ts: new Date().toISOString(), category: 'uncaught',
+      message: err.message.substring(0, 300),
+      stack: err.stack?.split('\n').slice(0, 3).join('\n'),
+    });
+  });
+  process.on('unhandledRejection', (reason: unknown) => {
+    const msg = reason instanceof Error ? reason.message : String(reason);
+    appendErrorLog({
+      ts: new Date().toISOString(), category: 'unhandled-rejection',
+      message: msg.substring(0, 300),
+      stack: reason instanceof Error ? reason.stack?.split('\n').slice(0, 3).join('\n') : undefined,
+    });
+  });
+
   // Register all engine adapters
   registerAllEngines();
 
@@ -1730,7 +1764,6 @@ export function activate(context: vscode.ExtensionContext): void {
 
     // Collect friction and offer feedback sharing when the run had failures/escalations
     const hasFriction = executionTasksFailed > 0 || escalatedTaskIds.size > 0;
-    const unfiledSelfIssues = readUnfiledSelfIssues();
     if (runner.currentRunId && hasFriction) {
       const report = collectRunFriction(runner.currentRunId, totalDuration);
       if (report.friction.length > 0) {
@@ -1738,26 +1771,12 @@ export function activate(context: vscode.ExtensionContext): void {
         const frictionMsg = `${report.summary.failed} failed` +
           (report.summary.escalated > 0 ? `, ${report.summary.escalated} escalated` : '') +
           ' — help improve MOAG?';
-        const frictionBtns: string[] = ['Share Feedback', 'Show Dashboard'];
-        if (unfiledSelfIssues.length > 0) { frictionBtns.splice(1, 0, `Review ${unfiledSelfIssues.length} Issues`); }
-        vscode.window.showInformationMessage(frictionMsg, ...frictionBtns).then(choice => {
+        vscode.window.showInformationMessage(frictionMsg, 'Share Feedback', 'Show Dashboard').then(choice => {
           if (choice === 'Share Feedback') { void cmdShareRunFeedback(); }
-          else if (choice?.startsWith('Review')) { void vscode.commands.executeCommand('agentTaskPlayer.reviewSelfIssues'); }
           else if (choice === 'Show Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); }
         });
         return;
       }
-    }
-
-    if (unfiledSelfIssues.length > 0) {
-      vscode.window.showInformationMessage(
-        `${summary}${filesSuffix} — ${unfiledSelfIssues.length} MOAG issue${unfiledSelfIssues.length > 1 ? 's' : ''} detected`,
-        'Review Issues', 'Show Dashboard',
-      ).then(action => {
-        if (action === 'Review Issues') { void vscode.commands.executeCommand('agentTaskPlayer.reviewSelfIssues'); }
-        else if (action === 'Show Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); }
-      });
-      return;
     }
 
     // Offer to close the GitHub issues this plan was generated from (only on full success)
@@ -1811,6 +1830,11 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   runner.on('error', (err) => {
+    appendErrorLog({
+      ts: new Date().toISOString(), category: 'runner',
+      message: (err instanceof Error ? err.message : String(err)).substring(0, 300),
+      stack: err instanceof Error ? err.stack?.split('\n').slice(0, 3).join('\n') : undefined,
+    });
     endProgressNotification();
     vscode.window.showErrorMessage(
       `Runner error: ${err.message}`,
@@ -2132,7 +2156,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (moagDirForWeights) { setWeightsMoagDir(moagDirForWeights); }
 
       setTimeout(() => {
-        try { setActiveKG(buildKG(kgCwd)); } catch { /* non-critical */ }
+        try { setActiveKG(buildKG(kgCwd)); } catch (e) { appendErrorLog({ ts: new Date().toISOString(), category: 'kg', message: String(e).substring(0, 200), context: 'KG initial build' }); }
       }, 2000);
 
       // Debounce map for file-save KG updates
@@ -2147,7 +2171,7 @@ export function activate(context: vscode.ExtensionContext): void {
             kgRebuildTimers.delete(relPath);
             const kg = getActiveKG();
             if (kg) {
-              try { rebuildKGForFile(kg, kgCwd, relPath); } catch { /* non-critical */ }
+              try { rebuildKGForFile(kg, kgCwd, relPath); } catch (e) { appendErrorLog({ ts: new Date().toISOString(), category: 'kg', message: String(e).substring(0, 200), context: 'KG rebuild: ' + relPath }); }
             }
           }, 1500));
         }),
@@ -3803,10 +3827,39 @@ function cmdSavePlanRules(arg?: unknown): void {
 }
 
 async function cmdPreviewTaskPrompt(arg?: unknown): Promise<void> {
-  if (!currentPlan || !arg || typeof arg !== 'object') { return; }
-  const { playlistIndex, taskIndex } = arg as { playlistIndex: number; taskIndex: number };
-  const playlist = currentPlan.playlists[playlistIndex];
-  const task = playlist?.tasks[taskIndex];
+  if (!currentPlan) { return; }
+
+  let playlistIndex: number;
+  let taskIndex: number;
+
+  if (arg && typeof arg === 'object' && 'playlistIndex' in (arg as object)) {
+    // Called from tree context menu with explicit indices
+    ({ playlistIndex, taskIndex } = arg as { playlistIndex: number; taskIndex: number });
+  } else {
+    // Called from toolbar or palette — find the first pending task automatically
+    let found = false;
+    for (let pi = 0; pi < currentPlan.playlists.length; pi++) {
+      const pl = currentPlan.playlists[pi];
+      for (let ti = 0; ti < pl.tasks.length; ti++) {
+        const t = pl.tasks[ti];
+        const s = t.status ?? 'pending';
+        if (s === 'pending' || s === 'running') {
+          playlistIndex = pi;
+          taskIndex = ti;
+          found = true;
+          break;
+        }
+      }
+      if (found) { break; }
+    }
+    if (!found) {
+      vscode.window.showInformationMessage('No pending tasks — all tasks are completed.');
+      return;
+    }
+  }
+
+  const playlist = currentPlan.playlists[playlistIndex!];
+  const task = playlist?.tasks[taskIndex!];
   if (!task || !playlist) { return; }
 
   const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
@@ -4405,6 +4458,23 @@ function readLastFrictionReport(): RunFrictionReport | null {
   } catch { return null; }
 }
 
+// ─── Internal error log — thin wrappers around src/utils/error-log.ts ────────
+
+import type { InternalError } from './utils/error-log';
+import { appendErrorLog as _appendErrorLog, readRecentErrors as _readRecentErrors } from './utils/error-log';
+
+function appendErrorLog(err: InternalError): void {
+  const moagDir = getMoagDir();
+  if (!moagDir) { return; }
+  _appendErrorLog(moagDir, err, moagOutputChannel ? (s) => moagOutputChannel!.appendLine(s) : undefined);
+}
+
+function readRecentErrors(n = 10): InternalError[] {
+  const moagDir = getMoagDir();
+  if (!moagDir) { return []; }
+  return _readRecentErrors(moagDir, n);
+}
+
 async function cmdRunContextEval(): Promise<void> {
   const moagDir = getMoagDir();
   if (!moagDir) { vscode.window.showWarningMessage('No .moag directory found. Open a workspace with a plan first.'); return; }
@@ -4832,6 +4902,18 @@ async function openReportPanel(
       const frictionSuffix = friction
         ? `\n\n**Recent run friction:**\n- ${friction.summary.failed} failed · ${friction.summary.escalated} escalated · engine: ${friction.engine}\n- Error patterns: ${Object.entries(friction.errorCategories).map(([k, v]) => `${k}(${v})`).join(', ') || 'none'}`
         : '';
+      // Attach recent internal extension errors to the report
+      const recentErrs = readRecentErrors(15);
+      const errorLogSection = recentErrs.length > 0
+        ? `\n\n## Extension Error Log (last ${recentErrs.length})\n\`\`\`\n` +
+          recentErrs.map(e =>
+            `[${e.ts.substring(0, 19)}] [${e.category}] ${e.message}` +
+            (e.context ? ` | ${e.context}` : '') +
+            (e.stack ? `\n  ${(e.stack.split('\n')[1] ?? '').trim()}` : '')
+          ).join('\n') +
+          '\n```'
+        : '';
+
       const bodyParts = [
         '## Environment', '| | |', '|---|---|',
         `| **MOAG** | v${extVersion} |`,
@@ -4840,7 +4922,7 @@ async function openReportPanel(
         `| **Engine** | ${defaultEngine} (detected: ${detectedEngines.join(', ') || 'none'}) |`,
         errLines ? `\n## Error Output\n\`\`\`\n${errLines}\n\`\`\`` : '',
       ].filter(Boolean).join('\n');
-      const fullBody = [description, bodyParts + frictionSuffix].filter(Boolean).join('\n\n');
+      const fullBody = [description, bodyParts + frictionSuffix + errorLogSection].filter(Boolean).join('\n\n');
       const cfgForReport = vscode.workspace.getConfiguration('agentTaskPlayer');
       const repo = cfgForReport.get<string>('issueRepo', '').trim() || MOAG_REPO;
       const syncLabel = cfgForReport.get<string>('issueSync.label', '').trim() || 'moag';
@@ -4873,7 +4955,11 @@ async function openReportPanel(
         if (action === 'View Issue') { vscode.env.openExternal(vscode.Uri.parse(url)); }
         // Immediately poll so the new issue appears as a task without waiting for the interval
         void vscode.commands.executeCommand('agentTaskPlayer.ghSyncPollNow');
-      } catch (err) { vscode.window.showErrorMessage(`Failed to create issue: ${err instanceof Error ? err.message.substring(0, 300) : String(err)}`); }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message.substring(0, 300) : String(err);
+        appendErrorLog({ ts: new Date().toISOString(), category: 'github', message: msg, context: 'gh issue create (bug report)' });
+        vscode.window.showErrorMessage(`Failed to create issue: ${msg}`);
+      }
       finally { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
 
     } else {

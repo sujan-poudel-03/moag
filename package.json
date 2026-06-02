@@ -415,6 +415,30 @@
         "icon": "$(symbol-event)"
       },
       {
+        "command": "agentTaskPlayer.previewTaskPrompt",
+        "title": "Preview Context for Next Task",
+        "category": "MOAG",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "agentTaskPlayer.undoTask",
+        "title": "Undo Task Changes",
+        "category": "MOAG",
+        "icon": "$(discard)"
+      },
+      {
+        "command": "agentTaskPlayer.watchMode",
+        "title": "Toggle Watch Mode",
+        "category": "MOAG",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "agentTaskPlayer.ghSyncConfigureInteractive",
+        "title": "Configure GitHub Sync",
+        "category": "MOAG",
+        "icon": "$(github)"
+      },
+      {
         "command": "agentTaskPlayer.reviewSelfIssues",
         "title": "Review MOAG Self-Issues",
         "category": "MOAG",
@@ -600,7 +624,7 @@
           "group": "1_run@1"
         },
         {
-          "command": "agentTaskPlayer.toggleFullAuto",
+          "command": "agentTaskPlayer.watchMode",
           "when": "view == agentTaskPlayer.promptView",
           "group": "1_run@2"
         },
@@ -695,7 +719,7 @@
           "group": "5_github@3"
         },
         {
-          "command": "agentTaskPlayer.reviewSelfIssues",
+          "command": "agentTaskPlayer.ghSyncConfigureInteractive",
           "when": "view == agentTaskPlayer.promptView",
           "group": "5_github@4"
         },
@@ -740,14 +764,24 @@
           "group": "7_git@2"
         },
         {
-          "command": "agentTaskPlayer.manageAiRules",
+          "command": "agentTaskPlayer.previewTaskPrompt",
           "when": "view == agentTaskPlayer.promptView",
           "group": "9_manage@1"
         },
         {
-          "command": "agentTaskPlayer.reloadWindow",
+          "command": "agentTaskPlayer.runContextEval",
           "when": "view == agentTaskPlayer.promptView",
           "group": "9_manage@2"
+        },
+        {
+          "command": "agentTaskPlayer.manageAiRules",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "9_manage@3"
+        },
+        {
+          "command": "agentTaskPlayer.reloadWindow",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "9_manage@4"
         }
       ],
       "view/item/context": [
@@ -840,6 +874,16 @@
           "command": "agentTaskPlayer.runSelected",
           "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/ && listMultiSelection",
           "group": "0_run@0"
+        },
+        {
+          "command": "agentTaskPlayer.undoTask",
+          "when": "view == agentTaskPlayer.planView && viewItem == task",
+          "group": "3_status@9"
+        },
+        {
+          "command": "agentTaskPlayer.bulkDelete",
+          "when": "view == agentTaskPlayer.planView && viewItem =~ /playlist|task/",
+          "group": "9_manage@8"
         }
       ],
       "commandPalette": [
@@ -849,17 +893,13 @@
         { "command": "agentTaskPlayer.deleteThread", "when": "false" },
         { "command": "agentTaskPlayer.renameThread", "when": "false" },
         { "command": "agentTaskPlayer.newConversation", "when": "false" },
-        { "command": "agentTaskPlayer.markTaskComplete", "when": "false" },
-        { "command": "agentTaskPlayer.playPlaylist", "when": "false" },
         { "command": "agentTaskPlayer.playTask", "when": "false" },
-        { "command": "agentTaskPlayer.retryTask", "when": "false" },
         { "command": "agentTaskPlayer.retryTaskWithNote", "when": "false" },
         { "command": "agentTaskPlayer.addTask", "when": "false" },
         { "command": "agentTaskPlayer.editTask", "when": "false" },
         { "command": "agentTaskPlayer.deleteItem", "when": "false" },
         { "command": "agentTaskPlayer.moveUp", "when": "false" },
         { "command": "agentTaskPlayer.moveDown", "when": "false" },
-        { "command": "agentTaskPlayer.setTaskStatus", "when": "false" },
         { "command": "agentTaskPlayer.setPlaylistStatus", "when": "false" },
         { "command": "agentTaskPlayer.setTestPhase", "when": "false" },
         { "command": "agentTaskPlayer.saveTaskAsTemplate", "when": "false" },
@@ -887,6 +927,21 @@
         "command": "agentTaskPlayer.quickAddTask",
         "key": "ctrl+alt+t",
         "mac": "cmd+alt+t"
+      },
+      {
+        "command": "agentTaskPlayer.play",
+        "key": "ctrl+alt+p",
+        "mac": "cmd+alt+p"
+      },
+      {
+        "command": "agentTaskPlayer.stop",
+        "key": "ctrl+alt+.",
+        "mac": "cmd+alt+."
+      },
+      {
+        "command": "agentTaskPlayer.showDashboard",
+        "key": "ctrl+alt+d",
+        "mac": "cmd+alt+d"
       }
     ],
     "configuration": {
