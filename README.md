@@ -143,6 +143,35 @@ Toggle `MOAG: Watch Mode` to re-run tasks when source files change. Edit a spec,
 
 ---
 
+## Autonomous Operation (Headless CLI & Daemon)
+
+MOAG also runs **without a VS Code window** — as a CLI, a single-repo issue loop, or an
+always-on multi-repo daemon. It closes the full lifecycle: intake GitHub issues →
+develop → test → **(human-approved)** deploy → release → monitor → on incident, file an
+issue → back to intake.
+
+```bash
+moag run    <plan.json> --full-auto                       # execute a plan, no VS Code
+moag loop   --repo org/app --label moag --full-auto       # poll issues → fix → close
+moag daemon --config .moag/daemon.json --full-auto        # always-on, multi-repo + monitors
+```
+
+New task types power the ship & maintain phases: **`deploy`** (pluggable command + health
+smoke gate), **`release`** (tag + GitHub release), and **`monitor`** (health probe → files
+an incident on breach). Shipping is **gated** — a `manual` approval task halts the run
+(exit 3) until a human approves.
+
+Build & install the extension + CLI on any platform:
+
+```bash
+./scripts/install-linux.sh      # or install-macos.sh  /  install-windows.ps1
+```
+
+📖 **Full operator's guide:** [docs/AUTONOMOUS.md](docs/AUTONOMOUS.md) — commands, config,
+task-type reference, JSONL output, systemd/cron, and the safety model.
+
+---
+
 ## Configuration
 
 ### Execution Profiles
