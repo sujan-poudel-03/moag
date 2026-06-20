@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
   "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
-  "version": "0.9.10",
+  "version": "0.9.12",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -52,6 +52,9 @@
     "workspaceContains:**/*.agent-plan.json"
   ],
   "main": "./out/extension.js",
+  "bin": {
+    "moag": "./out/headless/cli.js"
+  },
   "contributes": {
     "commands": [
       {
@@ -887,27 +890,90 @@
         }
       ],
       "commandPalette": [
-        { "command": "agentTaskPlayer.openSession", "when": "false" },
-        { "command": "agentTaskPlayer.openThread", "when": "false" },
-        { "command": "agentTaskPlayer.deleteSession", "when": "false" },
-        { "command": "agentTaskPlayer.deleteThread", "when": "false" },
-        { "command": "agentTaskPlayer.renameThread", "when": "false" },
-        { "command": "agentTaskPlayer.newConversation", "when": "false" },
-        { "command": "agentTaskPlayer.playTask", "when": "false" },
-        { "command": "agentTaskPlayer.retryTaskWithNote", "when": "false" },
-        { "command": "agentTaskPlayer.addTask", "when": "false" },
-        { "command": "agentTaskPlayer.editTask", "when": "false" },
-        { "command": "agentTaskPlayer.deleteItem", "when": "false" },
-        { "command": "agentTaskPlayer.moveUp", "when": "false" },
-        { "command": "agentTaskPlayer.moveDown", "when": "false" },
-        { "command": "agentTaskPlayer.setPlaylistStatus", "when": "false" },
-        { "command": "agentTaskPlayer.setTestPhase", "when": "false" },
-        { "command": "agentTaskPlayer.saveTaskAsTemplate", "when": "false" },
-        { "command": "agentTaskPlayer.duplicateTask", "when": "false" },
-        { "command": "agentTaskPlayer.splitTask", "when": "false" },
-        { "command": "agentTaskPlayer.addReviewStep", "when": "false" },
-        { "command": "agentTaskPlayer.addTaskFromTemplate", "when": "false" },
-        { "command": "agentTaskPlayer.runSelected", "when": "false" }
+        {
+          "command": "agentTaskPlayer.openSession",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.openThread",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.deleteSession",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.deleteThread",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.renameThread",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.newConversation",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.playTask",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.retryTaskWithNote",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.addTask",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.editTask",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.deleteItem",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.moveUp",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.moveDown",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.setPlaylistStatus",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.setTestPhase",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.saveTaskAsTemplate",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.duplicateTask",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.splitTask",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.addReviewStep",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.addTaskFromTemplate",
+          "when": "false"
+        },
+        {
+          "command": "agentTaskPlayer.runSelected",
+          "when": "false"
+        }
       ],
       "editor/context": [
         {
@@ -1111,7 +1177,14 @@
         },
         "agentTaskPlayer.testTool": {
           "type": "string",
-          "enum": ["claude-chrome", "sandbox", "playwright", "cypress", "custom", "manual"],
+          "enum": [
+            "claude-chrome",
+            "sandbox",
+            "playwright",
+            "cypress",
+            "custom",
+            "manual"
+          ],
           "default": "manual",
           "description": "Default tool used for the TTT (Time to Test) phase"
         },
@@ -1419,6 +1492,8 @@
     "test:integration": "vscode-test",
     "pretest:integration": "npm run compile",
     "package": "vsce package",
+    "moag": "node ./out/headless/cli.js",
+    "headless:smoke": "npm run compile && node ./out/headless/cli.js run .moag/sample.plan.json --no-interactive --full-auto",
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch"
   },

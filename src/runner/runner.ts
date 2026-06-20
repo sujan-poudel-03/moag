@@ -32,6 +32,8 @@ import { analyzeProject } from '../context/project-analyzer';
 import { PromptLibraryStore } from '../templates/prompt-library';
 import { AiRulesStore } from '../ai-rules/rules-store';
 import { TaskQueue } from './task-queue';
+import { ghSync } from '../utils/gh';
+import { fileIncidentIssue } from '../github/issue-sync';
 
 const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const GIT_TIMEOUT_MS = 30_000;
@@ -266,6 +268,8 @@ export interface RunnerEvents {
   'error': (err: Error) => void;
   /** Fired when a type:"manual" task is waiting for human confirmation */
   'manual-gate': (task: Task) => void;
+  /** Fired when a type:"monitor" task detects an incident (optionally with a filed issue URL) */
+  'incident': (task: Task, summary: string, issueUrl: string | null) => void;
 }
 
 interface ServiceHandle {
@@ -291,6 +295,9 @@ export class TaskRunner {
   private _state: RunnerState = RunnerState.Idle;
   private _emitter = new EventEmitter();
   private _abortController: AbortController | null = null;
+  /** Watchdog that forces Idle if a stop() hangs in the Stopping state. */
+  private _stoppingWatchdog: ReturnType<typeof setTimeout> | null = null;
+  private static readonly STOP_WATCHDOG_MS = 30_000;
   private _currentPlaylistIndex = 0;
   private _currentTaskIndex = 0;
   private _plan: Plan | null = null;
@@ -378,6 +385,11 @@ export class TaskRunner {
 
   private setState(state: RunnerState): void {
     this._state = state;
+    // Clear the stop watchdog once we actually settle back to Idle.
+    if (state === RunnerState.Idle && this._stoppingWatchdog) {
+      clearTimeout(this._stoppingWatchdog);
+      this._stoppingWatchdog = null;
+    }
     this.emit('state-changed', state);
   }
 
@@ -562,6 +574,20 @@ export class TaskRunner {
       this._pauseResolve();
       this._pauseResolve = null;
     }
+
+    // Watchdog: if a task/subprocess refuses to unwind, don't leave the runner
+    // wedged in Stopping forever — force Idle so the user can resume/restart.
+    if (this._stoppingWatchdog) { clearTimeout(this._stoppingWatchdog); }
+    this._stoppingWatchdog = setTimeout(() => {
+      this._stoppingWatchdog = null;
+      if (this._state === RunnerState.Stopping) {
+        this.emit('error', new Error(
+          `Runner did not stop within ${TaskRunner.STOP_WATCHDOG_MS / 1000}s — forcing Idle.`,
+        ));
+        this.setState(RunnerState.Idle);
+      }
+    }, TaskRunner.STOP_WATCHDOG_MS);
+    this._stoppingWatchdog.unref?.();
   }
 
   /** Called by UI when the user clicks "Mark Complete" on a manual gate task */
@@ -718,9 +744,12 @@ export class TaskRunner {
             } else {
               startNext();
             }
-          }).catch(() => {
+          }).catch((err) => {
+            // Surface the failure instead of swallowing it — a silent catch here
+            // left the runner stuck "Playing" with no active playlist.
+            this.emit('error', err instanceof Error ? err : new Error(String(err)));
             running--;
-            if (running === 0) {
+            if (running === 0 && (nextIndex >= playlists.length || this.state === RunnerState.Stopping)) {
               resolve();
             } else {
               startNext();
@@ -1511,6 +1540,12 @@ export class TaskRunner {
         return this.runManualTask(task, signal);
       case 'visual-test':
         return this.runVisualTestTask(task, cwd, fullPrompt, signal);
+      case 'deploy':
+        return this.runDeployTask(task, cwd, signal, resolvedEnv);
+      case 'release':
+        return this.runReleaseTask(task, cwd, signal, resolvedEnv);
+      case 'monitor':
+        return this.runMonitorTask(task, signal);
       default:
         return { stdout: '', stderr: `Unsupported task type "${taskType}"`, exitCode: 1, durationMs: 0 };
     }
@@ -1966,6 +2001,147 @@ export class TaskRunner {
     });
     // Gap 7: check tasks — exit code 0 = passed, non-zero = failed. No stdout-pattern checks.
     return { ...result, summary: result.exitCode === 0 ? 'Check passed.' : 'Check failed.' };
+  }
+
+  /**
+   * deploy task — runs a pluggable deploy command (env-aware via inheritEnvFiles, e.g.
+   * .env.staging) and, if healthCheckUrl is set, gates success on a post-deploy smoke
+   * check. "Gated at ship": place a type:"manual" approval task that deploy dependsOn.
+   */
+  private async runDeployTask(task: Task, cwd: string, signal: AbortSignal, resolvedEnv?: Record<string, string>): Promise<EngineResult> {
+    const command = task.command?.trim();
+    if (!command) {
+      return { stdout: '', stderr: 'Deploy task is missing the "command" field (e.g. "npm run deploy").', exitCode: 1, durationMs: 0 };
+    }
+    this.emit('task-output', task, `\n-- Deploy: ${command} --\n`, 'stdout');
+    const result = await this.runLocalCommand(command, {
+      cwd,
+      env: resolvedEnv ?? task.env,
+      signal,
+      onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
+    });
+    if (result.exitCode !== 0) {
+      return { ...result, summary: 'Deploy command failed.' };
+    }
+    if (task.healthCheckUrl) {
+      const healthy = await this.waitForHealthy(task.healthCheckUrl, signal, task.startupTimeoutMs ?? 60_000);
+      if (!healthy) {
+        return {
+          stdout: result.stdout,
+          stderr: `${result.stderr}\n[Smoke gate] Deploy ran but ${task.healthCheckUrl} did not become healthy.`,
+          exitCode: 1,
+          durationMs: result.durationMs,
+          summary: 'Deploy smoke check failed.',
+        };
+      }
+      this.emit('task-output', task, `[Smoke gate] ${task.healthCheckUrl} healthy.\n`, 'stdout');
+    }
+    return { ...result, summary: 'Deploy completed successfully.' };
+  }
+
+  /** Poll a health endpoint until it returns <400 or the deadline passes. */
+  private async waitForHealthy(url: string, signal: AbortSignal, timeoutMs: number, intervalMs = 2000): Promise<boolean> {
+    const deadline = Date.now() + Math.max(0, timeoutMs);
+    do {
+      if (signal.aborted) { return false; }
+      if (await this.checkHealthUrl(url)) { return true; }
+      if (Date.now() + intervalMs >= deadline) { break; }
+      await new Promise((r) => setTimeout(r, intervalMs));
+    } while (Date.now() < deadline);
+    return false;
+  }
+
+  /**
+   * release task — optional pluggable command (version bump / changelog / publish),
+   * then optional annotated git tag, then optional push + GitHub release via gh.
+   */
+  private async runReleaseTask(task: Task, cwd: string, signal: AbortSignal, resolvedEnv?: Record<string, string>): Promise<EngineResult> {
+    const command = task.command?.trim();
+    if (!command && !task.releaseTag) {
+      return { stdout: '', stderr: 'Release task needs a "command" and/or a "releaseTag".', exitCode: 1, durationMs: 0 };
+    }
+    const outputs: string[] = [];
+
+    if (command) {
+      this.emit('task-output', task, `\n-- Release: ${command} --\n`, 'stdout');
+      const result = await this.runLocalCommand(command, {
+        cwd,
+        env: resolvedEnv ?? task.env,
+        signal,
+        onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
+      });
+      if (result.exitCode !== 0) {
+        return { ...result, summary: 'Release command failed.' };
+      }
+      outputs.push(result.stdout);
+    }
+
+    if (task.releaseTag) {
+      const notes = task.releaseNotes ?? `Release ${task.releaseTag}`;
+      const tagged = await this.runGitCommand(['tag', '-a', task.releaseTag, '-m', notes], cwd);
+      if (tagged === null) {
+        return { stdout: outputs.join('\n'), stderr: `Failed to create git tag ${task.releaseTag}.`, exitCode: 1, durationMs: 0, summary: 'Release tag failed.' };
+      }
+      this.emit('task-output', task, `[Release] Tagged ${task.releaseTag}.\n`, 'stdout');
+
+      if (task.githubRelease) {
+        const pushed = await this.runGitCommand(['push', 'origin', task.releaseTag], cwd);
+        if (pushed === null) {
+          return { stdout: outputs.join('\n'), stderr: `Tag created but failed to push ${task.releaseTag}.`, exitCode: 1, durationMs: 0, summary: 'Release push failed.' };
+        }
+        try {
+          ghSync(['release', 'create', task.releaseTag, '--title', task.releaseTag, '--notes', notes], { cwd, timeout: 20_000 });
+          this.emit('task-output', task, `[Release] GitHub release ${task.releaseTag} created.\n`, 'stdout');
+        } catch (err) {
+          return { stdout: outputs.join('\n'), stderr: `GitHub release failed: ${err instanceof Error ? err.message : String(err)}`, exitCode: 1, durationMs: 0, summary: 'GitHub release failed.' };
+        }
+      }
+    }
+
+    return { stdout: outputs.join('\n'), stderr: '', exitCode: 0, durationMs: 0, summary: 'Release completed.' };
+  }
+
+  /**
+   * monitor task — samples a health endpoint; on breach it surfaces an incident and
+   * (if incidentRepo is set) files an issue the autonomous loop will intake → fix →
+   * gated-redeploy, closing the maintenance loop. Fails the task on breach so it's visible.
+   */
+  private async runMonitorTask(task: Task, signal: AbortSignal): Promise<EngineResult> {
+    const url = task.healthCheckUrl?.trim();
+    if (!url) {
+      return { stdout: '', stderr: 'Monitor task requires a "healthCheckUrl" to probe.', exitCode: 1, durationMs: 0 };
+    }
+    const samples = Math.max(1, task.monitorSamples ?? 3);
+    const intervalMs = task.monitorIntervalMs ?? 2000;
+    const threshold = Math.max(1, task.failureThreshold ?? 1);
+    this.emit('task-output', task, `\n-- Monitor: ${url} (${samples} samples, threshold ${threshold}) --\n`, 'stdout');
+
+    let failures = 0;
+    for (let i = 0; i < samples; i++) {
+      if (signal.aborted) { break; }
+      const healthy = await this.checkHealthUrl(url);
+      if (!healthy) { failures++; }
+      this.emit('task-output', task, `  sample ${i + 1}/${samples}: ${healthy ? 'ok' : 'FAIL'}\n`, healthy ? 'stdout' : 'stderr');
+      if (i < samples - 1 && intervalMs > 0) { await new Promise((r) => setTimeout(r, intervalMs)); }
+    }
+
+    if (failures >= threshold) {
+      const summary = `Health check ${url} failed ${failures}/${samples} samples.`;
+      this.emit('task-output', task, `[Incident] ${summary}\n`, 'stderr');
+      let issueUrl: string | null = null;
+      if (task.incidentRepo) {
+        issueUrl = fileIncidentIssue(
+          task.incidentRepo,
+          `Incident: ${task.name} unhealthy`,
+          `Automated incident from a MOAG monitor task.\n\n${summary}\n\nEndpoint: ${url}`,
+          { label: task.incidentLabel ?? 'moag:incident', cwd: this.resolveCwd(task.cwd) },
+        );
+        if (issueUrl) { this.emit('task-output', task, `[Incident] Filed ${issueUrl}\n`, 'stdout'); }
+      }
+      this.emit('incident', task, summary, issueUrl);
+      return { stdout: '', stderr: summary, exitCode: 1, durationMs: 0, summary: 'Incident detected.' };
+    }
+    return { stdout: `Healthy (${samples - failures}/${samples}).`, stderr: '', exitCode: 0, durationMs: 0, summary: 'Monitor: healthy.' };
   }
 
   private async runServiceTask(task: Task, cwd: string, signal: AbortSignal): Promise<EngineResult> {

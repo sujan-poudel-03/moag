@@ -4,7 +4,7 @@
 export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom' | 'copilot' | 'anthropic';
 
 /** Supported task execution modes */
-export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review' | 'validate' | 'manual' | 'visual-test';
+export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review' | 'validate' | 'manual' | 'visual-test' | 'deploy' | 'release' | 'monitor';
 
 /** Supported validation targets for cross-platform checks */
 export type ValidationTarget = 'web' | 'mobile' | 'desktop' | 'all';
@@ -110,6 +110,22 @@ export interface Task {
   sourceIssueNumber?: number;
   /** GitHub repo (owner/repo) for the source issue */
   sourceIssueRepo?: string;
+  /** release task: annotated git tag to create after the release command succeeds (e.g. "v1.2.0") */
+  releaseTag?: string;
+  /** release task: message/notes for the tag and optional GitHub release */
+  releaseNotes?: string;
+  /** release task: when true, push the tag and create a GitHub release via gh */
+  githubRelease?: boolean;
+  /** monitor task: number of health samples to take (default 3) */
+  monitorSamples?: number;
+  /** monitor task: delay between samples in ms (default 2000) */
+  monitorIntervalMs?: number;
+  /** monitor task: failed-sample count that constitutes an incident (default 1) */
+  failureThreshold?: number;
+  /** monitor task: repo (owner/repo) to file an incident issue into on breach */
+  incidentRepo?: string;
+  /** monitor task: label applied to filed incident issues (default "moag:incident") */
+  incidentLabel?: string;
   /** Runtime status (not persisted in the plan file) */
   status: TaskStatus;
 }
@@ -422,6 +438,16 @@ export interface PlanFileTask {
   sourceIssueNumber?: number;
   /** GitHub repo (owner/repo) for the source issue */
   sourceIssueRepo?: string;
+  /** release task fields */
+  releaseTag?: string;
+  releaseNotes?: string;
+  githubRelease?: boolean;
+  /** monitor task fields */
+  monitorSamples?: number;
+  monitorIntervalMs?: number;
+  failureThreshold?: number;
+  incidentRepo?: string;
+  incidentLabel?: string;
   /** Persisted execution status (omitted or 'pending' means not yet run) */
   status?: string;
 }

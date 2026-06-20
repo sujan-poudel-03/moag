@@ -1024,4 +1024,115 @@ describe('TaskRunner', () => {
     // After completion, the original prompt should be restored
     assert.equal(plan.playlists[0].tasks[0].prompt, originalPrompt);
   });
+
+  // ─── Ship half: deploy / release task types ───
+
+  function shipPlan(mut: (t: ReturnType<typeof createTask>) => void): Plan {
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].autoplayDelay = 0;
+    mut(plan.playlists[0].tasks[0]);
+    return plan;
+  }
+
+  it('deploy task runs its command without an engine and completes', async () => {
+    const { runner, historyStore } = buildRunner();
+    spawnStub.callsFake((command: string) =>
+      command === 'git'
+        ? createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 })
+        : createSpawnProc({ stdoutChunks: ['deployed'], closeCode: 0 }));
+
+    const plan = shipPlan((t) => { t.type = 'deploy'; t.command = 'npm run deploy'; });
+    await runner.play(plan);
+
+    assert.equal(engineRunStub.callCount, 0);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.equal(historyStore.add.firstCall.args[0].taskType, 'deploy');
+  });
+
+  it('deploy task fails when the command exits non-zero', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake((command: string) =>
+      command === 'git'
+        ? createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 })
+        : createSpawnProc({ stderrChunks: ['deploy boom'], closeCode: 1 }));
+
+    const plan = shipPlan((t) => { t.type = 'deploy'; t.command = 'npm run deploy'; });
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+  });
+
+  it('deploy task with no command fails with a config error', async () => {
+    const { runner } = buildRunner();
+    const plan = shipPlan((t) => { t.type = 'deploy'; });
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+  });
+
+  it('release task runs its command and creates a tag', async () => {
+    const { runner, historyStore } = buildRunner();
+    const gitArgs: string[][] = [];
+    spawnStub.callsFake((command: string, args: string[]) => {
+      if (command === 'git') { gitArgs.push(args); return createSpawnProc({ stdoutChunks: [''], closeCode: 0 }); }
+      return createSpawnProc({ stdoutChunks: ['v1.2.3'], closeCode: 0 });
+    });
+
+    const plan = shipPlan((t) => { t.type = 'release'; t.command = 'npm version patch'; t.releaseTag = 'v1.2.3'; });
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.equal(historyStore.add.firstCall.args[0].taskType, 'release');
+    assert.ok(gitArgs.some((a) => a[0] === 'tag' && a.includes('v1.2.3')), 'should create an annotated git tag');
+  });
+
+  it('release task with neither command nor tag fails', async () => {
+    const { runner } = buildRunner();
+    const plan = shipPlan((t) => { t.type = 'release'; });
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+  });
+
+  // ─── Maintain half: monitor task type ───
+
+  it('monitor task passes when the endpoint is healthy', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const http = require('http');
+    const server = http.createServer((_req: unknown, res: { statusCode: number; end: () => void }) => { res.statusCode = 200; res.end(); });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    try {
+      const { runner } = buildRunner();
+      const plan = shipPlan((t) => {
+        t.type = 'monitor';
+        t.healthCheckUrl = `http://127.0.0.1:${port}/health`;
+        t.monitorSamples = 1; t.monitorIntervalMs = 0;
+      });
+      await runner.play(plan);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('monitor task fails and emits an incident when the endpoint is down', async () => {
+    const { runner } = buildRunner();
+    const incidents: string[] = [];
+    runner.on('incident', (_t: unknown, summary: string) => incidents.push(summary));
+    const plan = shipPlan((t) => {
+      t.type = 'monitor';
+      t.healthCheckUrl = 'http://127.0.0.1:1/health'; // nothing listening → breach
+      t.monitorSamples = 1; t.monitorIntervalMs = 0; t.failureThreshold = 1;
+    });
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    assert.equal(incidents.length, 1);
+  });
+
+  it('monitor task with no healthCheckUrl fails', async () => {
+    const { runner } = buildRunner();
+    const plan = shipPlan((t) => { t.type = 'monitor'; });
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+  });
 });

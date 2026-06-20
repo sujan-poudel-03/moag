@@ -26,6 +26,8 @@ type ToolResultContent = string | Array<{ type: string; [key: string]: unknown }
 const MAX_AGENT_ITERATIONS = 40;
 const MAX_SESSION_TURNS = 20;
 const TOOL_TIMEOUT_MS = 60_000;
+/** Cap run_bash output so a runaway agent can't OOM the extension host. */
+const MAX_TOOL_OUTPUT_BYTES = 1 * 1024 * 1024;
 
 const AGENT_TOOLS = [
   {
@@ -388,9 +390,29 @@ export class AnthropicAdapter implements EngineAdapter {
 
       let stdout = '';
       let stderr = '';
+      let stdoutTruncated = false;
+      let stderrTruncated = false;
 
-      proc.stdout?.on('data', (chunk: Buffer) => { stdout += chunk.toString(); });
-      proc.stderr?.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
+      proc.stdout?.on('data', (chunk: Buffer) => {
+        if (stdoutTruncated) { return; }
+        const text = chunk.toString();
+        if (stdout.length + text.length > MAX_TOOL_OUTPUT_BYTES) {
+          stdout += text.slice(0, MAX_TOOL_OUTPUT_BYTES - stdout.length) + '\n…[output truncated at 1MB]';
+          stdoutTruncated = true;
+        } else {
+          stdout += text;
+        }
+      });
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        if (stderrTruncated) { return; }
+        const text = chunk.toString();
+        if (stderr.length + text.length > MAX_TOOL_OUTPUT_BYTES) {
+          stderr += text.slice(0, MAX_TOOL_OUTPUT_BYTES - stderr.length) + '\n…[output truncated at 1MB]';
+          stderrTruncated = true;
+        } else {
+          stderr += text;
+        }
+      });
 
       const timeout = setTimeout(() => {
         proc.kill();

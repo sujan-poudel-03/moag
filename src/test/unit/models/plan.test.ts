@@ -285,6 +285,40 @@ describe('loadPlan / savePlan round-trip', () => {
     assert.equal(loaded.playlists[0].tasks[0].prompt, 'Deploy to {{env}} v{{version}}');
   });
 
+  it('should round-trip ship/maintain task fields (deploy/release/monitor) through save/load', () => {
+    const plan = createEmptyPlan('Ship Fields Round-trip');
+    const deploy = createTask('Deploy', 'deploy');
+    deploy.type = 'deploy';
+    deploy.command = 'npm run deploy:staging';
+    deploy.inheritEnvFiles = ['.env.staging'];
+    deploy.healthCheckUrl = 'http://localhost:3000/health';
+    const release = createTask('Release', 'release');
+    release.type = 'release';
+    release.releaseTag = 'v1.2.3';
+    release.releaseNotes = 'notes';
+    release.githubRelease = true;
+    const monitor = createTask('Monitor', 'monitor');
+    monitor.type = 'monitor';
+    monitor.healthCheckUrl = 'https://app/health';
+    monitor.monitorSamples = 5;
+    monitor.monitorIntervalMs = 1000;
+    monitor.failureThreshold = 2;
+    monitor.incidentRepo = 'owner/repo';
+    monitor.incidentLabel = 'moag:incident';
+    plan.playlists[0].tasks.push(deploy, release, monitor);
+
+    savePlan(plan, tmpFile);
+    const [d, r, m] = loadPlan(tmpFile).playlists[0].tasks;
+
+    assert.equal(d.inheritEnvFiles?.[0], '.env.staging');
+    assert.equal(r.releaseTag, 'v1.2.3');
+    assert.equal(r.githubRelease, true);
+    assert.equal(m.monitorSamples, 5);
+    assert.equal(m.failureThreshold, 2);
+    assert.equal(m.incidentRepo, 'owner/repo');
+    assert.equal(m.incidentLabel, 'moag:incident');
+  });
+
   it('should preserve skipIf through hydrate/dehydrate', () => {
     const plan = createEmptyPlan('SkipIf Hydrate Test');
     const task = createTask('Guarded', 'Run only if abc not done');

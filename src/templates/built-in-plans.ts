@@ -216,6 +216,74 @@ const monorepoSetup: PlanTemplate = {
   ]),
 };
 
+// ── Ship (gated at ship: human approves before deploy/release) ──
+
+const shipRelease: PlanTemplate = {
+  id: 'tpl-ship-release',
+  name: 'Ship & Release (Gated)',
+  description: 'Build → test → human approval gate → deploy (pluggable command + health smoke) → tag & GitHub release',
+  category: 'Automate',
+  buildPlan: (proj) => {
+    const approve = Object.assign(
+      createTask('Approve ship', 'Human approval required before shipping. Review the build & test results, then Mark Complete to deploy.'),
+      { type: 'manual' as const },
+    );
+    const deployStaging = Object.assign(
+      createTask('Deploy to staging', 'Deploy the current build to the staging environment.'),
+      {
+        type: 'deploy' as const,
+        command: 'npm run deploy:staging',
+        inheritEnvFiles: ['.env.staging'],
+        healthCheckUrl: 'http://localhost:3000/health',
+        dependsOn: [approve.id],
+      },
+    );
+    const release = Object.assign(
+      createTask('Tag & GitHub release', 'Create the release tag and a GitHub release once staging is healthy.'),
+      {
+        type: 'release' as const,
+        command: 'npm version patch --no-git-tag-version',
+        releaseTag: 'v0.0.0',
+        releaseNotes: `Automated release of ${proj}`,
+        githubRelease: true,
+        dependsOn: [deployStaging.id],
+      },
+    );
+    return plan(`${proj} — Ship & Release`, [
+      Object.assign(createPlaylist('Build & Test'), { tasks: [
+        task('Build', `Produce a production build of ${proj}.`, { verify: 'npm run build' }),
+        Object.assign(createTask('Run tests', 'Run the full test suite; fail the ship if anything is red.'), { type: 'check' as const, command: 'npm test' }),
+      ]}),
+      Object.assign(createPlaylist('Ship & Release'), { tasks: [approve, deployStaging, release] }),
+    ]);
+  },
+};
+
+// ── Maintain (monitor → file incident → loop intakes → fix → gated redeploy) ──
+
+const healthMonitor: PlanTemplate = {
+  id: 'tpl-health-monitor',
+  name: 'Health Monitor (Self-Healing)',
+  description: 'Probe a health endpoint; on breach, file an incident issue the autonomous loop intakes, fixes, and (gated) redeploys',
+  category: 'Automate',
+  buildPlan: (proj) => plan(`${proj} — Health Monitor`, [
+    Object.assign(createPlaylist('Monitor'), { tasks: [
+      Object.assign(
+        createTask('Probe production health', 'Sample the production health endpoint and raise an incident on breach.'),
+        {
+          type: 'monitor' as const,
+          healthCheckUrl: 'https://your-app.example.com/health',
+          monitorSamples: 3,
+          monitorIntervalMs: 5000,
+          failureThreshold: 2,
+          incidentRepo: 'owner/repo',
+          incidentLabel: 'moag:incident',
+        },
+      ),
+    ]}),
+  ]),
+};
+
 /** All built-in plan templates */
 export const BUILT_IN_PLAN_TEMPLATES: PlanTemplate[] = [
   // Scaffold
@@ -234,4 +302,6 @@ export const BUILT_IN_PLAN_TEMPLATES: PlanTemplate[] = [
   apiDocs,
   dbMigration,
   monorepoSetup,
+  shipRelease,
+  healthMonitor,
 ];

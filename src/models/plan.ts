@@ -247,6 +247,8 @@ function hydrateTask(t: PlanFileTask, sourceName: string): Task {
     command: t.command,
     cwd: t.cwd,
     env: t.env,
+    inheritEnvFiles: t.inheritEnvFiles,
+    scopedVerify: t.scopedVerify,
     files: t.files,
     acceptanceCriteria: t.acceptanceCriteria,
     verifyCommand: t.verifyCommand,
@@ -264,6 +266,14 @@ function hydrateTask(t: PlanFileTask, sourceName: string): Task {
     validation: normalizeTaskValidation(t.validation, sourceName, t.id || t.name || '<unknown-task>'),
     sourceIssueNumber: t.sourceIssueNumber,
     sourceIssueRepo: t.sourceIssueRepo,
+    releaseTag: t.releaseTag,
+    releaseNotes: t.releaseNotes,
+    githubRelease: t.githubRelease,
+    monitorSamples: t.monitorSamples,
+    monitorIntervalMs: t.monitorIntervalMs,
+    failureThreshold: t.failureThreshold,
+    incidentRepo: t.incidentRepo,
+    incidentLabel: t.incidentLabel,
     status: (t.status as TaskStatus) || TaskStatus.Pending,
   };
 }
@@ -321,6 +331,8 @@ function dehydrateTask(t: Task): PlanFileTask {
     command: t.command,
     cwd: t.cwd,
     env: t.env,
+    inheritEnvFiles: t.inheritEnvFiles,
+    scopedVerify: t.scopedVerify,
     files: t.files,
     acceptanceCriteria: t.acceptanceCriteria,
     verifyCommand: t.verifyCommand,
@@ -335,6 +347,14 @@ function dehydrateTask(t: Task): PlanFileTask {
     dependsOn: t.dependsOn,
     skipIf: t.skipIf ? { taskId: t.skipIf.taskId, status: t.skipIf.status } : undefined,
     consensus: t.consensus,
+    releaseTag: t.releaseTag,
+    releaseNotes: t.releaseNotes,
+    githubRelease: t.githubRelease,
+    monitorSamples: t.monitorSamples,
+    monitorIntervalMs: t.monitorIntervalMs,
+    failureThreshold: t.failureThreshold,
+    incidentRepo: t.incidentRepo,
+    incidentLabel: t.incidentLabel,
   };
   if (t.validation && Object.keys(t.validation).length > 0) {
     result.validation = {
