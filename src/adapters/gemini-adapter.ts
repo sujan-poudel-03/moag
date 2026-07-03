@@ -1,7 +1,7 @@
 // ─── Gemini CLI adapter ───
 // Invokes Google's Gemini CLI tool for task execution.
 
-import * as vscode from 'vscode';
+import { getConfig } from '../core/host';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId, TokenUsage } from '../models/types';
 import { runCli } from './base-cli';
@@ -11,12 +11,12 @@ export class GeminiAdapter implements EngineAdapter {
   readonly displayName = 'Gemini CLI';
 
   getCommand(): string {
-    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.gemini')
+    return getConfig('agentTaskPlayer.engines.gemini')
       .get<string>('command', 'gemini');
   }
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
-    const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.gemini');
+    const config = getConfig('agentTaskPlayer.engines.gemini');
     const command = this.getCommand();
     const extraArgs = config.get<string[]>('args', []);
 

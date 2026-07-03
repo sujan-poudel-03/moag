@@ -1,7 +1,7 @@
 // ─── Codex CLI adapter ───
 // Invokes the OpenAI Codex CLI in non-interactive mode via `codex exec`.
 
-import * as vscode from 'vscode';
+import { getConfig } from '../core/host';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId, TokenUsage } from '../models/types';
 import { runCli } from './base-cli';
@@ -11,12 +11,12 @@ export class CodexAdapter implements EngineAdapter {
   readonly displayName = 'Codex CLI';
 
   getCommand(): string {
-    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.codex')
+    return getConfig('agentTaskPlayer.engines.codex')
       .get<string>('command', 'codex');
   }
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
-    const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.codex');
+    const config = getConfig('agentTaskPlayer.engines.codex');
     const command = this.getCommand();
     const extraArgs = config.get<string[]>('args', []);
 

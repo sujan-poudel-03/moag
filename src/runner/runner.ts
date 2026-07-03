@@ -1,4 +1,4 @@
-import * as vscode from 'vscode';
+import { getConfig, notifyWarn, workspaceRoot } from '../core/host';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
@@ -465,7 +465,7 @@ export class TaskRunner {
   }
 
   private isFailSafeMode(): boolean {
-    return vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('failSafeMode', false);
+    return getConfig('agentTaskPlayer').get<boolean>('failSafeMode', false);
   }
 
   /**
@@ -488,7 +488,7 @@ export class TaskRunner {
    * plan tasks and authoring calls alike.
    */
   private onCostRecorded(e: CostEvent): void {
-    const budget = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('costBudgetUsd', 0);
+    const budget = getConfig('agentTaskPlayer').get<number>('costBudgetUsd', 0);
     if (budget <= 0) {
       return;
     }
@@ -556,7 +556,7 @@ export class TaskRunner {
 
   async playTask(plan: Plan, playlistIndex: number, taskIndex: number): Promise<void> {
     if (this._state !== RunnerState.Idle) {
-      vscode.window.showWarningMessage('Runner is already active. Stop it first.');
+      notifyWarn('Runner is already active. Stop it first.');
       return;
     }
     if (this._playLock) {
@@ -585,7 +585,7 @@ export class TaskRunner {
 
   async playTasks(plan: Plan, taskList: Array<{ playlistIndex: number; taskIndex: number }>): Promise<void> {
     if (this._state !== RunnerState.Idle) {
-      vscode.window.showWarningMessage('Runner is already active. Stop it first.');
+      notifyWarn('Runner is already active. Stop it first.');
       return;
     }
     if (this._playLock) {
@@ -754,7 +754,7 @@ export class TaskRunner {
     }
 
     const failSafe = this.isFailSafeMode();
-    const concurrentPlaylists = vscode.workspace.getConfiguration('agentTaskPlayer')
+    const concurrentPlaylists = getConfig('agentTaskPlayer')
       .get<number>('parallelPlaylists', 1);
     const requested = failSafe ? 1 : concurrentPlaylists;
     // Concurrency is only granted once each playlist has its own checkout.
@@ -899,7 +899,7 @@ export class TaskRunner {
         // Autoplay delay only between non-synthetic original tasks
         if (!synthetic && playlist.autoplay && !queue.isEmpty) {
           const delay = taskPlaylist.autoplayDelay ??
-            vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('autoplayDelay', 2000);
+            getConfig('agentTaskPlayer').get<number>('autoplayDelay', 2000);
           await this.sleep(delay);
         }
       }
@@ -966,7 +966,7 @@ export class TaskRunner {
 
   private async executeTaskWithRetry(task: Task, playlist: Playlist, plan: Plan, repairCycle = 0): Promise<void> {
     const failSafe = this.isFailSafeMode();
-    const fullAuto = !failSafe && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('fullAuto', false);
+    const fullAuto = !failSafe && getConfig('agentTaskPlayer').get<boolean>('fullAuto', false);
     const effectiveMaxAttempts = fullAuto ? Math.max((task.retryCount ?? 0) + 1, 4) : (task.retryCount ?? 0) + 1;
 
     if (fullAuto) {
@@ -1010,7 +1010,7 @@ export class TaskRunner {
     }
 
     // Auto-fix: if task still failed and auto-fix is enabled (or fullAuto), attempt AI-driven repair
-    const autoFixEnabled = !failSafe && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
+    const autoFixEnabled = !failSafe && getConfig('agentTaskPlayer').get<boolean>('autoFix', true);
     if (task.status !== TaskStatus.Completed && this.getTaskType(task) === 'agent' && (autoFixEnabled || fullAuto)) {
       await this.autoFixTask(task, playlist, plan);
     }
@@ -1029,7 +1029,7 @@ export class TaskRunner {
     // One auto-fix attempt per task per run — prevents retry→autofix→retry→autofix loops
     if (this._autoFixedTasks.has(task.id)) { return; }
 
-    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const cfg = getConfig('agentTaskPlayer');
     const profileName = cfg.get<string>('executionProfile', 'auto');
     const profile = resolveProfile(profileName as ProfileName);
     const autoFix = profile.autoFix && cfg.get<boolean>('autoFix', true);
@@ -1195,7 +1195,7 @@ export class TaskRunner {
       return;
     }
 
-    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const cfg = getConfig('agentTaskPlayer');
 
     // Resolve execution profile
     const profileName = cfg.get<string>('executionProfile', 'auto');
@@ -1244,7 +1244,7 @@ export class TaskRunner {
     const taskAbort = new AbortController();
     const settingOverrideMs = (() => {
       try {
-        const v = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('taskTimeoutMs');
+        const v = getConfig('agentTaskPlayer').get<number>('taskTimeoutMs');
         return typeof v === 'number' && v >= 30000 ? v : undefined;
       } catch { return undefined; }
     })();
@@ -1272,7 +1272,7 @@ export class TaskRunner {
       if (!baselineVerification.passed) {
         const haltOnBroken = (() => {
           try {
-            return vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('haltOnBrokenBaseline', true);
+            return getConfig('agentTaskPlayer').get<boolean>('haltOnBrokenBaseline', true);
           } catch { return true; }
         })();
         if (haltOnBroken) {
@@ -1500,7 +1500,7 @@ export class TaskRunner {
         this._taskFailureContext.set(task.id, failureLines.join('\n\n'));
         this.emit('task-failed', task, result);
         // Fix 3: Hint when autoFix is off so users know why MOAG won't self-repair
-        const autoFixOn = !this.isFailSafeMode() && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
+        const autoFixOn = !this.isFailSafeMode() && getConfig('agentTaskPlayer').get<boolean>('autoFix', true);
         if (!autoFixOn && taskType === 'agent') {
           this.emit('task-output', task,
             `[Hint] autoFix is disabled — Claude won't attempt self-repair.\n` +
@@ -1547,7 +1547,7 @@ export class TaskRunner {
 
       this.emit('task-failed', task, errorResult);
       // Fix 3: Hint when autoFix is off so users know why MOAG won't self-repair
-      const autoFixOnCatch = !this.isFailSafeMode() && vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('autoFix', true);
+      const autoFixOnCatch = !this.isFailSafeMode() && getConfig('agentTaskPlayer').get<boolean>('autoFix', true);
       if (!autoFixOnCatch && taskType === 'agent') {
         this.emit('task-output', task,
           `[Hint] autoFix is disabled — Claude won't attempt self-repair.\n` +
@@ -1714,7 +1714,7 @@ export class TaskRunner {
       };
     }
 
-    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer.engines.anthropic');
+    const cfg = getConfig('agentTaskPlayer.engines.anthropic');
     const model = cfg.get<string>('model', 'claude-sonnet-4-6');
 
     return engine.runTask({
@@ -1771,10 +1771,10 @@ export class TaskRunner {
   ): Promise<EngineResult> {
     // Auto-model selection — profile's modelPreset takes priority over the setting
     const profilePreset = (task as Task & { _profileModelPreset?: string })._profileModelPreset;
-    const settingPreset = vscode.workspace.getConfiguration('agentTaskPlayer')
+    const settingPreset = getConfig('agentTaskPlayer')
       .get<ReasoningPreset>('defaultReasoningPreset', 'auto');
     const preset: ReasoningPreset = profilePreset ? (profilePreset as ReasoningPreset) : settingPreset;
-    const autoSelect = vscode.workspace.getConfiguration('agentTaskPlayer')
+    const autoSelect = getConfig('agentTaskPlayer')
       .get<boolean>('autoModelSelection', true);
     const selection = autoSelect ? selectModel(task, engineId, preset) : null;
 
@@ -1879,7 +1879,7 @@ export class TaskRunner {
     // output is discarded at the runTaskByType dispatch), so the charter is prepended here
     // by hand. Default to the reviewer charter: a review task IS a review, whatever the
     // plan's default role happens to be. Resolved locally on every call — never stashed.
-    const rolesEnabled = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('roles.enabled', true);
+    const rolesEnabled = getConfig('agentTaskPlayer').get<boolean>('roles.enabled', true);
     const reviewRole = task.role ?? playlist.role ?? plan.defaultRole ?? 'reviewer';
     const roleCharter = rolesEnabled ? resolveRoleCharter(reviewRole, plan.customRoles) : null;
     const finalPrompt = roleCharter
@@ -2651,7 +2651,7 @@ export class TaskRunner {
       // Role: task > playlist > plan, mirroring the engine chain in runTaskByType.
       // Resolved fresh on every call and never stashed on the task — a second concurrent
       // loop would otherwise overwrite the first one's charter mid-flight.
-      const rolesEnabled = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('roles.enabled', true);
+      const rolesEnabled = getConfig('agentTaskPlayer').get<boolean>('roles.enabled', true);
       const roleId = task.role ?? playlist.role ?? plan.defaultRole;
       const roleCharter = rolesEnabled ? resolveRoleCharter(roleId, plan.customRoles) : null;
 
@@ -2689,7 +2689,7 @@ export class TaskRunner {
       }
     }
     // Inject execution rules before the task prompt
-    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const cfg = getConfig('agentTaskPlayer');
     const rulesEnabled = cfg.get<boolean>('promptRulesEnabled', true);
     if (rulesEnabled) {
       const rules = cfg.get<string>('promptRules', '');
@@ -2827,9 +2827,8 @@ export class TaskRunner {
   }
 
   private resolveCwd(taskCwd?: string, task?: Task): string {
-    const workspaceFolders = vscode.workspace.workspaceFolders;
     const isolated = task ? this._taskCwdRoot.get(task.id) : undefined;
-    const root = isolated ?? workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const root = isolated ?? workspaceRoot();
     if (!taskCwd) {
       return root;
     }
@@ -2958,7 +2957,7 @@ export class TaskRunner {
   }
 
   private getDeliveryConfig(): DeliveryConfig {
-    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const cfg = getConfig('agentTaskPlayer');
     return {
       enabled: cfg.get<boolean>('git.autoCommit', false),
       branchPrefix: cfg.get<string>('git.branchPrefix', 'moag/') || 'moag/',
@@ -3139,7 +3138,7 @@ export class TaskRunner {
     signal: AbortSignal,
     repairCycle: number,
   ): Promise<{ passed: boolean; output: string; repairQueued?: boolean }> {
-    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    const cfg = getConfig('agentTaskPlayer');
     if (!cfg.get<boolean>('autoTest', false)) {
       return { passed: true, output: '' };
     }

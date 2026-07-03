@@ -16,6 +16,7 @@ import { ghSync, ghAsync } from './utils/gh';
 import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
 import { cmdResolveParkedItem, cmdShowMorningReview } from './ui/morning-review';
 import { cmdShowSetupGuide } from './ui/setup-guide';
+import { setHost } from './core/host';
 import { TaskRunner, classifyFailure } from './runner/runner';
 import {
   createPrdLoop, HaltReason, PrdLoopConfig, PrdLoopController, PrdLoopReport, UatSession,
@@ -188,19 +189,43 @@ function updateEngineStatusBarVisibility(): void {
   engineStatusBarItem.show();
 }
 
+function getActiveEngineId(available: EngineId[]): EngineId | undefined {
+  const planEngine = currentPlan?.defaultEngine;
+  if (planEngine) {
+    return planEngine;
+  }
+  return getPreferredPromptEngine(available.length > 0 ? available : detectedPromptEngines);
+}
+
 function updateEngineStatusBar(available: EngineId[]): void {
   if (!engineStatusBarItem) {
     return;
   }
 
+  if (available.length > 0) {
+    detectedPromptEngines = [...available];
+  }
+
   const names = available.map(getEngineDisplayName);
-  engineStatusBarItem.text = available.length > 0
-    ? `$(check) ${available.length} engine${available.length === 1 ? '' : 's'}`
-    : '$(warning) No engines';
-  engineStatusBarItem.tooltip = available.length > 0
-    ? `Detected engines:\n${names.join('\n')}`
-    : 'No supported AI engines detected.\nClick to rescan.';
+  const activeEngine = getActiveEngineId(available);
+
+  if (available.length === 0) {
+    engineStatusBarItem.text = '$(warning) No engines';
+    engineStatusBarItem.tooltip = 'No supported AI engines detected.\nClick to rescan.';
+  } else if (activeEngine) {
+    engineStatusBarItem.text = `$(robot) ${getEngineDisplayName(activeEngine)}`;
+    engineStatusBarItem.tooltip =
+      `Active coding agent: ${getEngineDisplayName(activeEngine)}\n\n` +
+      `Detected engines:\n${names.join('\n')}\n\nClick to switch engine.`;
+  } else {
+    engineStatusBarItem.text = `$(check) ${available.length} engine${available.length === 1 ? '' : 's'}`;
+    engineStatusBarItem.tooltip = `Detected engines:\n${names.join('\n')}\n\nClick to switch engine.`;
+  }
   updateEngineStatusBarVisibility();
+}
+
+function refreshEngineStatusBar(): void {
+  updateEngineStatusBar(detectedPromptEngines);
 }
 
 function getPromptEngineOptions(available: EngineId[]): PromptEngineOption[] {
@@ -945,6 +970,7 @@ function setVisiblePlan(
   if (promptViewProvider) {
     schedulePromptProviderSidebarSync();
   }
+  refreshEngineStatusBar();
   if (refreshDashboard) {
     scheduleDashboardUpdate();
   }
@@ -1278,6 +1304,13 @@ async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<voi
 
 export function activate(context: vscode.ExtensionContext): void {
   extensionContext = context;
+
+  // Bind the engine core to the VS Code environment (see src/core/host.ts).
+  setHost({
+    getConfiguration: (section) => vscode.workspace.getConfiguration(section),
+    warn: (message) => { void vscode.window.showWarningMessage(message); },
+    workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+  });
 
   // ── Output Channel + Global Error Capture ────────────────────────────────
   moagOutputChannel = vscode.window.createOutputChannel('MOAG');
@@ -1932,7 +1965,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // ─── Status bar ───
 
   engineStatusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
-  engineStatusBarItem.command = 'agentTaskPlayer.detectEngines';
+  engineStatusBarItem.command = 'agentTaskPlayer.switchEngine';
   context.subscriptions.push(engineStatusBarItem);
   updateEngineStatusBar(context.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []));
 
@@ -5828,28 +5861,35 @@ function cmdClearHistory(): void {
 }
 
 async function cmdSwitchEngine(): Promise<void> {
-  if (!currentPlan) { return; }
   const engines: Array<{ label: string; id: string }> = [
     { label: 'Claude Code', id: 'claude' },
     { label: 'Codex CLI', id: 'codex' },
     { label: 'Gemini CLI', id: 'gemini' },
     { label: 'Ollama (local)', id: 'ollama' },
   ];
-  const current = currentPlan.defaultEngine;
+  const current = getActiveEngineId(detectedPromptEngines);
+  const scope = currentPlan ? 'this plan' : 'new plans';
   const items = engines.map(e => ({
     label: e.label + (e.id === current ? ' (current)' : ''),
     description: e.id,
     id: e.id,
   }));
   const pick = await vscode.window.showQuickPick(items, {
-    placeHolder: 'Switch default engine for this plan',
+    placeHolder: `Switch default engine for ${scope}`,
   });
   if (!pick || pick.id === current) { return; }
-  currentPlan.defaultEngine = pick.id as import('./models/types').EngineId;
-  if (currentPlanPath) {
-    savePlan(currentPlan, currentPlanPath);
+  const engineId = pick.id as import('./models/types').EngineId;
+  if (currentPlan) {
+    currentPlan.defaultEngine = engineId;
+    if (currentPlanPath) {
+      savePlan(currentPlan, currentPlanPath);
+    }
+    planTree.refresh();
+  } else {
+    await vscode.workspace.getConfiguration('agentTaskPlayer')
+      .update('defaultEngine', engineId, vscode.ConfigurationTarget.Global);
   }
-  planTree.refresh();
+  refreshEngineStatusBar();
   scheduleDashboardUpdate();
   vscode.window.showInformationMessage(`Engine switched to ${pick.label.replace(' (current)', '')}.`);
 }

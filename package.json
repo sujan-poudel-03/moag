@@ -1606,7 +1606,7 @@
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
     "test": "npm run test:unit",
-    "test:unit": "mocha --require ts-node/register \"src/test/unit/**/*.test.ts\" --ignore \"src/test/unit/**/*live.test.ts\"",
+    "test:unit": "mocha --require ts-node/register --require ./src/test/unit/test-setup.ts \"src/test/unit/**/*.test.ts\" --ignore \"src/test/unit/**/*live.test.ts\"",
     "test:live": "mocha --require ts-node/register \"src/test/unit/**/*live.test.ts\"",
     "test:integration": "vscode-test",
     "pretest:integration": "npm run compile",

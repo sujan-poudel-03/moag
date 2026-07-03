@@ -3,7 +3,7 @@
 // Features: agentic tool-use loop (read/write/bash), real extended thinking,
 // multi-turn sessions per playlist, live streaming output, browser vision.
 
-import * as vscode from 'vscode';
+import { getConfig } from '../core/host';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
@@ -126,7 +126,7 @@ export class AnthropicAdapter implements EngineAdapter {
   }
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
-    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer.engines.anthropic');
+    const cfg = getConfig('agentTaskPlayer.engines.anthropic');
     const apiKey = cfg.get<string>('apiKey', '') || process.env.ANTHROPIC_API_KEY || '';
 
     if (!apiKey) {

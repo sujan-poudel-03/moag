@@ -1,6 +1,6 @@
 // ─── Context Builder — enriches task prompts with plan-aware context ───
 
-import * as vscode from 'vscode';
+import { getConfig } from '../core/host';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Plan, Playlist, Task, TaskStatus, HistoryEntry } from '../models/types';
@@ -110,7 +110,7 @@ export interface ContextOptions {
 
 /** Read context settings from VS Code configuration */
 export function getContextSettings(): ContextSettings {
-  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer.context');
+  const cfg = getConfig('agentTaskPlayer.context');
   return {
     enabled: cfg.get<boolean>('enabled', true),
     planOverview: cfg.get<boolean>('planOverview', true),

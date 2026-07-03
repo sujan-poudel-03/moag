@@ -23,6 +23,15 @@ export function installVscodeShim(workspaceRoot?: string): void {
   const shim = require('./vscode-shim');
   if (workspaceRoot) { shim.__setWorkspaceRoot(workspaceRoot); }
 
+  // Bind the engine core to the headless (file-backed) environment.
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { setHost } = require('../core/host');
+  setHost({
+    getConfiguration: (section: string) => shim.workspace.getConfiguration(section),
+    warn: (message: string) => { try { shim.window.showWarningMessage(message); } catch { /* headless */ } },
+    workspaceRoot: () => shim.workspace.workspaceFolders?.[0]?.uri?.fsPath ?? process.cwd(),
+  });
+
   const originalLoad = Module._load;
   Module._load = function (request: string, parent: unknown, isMain: boolean): unknown {
     if (request === 'vscode') { return shim; }

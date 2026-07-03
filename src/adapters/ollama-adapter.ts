@@ -1,7 +1,7 @@
 // ─── Ollama CLI adapter ───
 // Invokes a local Ollama model via `ollama run <model> "<prompt>"`.
 
-import * as vscode from 'vscode';
+import { getConfig } from '../core/host';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId, TokenUsage } from '../models/types';
 import { runCli } from './base-cli';
@@ -11,12 +11,12 @@ export class OllamaAdapter implements EngineAdapter {
   readonly displayName = 'Ollama (Local)';
 
   getCommand(): string {
-    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.ollama')
+    return getConfig('agentTaskPlayer.engines.ollama')
       .get<string>('command', 'ollama');
   }
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
-    const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.ollama');
+    const config = getConfig('agentTaskPlayer.engines.ollama');
     const command = this.getCommand();
     const model = config.get<string>('model', 'codellama');
 

@@ -1,7 +1,7 @@
 // ─── Custom CLI adapter ───
 // Lets users configure an arbitrary command with {prompt} placeholder.
 
-import * as vscode from 'vscode';
+import { getConfig } from '../core/host';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId } from '../models/types';
 import { runCli } from './base-cli';
@@ -11,12 +11,12 @@ export class CustomAdapter implements EngineAdapter {
   readonly displayName = 'Custom Engine';
 
   getCommand(): string {
-    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.custom')
+    return getConfig('agentTaskPlayer.engines.custom')
       .get<string>('command', '');
   }
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
-    const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.custom');
+    const config = getConfig('agentTaskPlayer.engines.custom');
     const command = this.getCommand();
     const argTemplates = config.get<string[]>('args', []);
 

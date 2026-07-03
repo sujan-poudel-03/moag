@@ -3,7 +3,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as vscode from 'vscode';
+import { getConfig } from '../core/host';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId, TokenUsage } from '../models/types';
 import { runCli } from './base-cli';
@@ -25,12 +25,12 @@ export class ClaudeAdapter implements EngineAdapter {
   readonly displayName = 'Claude Code';
 
   getCommand(): string {
-    return vscode.workspace.getConfiguration('agentTaskPlayer.engines.claude')
+    return getConfig('agentTaskPlayer.engines.claude')
       .get<string>('command', 'claude');
   }
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
-    const config = vscode.workspace.getConfiguration('agentTaskPlayer.engines.claude');
+    const config = getConfig('agentTaskPlayer.engines.claude');
     const command = this.getCommand();
     const extraArgs = config.get<string[]>('args', ['-p']);
     const autoApprove = config.get<boolean>('autoApprove', true);

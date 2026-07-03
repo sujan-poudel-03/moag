@@ -26,6 +26,13 @@
   },
   "overrides": [
     {
+      "files": ["src/runner/**/*.ts", "src/context/**/*.ts", "src/adapters/**/*.ts"],
+      "excludedFiles": ["src/adapters/copilot-adapter.ts"],
+      "rules": {
+        "no-restricted-imports": ["error", { "paths": [{ "name": "vscode", "message": "Engine core must not import vscode directly — use src/core/host.ts (ConfigPort/MoagHost)." }] }]
+      }
+    },
+    {
       "files": ["src/adapters/**/*.ts", "src/test/**/*.ts"],
       "rules": {
         "no-restricted-syntax": "off"

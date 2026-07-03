@@ -6,18 +6,22 @@
  *   moag run    <plan.json> [--no-interactive] [--full-auto] [--engine <id>] [--cwd <dir>]
  *                           [--verify] [--fix] [--prd <file>] [--gate "<cmd>"] [--max-iterations <n>]
  *                           [--uat | --no-uat] [--uat-spec <path>]
+ *   moag run    --prompt "<text>" [--engine <id>] [--full-auto] [--cwd <dir>]
  *   moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]
  *                           [--engine <id>] [--cwd <dir>] [--uat | --no-uat] [--uat-spec <path>]
  *   moag loop   --repo <owner/repo> [--label <l>] [--interval <sec>] [--once]
  *                                   [--full-auto] [--engine <id>] [--cwd <dir>]
+ *   moag config <get-engine | set-engine <id>>
  *
- * `run`    executes a single plan file.
+ * `run`    executes a single plan file, or a one-shot prompt (`--prompt`) which is
+ *          turned into a single agent task and run through the selected engine.
  * `verify` runs the deterministic PRD gates (change / command / artifact / status)
  *          and only then asks a model for a verdict; with `--fix` it generates and
  *          runs fix playlists until the gates pass or a halt condition trips.
  *          `--uat` forces the browser UAT gate to run and pass (a missing
  *          Playwright/Cypress setup then FAILS verification); `--no-uat` disables
  *          it. Without either flag, agentTaskPlayer.prdLoop.uat.mode decides.
+ * `config` reads/sets the persistent default engine in `.moag/config.json`.
  * `loop`   polls a GitHub repo for open issues, turns each new issue into a task,
  *          runs them, then reports the outcome back to the issue (comment + close on
  *          success; comment + label on failure) — the closed autonomous loop.
@@ -44,6 +48,9 @@ export interface Args {
   noInteractive: boolean;
   fullAuto: boolean;
   engine?: string;
+  prompt?: string;
+  /** Raw non-flag positional args, in order (e.g. config subcommand + value). */
+  positionals: string[];
   // loop-only
   repo?: string;
   label?: string;
@@ -66,8 +73,6 @@ export interface Args {
   pr?: boolean;
   /** Target branch for --pr; gh picks the repo default when omitted. */
   prBase?: string;
-  /** Bare words after the command, e.g. `queue resolve <id>`. */
-  positionals: string[];
   /** Lower bound for `digest`, any value git --since understands. */
   since?: string;
 }
@@ -97,6 +102,7 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--verify') { a.verify = true; }
     else if (arg === '--fix') { a.fix = true; }
     else if (arg === '--engine') { a.engine = rest[++i]; }
+    else if (arg === '--prompt') { a.prompt = rest[++i]; }
     else if (arg === '--cwd') { a.cwd = path.resolve(rest[++i]); }
     else if (arg === '--repo') { a.repo = rest[++i]; }
     else if (arg === '--label') { a.label = rest[++i]; }
@@ -115,7 +121,7 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
     else if (!arg.startsWith('--')) {
-      // `queue` reads its verb from positionals; `run`/`verify` take a plan path.
+      // `queue`/`config` read their verb from positionals; `run`/`verify` take a plan path.
       a.positionals.push(arg);
       if (!a.planPath) { a.planPath = path.resolve(a.cwd, arg); }
     }
@@ -449,17 +455,27 @@ async function runVerifyCore(args: Args, ctx: Ctx, plan: any, events: RunnerEven
 // ─── command: run ────────────────────────────────────────────────────────────
 
 async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
-  const planPath = args.planPath!;
   let plan;
-  try { plan = ctx.loadPlan(planPath); }
-  catch (err) { process.stderr.write(`Failed to load plan: ${err instanceof Error ? err.message : String(err)}\n`); return 2; }
-  if (args.engine) { plan.defaultEngine = args.engine; }
+  let planPath: string;
+  if (args.prompt) {
+    // One-shot mode: synthesise a single agent task from the prompt, like `claude "<text>"`.
+    // Resolve the engine: explicit flag wins, else the persistent default (.moag/config.json).
+    const engineId = args.engine
+      ?? ctx.vscode.workspace.getConfiguration('agentTaskPlayer').get('defaultEngine', 'claude');
+    plan = buildPromptPlan(args.prompt, engineId);
+    planPath = '<inline prompt>';
+  } else {
+    planPath = args.planPath!;
+    try { plan = ctx.loadPlan(planPath); }
+    catch (err) { process.stderr.write(`Failed to load plan: ${err instanceof Error ? err.message : String(err)}\n`); return 2; }
+    if (args.engine) { plan.defaultEngine = args.engine; }
+  }
 
   const events = wireEvents(ctx.runner);
   // Captured before the run so --pr can report what the run actually touched.
   const { captureBaseRef } = require('../runner/evidence');
   const prBaseRef = args.pr ? await captureBaseRef(args.cwd) : null;
-  emit({ event: 'run-started', plan: plan.name, planPath, fullAuto: args.fullAuto });
+  emit({ event: 'run-started', plan: plan.name, planPath, fullAuto: args.fullAuto, engine: plan.defaultEngine });
   try { await ctx.runner.play(plan); }
   catch (err) { emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
 
@@ -722,12 +738,104 @@ function cmdQueue(args: Args): number {
   return open.length > 0 ? 1 : 0;
 }
 
+// ─── one-shot prompt → plan ──────────────────────────────────────────────────
+
+/** Build a single-agent-task plan from a prompt string (the `--prompt` one-shot path). */
+export function buildPromptPlan(prompt: string, engineId: string): any {
+  const { createEmptyPlan, createTask } = require('../models/plan');
+  const plan = createEmptyPlan('One-shot prompt');
+  const name = prompt.length > 60 ? `${prompt.slice(0, 57)}…` : prompt;
+  plan.playlists[0].tasks = [createTask(name, prompt, undefined)];
+  plan.defaultEngine = engineId;
+  return plan;
+}
+
+// ─── command: config ─────────────────────────────────────────────────────────
+
+const KNOWN_ENGINES = ['claude', 'codex', 'gemini', 'ollama', 'custom', 'copilot', 'anthropic'];
+
+/** Resolve the persistent config file path (honours MOAG_CONFIG_PATH). */
+export function configFilePath(cwd: string): string {
+  const explicit = process.env.MOAG_CONFIG_PATH;
+  return explicit && explicit.length > 0 ? path.resolve(explicit) : path.join(cwd, '.moag', 'config.json');
+}
+
+/** Read the `.moag/config.json` object (empty object if missing/unreadable). */
+export function readConfigFile(cwd: string): Record<string, any> {
+  const fs = require('fs');
+  const p = configFilePath(cwd);
+  try { return fs.existsSync(p) ? JSON.parse(fs.readFileSync(p, 'utf-8')) : {}; }
+  catch { return {}; }
+}
+
+/** Current persistent default engine, defaulting to `claude`. */
+export function readDefaultEngine(cwd: string): string {
+  const cfg = readConfigFile(cwd);
+  return (cfg && cfg.agentTaskPlayer && cfg.agentTaskPlayer.defaultEngine) || 'claude';
+}
+
+/** Validate + persist the default engine, preserving other config keys. Atomic write. */
+export function setDefaultEngine(cwd: string, id: string): { ok: boolean; path: string; error?: string } {
+  const fs = require('fs');
+  const p = configFilePath(cwd);
+  if (!id || !KNOWN_ENGINES.includes(id)) {
+    return { ok: false, path: p, error: `Usage: moag config set-engine <${KNOWN_ENGINES.join('|')}>` };
+  }
+  const cfg = readConfigFile(cwd);
+  cfg.agentTaskPlayer = (cfg.agentTaskPlayer && typeof cfg.agentTaskPlayer === 'object') ? cfg.agentTaskPlayer : {};
+  cfg.agentTaskPlayer.defaultEngine = id;
+  try {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    const tmp = `${p}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), 'utf-8');
+    fs.renameSync(tmp, p);
+  } catch (err) {
+    return { ok: false, path: p, error: `Failed to write config at ${p}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  return { ok: true, path: p };
+}
+
+/** Read/set the persistent default engine in `.moag/config.json` (no runner needed). */
+async function cmdConfig(args: Args): Promise<number> {
+  const sub = args.positionals[0];
+
+  if (sub === 'set-engine') {
+    const res = setDefaultEngine(args.cwd, args.positionals[1]);
+    if (!res.ok) { process.stderr.write(`${res.error}\n`); return 2; }
+    emit({ event: 'config-updated', key: 'agentTaskPlayer.defaultEngine', value: args.positionals[1], path: res.path });
+    return 0;
+  }
+
+  if (sub === 'get-engine') {
+    const current = readDefaultEngine(args.cwd);
+    let detected: string[] = [];
+    try {
+      installVscodeShim(args.cwd);
+      const { registerAllEngines } = require('../adapters/index');
+      registerAllEngines();
+      const { detectEngines } = require('../engine-detection');
+      detected = (await detectEngines()).available;
+    } catch { /* detection is best-effort */ }
+    emit({ event: 'config', defaultEngine: current, detected, path: configFilePath(args.cwd) });
+    return 0;
+  }
+
+  process.stderr.write(
+    'Usage: moag config <get-engine | set-engine <id>>\n' +
+    `  engines: ${KNOWN_ENGINES.join(' | ')}\n`,
+  );
+  return 2;
+}
+
 // ─── entry ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
   if (args.command === 'run') {
-    if (!args.planPath) { process.stderr.write('Usage: moag run <plan.json> [--full-auto] [--engine <id>] [--cwd <dir>]\n'); return 2; }
+    if (!args.planPath && !args.prompt) {
+      process.stderr.write('Usage: moag run <plan.json | --prompt "<text>"> [--full-auto] [--engine <id>] [--cwd <dir>]\n');
+      return 2;
+    }
     return cmdRun(args, await setup(args));
   }
   if (args.command === 'verify') {
@@ -749,12 +857,17 @@ async function main(): Promise<number> {
   if (args.command === 'daemon') {
     return cmdDaemon(args, await setup(args));
   }
+  if (args.command === 'config') {
+    return cmdConfig(args);
+  }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|queue|digest> ...\n' +
+    'Usage: moag <run|verify|loop|daemon|config|queue|digest> ...\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
+    '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
     '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
     '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
     '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
+    '  moag config <get-engine | set-engine <id>>\n' +
     '  moag queue <list | resolve <id>>\n' +
     '  moag digest [--since <when>]\n',
   );
