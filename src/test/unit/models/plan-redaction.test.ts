@@ -17,6 +17,7 @@ const SECRET_PLAYLIST_RULES = 'secret-playlist-rules';
 const SECRET_PRD_CONTEXT = 'secret-playlist-prd-context';
 const SECRET_ENV = 'secret-env-value';
 const SECRET_OWNER_NOTE = 'secret-owner-note';
+const SECRET_CUSTOM_ROLE_CHARTER = 'secret-custom-role-charter';
 
 function buildSensitivePlan(): Plan {
   const plan = createEmptyPlan('Sensitive Plan');
@@ -25,14 +26,20 @@ function buildSensitivePlan(): Plan {
   plan.prdSource = SECRET_PRD;
   plan.prdVersions = [{ version: 'v1', text: SECRET_PRD_VERSION, createdAt: '2026-01-01T00:00:00.000Z' }];
   plan.fixIterations = 2;
+  // A charter is project-authored prompt text — same class as aiRules, so it is redacted.
+  // The role *ids* below are structural and must survive, or a shared plan stops being diffable.
+  plan.defaultRole = 'engineer';
+  plan.customRoles = [{ id: 'custom', name: 'House Role', charter: SECRET_CUSTOM_ROLE_CHARTER }];
 
   const playlist = plan.playlists[0];
   playlist.aiRules = SECRET_PLAYLIST_RULES;
   playlist.prdContext = SECRET_PRD_CONTEXT;
+  playlist.role = 'designer';
 
   const task = createTask('Build', 'Build the thing');
   task.env = { DEPLOY_KEY: SECRET_ENV };
   task.ownerNote = SECRET_OWNER_NOTE;
+  task.role = 'reviewer';
   task.status = TaskStatus.Completed;
   playlist.tasks.push(task);
 
@@ -58,6 +65,7 @@ describe('redactPlanFile / serializePlanForSharing', () => {
     for (const sentinel of [
       SECRET_VARIABLE, SECRET_PLAN_RULES, SECRET_PRD, SECRET_PRD_VERSION,
       SECRET_PLAYLIST_RULES, SECRET_PRD_CONTEXT, SECRET_ENV, SECRET_OWNER_NOTE,
+      SECRET_CUSTOM_ROLE_CHARTER,
     ]) {
       assert.ok(!json.includes(sentinel), `shared JSON still contains "${sentinel}"`);
     }
@@ -67,6 +75,7 @@ describe('redactPlanFile / serializePlanForSharing', () => {
     assert.ok(!('aiRules' in parsed));
     assert.ok(!('prdSource' in parsed));
     assert.ok(!('prdVersions' in parsed));
+    assert.ok(!('customRoles' in parsed));
     // Non-sensitive fields survive
     assert.equal(parsed.name, 'Sensitive Plan');
     assert.equal(parsed.fixIterations, 2);
@@ -78,6 +87,7 @@ describe('redactPlanFile / serializePlanForSharing', () => {
     assert.deepEqual([...redacted].sort(), [
       'PRD text',
       'PRD version history',
+      'custom role definitions',
       'owner notes',
       'plan rules',
       'playlist PRD context',
@@ -182,5 +192,31 @@ describe('redactPlanFile / serializePlanForSharing', () => {
     assert.deepEqual(file.variables, { API_TOKEN: SECRET_VARIABLE });
     assert.equal(file.playlists[0].tasks[0].env!.DEPLOY_KEY, SECRET_ENV);
     assert.ok(!('variables' in (shared as object)));
+  });
+
+  it('shares role ids at every level while redacting the custom charter', () => {
+    const { json } = serializePlanForSharing(buildSensitivePlan());
+    const parsed = JSON.parse(json) as PlanFile;
+
+    // Redacted: the charter text itself.
+    assert.ok(!json.includes(SECRET_CUSTOM_ROLE_CHARTER));
+    assert.ok(!('customRoles' in (parsed as object)));
+
+    // Shared: the structural role ids. Over-eager redaction here would destroy the
+    // diffability that motivates roles in the first place.
+    assert.equal(parsed.defaultRole, 'engineer');
+    assert.equal(parsed.playlists[0].role, 'designer');
+    assert.equal(parsed.playlists[0].tasks[0].role, 'reviewer');
+  });
+
+  it('keeps custom charters at full fidelity on the local save path', () => {
+    const plan = buildSensitivePlan();
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+
+    assert.equal(loaded.defaultRole, 'engineer');
+    assert.equal(loaded.customRoles![0].charter, SECRET_CUSTOM_ROLE_CHARTER);
+    assert.equal(loaded.playlists[0].role, 'designer');
+    assert.equal(loaded.playlists[0].tasks[0].role, 'reviewer');
   });
 });

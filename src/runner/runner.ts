@@ -21,6 +21,7 @@ import {
   VerificationResult,
 } from '../models/types';
 import { generateId } from '../models/plan';
+import { resolveRoleCharter } from '../models/roles';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
 import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName, ProfileConfig } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
@@ -1261,7 +1262,7 @@ export class TaskRunner {
       if (task.consensus && task.consensus.engines.length > 0 && taskType === 'agent') {
         result = await this.runConsensusTask(task, cwd, executionDescription, taskAbort.signal, plan);
       } else {
-        result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal, plan, plan.fallbackEngine, resolvedEnv);
+        result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal, plan, playlist, plan.fallbackEngine, resolvedEnv);
       }
 
       if (taskAbort.signal.aborted && !this._abortController?.signal.aborted) {
@@ -1576,6 +1577,7 @@ export class TaskRunner {
     fullPrompt: string,
     signal: AbortSignal,
     plan: Plan,
+    playlist: Playlist,
     fallbackEngine?: EngineId,
     resolvedEnv?: Record<string, string>,
   ): Promise<EngineResult> {
@@ -1589,7 +1591,7 @@ export class TaskRunner {
       case 'check':
         return this.runCheckTask(task, cwd, signal, resolvedEnv);
       case 'review':
-        return this.runReviewTask(task, engineId, cwd, signal, plan, fallbackEngine);
+        return this.runReviewTask(task, engineId, cwd, signal, plan, playlist, fallbackEngine);
       case 'validate':
         return this.runValidateTask(task, cwd, signal, plan);
       case 'manual':
@@ -1779,6 +1781,7 @@ export class TaskRunner {
     cwd: string,
     signal: AbortSignal,
     plan: Plan,
+    playlist: Playlist,
     fallbackEngine?: EngineId,
   ): Promise<EngineResult> {
     // Find the dependency task's history entry
@@ -1830,7 +1833,18 @@ export class TaskRunner {
       ].join('\n');
     }
 
-    return this.runAgentTask(task, reviewEngine, cwd, reviewPrompt, signal, fallbackEngine);
+    // Review tasks never touch buildContext (buildPrompt is gated to agent|review but its
+    // output is discarded at the runTaskByType dispatch), so the charter is prepended here
+    // by hand. Default to the reviewer charter: a review task IS a review, whatever the
+    // plan's default role happens to be. Resolved locally on every call — never stashed.
+    const rolesEnabled = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('roles.enabled', true);
+    const reviewRole = task.role ?? playlist.role ?? plan.defaultRole ?? 'reviewer';
+    const roleCharter = rolesEnabled ? resolveRoleCharter(reviewRole, plan.customRoles) : null;
+    const finalPrompt = roleCharter
+      ? `## Role\n${roleCharter}\n\n${reviewPrompt}`
+      : reviewPrompt;
+
+    return this.runAgentTask(task, reviewEngine, cwd, finalPrompt, signal, fallbackEngine);
   }
 
   private async runValidateTask(
@@ -2591,6 +2605,14 @@ export class TaskRunner {
       if (plan.aiRules?.trim()) { ruleParts.push(`### Plan Rules\n${plan.aiRules.trim()}`); }
       if (playlist.aiRules?.trim()) { ruleParts.push(`### Playlist Rules\n${playlist.aiRules.trim()}`); }
       const aiRules = ruleParts.join('\n\n');
+
+      // Role: task > playlist > plan, mirroring the engine chain in runTaskByType.
+      // Resolved fresh on every call and never stashed on the task — a second concurrent
+      // loop would otherwise overwrite the first one's charter mid-flight.
+      const rolesEnabled = vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('roles.enabled', true);
+      const roleId = task.role ?? playlist.role ?? plan.defaultRole;
+      const roleCharter = rolesEnabled ? resolveRoleCharter(roleId, plan.customRoles) : null;
+
       const threadMeta = task as Task & { _threadId?: string; _turnIndex?: number };
       const priorThread = (threadMeta._threadId && (threadMeta._turnIndex ?? 0) > 0)
         ? this.historyStore.getThread(threadMeta._threadId)
@@ -2608,6 +2630,7 @@ export class TaskRunner {
         plan, playlist, task, cwd, historyStore: this.historyStore, settings: effectiveSettings,
         budgetUsage,
         pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
+        roleCharter: roleCharter ?? undefined,
         aiRules: aiRules || undefined,
         priorThread: priorThread?.length ? priorThread : undefined,
         sandboxUrl: (playlist.testPhase && this._sandboxUrl) ? this._sandboxUrl : undefined,

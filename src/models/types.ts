@@ -3,6 +3,16 @@
 /** Supported agent engine identifiers */
 export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom' | 'copilot' | 'anthropic';
 
+/** Supported expert-role identifiers a plan, playlist, or task may declare */
+export type RoleId = 'architect' | 'designer' | 'engineer' | 'reviewer' | 'tester' | 'devops' | 'custom';
+
+/** A named expert role and the charter text injected into the prompt for it */
+export interface RoleDefinition {
+  id: RoleId;
+  name: string;
+  charter: string;
+}
+
 /** Supported task execution modes */
 export type TaskType = 'agent' | 'command' | 'service' | 'check' | 'review' | 'validate' | 'manual' | 'visual-test' | 'deploy' | 'release' | 'monitor';
 
@@ -64,6 +74,8 @@ export interface Task {
   type?: TaskType;
   /** Optional engine override — falls back to playlist/global default */
   engine?: EngineId;
+  /** Optional expert-role override — falls back to playlist role, then plan.defaultRole */
+  role?: RoleId;
   /** Command to run for command/check/service tasks */
   command?: string;
   /** Working directory override relative to workspace root */
@@ -136,6 +148,8 @@ export interface Playlist {
   name: string;
   /** Default engine for tasks in this playlist */
   engine?: EngineId;
+  /** Default expert role for tasks in this playlist — overridden per task */
+  role?: RoleId;
   /** Whether to automatically advance to the next task */
   autoplay: boolean;
   /** Delay between tasks in ms (overrides global setting) */
@@ -200,6 +214,10 @@ export interface Plan {
   fallbackEngine?: EngineId;
   /** User-defined variables for template substitution in prompts */
   variables?: Record<string, string>;
+  /** Plan-wide default expert role — the last link in the task → playlist → plan chain */
+  defaultRole?: RoleId;
+  /** Project-specific role definitions; override built-in roles by id */
+  customRoles?: RoleDefinition[];
   /** Validation defaults (targets/profile/budget) used by validation-aware tasks */
   validation: ValidationSettings;
   /** Optional sandbox configuration — overrides project auto-detection */
@@ -378,6 +396,10 @@ export interface PlanFile {
   fallbackEngine?: EngineId;
   /** User-defined variables for template substitution in prompts */
   variables?: Record<string, string>;
+  /** Plan-wide default expert role */
+  defaultRole?: RoleId;
+  /** Project-specific role definitions; override built-in roles by id */
+  customRoles?: RoleDefinition[];
   /** GitHub issues this plan was generated from */
   sourceIssues?: Array<{ repo: string; number: number; title: string }>;
   /** Full original PRD text from which this plan was generated */
@@ -403,6 +425,7 @@ export interface PlanFilePlaylist {
   id: string;
   name: string;
   engine?: EngineId;
+  role?: RoleId;
   autoplay: boolean;
   autoplayDelay?: number;
   parallel?: boolean;
@@ -419,6 +442,7 @@ export interface PlanFileTask {
   prompt: string;
   type?: TaskType;
   engine?: EngineId;
+  role?: RoleId;
   command?: string;
   cwd?: string;
   env?: Record<string, string>;

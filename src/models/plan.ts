@@ -5,10 +5,11 @@ import * as path from 'path';
 import {
   Plan, PlanFile, PlanFilePlaylist, PlanFileTask,
   Playlist, Task, TaskStatus, EngineId,
-  ContextBudget, PrdVersion, SandboxConfig, SandboxTarget,
+  ContextBudget, PrdVersion, RoleDefinition, RoleId, SandboxConfig, SandboxTarget,
   ValidationProfile, ValidationSettings, ValidationTarget,
 } from './types';
 import { redactPlanFile } from './plan-redaction';
+import { isRoleId, MAX_ROLE_CHARTER_CHARS } from './roles';
 
 const DEFAULT_VALIDATION_TARGETS: ValidationTarget[] = ['all'];
 const DEFAULT_VALIDATION_PROFILE: ValidationProfile = 'quick';
@@ -20,6 +21,49 @@ const DEFAULT_CONTEXT_BUDGET: ContextBudget = {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+// ─── Role coercion ───
+
+/**
+ * Coerce a persisted role value to a `RoleId`.
+ *
+ * Deliberately non-throwing: a generator that writes `"role": "senior-backend-engineer"`
+ * into a plan file must not be able to stop that plan from loading. An unrecognised value
+ * simply becomes undefined, and the next level of the task → playlist → plan chain applies.
+ */
+function coerceRoleId(raw: unknown): RoleId | undefined {
+  return isRoleId(raw) ? raw : undefined;
+}
+
+/**
+ * Normalize a persisted `customRoles` array.
+ *
+ * Filters rather than throws — unlike {@link parseValidationTargets}, which rejects the
+ * whole file. Role definitions only shape a prompt, so one malformed entry costs that entry
+ * and nothing more. Non-records, unknown ids and non-string or empty charters are dropped,
+ * each surviving charter is capped, and an array with no survivors returns undefined so the
+ * key is simply absent from the plan.
+ *
+ * `_sourceName` is unused on purpose: it keeps the signature aligned with the other
+ * normalizers, which use it to build a throw message this one never produces.
+ */
+function normalizeCustomRoles(raw: unknown, _sourceName: string): RoleDefinition[] | undefined {
+  if (!Array.isArray(raw)) {
+    return undefined;
+  }
+  const roles: RoleDefinition[] = [];
+  for (const entry of raw) {
+    if (!isRecord(entry)) { continue; }
+    const id = coerceRoleId(entry.id);
+    if (!id) { continue; }
+    if (typeof entry.charter !== 'string') { continue; }
+    const charter = entry.charter.trim().slice(0, MAX_ROLE_CHARTER_CHARS);
+    if (!charter) { continue; }
+    const name = typeof entry.name === 'string' && entry.name.trim() ? entry.name.trim() : id;
+    roles.push({ id, name, charter });
+  }
+  return roles.length > 0 ? roles : undefined;
 }
 
 function parseValidationTargets(
@@ -336,6 +380,10 @@ export function hydratePlan(file: PlanFile, sourceName = 'plan'): Plan {
     validation: normalizePlanValidation(file.validation, sourceName),
     playlists: file.playlists.map(p => hydratePlaylist(p, sourceName)),
   };
+  const defaultRole = coerceRoleId(file.defaultRole);
+  if (defaultRole) { plan.defaultRole = defaultRole; }
+  const customRoles = normalizeCustomRoles(file.customRoles, sourceName);
+  if (customRoles) { plan.customRoles = customRoles; }
   if (file.sourceIssues?.length) { plan.sourceIssues = file.sourceIssues; }
   if (file.prdSource) { plan.prdSource = file.prdSource; }
   if (file.aiRules) { plan.aiRules = file.aiRules; }
@@ -369,6 +417,7 @@ function hydratePlaylist(p: PlanFilePlaylist, sourceName: string): Playlist {
     id: p.id || generateId(),
     name: p.name,
     engine: p.engine,
+    role: coerceRoleId(p.role),
     autoplay: p.autoplay ?? true,
     autoplayDelay: p.autoplayDelay,
     parallel: p.parallel,
@@ -386,6 +435,7 @@ function hydrateTask(t: PlanFileTask, sourceName: string): Task {
     prompt: t.prompt,
     type: t.type ?? 'agent',
     engine: t.engine,
+    role: coerceRoleId(t.role),
     command: t.command,
     cwd: t.cwd,
     env: t.env,
@@ -451,6 +501,10 @@ export function dehydratePlan(plan: Plan): PlanFile {
   if (plan.variables && Object.keys(plan.variables).length > 0) {
     result.variables = plan.variables;
   }
+  if (plan.defaultRole) { result.defaultRole = plan.defaultRole; }
+  if (plan.customRoles?.length) {
+    result.customRoles = plan.customRoles.map(r => ({ id: r.id, name: r.name, charter: r.charter }));
+  }
   if (plan.sourceIssues?.length) { result.sourceIssues = plan.sourceIssues; }
   if (plan.prdSource) { result.prdSource = plan.prdSource; }
   if (plan.aiRules) { result.aiRules = plan.aiRules; }
@@ -493,6 +547,7 @@ function dehydratePlaylist(p: Playlist): PlanFilePlaylist {
     parallel: p.parallel,
     tasks: p.tasks.map(dehydrateTask),
   };
+  if (p.role)       { result.role = p.role; }
   if (p.aiRules)    { result.aiRules = p.aiRules; }
   if (p.testPhase)  { result.testPhase = p.testPhase; }
   if (p.prdContext) { result.prdContext = p.prdContext; }
@@ -544,6 +599,7 @@ function dehydrateTask(t: Task): PlanFileTask {
   if (t.timeoutMs !== undefined) { result.timeoutMs = t.timeoutMs; }
   if (t.sourceIssueNumber !== undefined) { result.sourceIssueNumber = t.sourceIssueNumber; }
   if (t.sourceIssueRepo) { result.sourceIssueRepo = t.sourceIssueRepo; }
+  if (t.role) { result.role = t.role; }
   // Only persist non-pending statuses to keep plan files clean
   if (t.status && t.status !== TaskStatus.Pending) {
     result.status = t.status;

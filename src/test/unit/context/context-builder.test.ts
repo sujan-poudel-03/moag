@@ -865,3 +865,89 @@ describe('Context Builder', () => {
     });
   });
 });
+
+describe('Context Builder — role charter', () => {
+  const ROLE = 'You are the reviewer. You refuse to approve on the strength of a summary.';
+  const RULES = 'Follow SOLID design principles.';
+
+  function bareSettings() {
+    return {
+      ...defaultSettings(),
+      planOverview: false,
+      priorTaskOutputs: false,
+      projectState: false,
+      changedFiles: false,
+      cumulativeProgress: false,
+    };
+  }
+
+  it('emits the charter under a ## Role header', () => {
+    const { plan, playlist, tasks } = makePlanWithTasks();
+    const result = buildContext({
+      plan, playlist, task: tasks[1], cwd: '/mock/workspace',
+      historyStore: createMockHistoryStore(), settings: bareSettings(),
+      roleCharter: ROLE,
+    });
+    assert.ok(result.includes('## Role'), 'missing ## Role header');
+    assert.ok(result.includes(ROLE));
+  });
+
+  it('places ## Role before ## AI Rules', () => {
+    const { plan, playlist, tasks } = makePlanWithTasks();
+    const result = buildContext({
+      plan, playlist, task: tasks[1], cwd: '/mock/workspace',
+      historyStore: createMockHistoryStore(), settings: bareSettings(),
+      roleCharter: ROLE, aiRules: RULES,
+    });
+    const roleAt = result.indexOf('## Role');
+    const rulesAt = result.indexOf('## AI Rules');
+    assert.ok(roleAt >= 0 && rulesAt >= 0, 'both sections should be present');
+    assert.ok(roleAt < rulesAt, 'identity must be read before the constraints it works under');
+  });
+
+  it('emits no header for a whitespace-only or absent charter', () => {
+    const { plan, playlist, tasks } = makePlanWithTasks();
+    for (const roleCharter of ['   ', '', undefined]) {
+      const result = buildContext({
+        plan, playlist, task: tasks[1], cwd: '/mock/workspace',
+        historyStore: createMockHistoryStore(), settings: bareSettings(),
+        roleCharter,
+      });
+      assert.ok(!result.includes('## Role'), `emitted ## Role for ${JSON.stringify(roleCharter)}`);
+    }
+  });
+
+  it('trims the charter before emitting it', () => {
+    const { plan, playlist, tasks } = makePlanWithTasks();
+    const result = buildContext({
+      plan, playlist, task: tasks[1], cwd: '/mock/workspace',
+      historyStore: createMockHistoryStore(), settings: bareSettings(),
+      roleCharter: `   ${ROLE}   `,
+    });
+    const lf = String.fromCharCode(10);
+    assert.ok(result.includes('## Role' + lf + ROLE), 'charter should be trimmed');
+  });
+
+  it('survives a budget squeeze that drops the AI Rules section', () => {
+    const role = { priority: -2, header: '## Role', body: 'R'.repeat(100) };
+    const rules = { priority: -1, header: '## AI Rules', body: 'A'.repeat(100) };
+    const overview = { priority: 1, header: '## Plan Overview', body: 'P'.repeat(100) };
+
+    // Budget fits exactly one 100-char section (header + body + separators).
+    const kept = applyBudget([overview, rules, role], role.header.length + 1 + role.body.length + 2);
+    assert.equal(kept.length, 1);
+    assert.equal(kept[0].header, '## Role');
+  });
+
+  it('is the last section standing end-to-end when the budget collapses', () => {
+    const { plan, playlist, tasks } = makePlanWithTasks();
+    const settings = { ...bareSettings(), maxContextChars: 60 };
+    const result = buildContext({
+      plan, playlist, task: tasks[1], cwd: '/mock/workspace',
+      historyStore: createMockHistoryStore(), settings,
+      roleCharter: 'Short role.', aiRules: 'A'.repeat(500),
+    });
+    assert.ok(result.includes('## Role'));
+    assert.ok(!result.includes('## AI Rules'), 'AI Rules should have been squeezed out first');
+  });
+});

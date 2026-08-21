@@ -1136,3 +1136,251 @@ describe('TaskRunner', () => {
     assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
   });
 });
+
+// ─── Expert role resolution in buildPrompt ───
+
+describe('TaskRunner — role charter resolution', () => {
+  // Captures the options object handed to buildContext so the resolved charter can be
+  // inspected without asserting on the final prompt text.
+  function buildRunnerCapturingContext() {
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    const captured: Array<Record<string, unknown>> = [];
+    spawnStub = sinon.stub().callsFake(() => createSpawnProc());
+
+    const { TaskRunner } = proxyquire('../../../runner/runner', {
+      'vscode': vscodeMock,
+      '../adapters/index': { getEngine: () => mockEngine },
+      '../context/context-builder': {
+        buildContext: (opts: Record<string, unknown>) => { captured.push(opts); return ''; },
+        getContextSettings: () => ({ enabled: true, maxContextChars: 30000, maxFileContextChars: 4000 }),
+        runRetrievalCascade: async () => ({ spans: [], usedSemantic: false }),
+        adaptiveContextBudget: (_t: unknown, base: number) => base,
+      },
+      'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+    });
+
+    return { runner: new TaskRunner(historyStore), captured };
+  }
+
+  function singleTaskPlan(): Plan {
+    const plan = createEmptyPlan('Role Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    pl.tasks.push(createTask('Only Task', 'Do the thing'));
+    return plan;
+  }
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  it('prefers the task role over the playlist and plan roles', async () => {
+    const { runner, captured } = buildRunnerCapturingContext();
+    const plan = singleTaskPlan();
+    plan.defaultRole = 'architect';
+    plan.playlists[0].role = 'designer';
+    plan.playlists[0].tasks[0].role = 'tester';
+
+    await runner.play(plan);
+
+    assert.equal(captured.length, 1);
+    assert.ok(String(captured[0].roleCharter).startsWith('You are the tester.'));
+  });
+
+  it('falls back to the playlist role when the task declares none', async () => {
+    const { runner, captured } = buildRunnerCapturingContext();
+    const plan = singleTaskPlan();
+    plan.defaultRole = 'architect';
+    plan.playlists[0].role = 'designer';
+
+    await runner.play(plan);
+
+    assert.ok(String(captured[0].roleCharter).startsWith('You are the designer.'));
+  });
+
+  it('falls back to plan.defaultRole when neither task nor playlist declares one', async () => {
+    const { runner, captured } = buildRunnerCapturingContext();
+    const plan = singleTaskPlan();
+    plan.defaultRole = 'architect';
+
+    await runner.play(plan);
+
+    assert.ok(String(captured[0].roleCharter).startsWith('You are the architect.'));
+  });
+
+  it('passes no charter at all when no level declares a role', async () => {
+    const { runner, captured } = buildRunnerCapturingContext();
+
+    await runner.play(singleTaskPlan());
+
+    assert.equal(captured[0].roleCharter, undefined);
+  });
+
+  it('resolves a plan-level custom role that overrides a built-in by id', async () => {
+    const { runner, captured } = buildRunnerCapturingContext();
+    const plan = singleTaskPlan();
+    plan.customRoles = [{ id: 'tester', name: 'House Tester', charter: 'House charter.' }];
+    plan.playlists[0].tasks[0].role = 'tester';
+
+    await runner.play(plan);
+
+    assert.equal(captured[0].roleCharter, 'House charter.');
+  });
+
+  it('emits no charter when roles.enabled is false, at every level', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'roles.enabled': false });
+    const { runner, captured } = buildRunnerCapturingContext();
+    const plan = singleTaskPlan();
+    plan.defaultRole = 'architect';
+    plan.playlists[0].role = 'designer';
+    plan.playlists[0].tasks[0].role = 'tester';
+
+    await runner.play(plan);
+
+    assert.equal(captured[0].roleCharter, undefined);
+  });
+
+  it('never stashes the resolved charter on the task object', async () => {
+    const { runner } = buildRunnerCapturingContext();
+    const plan = singleTaskPlan();
+    plan.defaultRole = 'reviewer';
+
+    await runner.play(plan);
+
+    const task = plan.playlists[0].tasks[0] as unknown as Record<string, unknown>;
+    assert.ok(!('_roleCharter' in task), 'a stashed charter would be clobbered by a concurrent loop');
+    assert.equal(task.role, undefined, 'resolution must not write a role back onto the task');
+  });
+});
+
+// ─── Expert role on review tasks (which bypass the context builder entirely) ───
+
+describe('TaskRunner — role charter on review tasks', () => {
+  const DEP_ENTRY = {
+    id: 'h-1',
+    taskId: 'target-task',
+    engine: 'codex',
+    prompt: 'Build the thing',
+    changedFiles: ['src/a.ts'],
+    codeChanges: '--- a/src/a.ts',
+  };
+
+  function reviewPlan(): Plan {
+    const plan = createEmptyPlan('Review Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+
+    const target = createTask('Build', 'Build the thing');
+    target.id = 'target-task';
+
+    const review = createTask('Review', 'Review the build');
+    review.id = 'review-task';
+    review.type = 'review';
+    review.dependsOn = ['target-task'];
+
+    pl.tasks.push(target, review);
+    return plan;
+  }
+
+  /** The prompt actually handed to the engine for the review (the last engine call). */
+  function reviewPromptSent(): string {
+    return String(engineRunStub.lastCall.args[0].prompt);
+  }
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  it('prepends the reviewer charter when no level declares a role', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask.returns([DEP_ENTRY]);
+
+    await runner.play(reviewPlan());
+
+    const prompt = reviewPromptSent();
+    assert.ok(prompt.startsWith('## Role'), 'charter must lead the review prompt');
+    assert.ok(prompt.includes('You are the reviewer.'));
+    assert.ok(prompt.includes('Review the code changes made by the previous task.'),
+      'the original review prompt must survive underneath the charter');
+  });
+
+  it('lets an explicit task role override the reviewer default', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask.returns([DEP_ENTRY]);
+    const plan = reviewPlan();
+    plan.playlists[0].tasks[1].role = 'architect';
+
+    await runner.play(plan);
+
+    const prompt = reviewPromptSent();
+    assert.ok(prompt.includes('You are the architect.'));
+    assert.ok(!prompt.includes('You are the reviewer.'));
+  });
+
+  it('prefers the task role over the playlist role and plan.defaultRole', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask.returns([DEP_ENTRY]);
+    const plan = reviewPlan();
+    plan.defaultRole = 'devops';
+    plan.playlists[0].role = 'designer';
+    plan.playlists[0].tasks[1].role = 'tester';
+
+    await runner.play(plan);
+
+    assert.ok(reviewPromptSent().includes('You are the tester.'));
+  });
+
+  it('emits no ## Role section when roles.enabled is false', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'roles.enabled': false });
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask.returns([DEP_ENTRY]);
+
+    await runner.play(reviewPlan());
+
+    const prompt = reviewPromptSent();
+    assert.ok(!prompt.includes('## Role'));
+    assert.ok(prompt.startsWith('Review the code changes made by the previous task.'));
+  });
+
+  it('leaves the missing-dependsOn early return untouched', async () => {
+    const { runner, historyStore } = buildRunner();
+    historyStore.getForTask.returns([DEP_ENTRY]);
+    const plan = reviewPlan();
+    plan.playlists[0].tasks[1].dependsOn = undefined;
+
+    const failures: EngineResult[] = [];
+    runner.on('task-failed', (_t: unknown, r: EngineResult) => failures.push(r));
+
+    await runner.play(plan);
+
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].exitCode, 1);
+    assert.equal(
+      failures[0].stderr,
+      'Review task requires "dependsOn" pointing to the task to review.',
+    );
+    assert.ok(!failures[0].stderr.includes('## Role'), 'the guard must return before role resolution');
+  });
+
+  it('leaves the missing-history early return untouched', async () => {
+    const { runner } = buildRunner();
+    // Default mock history store returns no entries for any task.
+
+    const failures: EngineResult[] = [];
+    runner.on('task-failed', (_t: unknown, r: EngineResult) => failures.push(r));
+
+    await runner.play(reviewPlan());
+
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].exitCode, 1);
+    assert.ok(failures[0].stderr.startsWith(
+      'No history found for dependency task "target-task".',
+    ));
+    assert.ok(!failures[0].stderr.includes('## Role'), 'the guard must return before role resolution');
+  });
+});

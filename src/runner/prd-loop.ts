@@ -489,6 +489,9 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
       const fixPlaylist: Playlist = {
         id: `pl-fix-${stamp}`,
         name: `Fix — Iteration ${iterationN}`,
+        // Repair work, not review: the deterministic gates already rendered the verdict,
+        // so the fix playlist runs as an engineer rather than re-litigating the failure.
+        role: 'engineer',
         autoplay: true,
         testPhase: false,
         tasks: fixTasks.map((t, i) => ({

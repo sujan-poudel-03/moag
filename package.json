@@ -1366,6 +1366,11 @@
           "default": "auto",
           "description": "Default reasoning preset for model selection. 'auto' analyzes task complexity to pick the best model."
         },
+        "agentTaskPlayer.roles.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Inject the expert-role charter for playlists and tasks that declare a role. Disable to run every task as a generic agent without editing plan files."
+        },
         "agentTaskPlayer.promptRulesEnabled": {
           "type": "boolean",
           "default": true,

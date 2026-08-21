@@ -20,7 +20,7 @@ const vscodeMock = require('./mocks/vscode');
 
 describe('Regression: legacy plan hydration', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { hydratePlan } = require('../../models/plan');
+  const { hydratePlan, dehydratePlan } = require('../../models/plan');
 
   it('hydrates plan with no validation field — all defaults', () => {
     const raw = {
@@ -111,6 +111,89 @@ describe('Regression: legacy plan hydration', () => {
     assert.equal(tasks[1].status, TaskStatus.Failed);
     assert.equal(tasks[2].status, TaskStatus.Skipped);
     assert.equal(tasks[3].status, TaskStatus.Pending);
+  });
+
+  // ─── Expert roles: old files must load unchanged, bad values must not brick loading ───
+
+  it('round-trips a role-free plan without emitting a single role key', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Pre-Roles Plan',
+      defaultEngine: 'claude',
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{ id: 't-1', name: 'Do something', prompt: 'p' }],
+      }],
+    };
+    const plan = hydratePlan(raw, 'pre-roles.agent-plan.json');
+    assert.equal(plan.defaultRole, undefined);
+    assert.equal(plan.customRoles, undefined);
+
+    const file = dehydratePlan(plan);
+    assert.ok(!('defaultRole' in file), 'emitted defaultRole for a plan that never had one');
+    assert.ok(!('customRoles' in file), 'emitted customRoles for a plan that never had one');
+    assert.ok(!('role' in file.playlists[0]), 'emitted a playlist role that never existed');
+    assert.ok(!('role' in file.playlists[0].tasks[0]), 'emitted a task role that never existed');
+  });
+
+  it('drops an unrecognised role without throwing and leaves the playlist intact', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Hallucinated Role Plan',
+      defaultEngine: 'claude',
+      playlists: [{
+        id: 'pl-1',
+        name: 'Development',
+        autoplay: true,
+        role: 'senior-backend-engineer',
+        tasks: [{ id: 't-1', name: 'Build', prompt: 'p', role: 'Engineer' }],
+      }],
+    };
+    const load = () => hydratePlan(raw, 'hallucinated.agent-plan.json');
+    assert.doesNotThrow(load);
+    const plan = load();
+
+    const playlist = plan.playlists[0];
+    assert.equal(playlist.role, undefined);
+    assert.equal(playlist.tasks[0].role, undefined, 'casing is not coerced — Engineer is not engineer');
+    // Everything else about the playlist survives the bad role.
+    assert.equal(playlist.name, 'Development');
+    assert.equal(playlist.id, 'pl-1');
+    assert.equal(playlist.tasks.length, 1);
+    assert.equal(playlist.tasks[0].prompt, 'p');
+  });
+
+  it('filters customRoles entry by entry and rejects a non-array outright', () => {
+    const base = {
+      version: '1.0',
+      name: 'Custom Roles Plan',
+      defaultEngine: 'claude',
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    const mixed = hydratePlan({
+      ...base,
+      customRoles: [
+        { id: 'not-a-role', name: 'Bad', charter: 'should be dropped' },
+        { id: 'custom', name: 'Good', charter: 'should survive' },
+        { id: 'engineer', name: 'No Charter', charter: '   ' },
+        'not-even-an-object',
+      ],
+    }, 'mixed.agent-plan.json');
+    assert.equal(mixed.customRoles.length, 1);
+    assert.equal(mixed.customRoles[0].id, 'custom');
+    assert.equal(mixed.customRoles[0].charter, 'should survive');
+
+    const notArray = hydratePlan({ ...base, customRoles: 'not-an-array' }, 'bad.agent-plan.json');
+    assert.equal(notArray.customRoles, undefined);
+
+    const allBad = hydratePlan({
+      ...base,
+      customRoles: [{ id: 'nope', name: 'X', charter: 'y' }],
+    }, 'allbad.agent-plan.json');
+    assert.equal(allBad.customRoles, undefined, 'an array with no survivors must vanish, not become []');
   });
 
   it('deduplicates clashing task ids by regenerating the duplicate', () => {

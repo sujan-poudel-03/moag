@@ -20,6 +20,7 @@ import {
 import { HistoryStore } from './history/store';
 import { TemplateStore } from './templates/store';
 import { generateId } from './models/plan';
+import { isRoleId, resolveRoleCharter } from './models/roles';
 import { PlanTreeProvider, PlanTreeItem } from './ui/plan-tree';
 import { HistoryTreeProvider } from './ui/history-tree';
 import { DashboardPanel } from './ui/dashboard-panel';
@@ -3537,6 +3538,8 @@ async function createPlanFromIdea(
   currentPlan.description = trimmedIdea.length > 500 ? trimmedIdea.substring(0, 500) + '...' : trimmedIdea;
   currentPlan.playlists = playlists.map(pl => {
     const playlist = createPlaylist(pl.name, pl.engine as EngineId | undefined);
+    const parsedRole = (pl as ParsedPlanPlaylist).role;
+    if (isRoleId(parsedRole)) { playlist.role = parsedRole; }
     if ((pl as ParsedPlanPlaylist).testPhase) { playlist.testPhase = true; }
     if ((pl as ParsedPlanPlaylist).prdContext) { playlist.prdContext = (pl as ParsedPlanPlaylist).prdContext; }
     for (const t of pl.tasks) {
@@ -3793,7 +3796,7 @@ Plan structure rules:
 - Do NOT create placeholder or "TODO later" tasks — only include what should be built now`;
 
 interface ParsedPlanTask { name: string; prompt: string; type?: string; command?: string }
-interface ParsedPlanPlaylist { name: string; engine?: string; testPhase?: boolean; prdContext?: string; tasks: ParsedPlanTask[] }
+interface ParsedPlanPlaylist { name: string; engine?: string; role?: string; testPhase?: boolean; prdContext?: string; tasks: ParsedPlanTask[] }
 interface ParsedPlan { name: string; tasks?: ParsedPlanTask[]; playlists?: ParsedPlanPlaylist[] }
 
 /** Try to extract structured plan from AI response */
@@ -3825,9 +3828,10 @@ function parsePlanResponse(raw: string): ParsedPlan | null {
     if (Array.isArray(parsed.playlists) && parsed.playlists.length > 0) {
       const playlists: ParsedPlanPlaylist[] = parsed.playlists
         .filter((pl: { name?: string; tasks?: unknown[] }) => pl.name && Array.isArray(pl.tasks) && pl.tasks.length > 0)
-        .map((pl: { name: string; engine?: string; testPhase?: boolean; prdContext?: string; tasks: Array<{ name?: string; prompt?: string; type?: string; command?: string }> }) => ({
+        .map((pl: { name: string; engine?: string; role?: string; testPhase?: boolean; prdContext?: string; tasks: Array<{ name?: string; prompt?: string; type?: string; command?: string }> }) => ({
           name: pl.name,
           engine: pl.engine,
+          role: pl.role,
           testPhase: pl.testPhase === true,
           prdContext: typeof pl.prdContext === 'string' ? pl.prdContext.substring(0, 4000) : undefined,
           tasks: pl.tasks
@@ -4033,15 +4037,23 @@ async function cmdPreviewTaskPrompt(arg?: unknown): Promise<void> {
         await runRetrievalCascade(task, cwd, settings.maxFileContextChars);
 
       const previewAiRules = aiRulesStore?.getEnabledText(cwd) || undefined;
+      const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+
+      // Same resolution chain as TaskRunner.buildPrompt — task > playlist > plan.
+      const rolesEnabled = cfg.get<boolean>('roles.enabled', true);
+      const previewRoleId = task.role ?? playlist.role ?? currentPlan!.defaultRole;
+      const previewRoleCharter = rolesEnabled
+        ? resolveRoleCharter(previewRoleId, currentPlan!.customRoles)
+        : null;
       const ctx = buildContext({
         plan: currentPlan!, playlist, task, cwd, historyStore,
         settings, budgetUsage, retrievedSpans, retrievedSpansUsedSemantic: usedSemantic,
+        roleCharter: previewRoleCharter ?? undefined,
         aiRules: previewAiRules,
       });
 
       // Replicate runner prompt assembly (minus screenshots/variable substitution)
       let fullPrompt = ctx ? ctx + '\n\n' : '';
-      const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
       if (cfg.get<boolean>('promptRulesEnabled', true)) {
         const rules = cfg.get<string>('promptRules', '');
         if (rules) { fullPrompt += rules + '\n\n'; }
@@ -4064,6 +4076,7 @@ async function cmdPreviewTaskPrompt(arg?: unknown): Promise<void> {
         `|---|---|`,
         `| Engine | \`${engine}\` |`,
         `| Type | \`${taskType}\` |`,
+        `| Role | ${previewRoleId ? `\`${previewRoleId}\`${rolesEnabled ? '' : ' (roles disabled)'}` : 'none'} |`,
         `| Playlist | ${playlist.name} |`,
         `| Status | ${task.status ?? 'pending'} |`,
         ``,
@@ -4499,6 +4512,8 @@ async function cmdPlanFromGitHubIssue(): Promise<void> {
   currentPlan.sourceIssues = [{ repo: `${owner}/${repo}`, number: parseInt(issueNumber, 10), title: issueTitle }];
   currentPlan.playlists = playlists.map(pl => {
     const playlist = createPlaylist(pl.name);
+    const parsedRole = (pl as ParsedPlanPlaylist).role;
+    if (isRoleId(parsedRole)) { playlist.role = parsedRole; }
     if ((pl as ParsedPlanPlaylist).testPhase) { playlist.testPhase = true; }
     if ((pl as ParsedPlanPlaylist).prdContext) { playlist.prdContext = (pl as ParsedPlanPlaylist).prdContext; }
     for (const t of pl.tasks) {
@@ -6296,6 +6311,10 @@ Rules:
   - "command"     Shell commands (test runners, builds). Set "command" field to the exact shell command (e.g., "npm test", "pytest", "go test ./..."). The Testing playlist MUST include at least one "command" task running the test suite.
   - "visual-test" Browser UI verification via screenshot + vision. For web/frontend projects only.
 - Each playlist must have: "id" (unique string), "name" (string), "testPhase" (boolean — true only for Testing), "tasks" (array)
+- Each playlist SHOULD have a "role" — the expert persona the agent adopts. Exactly one of:
+  "architect" | "designer" | "engineer" | "reviewer" | "tester" | "devops".
+  Typical mapping: Design → "designer", Development → "engineer", Testing → "tester".
+  Omit the field entirely if unsure. Never invent a value outside that list.
 - The root plan object must have: "version": "1.0", "name" (brief feature name derived from the PRD), "description" (one sentence), "playlists" (array)
 - Return ONLY valid JSON. No markdown code fences, no explanation, no preamble.
 - Keep tasks focused and atomic — one concern per task.
@@ -6352,6 +6371,11 @@ ${prdText}`;
 
   (parsed as Record<string, unknown>).prdSource = prdText;
 
+  // Count roles the generator invented before hydration silently coerces them away, so the
+  // completion notification can say why a playlist came back without the role it asked for.
+  const invalidRoleCount = (parsed.playlists as Array<{ role?: unknown }>)
+    .filter(pl => pl?.role !== undefined && !isRoleId(pl.role)).length;
+
   // Hydrate → inject missing test runner → dehydrate back so the JSON file has the task
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -6396,8 +6420,11 @@ ${prdText}`;
 
   fs.writeFileSync(planPath, JSON.stringify(parsed, null, 2), 'utf-8');
 
+  const roleNote = invalidRoleCount > 0
+    ? ` — ${invalidRoleCount} playlist${invalidRoleCount !== 1 ? 's' : ''} had an unrecognised role and will use the plan default`
+    : '';
   const action = await vscode.window.showInformationMessage(
-    `Plan generated — ${taskCount} task${taskCount !== 1 ? 's' : ''} across ${playlistCount} playlist${playlistCount !== 1 ? 's' : ''}`,
+    `Plan generated — ${taskCount} task${taskCount !== 1 ? 's' : ''} across ${playlistCount} playlist${playlistCount !== 1 ? 's' : ''}${roleNote}`,
     'Open Plan',
   );
   if (action === 'Open Plan') {

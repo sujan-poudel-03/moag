@@ -843,3 +843,53 @@ describe('createPrdLoop — browser UAT gate', () => {
     assert.equal(report.uatSkipReason, null);
   });
 });
+
+// ─── The generated fix playlist carries an explicit role ───
+
+describe('createPrdLoop — fix playlist role', () => {
+  it('R1. a generated fix playlist runs as engineer', async () => {
+    const { createPrdLoop } = loadLoop({
+      gateResult: (c) => FAILING_GATE(c),
+      changedFilesSequence: [['a.ts'], ['b.ts']],
+    });
+    const plan = makePlan();
+    const h = makeDeps(plan);
+    h.deps.runEngine = async () => engineResult('[{"name":"Fix it","prompt":"fix"}]');
+
+    await createPrdLoop(baseConfig({ fix: true, maxFixIterations: 1 }), h.deps).run();
+
+    const fixPlaylists = plan.playlists.filter((pl) => pl.name.startsWith('Fix — Iteration'));
+    assert.equal(fixPlaylists.length, 1);
+    assert.equal(fixPlaylists[0].role, 'engineer', 'repair work, not review');
+    // The tasks themselves stay role-free so they inherit the playlist role.
+    assert.equal(fixPlaylists[0].tasks[0].role, undefined);
+  });
+
+  it('R2. verification-only mode pushes no playlist at all', async () => {
+    const { createPrdLoop } = loadLoop({ gateResult: (c) => FAILING_GATE(c) });
+    const plan = makePlan();
+    const before = plan.playlists.length;
+    const h = makeDeps(plan);
+
+    const report = await createPrdLoop(baseConfig({ fix: false }), h.deps).run();
+
+    assert.equal(report.passed, false);
+    assert.equal(plan.playlists.length, before, 'fix:false must never mutate the plan');
+    assert.equal(plan.playlists.filter((pl) => pl.name.startsWith('Fix — Iteration')).length, 0);
+  });
+
+  it('R3. an engine that returns no fix tasks halts without mutating the plan', async () => {
+    const { createPrdLoop } = loadLoop({ gateResult: (c) => FAILING_GATE(c) });
+    const plan = makePlan();
+    const before = plan.playlists.length;
+    const h = makeDeps(plan);
+    h.deps.runEngine = async () => engineResult('[]');
+
+    const report = await createPrdLoop(baseConfig({ fix: true, maxFixIterations: 3 }), h.deps).run();
+
+    assert.equal(report.passed, false);
+    assert.equal(report.haltReason, 'engine-error');
+    assert.equal(plan.playlists.length, before);
+    assert.equal(plan.fixIterations ?? 0, 0);
+  });
+});

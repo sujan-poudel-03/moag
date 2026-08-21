@@ -30,6 +30,9 @@ export const PLAN_FILE_DISCLOSURE: Record<keyof PlanFile, Disclosure> = {
   defaultEngine: 'share',
   fallbackEngine: 'share',
   variables: 'redact',
+  defaultRole: 'share',
+  // Custom charters are project-authored prompt text — same class as aiRules, never shared.
+  customRoles: 'redact',
   sourceIssues: 'share',
   prdSource: 'redact',
   aiRules: 'redact',
@@ -44,6 +47,7 @@ export const PLAYLIST_DISCLOSURE: Record<keyof PlanFilePlaylist, Disclosure> = {
   id: 'share',
   name: 'share',
   engine: 'share',
+  role: 'share',
   autoplay: 'share',
   autoplayDelay: 'share',
   parallel: 'share',
@@ -61,6 +65,7 @@ export const TASK_DISCLOSURE: Record<keyof PlanFileTask, Disclosure> = {
   prompt: 'share',
   type: 'share',
   engine: 'share',
+  role: 'share',
   command: 'share',
   cwd: 'share',
   env: 'redact',
@@ -104,6 +109,7 @@ const PLAN_FILE_LABELS: Record<string, string> = {
   prdSource: 'PRD text',
   aiRules: 'plan rules',
   prdVersions: 'PRD version history',
+  customRoles: 'custom role definitions',
 };
 
 const PLAYLIST_LABELS: Record<string, string> = {

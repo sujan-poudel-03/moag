@@ -86,7 +86,12 @@ export interface ContextOptions {
   retrievedSpans?: SemanticSpan[];
   /** True when retrievedSpans were produced by the semantic provider (not just rg/hint). */
   retrievedSpansUsedSemantic?: boolean;
-  /** Pre-formatted text from enabled AI rules — injected as the highest-priority context section. */
+  /**
+   * Resolved expert-role charter — injected above the AI rules at priority -2, so it is the
+   * first thing the agent reads and the last thing a budget squeeze would drop.
+   */
+  roleCharter?: string;
+  /** Pre-formatted text from enabled AI rules — injected as the second-highest-priority context section. */
   aiRules?: string;
   /**
    * Prior turns from the same chat thread (oldest-first, excluding the current turn).
@@ -177,6 +182,12 @@ export function buildContext(options: ContextOptions): string {
 
   const allPlanTasks = options.plan.playlists.flatMap(pl => pl.tasks);
   const isFirstTask = allPlanTasks.length === 0 || allPlanTasks[0]?.id === options.task.id;
+
+  // Pushed before the AI rules so push order matches priority order — identity first,
+  // then the constraints that identity works under.
+  if (options.roleCharter && options.roleCharter.trim()) {
+    sections.push({ priority: -2, header: '## Role', body: options.roleCharter.trim() });
+  }
 
   if (options.aiRules && options.aiRules.trim()) {
     sections.push({ priority: -1, header: '## AI Rules', body: options.aiRules.trim() });
