@@ -22,8 +22,9 @@ import {
 } from '../models/types';
 import { generateId } from '../models/plan';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
-import { resolveProfile, resolveValidationProfile, ProfileName, ProfileConfig } from '../models/execution-profiles';
+import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName, ProfileConfig } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
+import { costLedger, CostEvent } from '../utils/cost-ledger';
 import { getValidationAdapters, validationResultToEngineResult } from '../adapters/validation/index';
 import { HistoryStore } from '../history/store';
 import { buildContext, getContextSettings, runRetrievalCascade, adaptiveContextBudget } from '../context/context-builder';
@@ -306,11 +307,11 @@ export class TaskRunner {
   private _taskGitRefs = new Map<string, { ref: string; cwd: string }>();
   private _serviceProcesses = new Map<string, ServiceHandle>();
   private _currentRunId: string | null = null;
-  private _totalCostUsd = 0;
   private _sessionCostUsd = 0;
   private _sessionTokensIn = 0;
   private _sessionTokensOut = 0;
-  private _budgetExceededEmitted = false;
+  /** Lifetime-spend level at which the next 'budget-exceeded' fires. Null until the first tracked cost. */
+  private _budgetNextThresholdUsd: number | null = null;
   private _autoFixedTasks = new Set<string>();
   /** Live task queue for the currently-running sequential playlist. Null during parallel execution. */
   private _activeQueue: TaskQueue | null = null;
@@ -325,8 +326,25 @@ export class TaskRunner {
   private _taskFailureContext = new Map<string, string>();
   /** Pending manual gate resolvers — keyed by task id, resolved when user marks step complete */
   private _manualGates = new Map<string, { complete: () => void; skip: () => void }>();
+  /** Unsubscribes this runner from the shared cost ledger. Called by dispose(). */
+  private _ledgerUnsub: (() => void) | null = null;
 
-  constructor(private readonly historyStore: HistoryStore) {}
+  constructor(private readonly historyStore: HistoryStore) {
+    // Budget enforcement listens to the ledger, not to trackTaskCost(), so
+    // authoring calls made outside play() (PRD chat, plan generation, …) count
+    // toward the same ceiling as plan execution.
+    this._ledgerUnsub = costLedger.onRecord((e) => this.onCostRecorded(e));
+  }
+
+  /**
+   * Detach from the shared cost ledger. Must be called when the runner is torn
+   * down (the extension pushes this into context.subscriptions) so a disposed
+   * runner stops emitting 'budget-exceeded'.
+   */
+  dispose(): void {
+    this._ledgerUnsub?.();
+    this._ledgerUnsub = null;
+  }
 
   setPromptLibrary(store: PromptLibraryStore): void {
     this._promptLibrary = store;
@@ -401,12 +419,28 @@ export class TaskRunner {
     return { tokensIn: this._sessionTokensIn, tokensOut: this._sessionTokensOut };
   }
 
+  /**
+   * Total estimated spend since the process started (or since resetLifetimeBudget()).
+   * Read straight from the shared ledger, so it includes authoring calls made
+   * outside play() as well as plan-executed tasks.
+   */
+  getLifetimeCostUsd(): number {
+    return costLedger.getLifetimeUsd();
+  }
+
+  /**
+   * Zero the lifetime spend accumulator and re-arm the budget ceiling.
+   * For callers that genuinely want a fresh ceiling — the daemon deliberately does not call this.
+   */
+  resetLifetimeBudget(): void {
+    costLedger.reset();
+    this._budgetNextThresholdUsd = null;
+  }
+
   private resetRunBudgetTracking(): void {
-    this._totalCostUsd = 0;
     this._sessionCostUsd = 0;
     this._sessionTokensIn = 0;
     this._sessionTokensOut = 0;
-    this._budgetExceededEmitted = false;
     this._autoFixedTasks.clear();
   }
 
@@ -414,24 +448,41 @@ export class TaskRunner {
     return vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('failSafeMode', false);
   }
 
+  /**
+   * Per-run session counters for tasks this runner executed.
+   * Lifetime spend and budget enforcement live on the ledger — see onCostRecorded().
+   */
   private trackTaskCost(result: EngineResult): void {
     const estimatedCost = result.tokenUsage?.estimatedCost;
     if (estimatedCost === undefined || !Number.isFinite(estimatedCost)) {
       return;
     }
 
-    this._totalCostUsd += estimatedCost;
     this._sessionCostUsd += estimatedCost;
     this._sessionTokensIn += result.tokenUsage?.inputTokens ?? 0;
     this._sessionTokensOut += result.tokenUsage?.outputTokens ?? 0;
+  }
 
+  /**
+   * Budget ceiling, driven by every accounted engine call in the process —
+   * plan tasks and authoring calls alike.
+   */
+  private onCostRecorded(e: CostEvent): void {
     const budget = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('costBudgetUsd', 0);
-    if (budget <= 0 || this._budgetExceededEmitted || this._totalCostUsd <= budget) {
+    if (budget <= 0) {
       return;
     }
 
-    this._budgetExceededEmitted = true;
-    this.emit('budget-exceeded', { totalCost: this._totalCostUsd, budget });
+    if (this._budgetNextThresholdUsd === null) {
+      this._budgetNextThresholdUsd = budget;
+    }
+    if (e.lifetimeUsd <= this._budgetNextThresholdUsd) {
+      return;
+    }
+
+    // Re-arm one budget-worth above current spend so the ceiling repeats instead of latching.
+    this._budgetNextThresholdUsd = e.lifetimeUsd + budget;
+    this.emit('budget-exceeded', { totalCost: e.lifetimeUsd, budget });
   }
 
   async play(plan: Plan, playlistIndex = 0, taskIndex = 0): Promise<void> {
@@ -1156,9 +1207,14 @@ export class TaskRunner {
         return typeof v === 'number' && v >= 30000 ? v : undefined;
       } catch { return undefined; }
     })();
-    const taskTimeoutMs = taskType === 'service'
-      ? (task.startupTimeoutMs ?? DEFAULT_SERVICE_STARTUP_TIMEOUT_MS)
-      : (task.timeoutMs ?? settingOverrideMs ?? profile.taskTimeoutMs);
+    const taskTimeoutMs = resolveTaskTimeoutMs({
+      isService: taskType === 'service',
+      taskTimeoutMs: task.timeoutMs,
+      startupTimeoutMs: task.startupTimeoutMs,
+      serviceDefaultMs: DEFAULT_SERVICE_STARTUP_TIMEOUT_MS,
+      settingOverrideMs,
+      profileTimeoutMs: profile.taskTimeoutMs,
+    });
     const timeoutId = setTimeout(() => taskAbort.abort(), taskTimeoutMs);
     const onParentAbort = () => taskAbort.abort();
     this._abortController?.signal.addEventListener('abort', onParentAbort, { once: true });
@@ -1625,6 +1681,7 @@ export class TaskRunner {
       sandboxUrl: this._sandboxUrl ?? undefined,
       modelId: model,
       sessionId: this._currentSessionId ?? undefined,
+      costLabel: 'task',
       onOutput: (chunk, stream) => {
         this.emit('task-output', task, chunk, stream);
       },
@@ -1703,6 +1760,7 @@ export class TaskRunner {
       signal,
       modelId: selection?.modelId,
       sessionId: this._currentSessionId ?? undefined,
+      costLabel: 'task',
       onOutput: (chunk, stream) => {
         this.emit('task-output', task, chunk, stream);
       },
