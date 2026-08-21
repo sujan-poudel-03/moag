@@ -8,6 +8,9 @@ import * as net from 'net';
 import * as path from 'path';
 import { detectProject, ProjectInfo } from './project-detector';
 import { SandboxConfig } from '../models/types';
+// One tree-kill implementation for the whole extension. `runner/evidence` is
+// dependency-free (fs/path/child_process only) so this import adds no cycle.
+import { killProcess } from '../utils/process-kill';
 
 export type SandboxStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -19,6 +22,24 @@ export interface SandboxState {
   error: string | null;
   /** Path to the most recently captured screenshot */
   lastScreenshotPath: string | null;
+}
+
+/**
+ * Probe whether something is already listening on `port`.
+ *
+ * Resolves false — never rejects — on connection refused, on an unreachable host
+ * (via the timeout branch) and on any socket error, so callers can treat it as a
+ * plain boolean question. Exported so the headless CLI can preflight a port before
+ * launching a sandbox of its own.
+ */
+export function isPortOpen(port: number, host = '127.0.0.1', timeoutMs = 1500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ port, host });
+    socket.setTimeout(timeoutMs);
+    socket.on('connect', () => { socket.destroy(); resolve(true); });
+    socket.on('error', () => resolve(false));
+    socket.on('timeout', () => { socket.destroy(); resolve(false); });
+  });
 }
 
 export class SandboxManager extends EventEmitter {
@@ -102,15 +123,27 @@ export class SandboxManager extends EventEmitter {
     proc.on('error', cleanup);
   }
 
-  /** Stop the running sandbox process. */
+  /**
+   * Stop the running sandbox process and every background target.
+   *
+   * Uses the runner's tree-kill: dev servers are spawned through a shell, so the
+   * pid we hold is the shell. A bare SIGTERM kills the shell and ORPHANS the real
+   * server, which keeps holding the port — and a later UAT run would then pass
+   * green against a stale build. Each kill is isolated so one failure cannot
+   * prevent the rest from being killed.
+   */
   stop(): void {
     if (this._process) {
-      this._process.kill('SIGTERM');
+      try {
+        killProcess(this._process);
+      } catch {
+        // ignore — the process may already be gone
+      }
       this._process = null;
     }
     for (const proc of this._backgroundProcesses) {
       try {
-        proc.kill('SIGTERM');
+        killProcess(proc);
       } catch {
         // ignore
       }
@@ -246,13 +279,7 @@ export class SandboxManager extends EventEmitter {
   }
 
   private _isPortOpen(port: number): Promise<boolean> {
-    return new Promise((resolve) => {
-      const socket = net.createConnection({ port, host: '127.0.0.1' });
-      socket.setTimeout(1500);
-      socket.on('connect', () => { socket.destroy(); resolve(true); });
-      socket.on('error', () => resolve(false));
-      socket.on('timeout', () => { socket.destroy(); resolve(false); });
-    });
+    return isPortOpen(port);
   }
 
   private _setState(next: SandboxState): void {

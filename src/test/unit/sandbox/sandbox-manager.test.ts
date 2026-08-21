@@ -4,8 +4,11 @@
 // Import a local TS module first so ts-node/register resolves this file
 // through CommonJS instead of Node's native ESM loader.
 import type { SandboxState } from '../../../sandbox/sandbox-manager';
+// The real (un-proxied) module — the port probe must talk to real sockets.
+import { isPortOpen } from '../../../sandbox/sandbox-manager';
 import { strict as assert } from 'assert';
 import { EventEmitter } from 'events';
+import * as net from 'net';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -33,6 +36,24 @@ function makeFakeProc(): FakeProc {
   return proc;
 }
 
+/**
+ * Assert `proc` was tree-killed, whichever platform the suite runs on:
+ * win32 goes through `taskkill /T /F`, everything else through SIGTERM.
+ */
+function assertTreeKilled(proc: FakeProc, execSyncStub: sinon.SinonStub, label: string): void {
+  if (process.platform === 'win32') {
+    const call = execSyncStub.getCalls().find((c) => String(c.args[0]).includes(String(proc.pid)));
+    assert.ok(call, `${label}: expected a taskkill for pid ${proc.pid}`);
+    const cmd = String(call!.args[0]);
+    assert.match(cmd, /taskkill/i, `${label}: must use taskkill`);
+    assert.ok(cmd.includes('/T'), `${label}: must pass /T so the tree dies, not just the shell`);
+    assert.ok(cmd.includes('/F'), `${label}: must pass /F`);
+  } else {
+    assert.ok(proc.kill.calledOnce, `${label}: expected a single kill`);
+    assert.equal(proc.kill.firstCall.args[0], 'SIGTERM', `${label}: must SIGTERM`);
+  }
+}
+
 function makeTempProject(files: Record<string, string>): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-sandbox-'));
   for (const [rel, content] of Object.entries(files)) {
@@ -43,8 +64,22 @@ function makeTempProject(files: Record<string, string>): string {
   return root;
 }
 
-function loadManager(spawnStub: sinon.SinonStub): typeof import('../../../sandbox/sandbox-manager') {
+/**
+ * Load the manager with `child_process` stubbed everywhere it matters.
+ *
+ * `utils/process-kill` is proxied too because `stop()` tree-kills through it: on
+ * win32 that is a real `execSync('taskkill …')`, which must never fire against
+ * the fake pid of a test double.
+ */
+function loadManager(
+  spawnStub: sinon.SinonStub,
+  execSyncStub: sinon.SinonStub = sinon.stub(),
+): typeof import('../../../sandbox/sandbox-manager') {
+  const processKill = proxyquire('../../../utils/process-kill', {
+    child_process: { execSync: execSyncStub },
+  });
   return proxyquire('../../../sandbox/sandbox-manager', {
+    '../utils/process-kill': processKill,
     child_process: { spawn: spawnStub, ChildProcess: class {} },
     net: {
       createConnection: () => {
@@ -133,7 +168,8 @@ describe('SandboxManager', () => {
   it('stop() kills the running process and returns to stopped state', async () => {
     const fakeProc = makeFakeProc();
     const spawnStub = sinon.stub().returns(fakeProc);
-    const { SandboxManager } = loadManager(spawnStub);
+    const execSyncStub = sinon.stub();
+    const { SandboxManager } = loadManager(spawnStub, execSyncStub);
     const mgr = new SandboxManager();
     const root = makeTempProject({
       'package.json': JSON.stringify({ dependencies: { next: '14.0.0' } }),
@@ -144,7 +180,7 @@ describe('SandboxManager', () => {
     assert.equal(mgr.state.status, 'running');
 
     mgr.stop();
-    assert.ok(fakeProc.kill.calledOnce);
+    assertTreeKilled(fakeProc, execSyncStub, 'primary');
     assert.equal(mgr.state.status, 'stopped');
     assert.equal(mgr.state.url, null);
   });
@@ -249,11 +285,13 @@ describe('SandboxManager', () => {
   it('launches sandbox.targets and stop() kills both primary and background processes', async () => {
     const primaryProc = makeFakeProc();
     const bgProc = makeFakeProc();
+    bgProc.pid = 54321; // distinct pid so the taskkill assertions cannot alias
     const spawnStub = sinon.stub();
     spawnStub.onCall(0).returns(bgProc);      // background target(s) launched first
     spawnStub.onCall(1).returns(primaryProc); // primary web target
 
-    const { SandboxManager } = loadManager(spawnStub);
+    const execSyncStub = sinon.stub();
+    const { SandboxManager } = loadManager(spawnStub, execSyncStub);
     const mgr = new SandboxManager();
     const root = makeTempProject({ 'README.md': 'monorepo style test' });
 
@@ -274,7 +312,103 @@ describe('SandboxManager', () => {
     assert.equal(primaryOpts.cwd, path.join(root, 'apps', 'web'));
 
     mgr.stop();
-    assert.ok(primaryProc.kill.calledOnce);
-    assert.ok(bgProc.kill.calledOnce);
+    assertTreeKilled(primaryProc, execSyncStub, 'primary');
+    assertTreeKilled(bgProc, execSyncStub, 'background');
+  });
+});
+
+describe('SandboxManager — stop() tree-kill', () => {
+  afterEach(() => sinon.restore());
+
+  it('does not throw when there is nothing running', () => {
+    const { SandboxManager } = loadManager(sinon.stub());
+    const mgr = new SandboxManager();
+    assert.doesNotThrow(() => mgr.stop());
+    assert.equal(mgr.state.status, 'stopped');
+  });
+
+  it('kills every background process even when one kill throws', async () => {
+    const primary = makeFakeProc();
+    const bgA = makeFakeProc();
+    const bgB = makeFakeProc();
+    bgA.pid = 22222;
+    bgB.pid = 33333;
+    bgA.kill.throws(new Error('EPERM'));
+
+    const spawnStub = sinon.stub();
+    spawnStub.onCall(0).returns(bgA);
+    spawnStub.onCall(1).returns(bgB);
+    spawnStub.onCall(2).returns(primary);
+
+    const execSyncStub = sinon.stub();
+    // On win32 the first taskkill throws; the loop must still reach the rest.
+    execSyncStub.withArgs(sinon.match(/22222/)).throws(new Error('EPERM'));
+
+    const { SandboxManager } = loadManager(spawnStub, execSyncStub);
+    const mgr = new SandboxManager();
+    const root = makeTempProject({ 'README.md': 'targets' });
+
+    await mgr.launch(root, {
+      targets: [
+        { name: 'Web', cwd: '.', command: 'npm run dev', port: 3000 },
+        { name: 'A', cwd: '.', command: 'npm run a', port: 4000 },
+        { name: 'B', cwd: '.', command: 'npm run b', port: 5000 },
+      ],
+    });
+
+    assert.doesNotThrow(() => mgr.stop());
+    assertTreeKilled(primary, execSyncStub, 'primary');
+    assertTreeKilled(bgB, execSyncStub, 'surviving background target');
+    assert.equal(mgr.state.status, 'stopped');
+  });
+});
+
+describe('isPortOpen', () => {
+  const servers: net.Server[] = [];
+
+  afterEach(() => {
+    for (const s of servers.splice(0)) {
+      try { s.close(); } catch { /* ignore */ }
+    }
+  });
+
+  it('resolves false for a closed port without hanging', async function () {
+    this.timeout(8000);
+    let open: boolean;
+    try {
+      open = await isPortOpen(1, '127.0.0.1', 1000);
+    } catch (err) {
+      if (err instanceof Error && /EPERM/i.test(err.message)) { this.skip(); return; }
+      throw err;
+    }
+    assert.equal(open, false);
+  });
+
+  it('resolves true for a port that is actually listening', async function () {
+    this.timeout(8000);
+    const server = net.createServer();
+    servers.push(server);
+    let port: number;
+    try {
+      port = await new Promise<number>((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(0, '127.0.0.1', () => {
+          const addr = server.address();
+          if (addr && typeof addr === 'object') { resolve(addr.port); } else { reject(new Error('no address')); }
+        });
+      });
+    } catch (err) {
+      if (err instanceof Error && /EPERM|EACCES/i.test(err.message)) { this.skip(); return; }
+      throw err;
+    }
+    assert.equal(await isPortOpen(port, '127.0.0.1', 1500), true);
+  });
+
+  it('resolves false for an unreachable host via the timeout branch', async function () {
+    this.timeout(8000);
+    // TEST-NET-1 (RFC 5737) — routable nowhere, so the connect stalls and the
+    // timeout branch must resolve false rather than surfacing an unhandled error.
+    const open = await isPortOpen(80, '192.0.2.1', 600);
+    assert.equal(open, false);
   });
 });

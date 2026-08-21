@@ -7,6 +7,7 @@ import { spawn, execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ProjectType } from './project-detector';
+import { resolveBrowserRunner } from './browser-driver';
 
 export interface ScreenshotOptions {
   projectType: ProjectType;
@@ -44,14 +45,16 @@ export async function captureScreenshot(opts: ScreenshotOptions): Promise<string
 // ── Web ───────────────────────────────────────────────────────────────────────
 
 async function captureWebScreenshot(url: string, outputPath: string, cwd: string): Promise<string | null> {
-  // Prefer a locally-installed playwright binary over npx to avoid the
-  // interactive install prompt on first run.
-  const playwrightBin = findLocalPlaywright(cwd);
+  // A locally-installed playwright binary is the only supported path. There is
+  // no `npx --yes` fallback: it downloaded a package inside the 30s timeout, so
+  // the call always failed while leaving an install running behind it.
+  const runner = resolveBrowserRunner(cwd);
+  if (runner.kind === 'unprovisioned') {
+    return null;
+  }
 
   return new Promise((resolve) => {
-    const args = playwrightBin
-      ? [playwrightBin, 'screenshot', '--full-page', url, outputPath]
-      : ['npx', '--yes', 'playwright', 'screenshot', '--full-page', url, outputPath];
+    const args = [runner.bin, 'screenshot', '--full-page', url, outputPath];
 
     const proc = spawn(args[0], args.slice(1), {
       cwd,
@@ -72,18 +75,6 @@ async function captureWebScreenshot(url: string, outputPath: string, cwd: string
 
     proc.on('error', () => { clearTimeout(timer); resolve(null); });
   });
-}
-
-function findLocalPlaywright(cwd: string): string | null {
-  // Look for playwright in node_modules/.bin relative to the workspace/sandbox cwd
-  const candidates = [
-    path.join(cwd, 'node_modules', '.bin', 'playwright'),
-    path.join(cwd, 'node_modules', '.bin', 'playwright.cmd'),
-  ];
-  for (const c of candidates) {
-    if (fs.existsSync(c)) { return c; }
-  }
-  return null;
 }
 
 // ── Mobile ────────────────────────────────────────────────────────────────────

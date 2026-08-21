@@ -19,6 +19,19 @@ function tmpCwd(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'moag-shot-'));
 }
 
+/**
+ * A workspace with a provisioned local playwright binary. Required now that the
+ * `npx --yes playwright` fallback is gone — without a binary nothing spawns.
+ */
+function provisionedCwd(): { cwd: string; bin: string } {
+  const cwd = tmpCwd();
+  const binDir = path.join(cwd, 'node_modules', '.bin');
+  fs.mkdirSync(binDir, { recursive: true });
+  const bin = path.join(binDir, process.platform === 'win32' ? 'playwright.cmd' : 'playwright');
+  fs.writeFileSync(bin, 'echo playwright');
+  return { cwd, bin };
+}
+
 function makeFakeSpawnProc(exitCode: number, writeFile?: string): EventEmitter {
   const proc = new EventEmitter();
   setImmediate(() => {
@@ -51,8 +64,22 @@ describe('captureScreenshot', () => {
     assert.equal(result, null);
   });
 
+  it('returns null and never spawns when playwright is not provisioned', async () => {
+    const spawnStub = sinon.stub();
+    const { captureScreenshot } = loadScreenshot({ spawnStub });
+
+    const result = await captureScreenshot({
+      projectType: 'web',
+      url: 'http://localhost:3000',
+      cwd: tmpCwd(),
+    });
+
+    assert.equal(result, null);
+    assert.ok(spawnStub.notCalled, 'no binary must mean no spawn — no npx --yes install');
+  });
+
   it('invokes playwright for web projects and returns path on success', async () => {
-    const cwd = tmpCwd();
+    const { cwd } = provisionedCwd();
     let spawnedArgs: string[] = [];
     let spawnOpts: { cwd?: string } | undefined;
     const spawnStub = sinon.stub().callsFake((cmd: string, args: string[], opts: { cwd?: string }) => {
@@ -73,16 +100,13 @@ describe('captureScreenshot', () => {
     assert.ok(result?.includes('screenshot-'));
     assert.ok(spawnedArgs.some(a => a.includes('playwright')), 'should invoke playwright');
     assert.ok(spawnedArgs.includes('http://localhost:3000'), 'should pass URL to playwright');
+    assert.ok(!spawnedArgs.includes('--yes'), 'regression lock: --yes must never appear in argv');
     assert.equal(spawnOpts?.cwd, cwd, 'should run playwright from workspace cwd');
     assert.ok(fs.existsSync(result!));
   });
 
   it('prefers local playwright binary from workspace cwd', async () => {
-    const cwd = tmpCwd();
-    const binDir = path.join(cwd, 'node_modules', '.bin');
-    fs.mkdirSync(binDir, { recursive: true });
-    const localBin = path.join(binDir, process.platform === 'win32' ? 'playwright.cmd' : 'playwright');
-    fs.writeFileSync(localBin, 'echo playwright');
+    const { cwd, bin: localBin } = provisionedCwd();
 
     let spawnedCmd = '';
     const spawnStub = sinon.stub().callsFake((cmd: string, args: string[]) => {
@@ -103,7 +127,7 @@ describe('captureScreenshot', () => {
   });
 
   it('returns null when playwright exits non-zero', async () => {
-    const cwd = tmpCwd();
+    const { cwd } = provisionedCwd();
     const spawnStub = sinon.stub().callsFake(() => makeFakeSpawnProc(1));
     const { captureScreenshot } = loadScreenshot({ spawnStub });
 
@@ -146,7 +170,7 @@ describe('captureScreenshot', () => {
   });
 
   it('creates .moag/screenshots/ directory if missing', async () => {
-    const cwd = tmpCwd();
+    const { cwd } = provisionedCwd();
     const spawnStub = sinon.stub().callsFake((cmd: string, args: string[]) => {
       return makeFakeSpawnProc(0, args[args.length - 1]);
     });
