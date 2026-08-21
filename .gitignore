@@ -3,8 +3,10 @@ node_modules/
 *.vsix
 .vscode-test/
 
-# Claude Code
-.claude/
+# Claude Code — ignore local session state, track shared agent/command definitions
+.claude/*
+!.claude/agents/
+!.claude/commands/
 
 # OS files
 Thumbs.db
