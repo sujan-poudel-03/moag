@@ -3,6 +3,7 @@ import {
   VALIDATION_PROFILE_CONFIGS,
   resolveValidationProfile,
   resolveProfile,
+  resolveTaskTimeoutMs,
 } from '../../../models/execution-profiles';
 
 describe('VALIDATION_PROFILE_CONFIGS', () => {
@@ -100,5 +101,73 @@ describe('resolveProfile (engine profiles)', () => {
   it('unknown profile falls back to balanced', () => {
     const cfg = resolveProfile('nonexistent');
     assert.strictEqual(cfg.modelPreset, 'balanced');
+  });
+});
+
+describe('resolveTaskTimeoutMs', () => {
+  const SERVICE_DEFAULT = 60_000;
+  const PROFILE_DEFAULT = 30 * 60 * 1000;
+
+  it('task timeoutMs beats both the setting and the profile', () => {
+    const ms = resolveTaskTimeoutMs({
+      isService: false,
+      taskTimeoutMs: 900_000,
+      serviceDefaultMs: SERVICE_DEFAULT,
+      settingOverrideMs: 120_000,
+      profileTimeoutMs: PROFILE_DEFAULT,
+    });
+    assert.strictEqual(ms, 900_000);
+  });
+
+  it('setting override is used when the task has no timeoutMs', () => {
+    const ms = resolveTaskTimeoutMs({
+      isService: false,
+      serviceDefaultMs: SERVICE_DEFAULT,
+      settingOverrideMs: 120_000,
+      profileTimeoutMs: PROFILE_DEFAULT,
+    });
+    assert.strictEqual(ms, 120_000);
+  });
+
+  it('profile timeout is used when neither task nor setting provides one', () => {
+    const ms = resolveTaskTimeoutMs({
+      isService: false,
+      serviceDefaultMs: SERVICE_DEFAULT,
+      profileTimeoutMs: PROFILE_DEFAULT,
+    });
+    assert.strictEqual(ms, PROFILE_DEFAULT);
+  });
+
+  it('service tasks use startupTimeoutMs and ignore taskTimeoutMs', () => {
+    const ms = resolveTaskTimeoutMs({
+      isService: true,
+      taskTimeoutMs: 900_000,
+      startupTimeoutMs: 45_000,
+      serviceDefaultMs: SERVICE_DEFAULT,
+      settingOverrideMs: 120_000,
+      profileTimeoutMs: PROFILE_DEFAULT,
+    });
+    assert.strictEqual(ms, 45_000);
+  });
+
+  it('service tasks fall back to the service default, never to taskTimeoutMs', () => {
+    const ms = resolveTaskTimeoutMs({
+      isService: true,
+      taskTimeoutMs: 900_000,
+      serviceDefaultMs: SERVICE_DEFAULT,
+      settingOverrideMs: 120_000,
+      profileTimeoutMs: PROFILE_DEFAULT,
+    });
+    assert.strictEqual(ms, SERVICE_DEFAULT);
+  });
+
+  it('treats an explicit 0 setting override as a real value, not a fallback trigger', () => {
+    const ms = resolveTaskTimeoutMs({
+      isService: false,
+      serviceDefaultMs: SERVICE_DEFAULT,
+      settingOverrideMs: 0,
+      profileTimeoutMs: PROFILE_DEFAULT,
+    });
+    assert.strictEqual(ms, 0);
   });
 });

@@ -61,11 +61,21 @@ describe('Built-in Plan Templates', () => {
   it('plan round-trips through dehydrate/hydrate', () => {
     for (const tpl of templates) {
       const original = tpl.buildPlan('RoundTripTest') as Plan;
-      const dehydrated = dehydratePlan(original);
-      const rehydrated = hydratePlan(dehydrated);
-      const originalTaskCount = original.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
-      const rehydratedTaskCount = rehydrated.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
-      assert.equal(rehydratedTaskCount, originalTaskCount, `Template "${tpl.id}": task count mismatch after round-trip (expected ${originalTaskCount}, got ${rehydratedTaskCount})`);
+      // Compared in *file* space, not object space: templates build plans with `createTask`,
+      // which emits 5 keys, while `hydrateTask` emits every field of Task. Comparing the
+      // runtime objects would fail for that unrelated reason and hide real field loss.
+      const once = dehydratePlan(original);
+      const twice = dehydratePlan(hydratePlan(once));
+      assert.deepEqual(twice, once, `Template "${tpl.id}": fields lost in the dehydrate/hydrate round-trip`);
+    }
+  });
+
+  it('every template still yields at least one task after the round-trip', () => {
+    for (const tpl of templates) {
+      const original = tpl.buildPlan('RoundTripTest') as Plan;
+      const rehydrated = hydratePlan(dehydratePlan(original));
+      const taskCount = rehydrated.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
+      assert.ok(taskCount >= 1, `Template "${tpl.id}": expected at least 1 task after round-trip, got ${taskCount}`);
     }
   });
 

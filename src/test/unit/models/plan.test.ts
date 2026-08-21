@@ -2,8 +2,11 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { generateId, loadPlan, savePlan, createEmptyPlan, createPlaylist, createTask } from '../../../models/plan';
-import { TaskStatus, PlanFile } from '../../../models/types';
+import {
+  generateId, loadPlan, savePlan, createEmptyPlan, createPlaylist, createTask,
+  hydratePlan, dehydratePlan, appendPrdVersion, MAX_PRD_VERSIONS, MAX_PRD_VERSIONS_CHARS,
+} from '../../../models/plan';
+import { TaskStatus, PlanFile, PrdVersion } from '../../../models/types';
 
 describe('generateId', () => {
   it('should return a non-empty string', () => {
@@ -273,6 +276,72 @@ describe('loadPlan / savePlan round-trip', () => {
     assert.deepEqual(t.skipIf, { taskId: 'dep-1', status: TaskStatus.Completed });
   });
 
+  it('should round-trip task timeoutMs through save/load', () => {
+    const plan = createEmptyPlan('Timeout Test');
+    const task = createTask('Long', 'Do something slow');
+    task.timeoutMs = 900000;
+    plan.playlists[0].tasks.push(task);
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+    assert.equal(loaded.playlists[0].tasks[0].timeoutMs, 900000);
+  });
+
+  it('should omit task timeoutMs from the file when absent', () => {
+    const plan = createEmptyPlan('No Timeout');
+    plan.playlists[0].tasks.push(createTask('Plain', 'prompt'));
+
+    savePlan(plan, tmpFile);
+    const raw: PlanFile = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
+    assert.ok(!('timeoutMs' in (raw.playlists[0].tasks[0] as object)));
+    const loaded = loadPlan(tmpFile);
+    assert.equal(loaded.playlists[0].tasks[0].timeoutMs, undefined);
+  });
+
+  it('should throw when task timeoutMs is below the 1000ms floor', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Tiny Timeout',
+      defaultEngine: 'claude',
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{
+          id: 't-1',
+          name: 'Task',
+          prompt: 'Prompt',
+          timeoutMs: 500,
+        }],
+      }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /tasks\[\]\.timeoutMs/);
+  });
+
+  it('should throw when task timeoutMs is a string', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'String Timeout',
+      defaultEngine: 'claude',
+      playlists: [{
+        id: 'pl-1',
+        name: 'Tasks',
+        autoplay: true,
+        tasks: [{
+          id: 't-1',
+          name: 'Task',
+          prompt: 'Prompt',
+          timeoutMs: '900000' as any,
+        }],
+      }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /tasks\[\]\.timeoutMs/);
+  });
+
   it('should preserve variables through hydrate/dehydrate', () => {
     const plan = createEmptyPlan('Variables Hydrate Test');
     plan.variables = { env: 'staging', version: '2.0' };
@@ -459,5 +528,271 @@ describe('loadPlan / savePlan round-trip', () => {
 
     fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
     assert.throws(() => loadPlan(tmpFile), /tasks\[\]\.validation\.profile/i);
+  });
+
+  it('should round-trip plan aiRules byte-exact through save/load', () => {
+    const plan = createEmptyPlan('Rules Test');
+    plan.aiRules = 'never touch src/legacy/**';
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+
+    assert.equal(loaded.aiRules, 'never touch src/legacy/**');
+    // The glob must survive verbatim — no escaping, no normalisation
+    assert.ok(loaded.aiRules!.includes('src/legacy/**'));
+  });
+
+  it('should round-trip fixIterations through save/load', () => {
+    const plan = createEmptyPlan('Fix Iterations');
+    plan.fixIterations = 2;
+
+    savePlan(plan, tmpFile);
+    assert.equal(loadPlan(tmpFile).fixIterations, 2);
+  });
+
+  it('should persist fixIterations of 0 as 0, not drop it', () => {
+    const plan = createEmptyPlan('Zero Iterations');
+    plan.fixIterations = 0;
+
+    savePlan(plan, tmpFile);
+    const raw: PlanFile = JSON.parse(fs.readFileSync(tmpFile, 'utf-8'));
+    assert.equal(raw.fixIterations, 0);
+    assert.equal(loadPlan(tmpFile).fixIterations, 0);
+  });
+
+  it('should round-trip prdVersions preserving order', () => {
+    const plan = createEmptyPlan('PRD Versions');
+    plan.prdVersions = [
+      { version: 'v1', text: 'first draft', createdAt: '2026-01-01T00:00:00.000Z' },
+      { version: 'v2', text: 'second draft', createdAt: '2026-01-02T00:00:00.000Z' },
+    ];
+
+    savePlan(plan, tmpFile);
+    const loaded = loadPlan(tmpFile);
+
+    assert.deepEqual(loaded.prdVersions, plan.prdVersions);
+    assert.equal(loaded.prdVersions![0].version, 'v1');
+    assert.equal(loaded.prdVersions![1].version, 'v2');
+  });
+
+  it('should omit aiRules, prdVersions and fixIterations when absent', () => {
+    const plan = createEmptyPlan('Nothing Set');
+
+    savePlan(plan, tmpFile);
+    const raw = JSON.parse(fs.readFileSync(tmpFile, 'utf-8')) as Record<string, unknown>;
+    assert.ok(!('aiRules' in raw));
+    assert.ok(!('prdVersions' in raw));
+    assert.ok(!('fixIterations' in raw));
+  });
+
+  it('should throw when fixIterations is not an integer', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Bad Iterations',
+      defaultEngine: 'claude',
+      fixIterations: 1.5,
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /fixIterations/);
+  });
+
+  it('should throw when prdVersions is not an array', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Bad Versions',
+      defaultEngine: 'claude',
+      prdVersions: 'v1' as any,
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /prdVersions/);
+  });
+
+  it('should throw when a prdVersions entry is malformed', () => {
+    const raw: PlanFile = {
+      version: '1.0',
+      name: 'Bad Version Entry',
+      defaultEngine: 'claude',
+      prdVersions: [{ version: 1 } as any],
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /prdVersions\[0\]/);
+  });
+
+  it('should not apply the PRD retention cap in the loader or the serializer', () => {
+    const many: PrdVersion[] = Array.from({ length: 50 }, (_, i) => ({
+      version: `v${i + 1}`,
+      text: `draft ${i + 1}`,
+      createdAt: `2026-01-01T00:00:0${i % 10}.000Z`,
+    }));
+    const file: PlanFile = {
+      version: '1.0',
+      name: 'Hand Authored',
+      defaultEngine: 'claude',
+      prdVersions: many,
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    const hydrated = hydratePlan(file, 'hand.json');
+    assert.equal(hydrated.prdVersions!.length, 50);
+    assert.equal(dehydratePlan(hydrated).prdVersions!.length, 50);
+  });
+
+  it('should round-trip the documented two-target monorepo sandbox block', () => {
+    const sandbox = {
+      targets: [
+        { name: 'Frontend', cwd: 'apps/web', command: 'npm run dev', port: 3000 },
+        { name: 'Backend', cwd: 'apps/api', command: 'npm run dev', port: 4000 },
+      ],
+    };
+    const raw = {
+      version: '1.0',
+      name: 'Monorepo',
+      defaultEngine: 'claude',
+      sandbox,
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    const loaded = loadPlan(tmpFile);
+
+    assert.equal(loaded.sandbox!.targets!.length, 2);
+    assert.equal(loaded.sandbox!.targets![1].port, 4000);
+
+    savePlan(loaded, tmpFile);
+    const firstText = fs.readFileSync(tmpFile, 'utf-8');
+    const resaved = JSON.parse(firstText) as Record<string, unknown>;
+    assert.deepEqual(resaved.sandbox, sandbox);
+
+    // Idempotence: a second load/save cycle must produce byte-identical text
+    savePlan(loadPlan(tmpFile), tmpFile);
+    assert.equal(fs.readFileSync(tmpFile, 'utf-8'), firstText);
+  });
+
+  it('should round-trip the shorthand sandbox command/port form', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Shorthand',
+      defaultEngine: 'claude',
+      sandbox: { command: 'npm run dev', port: 5173 },
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    const loaded = loadPlan(tmpFile);
+    assert.equal(loaded.sandbox!.command, 'npm run dev');
+    assert.equal(loaded.sandbox!.port, 5173);
+    assert.equal(loaded.sandbox!.targets, undefined);
+
+    savePlan(loaded, tmpFile);
+    const resaved = JSON.parse(fs.readFileSync(tmpFile, 'utf-8')) as Record<string, unknown>;
+    assert.deepEqual(resaved.sandbox, { command: 'npm run dev', port: 5173 });
+  });
+
+  it('should omit sandbox from the file when the plan has none', () => {
+    const plan = createEmptyPlan('No Sandbox');
+    savePlan(plan, tmpFile);
+    const raw = JSON.parse(fs.readFileSync(tmpFile, 'utf-8')) as Record<string, unknown>;
+    assert.ok(!('sandbox' in raw));
+  });
+
+  it('should throw when a sandbox target is missing its command', () => {
+    const raw = {
+      version: '1.0',
+      name: 'No Command',
+      defaultEngine: 'claude',
+      sandbox: { targets: [{ name: 'Frontend', cwd: 'apps/web' }] },
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /sandbox\.targets\[0\]\.command/);
+  });
+
+  it('should throw when sandbox targets is an empty array', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Empty Targets',
+      defaultEngine: 'claude',
+      sandbox: { targets: [] },
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /sandbox\.targets/);
+  });
+
+  it('should throw on the singular "target" typo instead of silently ignoring it', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Typo',
+      defaultEngine: 'claude',
+      sandbox: { target: [] },
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /sandbox/);
+  });
+
+  it('should throw when a sandbox port is a string', () => {
+    const raw = {
+      version: '1.0',
+      name: 'String Port',
+      defaultEngine: 'claude',
+      sandbox: { targets: [{ name: 'Web', command: 'npm run dev', port: '3000' }] },
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
+    };
+
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    assert.throws(() => loadPlan(tmpFile), /port/);
+  });
+});
+
+describe('appendPrdVersion', () => {
+  const makeEntry = (n: number, text = `draft ${n}`): PrdVersion => ({
+    version: `v${n}`,
+    text,
+    createdAt: `2026-01-01T00:00:00.00${n % 10}Z`,
+  });
+
+  it('should append to an empty history without dropping anything', () => {
+    const { versions, dropped } = appendPrdVersion(undefined, makeEntry(1));
+    assert.equal(versions.length, 1);
+    assert.equal(dropped, 0);
+    assert.equal(versions[0].version, 'v1');
+  });
+
+  it('should drop the oldest entry when exceeding MAX_PRD_VERSIONS', () => {
+    const existing = Array.from({ length: MAX_PRD_VERSIONS }, (_, i) => makeEntry(i + 1));
+    const { versions, dropped } = appendPrdVersion(existing, makeEntry(MAX_PRD_VERSIONS + 1));
+
+    assert.equal(versions.length, MAX_PRD_VERSIONS);
+    assert.equal(dropped, 1);
+    // Newest stays last, and the oldest survivor is the former second entry
+    assert.equal(versions[versions.length - 1].version, `v${MAX_PRD_VERSIONS + 1}`);
+    assert.equal(versions[0].version, 'v2');
+  });
+
+  it('should never drop the entry just added, even when it alone exceeds the char ceiling', () => {
+    const existing = Array.from({ length: 19 }, (_, i) => makeEntry(i + 1, 'x'.repeat(10)));
+    const huge = makeEntry(99, 'y'.repeat(MAX_PRD_VERSIONS_CHARS + 1));
+    const { versions, dropped } = appendPrdVersion(existing, huge);
+
+    assert.equal(versions.length, 1);
+    assert.equal(dropped, 19);
+    assert.equal(versions[0].version, 'v99');
+    assert.equal(versions[0].text.length, MAX_PRD_VERSIONS_CHARS + 1);
+  });
+
+  it('should not mutate the array it was given', () => {
+    const existing = [makeEntry(1)];
+    appendPrdVersion(existing, makeEntry(2));
+    assert.equal(existing.length, 1);
   });
 });

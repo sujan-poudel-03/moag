@@ -104,6 +104,30 @@ const PROFILE_DEFINITIONS: Record<Exclude<ProfileName, 'auto'>, ProfileConfig> =
   },
 };
 
+// ─── Timeout Resolution ───
+
+/**
+ * Resolve the wall-clock timeout for a single task execution.
+ *
+ * Service tasks use the startup chain (`startupTimeoutMs` → `serviceDefaultMs`) and
+ * deliberately ignore `taskTimeoutMs`: a service is expected to keep running past the
+ * point where it is "ready", so a task timeout would kill a healthy server.
+ * Every other task type uses `taskTimeoutMs` → `settingOverrideMs` → `profileTimeoutMs`.
+ */
+export function resolveTaskTimeoutMs(opts: {
+  isService: boolean;
+  taskTimeoutMs?: number;
+  startupTimeoutMs?: number;
+  serviceDefaultMs: number;
+  settingOverrideMs?: number;
+  profileTimeoutMs: number;
+}): number {
+  if (opts.isService) {
+    return opts.startupTimeoutMs ?? opts.serviceDefaultMs;
+  }
+  return opts.taskTimeoutMs ?? opts.settingOverrideMs ?? opts.profileTimeoutMs;
+}
+
 export const PROFILE_META: ProfileMeta[] = [
   { name: 'auto', label: 'Auto', description: 'Use default settings (balanced)', icon: '$(sparkle)' },
   { name: 'fast', label: 'Fast', description: 'Claude, fast model, 10min timeout, no auto-fix', icon: '$(zap)' },

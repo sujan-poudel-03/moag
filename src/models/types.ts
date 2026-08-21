@@ -164,8 +164,8 @@ export interface Playlist {
 export interface SandboxTarget {
   /** Display label for this target (e.g. "Frontend", "API") */
   name: string;
-  /** Path relative to workspace root where the dev command runs */
-  cwd: string;
+  /** Path relative to workspace root where the dev command runs (defaults to the workspace root) */
+  cwd?: string;
   /** Shell command to start the dev server (e.g. "npm run dev") */
   command: string;
   /** Expected port so MOAG can detect readiness and build the URL */
@@ -382,6 +382,14 @@ export interface PlanFile {
   sourceIssues?: Array<{ repo: string; number: number; title: string }>;
   /** Full original PRD text from which this plan was generated */
   prdSource?: string;
+  /** Freeform rules/guidelines injected before every task in this plan */
+  aiRules?: string;
+  /** Version history of the PRD — each entry is a snapshot saved by the user */
+  prdVersions?: PrdVersion[];
+  /** Number of fix-iteration playlists generated so far */
+  fixIterations?: number;
+  /** Optional sandbox configuration — overrides project auto-detection */
+  sandbox?: SandboxConfig;
   /** Optional plan-level validation defaults */
   validation?: {
     targets?: ValidationTarget[];
@@ -426,6 +434,8 @@ export interface PlanFileTask {
   readyPattern?: string;
   healthCheckUrl?: string;
   startupTimeoutMs?: number;
+  /** Per-task timeout override in milliseconds (overrides profile and global setting) */
+  timeoutMs?: number;
   retryCount?: number;
   dependsOn?: string[];
   /** Skip this task if a referenced task has a specific status */

@@ -5,8 +5,10 @@ import * as path from 'path';
 import {
   Plan, PlanFile, PlanFilePlaylist, PlanFileTask,
   Playlist, Task, TaskStatus, EngineId,
-  ContextBudget, ValidationProfile, ValidationSettings, ValidationTarget,
+  ContextBudget, PrdVersion, SandboxConfig, SandboxTarget,
+  ValidationProfile, ValidationSettings, ValidationTarget,
 } from './types';
+import { redactPlanFile } from './plan-redaction';
 
 const DEFAULT_VALIDATION_TARGETS: ValidationTarget[] = ['all'];
 const DEFAULT_VALIDATION_PROFILE: ValidationProfile = 'quick';
@@ -63,6 +65,24 @@ function parseBudgetTokenValue(rawValue: unknown, fieldPath: string, sourceName:
   return rawValue;
 }
 
+/**
+ * Validate a per-task `timeoutMs` override.
+ * The 1000 ms floor is deliberate: the `agentTaskPlayer.taskTimeoutMs` *setting* is
+ * floored at 30000 in the runner, but the task field bypasses that resolution, so the
+ * only guard against a nonsense value (0, negatives, seconds-instead-of-ms) is here.
+ */
+function parseTaskTimeoutMs(rawValue: unknown, sourceName: string, taskId: string): number | undefined {
+  if (rawValue === undefined) {
+    return undefined;
+  }
+  if (typeof rawValue !== 'number' || !Number.isInteger(rawValue) || rawValue < 1000) {
+    throw new Error(
+      `"${sourceName}" has invalid "tasks[].timeoutMs" for task "${taskId}" — expected an integer >= 1000 (milliseconds).`,
+    );
+  }
+  return rawValue;
+}
+
 function normalizePlanValidation(raw: unknown, sourceName: string): ValidationSettings {
   if (raw === undefined) {
     return {
@@ -113,6 +133,124 @@ function normalizePlanValidation(raw: unknown, sourceName: string): ValidationSe
   }
 
   return { targets, profile, contextBudget };
+}
+
+/** Validate an optional port value that must be a real TCP port when present. */
+function parseSandboxPort(rawValue: unknown, fieldPath: string, sourceName: string): number | undefined {
+  if (rawValue === undefined) {
+    return undefined;
+  }
+  if (typeof rawValue !== 'number' || !Number.isInteger(rawValue) || rawValue < 1 || rawValue > 65535) {
+    throw new Error(`"${sourceName}" has invalid "${fieldPath}" — expected an integer between 1 and 65535.`);
+  }
+  return rawValue;
+}
+
+/**
+ * Validate the optional plan-level sandbox configuration.
+ *
+ * Each target is rebuilt explicitly in `name, cwd, command, port` order rather than
+ * spread from the raw object: spreading would carry unknown user keys into the model
+ * and write them straight back out on the next save.
+ */
+function normalizeSandbox(raw: unknown, sourceName: string): SandboxConfig | undefined {
+  if (!isRecord(raw)) {
+    throw new Error(`"${sourceName}" has invalid "sandbox" — expected an object.`);
+  }
+  if (raw.targets === undefined && raw.command === undefined) {
+    // Also catches the common "target" (singular) typo, which would otherwise load as an empty config.
+    throw new Error(`"${sourceName}" has invalid "sandbox" — expected "targets" or "command".`);
+  }
+
+  const config: SandboxConfig = {};
+  const rawTargets = raw.targets;
+  const rawCommand = raw.command;
+
+  if (rawTargets !== undefined) {
+    if (!Array.isArray(rawTargets) || rawTargets.length === 0) {
+      throw new Error(`"${sourceName}" has invalid "sandbox.targets" — expected a non-empty array.`);
+    }
+    config.targets = rawTargets.map((entry: unknown, i: number) => {
+      if (!isRecord(entry)) {
+        throw new Error(`"${sourceName}" has invalid "sandbox.targets[${i}]" — expected an object.`);
+      }
+      const name = entry.name;
+      const command = entry.command;
+      const cwd = entry.cwd;
+      if (typeof name !== 'string' || name.length === 0) {
+        throw new Error(`"${sourceName}" has invalid "sandbox.targets[${i}].name" — expected a non-empty string.`);
+      }
+      if (typeof command !== 'string' || command.length === 0) {
+        throw new Error(`"${sourceName}" has invalid "sandbox.targets[${i}].command" — expected a non-empty string.`);
+      }
+      if (cwd !== undefined && typeof cwd !== 'string') {
+        throw new Error(`"${sourceName}" has invalid "sandbox.targets[${i}].cwd" — expected a string.`);
+      }
+      const port = parseSandboxPort(entry.port, `sandbox.targets[${i}].port`, sourceName);
+      // Rebuilt explicitly in key order: name, cwd, command, port.
+      const target: SandboxTarget = {
+        name,
+        ...(cwd !== undefined ? { cwd } : {}),
+        command,
+        ...(port !== undefined ? { port } : {}),
+      };
+      return target;
+    });
+  }
+
+  if (rawCommand !== undefined) {
+    if (typeof rawCommand !== 'string' || rawCommand.length === 0) {
+      throw new Error(`"${sourceName}" has invalid "sandbox.command" — expected a non-empty string.`);
+    }
+    config.command = rawCommand;
+  }
+
+  const shorthandPort = parseSandboxPort(raw.port, 'sandbox.port', sourceName);
+  if (shorthandPort !== undefined) { config.port = shorthandPort; }
+
+  return config;
+}
+
+/**
+ * Validate the persisted PRD version history.
+ *
+ * Order is preserved verbatim (plain `.map`, never sorted) — `prdVersions` is an append
+ * log and the UI shows the newest snapshot last. Note that the retention cap
+ * (`MAX_PRD_VERSIONS` / `MAX_PRD_VERSIONS_CHARS`) is deliberately **not** applied here:
+ * a hand-authored file with 50 versions loads all 50 and re-saves all 50. The cap belongs
+ * to `appendPrdVersion`, i.e. to the moment a new snapshot is added — never to the loader
+ * or the serializer, which stay faithful at any count.
+ */
+function normalizePrdVersions(raw: unknown, sourceName: string): PrdVersion[] {
+  if (!Array.isArray(raw)) {
+    throw new Error(`"${sourceName}" has invalid "prdVersions" — expected an array.`);
+  }
+  return raw.map((entry: unknown, i: number) => {
+    if (!isRecord(entry)) {
+      throw new Error(`"${sourceName}" has invalid "prdVersions[${i}]" — expected an object.`);
+    }
+    const version = entry.version;
+    const text = entry.text;
+    const createdAt = entry.createdAt;
+    if (typeof version !== 'string' || version.length === 0) {
+      throw new Error(`"${sourceName}" has invalid "prdVersions[${i}].version" — expected a non-empty string.`);
+    }
+    if (typeof text !== 'string') {
+      throw new Error(`"${sourceName}" has invalid "prdVersions[${i}].text" — expected a string.`);
+    }
+    if (typeof createdAt !== 'string' || createdAt.length === 0) {
+      throw new Error(`"${sourceName}" has invalid "prdVersions[${i}].createdAt" — expected a non-empty string.`);
+    }
+    return { version, text, createdAt };
+  });
+}
+
+/** Validate the fix-iteration counter — a non-negative integer, where 0 is meaningful. */
+function parseFixIterations(rawValue: unknown, sourceName: string): number {
+  if (typeof rawValue !== 'number' || !Number.isInteger(rawValue) || rawValue < 0) {
+    throw new Error(`"${sourceName}" has invalid "fixIterations" — expected an integer >= 0.`);
+  }
+  return rawValue;
 }
 
 function normalizeTaskValidation(raw: unknown, sourceName: string, taskId: string): Task['validation'] {
@@ -200,6 +338,10 @@ export function hydratePlan(file: PlanFile, sourceName = 'plan'): Plan {
   };
   if (file.sourceIssues?.length) { plan.sourceIssues = file.sourceIssues; }
   if (file.prdSource) { plan.prdSource = file.prdSource; }
+  if (file.aiRules) { plan.aiRules = file.aiRules; }
+  if (file.prdVersions !== undefined) { plan.prdVersions = normalizePrdVersions(file.prdVersions, sourceName); }
+  if (file.fixIterations !== undefined) { plan.fixIterations = parseFixIterations(file.fixIterations, sourceName); }
+  if (file.sandbox !== undefined) { plan.sandbox = normalizeSandbox(file.sandbox, sourceName); }
   // Ensure all task/playlist IDs are unique; fix duplicates or missing IDs
   ensureUniqueIds(plan);
   return plan;
@@ -259,6 +401,7 @@ function hydrateTask(t: PlanFileTask, sourceName: string): Task {
     readyPattern: t.readyPattern,
     healthCheckUrl: t.healthCheckUrl,
     startupTimeoutMs: t.startupTimeoutMs,
+    timeoutMs: parseTaskTimeoutMs(t.timeoutMs, sourceName, t.id || t.name || '<unknown-task>'),
     retryCount: t.retryCount,
     dependsOn: t.dependsOn,
     skipIf: t.skipIf ? { taskId: t.skipIf.taskId, status: t.skipIf.status as TaskStatus } : undefined,
@@ -278,7 +421,15 @@ function hydrateTask(t: PlanFileTask, sourceName: string): Task {
   };
 }
 
-/** Strip runtime status from Plan to get a serializable PlanFile */
+/**
+ * Strip runtime status from Plan to get a serializable PlanFile.
+ *
+ * Full fidelity, including secrets — variables, AI rules, PRD text and per-task
+ * environment variables all survive. That is correct for `savePlan` and for internal plan
+ * rewriting, which write back into the user's own workspace. Anything that leaves this
+ * machine (clipboard, gist, issue comment) must go through
+ * {@link serializePlanForSharing} instead.
+ */
 export function dehydratePlan(plan: Plan): PlanFile {
   const result: PlanFile = {
     version: plan.version,
@@ -302,6 +453,33 @@ export function dehydratePlan(plan: Plan): PlanFile {
   }
   if (plan.sourceIssues?.length) { result.sourceIssues = plan.sourceIssues; }
   if (plan.prdSource) { result.prdSource = plan.prdSource; }
+  if (plan.aiRules) { result.aiRules = plan.aiRules; }
+  if (plan.prdVersions?.length) {
+    // Faithful at any count — the retention cap lives in appendPrdVersion, not here,
+    // so a hand-authored 50-version file re-saves with all 50 intact.
+    result.prdVersions = plan.prdVersions.map(v => ({ version: v.version, text: v.text, createdAt: v.createdAt }));
+  }
+  // typeof, not truthiness: fixIterations === 0 is a real value and must persist as 0.
+  if (typeof plan.fixIterations === 'number') { result.fixIterations = plan.fixIterations; }
+  if (plan.sandbox && (plan.sandbox.targets?.length || plan.sandbox.command)) {
+    // Rebuilt field-by-field in the same key order the loader produces — never emit
+    // an empty "targets" array, and never carry unknown keys back out.
+    const sandbox: SandboxConfig = {};
+    if (plan.sandbox.targets?.length) {
+      sandbox.targets = plan.sandbox.targets.map(t => {
+        const target: SandboxTarget = {
+          name: t.name,
+          ...(t.cwd !== undefined ? { cwd: t.cwd } : {}),
+          command: t.command,
+          ...(t.port !== undefined ? { port: t.port } : {}),
+        };
+        return target;
+      });
+    }
+    if (plan.sandbox.command) { sandbox.command = plan.sandbox.command; }
+    if (plan.sandbox.port !== undefined) { sandbox.port = plan.sandbox.port; }
+    result.sandbox = sandbox;
+  }
   return result;
 }
 
@@ -363,6 +541,7 @@ function dehydrateTask(t: Task): PlanFileTask {
       contextBudget: t.validation.contextBudget,
     };
   }
+  if (t.timeoutMs !== undefined) { result.timeoutMs = t.timeoutMs; }
   if (t.sourceIssueNumber !== undefined) { result.sourceIssueNumber = t.sourceIssueNumber; }
   if (t.sourceIssueRepo) { result.sourceIssueRepo = t.sourceIssueRepo; }
   // Only persist non-pending statuses to keep plan files clean
@@ -370,6 +549,24 @@ function dehydrateTask(t: Task): PlanFileTask {
     result.status = t.status;
   }
   return result;
+}
+
+/**
+ * Serialize a plan for somewhere other than this machine.
+ *
+ * Dehydrates the plan, strips every field classified as 'redact' in `plan-redaction.ts`,
+ * then formats it. Use this for a clipboard, a gist or an issue comment; use
+ * {@link dehydratePlan} + `savePlan` for a local backup, which stays complete.
+ *
+ * @param opts.stripStatus also remove each task's persisted execution status.
+ * @returns the JSON text and the human labels of what was removed (empty when nothing was).
+ */
+export function serializePlanForSharing(
+  plan: Plan,
+  opts?: { stripStatus?: boolean },
+): { json: string; redacted: string[] } {
+  const { file, redacted } = redactPlanFile(dehydratePlan(plan), opts);
+  return { json: JSON.stringify(file, null, 2), redacted };
 }
 
 /** Load a plan from a JSON file */
@@ -419,6 +616,42 @@ export function savePlan(plan: Plan, filePath: string): void {
     fs.mkdirSync(dir, { recursive: true });
   }
   fs.writeFileSync(filePath, json, 'utf-8');
+}
+
+// ─── PRD version retention ───
+
+/** Maximum number of PRD snapshots kept in a plan file */
+export const MAX_PRD_VERSIONS = 20;
+
+/** Maximum total characters of PRD snapshot text kept in a plan file */
+export const MAX_PRD_VERSIONS_CHARS = 400_000;
+
+/**
+ * Append a PRD snapshot, trimming the oldest entries until the history fits
+ * `MAX_PRD_VERSIONS` and `MAX_PRD_VERSIONS_CHARS`.
+ *
+ * The entry being added is never dropped, even when it alone exceeds the character
+ * ceiling — losing the snapshot the user just asked to save would be worse than
+ * exceeding the budget. Trimming always happens from the front (oldest first).
+ *
+ * @returns the new history and how many older snapshots were removed.
+ */
+export function appendPrdVersion(
+  existing: PrdVersion[] | undefined,
+  entry: PrdVersion,
+): { versions: PrdVersion[]; dropped: number } {
+  const versions: PrdVersion[] = [...(existing ?? []), entry];
+  let chars = versions.reduce((sum, v) => sum + v.text.length, 0);
+  let dropped = 0;
+
+  while (versions.length > 1 && (versions.length > MAX_PRD_VERSIONS || chars > MAX_PRD_VERSIONS_CHARS)) {
+    const removed = versions.shift();
+    if (!removed) { break; }
+    chars -= removed.text.length;
+    dropped++;
+  }
+
+  return { versions, dropped };
 }
 
 /** Create a new plan with a default playlist ready for tasks */
