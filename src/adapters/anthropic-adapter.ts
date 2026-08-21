@@ -209,8 +209,9 @@ export class AnthropicAdapter implements EngineAdapter {
           requestParams.thinking = { type: 'enabled', budget_tokens: thinkingBudget };
         }
 
-        // Stream the response for live output
-        const stream = client.messages.stream(requestParams);
+        // Stream the response for live output. Passing the abort signal cancels the
+        // HTTP request itself, so a stopped task stops costing money mid-stream.
+        const stream = client.messages.stream(requestParams, { signal: options.signal });
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const toolInputAccumulators = new Map<number, { id: string; name: string; json: string }>();
@@ -295,15 +296,20 @@ export class AnthropicAdapter implements EngineAdapter {
         break;
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      options.onOutput?.(`\n[Anthropic Error] ${msg}\n`, 'stderr');
-      return {
-        stdout,
-        stderr: msg,
-        exitCode: 1,
-        durationMs: Date.now() - startTime,
-        tokenUsage: this.buildUsage(totalInputTokens, totalOutputTokens),
-      };
+      // An abort is a stop, not a failure: fall through to the normal return with
+      // whatever streamed before cancellation (same as the in-loop abort breaks above).
+      if (!this.isAbortError(err, options.signal)) {
+        const msg = err instanceof Error ? err.message : String(err);
+        options.onOutput?.(`\n[Anthropic Error] ${msg}\n`, 'stderr');
+        return {
+          stdout,
+          stderr: msg,
+          exitCode: 1,
+          durationMs: Date.now() - startTime,
+          tokenUsage: this.buildUsage(totalInputTokens, totalOutputTokens),
+        };
+      }
+      options.onOutput?.('\n[Anthropic] Request cancelled.\n', 'stdout');
     }
 
     const tokenUsage = this.buildUsage(totalInputTokens, totalOutputTokens);
@@ -314,6 +320,16 @@ export class AnthropicAdapter implements EngineAdapter {
       durationMs: Date.now() - startTime,
       tokenUsage,
     };
+  }
+
+  /**
+   * True when an SDK error is our AbortSignal firing rather than a real API failure.
+   * The SDK raises APIUserAbortError; the underlying fetch raises AbortError.
+   */
+  private isAbortError(err: unknown, signal?: AbortSignal): boolean {
+    if (signal?.aborted) { return true; }
+    const name = (err as { name?: string } | null)?.name ?? '';
+    return name === 'AbortError' || name === 'APIUserAbortError';
   }
 
   // ─── Tool execution ───────────────────────────────────────────────────────

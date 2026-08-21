@@ -5,12 +5,18 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { Plan, Playlist, RunnerState, EngineId, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task, PrdVerificationResult } from './models/types';
-import { loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask } from './models/plan';
-import { registerAllEngines, checkEngineAvailability, getEngine } from './adapters/index';
+import { Plan, Playlist, RunnerState, EngineId, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task } from './models/types';
+import {
+  loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask,
+  serializePlanForSharing, appendPrdVersion, MAX_PRD_VERSIONS,
+} from './models/plan';
+import { registerAllEngines, checkEngineAvailability, getEngine, setCeilingGuard } from './adapters/index';
 import { commandExists } from './utils/command-exists';
 import { ghSync, ghAsync } from './utils/gh';
 import { TaskRunner, classifyFailure } from './runner/runner';
+import {
+  createPrdLoop, HaltReason, PrdLoopConfig, PrdLoopController, PrdLoopReport, UatSession,
+} from './runner/prd-loop';
 import { HistoryStore } from './history/store';
 import { TemplateStore } from './templates/store';
 import { generateId } from './models/plan';
@@ -47,6 +53,8 @@ import { BUILT_IN_PLAN_TEMPLATES, PlanTemplate } from './templates/built-in-plan
 import { PROFILE_META, ProfileName } from './models/execution-profiles';
 import { PromptLibraryStore } from './templates/prompt-library';
 import { SandboxManager } from './sandbox/sandbox-manager';
+import { resolveBrowserRunner } from './sandbox/browser-driver';
+import { runGate } from './runner/evidence';
 import { captureScreenshot } from './sandbox/screenshot';
 
 // ─── Shared state ───
@@ -74,6 +82,14 @@ let currentSidebarThreadId: string | null = null;
 let pendingSidebarTurn: { prompt: string; engine: EngineId; startedAt: string; threadId: string; turnIndex: number } | null = null;
 let promptSidebarSyncTimer: ReturnType<typeof setTimeout> | null = null;
 let dashboardUpdateTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ─── Cost ceiling ───
+/**
+ * Raised when the spend ceiling is breached; read synchronously by the engine
+ * ceiling guard to block further engine calls. Cleared from the breach
+ * notification itself and by any edit to agentTaskPlayer.costBudgetUsd.
+ */
+let ceilingBlocked = false;
 
 // ─── AI Rules ───
 let aiRulesStore: AiRulesStore | null = null;
@@ -1120,11 +1136,16 @@ function parseRulesFromOutput(output: string): { name: string; text: string }[] 
     .filter(r => r.name.length > 2 && r.text.length > 10);
 }
 
-/** Ask the configured AI engine to generate project-specific rules. */
+/**
+ * Ask the configured AI engine to generate project-specific rules.
+ * `signal` is required, not optional: the compiler must reject the next caller
+ * that forgets to wire cancellation, which is how this call went inert before.
+ */
 async function generateAiRules(
   engineId: EngineId,
   signals: string[],
   cwd: string,
+  signal: AbortSignal,
 ): Promise<{ name: string; text: string }[]> {
   const engine = getEngine(engineId);
   const prompt = `You are a code quality assistant helping configure an AI coding agent.
@@ -1141,7 +1162,7 @@ Format each rule exactly like this (use ### heading):
 
 Output only the 5 rules. No preamble, no conclusion, no numbering outside the ### headings.`;
 
-  const result = await engine.runTask({ prompt, cwd });
+  const result = await engine.runTask({ prompt, cwd, signal, costLabel: 'ai-rules' });
   if (result.exitCode !== 0 || !result.stdout.trim()) { return []; }
   return parseRulesFromOutput(result.stdout);
 }
@@ -1205,11 +1226,14 @@ async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<voi
       },
       async (_progress, token) => {
         const abort = new AbortController();
-        token.onCancellationRequested(() => abort.abort());
+        const sub = token.onCancellationRequested(() => abort.abort());
         try {
-          generated = await generateAiRules(preferredEngine, signals, cwd);
+          generated = await generateAiRules(preferredEngine, signals, cwd, abort.signal);
         } catch {
+          // Includes the abort rejection — a cancelled generation yields no rules.
           generated = [];
+        } finally {
+          sub.dispose();
         }
       },
     );
@@ -1322,6 +1346,17 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // Initialize task runner
   runner = new TaskRunner(historyStore);
+  // Detaches the runner from the shared cost ledger on deactivate, so a stale
+  // runner cannot keep emitting 'budget-exceeded' after the host tears it down.
+  context.subscriptions.push({ dispose: () => runner.dispose() });
+
+  // Cost ceiling. The guard is a plain synchronous latch read — never async and
+  // never a modal, because under parallelPlaylists it runs once per concurrent
+  // engine call. The latch is raised by the 'budget-exceeded' handler and
+  // cleared from the same notification that announces it (plus any change to
+  // costBudgetUsd), so the user is never stuck without reloading the window.
+  setCeilingGuard(() => !ceilingBlocked);
+  context.subscriptions.push({ dispose: () => setCeilingGuard(null) });
   runner.setPromptLibrary(promptLibraryStore);
 
   // Initialize AI rules store
@@ -1565,11 +1600,35 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   runner.on('budget-exceeded', ({ totalCost, budget }) => {
-    if (runner.state === RunnerState.Playing) {
-      runner.pause();
+    // Raise the ceiling latch: further engine calls return a synthetic failure
+    // until the user clears it from one of the actions below.
+    ceilingBlocked = true;
+    const message = `Estimated run cost $${totalCost.toFixed(4)} exceeded the configured budget of $${budget.toFixed(4)}.`;
+
+    // A breach can now come from an authoring call (PRD chat, plan generation)
+    // with no run in flight. Only pause/resume when a plan is actually playing —
+    // calling play(activePlan) from Idle would start a run nobody asked for.
+    if (runner.state !== RunnerState.Playing) {
+      void vscode.window
+        .showWarningMessage(message, 'Open Settings', 'Reset Spend Counter')
+        .then((action) => {
+          if (action === 'Open Settings') {
+            void vscode.commands.executeCommand(
+              'workbench.action.openSettings',
+              'agentTaskPlayer.costBudgetUsd',
+            );
+            return;
+          }
+          if (action === 'Reset Spend Counter') {
+            runner.resetLifetimeBudget();
+            ceilingBlocked = false;
+          }
+        });
+      return;
     }
 
-    const message = `Estimated run cost $${totalCost.toFixed(4)} exceeded the configured budget of $${budget.toFixed(4)}.`;
+    runner.pause();
+
     void vscode.window.showWarningMessage(message, 'Continue', 'Stop').then((action) => {
       if (action === 'Stop') {
         runner.stop();
@@ -1584,6 +1643,12 @@ export function activate(context: vscode.ExtensionContext): void {
       if (!activePlan) {
         return;
       }
+
+      // Resuming without releasing the latch would fail the next task
+      // immediately — 'Continue' has to mean continue. The spend counter is
+      // deliberately NOT reset: the runner has already re-armed the threshold
+      // one budget-worth higher, so the ceiling fires again rather than latching.
+      ceilingBlocked = false;
 
       runner.play(activePlan).catch(err => {
         UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
@@ -2146,6 +2211,91 @@ export function activate(context: vscode.ExtensionContext): void {
         },
       );
     }),
+
+    // The ceiling latch has to be escapable from somewhere that is always
+    // reachable. Choosing 'Stop' on a breach — or dismissing the notification —
+    // leaves the latch raised, and because blocked calls never record, no further
+    // budget-exceeded fires to re-offer the inline action. Without this command
+    // the only ways out are editing settings or reloading the window.
+    vscode.commands.registerCommand('agentTaskPlayer.resetSpendCounter', () => {
+      runner.resetLifetimeBudget();
+      ceilingBlocked = false;
+      void vscode.window.showInformationMessage(
+        'Spend counter reset. Estimated spend is back to $0.00 and engine calls are unblocked.',
+      );
+    }),
+
+    vscode.commands.registerCommand('agentTaskPlayer.provisionBrowsers', async () => {
+      try {
+        const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+        if (!cwd) {
+          vscode.window.showWarningMessage('Open a workspace folder before provisioning browsers.');
+          return;
+        }
+
+        if (resolveBrowserRunner(cwd).kind === 'local') {
+          const choice = await vscode.window.showWarningMessage(
+            'Playwright is already installed in this workspace. Reinstall it?',
+            { modal: true },
+            'Reinstall',
+          );
+          if (choice !== 'Reinstall') {
+            return;
+          }
+        }
+
+        const version = vscode.workspace
+          .getConfiguration('agentTaskPlayer')
+          .get<string>('browser.playwrightVersion', '1.62.1');
+        // Deliberately NOT prdLoop.gateTimeoutMs — a browser download is nothing
+        // like a unit-test run, and borrowing that budget would truncate it.
+        const provisionTimeoutMs = 900_000;
+        const steps = [
+          `npm i -D @playwright/test@${version}`,
+          'npx playwright install chromium',
+        ];
+
+        await vscode.window.withProgress(
+          {
+            location: vscode.ProgressLocation.Notification,
+            title: 'MOAG: provisioning browsers',
+            cancellable: true,
+          },
+          async (progress, token) => {
+            const abort = new AbortController();
+            const cancelSub = token.onCancellationRequested(() => abort.abort());
+            try {
+              for (const command of steps) {
+                progress.report({ message: command });
+                // runGate owns spawn, abort, taskkill and the timeout — one
+                // implementation for every long-running command MOAG runs.
+                const result = await runGate(command, {
+                  cwd,
+                  signal: abort.signal,
+                  timeoutMs: provisionTimeoutMs,
+                });
+                if (!result.passed) {
+                  const tail = result.output.trim().slice(-1_200);
+                  UserMsg.showError(UserMsg.runnerError(
+                    `Browser provisioning failed at "${command}" (exit ${result.exitCode}` +
+                    `${result.timedOut ? ', timed out' : ''}).\n${tail}`,
+                  ));
+                  return;
+                }
+              }
+              vscode.window.showInformationMessage(
+                `Browsers provisioned — Playwright ${version} with chromium is ready.`,
+              );
+            } finally {
+              cancelSub.dispose();
+            }
+          },
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        UserMsg.showError(UserMsg.runnerError(`Browser provisioning failed: ${msg.substring(0, 200)}`));
+      }
+    }),
   );
 
   // ─── Knowledge Graph + Weights: init in background 2s after activation ──────
@@ -2233,6 +2383,10 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(e => {
     if (e.affectsConfiguration('agentTaskPlayer.issueSync')) {
       startIssuePolling(context);
+    }
+    // Re-editing the budget is an explicit "I know, carry on" — release the latch.
+    if (e.affectsConfiguration('agentTaskPlayer.costBudgetUsd')) {
+      ceilingBlocked = false;
     }
   }));
 
@@ -2999,7 +3153,9 @@ async function cmdPlay(): Promise<void> {
 
   // Resume from pause — don't reset anything
   if (runner.state === RunnerState.Paused) {
-    runner.play(activePlan);
+    runner.play(activePlan).catch(err => {
+      UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err)));
+    });
     return;
   }
 
@@ -3310,6 +3466,7 @@ async function createPlanFromIdea(
           prompt: prompt + '\n\nProject context:\n' + projectContext + '\n\nUser description:\n' + trimmedIdea,
           cwd,
           signal: abortController.signal,
+          costLabel: 'plan-generation',
         });
 
         if (result.exitCode === 0 && result.stdout.trim()) {
@@ -4145,6 +4302,7 @@ async function cmdSmartNewPlan(): Promise<void> {
           prompt: PLAN_GENERATION_PROMPT_LARGE + '\n\nUser description:\n' + rawIdea,
           cwd,
           signal: abortController.signal,
+          costLabel: 'plan-generation',
         });
         if (result.exitCode === 0 && result.stdout.trim()) {
           const parsed = parsePlanResponse(result.stdout);
@@ -4318,6 +4476,7 @@ async function cmdPlanFromGitHubIssue(): Promise<void> {
           prompt: PLAN_GENERATION_PROMPT_LARGE + '\n\nProject context:\n' + projectContext + '\n\nUser description:\n' + rawIdea,
           cwd,
           signal: abortController.signal,
+          costLabel: 'plan-generation',
         });
         if (result.exitCode === 0 && result.stdout.trim()) {
           const parsed = parsePlanResponse(result.stdout);
@@ -5093,6 +5252,7 @@ async function cmdPlanFromOpenIssues(): Promise<void> {
           prompt: PLAN_GENERATION_PROMPT_LARGE + '\n\nProject context:\n' + projectContext + '\n\nUser description:\n' + rawIdea,
           cwd,
           signal: abortController.signal,
+          costLabel: 'plan-generation',
         });
         if (result.exitCode === 0 && result.stdout.trim()) {
           const parsed = parsePlanResponse(result.stdout);
@@ -5313,7 +5473,25 @@ The codebase uses: ${stackContext}
 Ask ONE focused follow-up question (under 30 words) to get the most important missing info needed to write acceptance criteria. Focus on: UI presence, key user actions, edge cases, or integrations. Do NOT number the question or add preamble — just the question itself.`;
 
     try {
-      const result = await engine.runTask({ prompt, cwd, signal: new AbortController().signal });
+      // The await stays INSIDE this try: handlePrdChatAnswer is invoked as a
+      // floating `void handlePrdChatAnswer(...)`, so an abort rejection escaping
+      // here would become an unhandled rejection and kill the extension host.
+      const result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'MOAG is drafting a follow-up question…',
+          cancellable: true,
+        },
+        async (_progress, token) => {
+          const abort = new AbortController();
+          const sub = token.onCancellationRequested(() => abort.abort());
+          try {
+            return await engine.runTask({ prompt, cwd, signal: abort.signal, costLabel: 'prd-chat' });
+          } finally {
+            sub.dispose();
+          }
+        },
+      );
       const question = (result.stdout || '').trim() || 'Any specific acceptance criteria or edge cases to include?';
       postToSidebar({ type: 'prdMoagQuestion', question });
     } catch {
@@ -5345,7 +5523,23 @@ AC3: ...
 Return ONLY the PRD markdown. No preamble, no explanation.`;
 
     try {
-      const result = await engine.runTask({ prompt, cwd, signal: new AbortController().signal });
+      // As above: the await must not escape this try/catch.
+      const result = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'MOAG is writing your PRD…',
+          cancellable: true,
+        },
+        async (_progress, token) => {
+          const abort = new AbortController();
+          const sub = token.onCancellationRequested(() => abort.abort());
+          try {
+            return await engine.runTask({ prompt, cwd, signal: abort.signal, costLabel: 'prd-chat' });
+          } finally {
+            sub.dispose();
+          }
+        },
+      );
       const prdText = (result.stdout || '').trim();
       if (!prdText) {
         postToSidebar({ type: 'prdError', error: 'AI returned empty PRD' });
@@ -5604,7 +5798,24 @@ Return ONLY the PRD markdown. No preamble, no explanation.`;
   }
 
   try {
-    const result = await engine.runTask({ prompt, cwd, signal: new AbortController().signal });
+    // Await inside the try: this is also called as a floating promise
+    // (`void handlePrdAiImprove(...)`), so an abort must not escape.
+    const result = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: 'MOAG is improving your PRD…',
+        cancellable: true,
+      },
+      async (_progress, token) => {
+        const abort = new AbortController();
+        const sub = token.onCancellationRequested(() => abort.abort());
+        try {
+          return await engine.runTask({ prompt, cwd, signal: abort.signal, costLabel: 'prd-improve' });
+        } finally {
+          sub.dispose();
+        }
+      },
+    );
     const improved = result.stdout.trim();
     onResult(improved || text);
   } catch (err) {
@@ -5627,11 +5838,16 @@ function savePrdVersionToActivePlan(text: string, version: string): { versions: 
   const plan = getActivePlan();
   const newEntry = { version, text, createdAt: new Date().toISOString() };
   if (plan) {
-    plan.prdVersions = [...(plan.prdVersions ?? []), newEntry];
+    const { versions, dropped } = appendPrdVersion(plan.prdVersions, newEntry);
+    plan.prdVersions = versions;
     plan.prdSource = text;
     if (currentPlanPath) { savePlan(plan, currentPlanPath); }
     if (promptViewProvider) { syncPromptProviderSidebar(promptViewProvider); }
-    vscode.window.showInformationMessage(`PRD saved as ${version}`);
+    vscode.window.showInformationMessage(
+      dropped > 0
+        ? `PRD saved as ${version} — ${dropped} oldest snapshot${dropped !== 1 ? 's' : ''} removed (keeping the last ${MAX_PRD_VERSIONS}).`
+        : `PRD saved as ${version}`,
+    );
     return { versions: plan.prdVersions, version };
   }
   return { versions: [newEntry], version };
@@ -6100,6 +6316,7 @@ ${prdText}`;
           prompt: prdPrompt,
           cwd,
           signal: abortController.signal,
+          costLabel: 'plan-generation',
         });
         if (result.exitCode === 0 && result.stdout.trim()) {
           planHolder.json = result.stdout.trim();
@@ -6190,12 +6407,212 @@ ${prdText}`;
 
 // ─── PRD Verification ───
 
-async function cmdVerifyAgainstPrd(): Promise<void> {
-  const plan = getActivePlan();
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
+/**
+ * Read the PRD loop configuration block.
+ * Dotted keys resolve under the headless shim too, so both surfaces read the same values.
+ */
+function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  return {
+    cwd,
+    maxFixIterations: cfg.get<number>('prdLoop.maxFixIterations', 3),
+    gateCommands: cfg.get<string[]>('prdLoop.gateCommands', []),
+    gateTimeoutMs: cfg.get<number>('prdLoop.gateTimeoutMs', 600_000),
+    maxDiffChars: cfg.get<number>('prdLoop.maxDiffChars', 40_000),
+    onManualGate: cfg.get<'halt' | 'skip'>('prdLoop.onManualGate', 'halt'),
+    fix,
+    // Interactive surface: an undetectable repo warns instead of hard-failing.
+    unattended: false,
+    uat: {
+      mode: cfg.get<'off' | 'auto' | 'required'>('prdLoop.uat.mode', 'auto'),
+      command: cfg.get<string>('prdLoop.uat.command', ''),
+      specPath: cfg.get<string>('prdLoop.uat.specPath', ''),
+      timeoutMs: cfg.get<number>('prdLoop.uat.timeoutMs', 900_000),
+    },
+  };
+}
 
-  // Resolve PRD text: active playlist prdContext → plan.prdSource → disk detection → file picker
+// ─── Browser UAT sandbox lease ───
+//
+// There is exactly ONE `sandboxManager`, and two verification loops can be live
+// at once (parallelPlaylists 1-8, or Verify fired during a daemon run). Strategy:
+// reference counting, serialised behind a promise chain.
+//
+//  * acquire/release both run inside `uatChain`, so a second loop can never
+//    observe `status:'starting'` and take `launch()`'s early return at
+//    sandbox-manager.ts:44 as success;
+//  * a sandbox this extension started is shared, and only stopped once the LAST
+//    loop has released it;
+//  * a sandbox the USER started is adopted with a genuinely no-op dispose and is
+//    never reference-counted — we must never kill a server we did not launch.
+
+/** Serialises every acquire/release so the refcount cannot be raced. */
+let uatChain: Promise<unknown> = Promise.resolve();
+/** How many live loops hold the sandbox WE launched. */
+let uatRefCount = 0;
+/** The URL of the sandbox we launched, while we hold it. */
+let uatLeasedUrl: string | null = null;
+
+/** How long to wait for a freshly launched sandbox to report `running`. */
+const UAT_SANDBOX_READY_TIMEOUT_MS = 120_000;
+
+/** Run `fn` after everything already queued, keeping the chain alive on failure. */
+function serializeUat<T>(fn: () => Promise<T>): Promise<T> {
+  const next = uatChain.then(fn, fn);
+  uatChain = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+/**
+ * Wait for the sandbox to reach `running` with a URL.
+ *
+ * Resolves null on error, on stop, on abort and on timeout. The `state-changed`
+ * listener is removed in every one of those paths — one leaked listener per
+ * verification run would accumulate for the life of the extension host.
+ */
+function waitForSandboxUrl(
+  mgr: SandboxManager,
+  signal: AbortSignal,
+  timeoutMs: number,
+): Promise<string | null> {
+  return new Promise<string | null>((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = (url: string | null): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      try {
+        mgr.off('state-changed', onState);
+        signal.removeEventListener('abort', onAbort);
+      } finally {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        resolve(url);
+      }
+    };
+
+    const onState = (s: { status: string; url: string | null }): void => {
+      if (s.status === 'running' && s.url) {
+        finish(s.url);
+      } else if (s.status === 'error' || s.status === 'stopped') {
+        finish(null);
+      }
+    };
+    const onAbort = (): void => finish(null);
+
+    mgr.on('state-changed', onState);
+    signal.addEventListener('abort', onAbort, { once: true });
+    timer = setTimeout(() => finish(null), timeoutMs);
+
+    // The sandbox may already be up — no further event would ever arrive.
+    const current = mgr.state;
+    if (current.status === 'running' && current.url) {
+      finish(current.url);
+    } else if (signal.aborted) {
+      finish(null);
+    }
+  });
+}
+
+/** Drop one reference to the sandbox we launched, stopping it at zero. */
+function releaseUatLease(): Promise<void> {
+  return serializeUat(async () => {
+    uatRefCount = Math.max(0, uatRefCount - 1);
+    if (uatRefCount === 0 && uatLeasedUrl) {
+      uatLeasedUrl = null;
+      try {
+        sandboxManager?.stop();
+      } catch {
+        // ignore — stopping is best-effort
+      }
+    }
+  });
+}
+
+/**
+ * Prepare a live application for the browser UAT gate.
+ *
+ * Resolves null — never rejects — when no URL can be prepared, which the loop
+ * reads as "the gate could not run".
+ */
+async function prepareUatSession(cwd: string, signal: AbortSignal): Promise<UatSession | null> {
+  try {
+    return await serializeUat(async () => {
+      const mgr = sandboxManager;
+      if (!mgr) {
+        return null;
+      }
+      if (signal.aborted) {
+        return null;
+      }
+
+      // 1. Another loop already holds the sandbox we launched — share it.
+      if (uatRefCount > 0 && uatLeasedUrl) {
+        uatRefCount++;
+        const url = uatLeasedUrl;
+        let released = false;
+        return {
+          baseUrl: url,
+          startedByUs: true,
+          dispose: async () => {
+            if (released) { return; }
+            released = true;
+            await releaseUatLease();
+          },
+        };
+      }
+
+      // 2. The user already has a server running — adopt it and NEVER kill it.
+      const state = mgr.state;
+      if (state.status === 'running' && state.url) {
+        return {
+          baseUrl: state.url,
+          startedByUs: false,
+          dispose: (): void => { /* deliberately no-op — we did not start it */ },
+        };
+      }
+
+      // 3. Launch our own.
+      const ready = waitForSandboxUrl(mgr, signal, UAT_SANDBOX_READY_TIMEOUT_MS);
+      try {
+        await mgr.launch(cwd, currentPlan?.sandbox);
+      } catch {
+        // The wait still settles via the error/stopped state or the timeout.
+      }
+      const url = await ready;
+      if (!url) {
+        return null;
+      }
+      uatRefCount = 1;
+      uatLeasedUrl = url;
+      let released = false;
+      return {
+        baseUrl: url,
+        startedByUs: true,
+        dispose: async () => {
+          if (released) { return; }
+          released = true;
+          await releaseUatLease();
+        },
+      };
+    });
+  } catch {
+    // A rejection here must never escape into the loop.
+    return null;
+  }
+}
+
+/**
+ * Resolve the PRD text for verification, in the historical order:
+ * plan.prdSource → active playlist prdContext → detected workspace file → file picker.
+ * Returns null when the user dismisses the picker.
+ */
+async function resolvePrdTextInteractive(plan: Plan | null, cwd: string): Promise<string | null> {
   let prdText = plan?.prdSource ?? '';
   // Prefer the active (or next incomplete) playlist's own prdContext slice
   const activePl = plan?.playlists.find(pl =>
@@ -6216,100 +6633,52 @@ async function cmdVerifyAgainstPrd(): Promise<void> {
       filters: { 'PRD files': ['md', 'txt'] },
       title: 'Select PRD file for verification',
     });
-    if (!uris?.[0]) { return; }
-    try { prdText = fs.readFileSync(uris[0].fsPath, 'utf-8'); } catch { return; }
+    if (!uris?.[0]) { return null; }
+    try { prdText = fs.readFileSync(uris[0].fsPath, 'utf-8'); } catch { return null; }
   }
-  const activePlan = plan ?? { name: 'Unnamed Plan', playlists: [] };
-  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
+  return prdText || null;
+}
 
-  // Collect last 20 history entries for the current runId (or all recent)
-  const runId = runner.currentRunId;
-  const allEntries = historyStore.getAll();
-  const entries = (runId
-    ? allEntries.filter(e => e.runId === runId)
-    : allEntries).slice(0, 20);
+/** Escape text that lands in the generated HTML report. */
+function escapeReportHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
 
-  // Group by taskId to aggregate attempts
-  const byTask = new Map<string, typeof entries>();
-  for (const e of entries) {
-    const group = byTask.get(e.taskId) ?? [];
-    group.push(e);
-    byTask.set(e.taskId, group);
+/** Human phrasing for a halt reason. */
+function describeHaltReason(reason: HaltReason): string {
+  switch (reason) {
+    case 'max-iterations': return 'Fix-iteration ceiling reached — manual intervention required';
+    case 'no-progress': return 'The same failure recurred with no change — halted to avoid a loop';
+    case 'manual-gate': return 'Halted at a manual ship gate';
+    case 'budget-exceeded': return 'Halted on the cost ceiling';
+    case 'aborted': return 'Cancelled';
+    case 'no-prd': return 'No PRD could be resolved';
+    case 'engine-error': return 'The engine did not return a usable result';
+    case 'no-gates': return 'No deterministic gate commands could be resolved';
   }
+}
 
-  // Build results summary for the prompt
-  const resultLines: string[] = [];
-  for (const [, group] of byTask) {
-    const taskName = group[0].taskName;
-    const passed = group.filter(e => e.status === 'completed').length;
-    const failed = group.filter(e => e.status === 'failed' || e.status === 'blocked').length;
-    const escalated = group.filter(e => escalatedTaskIds.has(e.taskId)).length;
-    const lastFailed = [...group].reverse().find(e => e.status === 'failed' || e.status === 'blocked');
-    const stderrSnippet = lastFailed
-      ? (lastFailed.result.stderr || lastFailed.result.stdout || '')
-          .split('\n').map(l => l.trim()).find(l => l.length > 0)?.substring(0, 200) ?? ''
-      : '';
-    resultLines.push(
-      `Task: ${taskName} | passed=${passed} failed=${failed} escalated=${escalated}` +
-      (stderrSnippet ? ` | error: ${stderrSnippet}` : ''),
-    );
-  }
-  const resultsText = resultLines.length > 0 ? resultLines.join('\n') : 'No task history found.';
-
-  const verifyPrompt = `Given this PRD:\n${prdText}\n\nAnd these test results:\n${resultsText}\n\nDoes the implementation satisfy the PRD acceptance criteria? Reply with JSON only: { "passed": boolean, "score": number (0-100), "gaps": string[], "suggestion": string }`;
-
-  let verifyResult: { passed: boolean; score: number; gaps: string[]; suggestion: string } | null = null;
-
-  try {
-    const engine = getEngine(defaultEngine);
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Window, title: 'Verifying against PRD...' },
-      async (_progress, token) => {
-        const abortController = new AbortController();
-        token.onCancellationRequested(() => abortController.abort());
-        const result = await engine.runTask({ prompt: verifyPrompt, cwd, signal: abortController.signal });
-        if (result.stdout.trim()) {
-          const raw = result.stdout.trim()
-            .replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
-          verifyResult = JSON.parse(raw);
-        }
-      },
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    vscode.window.showErrorMessage(`PRD verification failed: ${msg.substring(0, 200)}`);
-    return;
-  }
-
-  if (!verifyResult) {
-    vscode.window.showErrorMessage('AI did not return a verification result. Try again.');
-    return;
-  }
-
-  const result = verifyResult as { passed: boolean; score: number; gaps: string[]; suggestion: string };
-
-  // Build HTML report
+/** Build the standalone HTML verification report opened in the browser. */
+function buildVerificationReportHtml(planName: string, prdText: string, report: PrdLoopReport): string {
   const timestamp = Date.now();
   const dateStr = new Date(timestamp).toLocaleString();
-  const score = result.score ?? 0;
+  const score = report.score ?? 0;
   const scoreBadgeColor = score >= 80 ? '#28a745' : score >= 50 ? '#f0ad4e' : '#dc3545';
-  const gaps: string[] = Array.isArray(result.gaps) ? result.gaps : [];
-  const suggestion = result.suggestion ?? '';
+  const gaps: string[] = Array.isArray(report.gaps) ? report.gaps : [];
+  const suggestion = report.suggestion ?? '';
 
   // Render PRD source as formatted text with acceptance criteria highlighted
-  const escapedPrd = prdText
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const escapedPrd = escapeReportHtml(prdText)
     .replace(/^(#{1,3} .+)$/gm, '<strong>$1</strong>')
     .replace(/\n/g, '<br>');
 
-  // Render right column: acceptance criteria vs gaps
   const criteriaLines = prdText
     .split('\n')
     .filter(l => /acceptance criteria|must|shall|should|given|when|then/i.test(l) && l.trim().length > 5)
     .slice(0, 20);
 
   const criteriaHtml = criteriaLines.map(line => {
-    const escaped = line.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const escaped = escapeReportHtml(line);
     const isGap = gaps.some(g => g.toLowerCase().split(' ').some(w => w.length > 4 && line.toLowerCase().includes(w)));
     return `<div class="criterion ${isGap ? 'fail' : 'pass'}">
       <span class="icon">${isGap ? '✗' : '✓'}</span>
@@ -6317,36 +6686,52 @@ async function cmdVerifyAgainstPrd(): Promise<void> {
     </div>`;
   }).join('');
 
-  // Test run summary table
-  const tableRows = [...byTask.entries()].map(([, group]) => {
-    const taskName = group[0].taskName;
-    const attempts = group.length;
-    const lastEntry = group[group.length - 1];
-    const status = lastEntry.status;
-    const errSnippet = (lastEntry.result.stderr || lastEntry.result.stdout || '')
-      .split('\n').map(l => l.trim()).find(l => l.length > 0)?.substring(0, 120) ?? '—';
-    const statusColor = status === 'completed' ? '#28a745' : status === 'failed' ? '#dc3545' : '#6c757d';
+  // Deterministic gates — the facts the verdict actually rests on.
+  const gateRows = report.gates.map(gate => {
+    const statusColor = gate.passed ? '#28a745' : '#dc3545';
+    const status = gate.passed ? 'pass' : gate.timedOut ? 'timeout' : 'fail';
+    const snippet = gate.output
+      .split('\n').map(l => l.trim()).reverse().find(l => l.length > 0)?.substring(0, 160) ?? '—';
     return `<tr>
-      <td>${taskName.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
+      <td><code>${escapeReportHtml(gate.command)}</code></td>
       <td style="color:${statusColor}">${status}</td>
-      <td>${attempts}</td>
-      <td style="font-size:0.8em;color:#999">${errSnippet.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>
+      <td>${gate.exitCode}</td>
+      <td>${gate.durationMs}ms</td>
+      <td style="font-size:0.8em;color:#999">${escapeReportHtml(snippet)}</td>
     </tr>`;
   }).join('');
 
-  const bannerHtml = result.passed
-    ? `<div class="banner pass-banner">All criteria satisfied — ready to commit</div>`
-    : `<div class="banner fail-banner">Gaps found — fix required before commit</div>`;
+  const gateEmptyNote = report.gateCommandsEmpty
+    ? '<p style="color:#f0ad4e;font-size:0.85em">No gate command could be detected for this repository — set <code>agentTaskPlayer.prdLoop.gateCommands</code> so verification rests on evidence, not judgment.</p>'
+    : '';
 
-  const actionBtn = result.passed
+  // Under `required` the skip arrives as a failing gate row instead, so this
+  // note only ever renders for `auto`.
+  const uatSkipNote = report.uatRan === false && report.uatSkipReason
+    ? `<p style="color:#f0ad4e;font-size:0.85em">Browser UAT: skipped — ${escapeReportHtml(report.uatSkipReason)}</p>`
+    : '';
+
+  const changedFilesHtml = report.changedFiles.length > 0
+    ? `<ul>${report.changedFiles.slice(0, 200).map(f => `<li>${escapeReportHtml(f)}</li>`).join('')}</ul>`
+    : '<p style="color:#dc3545">No files changed — nothing was implemented.</p>';
+
+  const bannerHtml = report.failedGate
+    ? `<div class="banner fail-banner">Failed at ${escapeReportHtml(report.failedGate)} gate — no model judgment was needed</div>`
+    : report.passed
+      ? `<div class="banner pass-banner">All criteria satisfied — ready to commit</div>`
+      : report.haltReason
+        ? `<div class="banner fail-banner">${escapeReportHtml(describeHaltReason(report.haltReason))}</div>`
+        : `<div class="banner fail-banner">Gaps found — fix required before commit</div>`;
+
+  const actionBtn = report.passed
     ? `<button onclick="navigator.clipboard.writeText('MOAG: Commit &amp; Push').then(()=>this.title='Copied!');" title="Paste in VS Code command palette">Commit &amp; Push</button>`
     : `<button onclick="navigator.clipboard.writeText('MOAG: Generate Fix Tasks').then(()=>this.title='Copied!');" title="Paste in VS Code command palette">Generate Fix Tasks</button>`;
 
   const gapsHtml = gaps.length > 0
-    ? `<ul>${gaps.map(g => `<li>${g.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</li>`).join('')}</ul>`
+    ? `<ul>${gaps.map(g => `<li>${escapeReportHtml(g)}</li>`).join('')}</ul>`
     : '<p style="color:#28a745">No gaps detected.</p>';
 
-  const html = `<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -6374,22 +6759,26 @@ async function cmdVerifyAgainstPrd(): Promise<void> {
   th { text-align: left; padding: 6px 10px; color: #888; font-weight: 600; border-bottom: 1px solid #3c3c3c; }
   td { padding: 7px 10px; border-bottom: 1px solid #2a2a2a; vertical-align: top; }
   tr:last-child td { border-bottom: none; }
+  code { font-family: 'Cascadia Code', Consolas, monospace; font-size: 0.92em; color: #d7ba7d; }
+  .file-list ul { padding-left: 18px; columns: 2; }
+  .file-list li { margin: 2px 0; font-size: 0.85em; color: #c8c8c8; }
   .gaps { margin-top: 8px; }
   .gaps ul { padding-left: 18px; }
   .gaps li { margin: 4px 0; color: #f0ad4e; font-size: 0.88em; }
-  .callout { background: #252526; border-left: 3px solid #0078d4; padding: 14px 18px; font-size: 0.9em; color: #c8c8c8; line-height: 1.6; margin: 0 24px 20px; border-radius: 0 4px 4px 0; }
+  .callout { background: #252526; border-left: 3px solid #0078d4; padding: 14px 18px; font-size: 0.9em; color: #c8c8c8; line-height: 1.6; margin: 0 24px 20px; border-radius: 0 4px 4px 0; white-space: pre-wrap; }
   .banner { text-align: center; padding: 12px 24px; font-weight: 700; font-size: 1em; }
   .pass-banner { background: #1a3a1a; color: #28a745; border-bottom: 1px solid #3c3c3c; }
   .fail-banner { background: #3a1a1a; color: #dc3545; border-bottom: 1px solid #3c3c3c; }
   .action-row { display: flex; gap: 12px; justify-content: center; padding: 16px 24px; background: #252526; border-top: 1px solid #3c3c3c; }
   button { padding: 8px 20px; border-radius: 4px; border: none; background: #0078d4; color: #fff; font-size: 0.9em; cursor: pointer; font-weight: 600; }
   button:hover { background: #005fa3; }
+  .meta { font-size: 0.8em; color: #888; margin-top: 10px; }
 </style>
 </head>
 <body>
 <div class="header">
   <span class="logo">MOAG</span>
-  <span class="plan-name">${(activePlan.name ?? 'Unnamed Plan').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</span>
+  <span class="plan-name">${escapeReportHtml(planName || 'Unnamed Plan')}</span>
   <span class="score-badge">${score}/100</span>
   <span class="date">${dateStr}</span>
 </div>
@@ -6409,43 +6798,151 @@ ${bannerHtml}
   </div>
 </div>
 <div class="section">
-  <h2>Test Run Summary</h2>
+  <h2>Deterministic gates</h2>
   <table>
-    <thead><tr><th>Task</th><th>Status</th><th>Attempts</th><th>Error Snippet</th></tr></thead>
-    <tbody>${tableRows || '<tr><td colspan="4" style="color:#888">No history entries.</td></tr>'}</tbody>
+    <thead><tr><th>Command</th><th>Result</th><th>Exit</th><th>Duration</th><th>Output tail</th></tr></thead>
+    <tbody>${gateRows || '<tr><td colspan="5" style="color:#888">No gate commands were run.</td></tr>'}</tbody>
   </table>
+  ${gateEmptyNote}
+  ${uatSkipNote}
+  <p class="meta">Iterations: ${report.iterations} · Model calls: ${report.modelCallsMade}${report.failedGate ? ' · verdict reached without a model' : ''}</p>
 </div>
-<div class="callout">${suggestion.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') || 'No suggestion provided.'}</div>
+<div class="section file-list">
+  <h2>Changed files (${report.changedFiles.length})</h2>
+  ${changedFilesHtml}
+  ${report.diffStat ? `<pre style="font-size:0.8em;color:#999;margin-top:10px">${escapeReportHtml(report.diffStat)}</pre>` : ''}
+</div>
+<div class="callout">${escapeReportHtml(suggestion) || 'No suggestion provided.'}</div>
 <div class="action-row">${actionBtn}</div>
 </body>
 </html>`;
+}
 
+/**
+ * Run the PRD loop from the extension surface.
+ *
+ * One cancellable notification wraps the whole loop (it can run for many minutes),
+ * runner gate/budget events are bridged into the controller for the loop's duration
+ * only, and the HTML report is written and opened at the end.
+ */
+async function runPrdLoopInteractive(options: { fix: boolean; title: string }): Promise<void> {
+  const plan = getActivePlan();
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
+  const activePlan: Plan = plan ?? createEmptyPlan('Unnamed Plan');
+  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
+
+  const abort = new AbortController();
+  // Holder object: the report is assigned inside a callback, and a plain `let`
+  // would lose its narrowing at the await boundary.
+  const holder: { report: PrdLoopReport | null; controller: PrdLoopController | null } = {
+    report: null,
+    controller: null,
+  };
+  const prdTextHolder: { text: string } = { text: '' };
+
+  const onManualGate = (task: Task): void => { holder.controller?.noteManualGate(task.id); };
+  const onBudgetExceeded = (): void => { holder.controller?.noteBudgetExceeded(); };
+  runner.on('manual-gate', onManualGate);
+  runner.on('budget-exceeded', onBudgetExceeded);
+
+  try {
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: options.title,
+        cancellable: true,
+      },
+      async (progress, token) => {
+        const cancelSub = token.onCancellationRequested(() => abort.abort());
+        try {
+          const controller = createPrdLoop(getPrdLoopConfig(cwd, options.fix), {
+            plan: activePlan,
+            resolvePrdText: async () => {
+              const text = await resolvePrdTextInteractive(plan, cwd);
+              prdTextHolder.text = text ?? '';
+              return text;
+            },
+            runPlan: (p: Plan) => runner.play(p),
+            runEngine: (prompt: string, signal: AbortSignal) =>
+              getEngine(defaultEngine).runTask({ prompt, cwd, signal, costLabel: 'prd-loop' }),
+            savePlan: () => saveAndRefresh(),
+            onProgress: (phase: string, detail: string) => progress.report({ message: `${phase}: ${detail}` }),
+            emitReport: (r: PrdLoopReport) => { holder.report = r; },
+            skipManualGate: (taskId: string) => runner.skipManualGate(taskId),
+            prepareUat: (signal: AbortSignal) => prepareUatSession(cwd, signal),
+            signal: abort.signal,
+          });
+          holder.controller = controller;
+          await controller.run();
+        } finally {
+          cancelSub.dispose();
+        }
+      },
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    UserMsg.showError(UserMsg.runnerError(`PRD verification failed: ${msg.substring(0, 200)}`));
+    return;
+  } finally {
+    runner.off('manual-gate', onManualGate);
+    runner.off('budget-exceeded', onBudgetExceeded);
+  }
+
+  const report = holder.report;
+  if (!report) {
+    vscode.window.showErrorMessage('Verification produced no report. Try again.');
+    return;
+  }
+  if (report.haltReason === 'no-prd') {
+    vscode.window.showWarningMessage('No PRD selected — verification cancelled.');
+    return;
+  }
+  if (report.haltReason === 'aborted') {
+    vscode.window.showInformationMessage('PRD verification cancelled.');
+    return;
+  }
+
+  const html = buildVerificationReportHtml(activePlan.name, prdTextHolder.text, report);
   const moagDir = ensureMoagDir();
   if (!moagDir) {
     vscode.window.showErrorMessage('Could not create .moag directory for report.');
     return;
   }
-  const reportPath = path.join(moagDir, `verification-${timestamp}.html`);
+  const reportPath = path.join(moagDir, `verification-${Date.now()}.html`);
   fs.writeFileSync(reportPath, html, 'utf-8');
   await vscode.env.openExternal(vscode.Uri.file(reportPath));
 
-  if (result.passed) {
+  if (report.passed) {
     const action = await vscode.window.showInformationMessage(
-      `PRD verified (${score}/100) — report opened in browser`,
+      `PRD verified (${report.score}/100) — report opened in browser`,
       'Commit & Push',
     );
     if (action === 'Commit & Push') {
       void cmdSuggestCommit();
     }
-  } else {
-    const action = await vscode.window.showWarningMessage(
-      `Verification failed (${score}/100) — report opened in browser`,
-      'Generate Fix Tasks',
-    );
-    if (action === 'Generate Fix Tasks') {
-      void cmdGenerateFixTasks(activePlan as Plan, result);
-    }
+    return;
   }
+
+  // Name the command when there is one: "command gate" alone cannot tell a failing
+  // `npm test` apart from a failing browser UAT run.
+  const failingCommand = report.gates.find((g) => !g.passed)?.command;
+  const headline = report.failedGate
+    ? `Failed at the ${report.failedGate} gate` +
+      (failingCommand ? ` (${failingCommand})` : '') +
+      ' — report opened in browser'
+    : report.haltReason
+      ? `${describeHaltReason(report.haltReason)} — report opened in browser`
+      : `Verification failed (${report.score}/100) — report opened in browser`;
+  const action = await vscode.window.showWarningMessage(headline, 'Generate Fix Tasks');
+  if (action === 'Generate Fix Tasks') {
+    void cmdGenerateFixTasks();
+  }
+}
+
+/** Verify the current work against the PRD using deterministic gates first. */
+async function cmdVerifyAgainstPrd(): Promise<void> {
+  await runPrdLoopInteractive({ fix: false, title: 'Verifying against PRD...' });
 }
 
 async function cmdSuggestCommit(): Promise<void> {
@@ -6504,65 +7001,12 @@ async function cmdSuggestCommit(): Promise<void> {
   }
 }
 
-async function cmdGenerateFixTasks(plan: Plan, verifyResult: PrdVerificationResult): Promise<void> {
-  if (!verifyResult.gaps || verifyResult.gaps.length === 0) {
-    vscode.window.showInformationMessage('No gaps to fix.');
-    return;
-  }
-
-  const iterations = plan.fixIterations ?? 0;
-  if (iterations >= 3) {
-    vscode.window.showErrorMessage('Max fix iterations (3) reached. Manual intervention required.');
-    return;
-  }
-
-  plan.fixIterations = iterations + 1;
-  const iterationN = plan.fixIterations;
-
-  const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
-
-  const fixPrompt = `Given these PRD gaps found during verification:\n${verifyResult.gaps.map((g, i) => `${i + 1}. ${g}`).join('\n')}\n\nAI suggestion: ${verifyResult.suggestion}\n\nGenerate fix tasks as JSON array. Each task: { "name": string, "prompt": string }. Reply with JSON only.`;
-
-  let fixTasks: Array<{ name: string; prompt: string }> = [];
-  try {
-    const engine = getEngine(defaultEngine);
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Window, title: 'Generating fix tasks...' },
-      async (_progress, token) => {
-        const abortController = new AbortController();
-        token.onCancellationRequested(() => abortController.abort());
-        const result = await engine.runTask({ prompt: fixPrompt, cwd, signal: abortController.signal });
-        if (result.stdout.trim()) {
-          const raw = result.stdout.trim()
-            .replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
-          fixTasks = JSON.parse(raw);
-        }
-      },
-    );
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    vscode.window.showErrorMessage(`Fix task generation failed: ${msg.substring(0, 200)}`);
-    return;
-  }
-
-  if (!Array.isArray(fixTasks) || fixTasks.length === 0) {
-    vscode.window.showWarningMessage('No fix tasks generated. Try again.');
-    return;
-  }
-
-  const fixPlaylist: Playlist = {
-    id: `pl-fix-${Date.now()}`,
-    name: `Fix — Iteration ${iterationN}`,
-    autoplay: true,
-    testPhase: false,
-    tasks: fixTasks.map(t => createTask(t.name, t.prompt)),
-  };
-
-  plan.playlists.push(fixPlaylist);
-  saveAndRefresh();
-  vscode.window.showInformationMessage(`Fix playlist added — ${fixTasks.length} task${fixTasks.length !== 1 ? 's' : ''}. Click Play to continue.`);
+/**
+ * Generate fix tasks and run them, gated the same way verification is:
+ * the loop only asks a model for fixes after a deterministic gate has failed.
+ */
+async function cmdGenerateFixTasks(): Promise<void> {
+  await runPrdLoopInteractive({ fix: true, title: 'Generating and running fix tasks...' });
 }
 
 // ─── Smart Task Decomposition ───
@@ -6591,6 +7035,7 @@ async function cmdSplitTask(item?: PlanTreeItem): Promise<void> {
           prompt: SPLIT_TASK_PROMPT + '\n\nOriginal task:\nName: ' + task.name + '\nPrompt: ' + task.prompt,
           cwd,
           signal: abortController.signal,
+          costLabel: 'task-split',
         });
         if (result.exitCode === 0 && result.stdout.trim()) {
           const parsed = parsePlanResponse(result.stdout);
@@ -7524,6 +7969,39 @@ async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
 
 // ─── Plan Import / Export ───
 
+// The boundary is "do the bytes leave this machine", not the command name. A path the
+// user picked in a save dialog is a backup and stays complete; a clipboard, a gist or an
+// issue comment does not. The two functions below therefore return different shapes —
+// a bare string vs { json, redacted } — so swapping them is a compile error either way.
+
+/** Export the full plan, secrets included, to a file the user picks. */
+async function exportPlanToLocalFile(plan: Plan): Promise<void> {
+  const json = JSON.stringify(dehydratePlan(plan), null, 2);
+
+  const uri = await vscode.window.showSaveDialog({
+    defaultUri: vscode.Uri.file(`${plan.name.toLowerCase().replace(/\s+/g, '-')}.agent-plan.json`),
+    filters: { 'Agent Plan': ['agent-plan.json', 'json'] },
+    title: 'Export Plan',
+  });
+  if (!uri) { return; }
+
+  await vscode.workspace.fs.writeFile(uri, Buffer.from(json, 'utf-8'));
+  // No redaction claim — nothing was removed.
+  vscode.window.showInformationMessage(`Plan exported to ${uri.fsPath}`);
+}
+
+/** Copy a redacted plan to the clipboard — variables, rules and PRD never leave. */
+async function copyPlanToClipboard(plan: Plan): Promise<void> {
+  const { json, redacted } = serializePlanForSharing(plan);
+
+  await vscode.env.clipboard.writeText(json);
+  vscode.window.showInformationMessage(
+    redacted.length > 0
+      ? `Plan copied to clipboard. — removed for safety: ${redacted.join(', ')}`
+      : 'Plan copied to clipboard.',
+  );
+}
+
 async function cmdExportPlan(): Promise<void> {
   if (!currentPlan) {
     vscode.window.showWarningMessage('No plan loaded.');
@@ -7532,31 +8010,19 @@ async function cmdExportPlan(): Promise<void> {
 
   const choice = await vscode.window.showQuickPick(
     [
-      { label: 'Export to file', description: 'Save as a new .agent-plan.json file' },
-      { label: 'Copy to clipboard', description: 'Copy plan JSON to clipboard for sharing' },
+      { label: 'Export to file', description: 'Complete backup — includes variables, rules and PRD' },
+      { label: 'Copy to clipboard', description: 'Redacted for sharing — variables, rules and PRD removed' },
     ],
     { placeHolder: 'How do you want to export the plan?' },
   );
   if (!choice) { return; }
 
-  const planFile = dehydratePlan(currentPlan);
-  const json = JSON.stringify(planFile, null, 2);
-
   if (choice.label === 'Copy to clipboard') {
-    await vscode.env.clipboard.writeText(json);
-    vscode.window.showInformationMessage('Plan copied to clipboard.');
+    await copyPlanToClipboard(currentPlan);
     return;
   }
 
-  const uri = await vscode.window.showSaveDialog({
-    defaultUri: vscode.Uri.file(`${currentPlan.name.toLowerCase().replace(/\s+/g, '-')}.agent-plan.json`),
-    filters: { 'Agent Plan': ['agent-plan.json', 'json'] },
-    title: 'Export Plan',
-  });
-  if (!uri) { return; }
-
-  await vscode.workspace.fs.writeFile(uri, Buffer.from(json, 'utf-8'));
-  vscode.window.showInformationMessage(`Plan exported to ${uri.fsPath}`);
+  await exportPlanToLocalFile(currentPlan);
 }
 
 async function cmdSharePlan(): Promise<void> {
@@ -7566,16 +8032,11 @@ async function cmdSharePlan(): Promise<void> {
     return;
   }
 
-  // Dehydrate and strip all statuses to create a clean template
-  const planFile = dehydratePlan(plan);
-  for (const pl of planFile.playlists) {
-    for (const t of pl.tasks) {
-      delete (t as any).status;
-    }
-  }
+  // A gist leaves this machine: redact, and strip all statuses to create a clean template.
+  const { json, redacted } = serializePlanForSharing(plan, { stripStatus: true });
+  const redactionSuffix = redacted.length > 0 ? ` — removed for safety: ${redacted.join(', ')}` : '';
 
   const fileName = `${plan.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`;
-  const json = JSON.stringify(planFile, null, 2);
 
   // Check if gh CLI is available
   const ghAvailable = await commandExists('gh');
@@ -7598,7 +8059,7 @@ async function cmdSharePlan(): Promise<void> {
       }
 
       const action = await vscode.window.showInformationMessage(
-        `Plan shared: ${gistUrl}`,
+        `Plan shared: ${gistUrl}${redactionSuffix}`,
         'Open',
         'Copy URL',
       );
@@ -8391,6 +8852,7 @@ async function cmdNewConversation(): Promise<void> {
           prompt: prompt.trim(),
           cwd,
           signal: abort.signal,
+          costLabel: 'conversation',
         });
 
         const entry: HistoryEntry = {

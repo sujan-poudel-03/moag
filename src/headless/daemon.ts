@@ -30,7 +30,7 @@ export interface DaemonConfig {
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export interface DaemonDeps {
-  runner: { play(plan: any): Promise<void> };
+  runner: { play(plan: any): Promise<void>; stop(): void };
   TaskStatus: { Completed: string };
   fetchOpenIssues: (o: { repo: string; label?: string }) => any[];
   newIssuesToTasks: (issues: any[], repo: string, known: Set<string>) => any[];

@@ -676,3 +676,251 @@ describe('Regression: DesktopValidator.unavailableReason', () => {
     assert.equal(await getAdapter().isAvailable(tmpDir), true);
   });
 });
+
+// ─── 4. Manifest contract: browser UAT command + settings ─────────────────────
+
+describe('Regression: browser UAT manifest contributions', () => {
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(__dirname, '..', '..', '..', 'package.json'), 'utf-8'),
+  ) as {
+    contributes: {
+      commands: Array<{ command: string; title: string; category?: string; icon?: string }>;
+      menus: Record<string, Array<{ command: string; when?: string; group?: string }>>;
+      configuration: { properties: Record<string, unknown> };
+    };
+  };
+
+  it('declares agentTaskPlayer.provisionBrowsers in contributes.commands', () => {
+    const cmd = pkg.contributes.commands.find((c) => c.command === 'agentTaskPlayer.provisionBrowsers');
+    assert.ok(cmd, 'the command must be declared or the palette entry is dead');
+    assert.equal(cmd!.title, 'Provision Browsers (Playwright)');
+    assert.equal(cmd!.category, 'MOAG');
+  });
+
+  // The ceiling latch blocks every engine call once raised, and blocked calls
+  // record nothing — so no further budget-exceeded fires to re-offer the inline
+  // 'Reset Spend Counter' action. This command is the only always-reachable
+  // escape; if it stops being contributed, a user who chose Stop on a breach is
+  // stuck until they edit settings or reload the window.
+  it('declares agentTaskPlayer.resetSpendCounter as the escape from the ceiling latch', () => {
+    const cmd = pkg.contributes.commands.find((c) => c.command === 'agentTaskPlayer.resetSpendCounter');
+    assert.ok(cmd, 'without this command a raised ceiling latch has no discoverable escape');
+    assert.equal(cmd!.title, 'Reset Spend Counter');
+    assert.equal(cmd!.category, 'MOAG');
+  });
+
+  it('leaves resetSpendCounter visible in the command palette', () => {
+    const palette = pkg.contributes.menus['commandPalette'] ?? [];
+    const hidden = palette.find(
+      (m) => m.command === 'agentTaskPlayer.resetSpendCounter' && m.when === 'false',
+    );
+    assert.equal(hidden, undefined, 'the ceiling escape must never be hidden from the palette');
+  });
+
+  it('leaves provisionBrowsers visible in the command palette', () => {
+    const palette = pkg.contributes.menus['commandPalette'] ?? [];
+    const hidden = palette.find(
+      (m) => m.command === 'agentTaskPlayer.provisionBrowsers' && m.when === 'false',
+    );
+    assert.equal(hidden, undefined, 'provisionBrowsers is user-facing — it must not be hidden');
+  });
+
+  it('places provisionBrowsers in the sandbox menu group', () => {
+    const entries = Object.values(pkg.contributes.menus).flat();
+    const placed = entries.find((m) => m.command === 'agentTaskPlayer.provisionBrowsers');
+    assert.ok(placed, 'an undeclared menu placement makes the command unreachable from the UI');
+    assert.match(placed!.group ?? '', /^4_sandbox@/);
+  });
+
+  it('declares every prdLoop.uat.* setting getPrdLoopConfig reads', () => {
+    // These four keys are read verbatim by getPrdLoopConfig / buildVerifyConfig.
+    // A missing declaration means the default silently wins and the setting is
+    // invisible in the Settings UI.
+    const required = [
+      'agentTaskPlayer.prdLoop.uat.mode',
+      'agentTaskPlayer.prdLoop.uat.command',
+      'agentTaskPlayer.prdLoop.uat.specPath',
+      'agentTaskPlayer.prdLoop.uat.timeoutMs',
+      'agentTaskPlayer.browser.playwrightVersion',
+    ];
+    for (const key of required) {
+      assert.ok(
+        Object.prototype.hasOwnProperty.call(pkg.contributes.configuration.properties, key),
+        `${key} is read at runtime but missing from contributes.configuration`,
+      );
+    }
+  });
+
+  it('locks the uat.mode enum to off/auto/required with an auto default', () => {
+    const prop = pkg.contributes.configuration.properties['agentTaskPlayer.prdLoop.uat.mode'] as {
+      enum: string[];
+      default: string;
+      enumDescriptions?: string[];
+    };
+    assert.deepEqual(prop.enum, ['off', 'auto', 'required']);
+    assert.equal(prop.default, 'auto');
+    assert.equal(prop.enumDescriptions?.length, 3, 'every enum member needs a description');
+    assert.match(prop.enumDescriptions![2], /fix-generation|FAILS/i, 'required must state its cost');
+  });
+
+  it('pins a concrete playwright version — never "latest"', () => {
+    const prop = pkg.contributes.configuration.properties['agentTaskPlayer.browser.playwrightVersion'] as {
+      default: string;
+    };
+    assert.equal(prop.default, '1.62.1');
+    assert.notEqual(prop.default, 'latest');
+  });
+});
+
+// ─── 5. Engine call-site census ───────────────────────────────────────────────
+//
+// Every engine call must be reachable by cost accounting and by cancellation.
+// These are mechanical guards against the two holes regrowing:
+//   * a new `.runTask(` site that forgets `costLabel` (spend nobody attributes)
+//   * `new AbortController().signal` inline (a Cancel button that cannot fire)
+//   * `new SomeAdapter()` in production (bypasses the accounting wrapper)
+
+describe('Regression: engine call-site census', () => {
+  const SRC_ROOT = path.join(__dirname, '..', '..');
+
+  /** Repo-relative, forward-slashed path — stable across platforms. */
+  function relative(file: string): string {
+    return path.relative(SRC_ROOT, file).split(path.sep).join('/');
+  }
+
+  /** Every .ts file under src/, excluding the test tree itself. */
+  function productionFiles(dir: string = SRC_ROOT): string[] {
+    const out: string[] = [];
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === 'test' || entry.name === 'node_modules') { continue; }
+        out.push(...productionFiles(full));
+        continue;
+      }
+      if (entry.isFile() && entry.name.endsWith('.ts') && !entry.name.endsWith('.d.ts')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  /** Count non-overlapping matches of a global regex in a string. */
+  function countMatches(text: string, pattern: RegExp): number {
+    const re = new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : pattern.flags + 'g');
+    return (text.match(re) ?? []).length;
+  }
+
+  /** Map from repo-relative file to its match count, for files with at least one. */
+  function census(pattern: RegExp, files: string[]): Map<string, number> {
+    const found = new Map<string, number>();
+    for (const file of files) {
+      const n = countMatches(fs.readFileSync(file, 'utf-8'), pattern);
+      if (n > 0) { found.set(relative(file), n); }
+    }
+    return found;
+  }
+
+  const RUN_TASK = /\.runTask\(/g;
+  const INLINE_ABORT_SIGNAL = /new AbortController\(\)\s*\.signal/g;
+  const DIRECT_ADAPTER = /new \w*Adapter\(/g;
+
+  // Sanity: a census helper whose regex silently matched nothing would make
+  // every assertion below pass vacuously. Prove it detects known content.
+  it('the census helper detects violations in a synthetic input', () => {
+    const synthetic = [
+      'await engine.runTask({ prompt });',
+      'const s = new AbortController().signal;',
+      'const a = new ClaudeAdapter();',
+      'x.runTask(y);',
+    ].join('\n');
+
+    assert.equal(countMatches(synthetic, RUN_TASK), 2, 'runTask regex must find both call sites');
+    assert.equal(countMatches(synthetic, INLINE_ABORT_SIGNAL), 1);
+    assert.equal(countMatches(synthetic, DIRECT_ADAPTER), 1);
+    assert.equal(countMatches('nothing to see here', RUN_TASK), 0);
+  });
+
+  it('scans a non-empty production file set outside src/test', () => {
+    const files = productionFiles();
+    assert.ok(files.length > 50, `expected the whole src tree, got ${files.length} files`);
+    assert.ok(
+      files.every((f) => !relative(f).startsWith('test/')),
+      'src/test must be excluded from the census',
+    );
+    assert.ok(files.some((f) => relative(f) === 'adapters/engine.ts'), 'scan must reach src/adapters');
+  });
+
+  it('holds the engine call-site allowlist at exactly 17 sites, each labelled', () => {
+    // Every entry is a call site that must carry a costLabel and a reachable
+    // AbortSignal. src/adapters/engine.ts is excluded and asserted separately:
+    // its single `.runTask(` is the accounting wrapper delegating inward.
+    const ALLOWLIST = new Map<string, number>([
+      ['extension.ts', 12],
+      ['runner/runner.ts', 2],
+      ['ui/execution-detail-panel.ts', 2],
+      ['headless/cli.ts', 1],
+    ]);
+    const ACCOUNTING_LAYER = 'adapters/engine.ts';
+
+    const expectedTotal = Array.from(ALLOWLIST.values()).reduce((a, b) => a + b, 0);
+    assert.equal(expectedTotal, 17, 'the allowlist itself must total 17');
+
+    const found = census(RUN_TASK, productionFiles());
+
+    assert.equal(
+      found.get(ACCOUNTING_LAYER),
+      1,
+      'withCostAccounting() must delegate to the inner adapter exactly once',
+    );
+    found.delete(ACCOUNTING_LAYER);
+
+    for (const [file, count] of found) {
+      const allowed = ALLOWLIST.get(file);
+      assert.ok(
+        allowed !== undefined,
+        `New engine call site in src/${file}. Before adding it to the census ` +
+        'allowlist in this test, give it a costLabel and a reachable AbortSignal — ' +
+        'an unlabelled call spends money nothing attributes, and an unreachable ' +
+        'signal is a Cancel button that does nothing.',
+      );
+      assert.equal(
+        count,
+        allowed,
+        `src/${file} has ${count} .runTask( sites, allowlist says ${allowed}. ` +
+        'Give the new call a costLabel and a reachable AbortSignal, then update the allowlist.',
+      );
+    }
+
+    for (const file of ALLOWLIST.keys()) {
+      assert.ok(
+        found.has(file),
+        `src/${file} no longer calls runTask — shrink the allowlist rather than leaving it stale.`,
+      );
+    }
+
+    const total = Array.from(found.values()).reduce((a, b) => a + b, 0);
+    assert.equal(total, 17, `expected 17 engine call sites outside the accounting layer, found ${total}`);
+  });
+
+  it('has no inline `new AbortController().signal` in production code', () => {
+    const found = census(INLINE_ABORT_SIGNAL, productionFiles());
+    assert.deepEqual(
+      Array.from(found.keys()),
+      [],
+      'An inline `new AbortController().signal` is a controller nobody can abort. ' +
+      'Create the controller, wire it to a cancellation token, and pass its signal.',
+    );
+  });
+
+  it('constructs no adapter directly outside src/adapters', () => {
+    const files = productionFiles().filter((f) => !relative(f).startsWith('adapters/'));
+    const found = census(DIRECT_ADAPTER, files);
+    assert.deepEqual(
+      Array.from(found.keys()),
+      [],
+      'Direct adapter construction bypasses withCostAccounting(). ' +
+      'Use getEngine()/getAllEngines() instead.',
+    );
+  });
+});

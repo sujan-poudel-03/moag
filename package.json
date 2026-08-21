@@ -538,6 +538,18 @@
         "icon": "$(device-camera)"
       },
       {
+        "command": "agentTaskPlayer.provisionBrowsers",
+        "title": "Provision Browsers (Playwright)",
+        "category": "MOAG",
+        "icon": "$(cloud-download)"
+      },
+      {
+        "command": "agentTaskPlayer.resetSpendCounter",
+        "title": "Reset Spend Counter",
+        "category": "MOAG",
+        "icon": "$(refresh)"
+      },
+      {
         "command": "agentTaskPlayer.reloadWindow",
         "title": "Reload Window",
         "category": "MOAG",
@@ -705,6 +717,11 @@
           "command": "agentTaskPlayer.takeScreenshot",
           "when": "view == agentTaskPlayer.promptView",
           "group": "4_sandbox@3"
+        },
+        {
+          "command": "agentTaskPlayer.provisionBrowsers",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "4_sandbox@4"
         },
         {
           "command": "agentTaskPlayer.planFromGitHubIssue",
@@ -1198,6 +1215,78 @@
           "default": 0,
           "minimum": 0,
           "description": "Estimated cost budget in USD for a run. Set to 0 to disable budget warnings."
+        },
+        "agentTaskPlayer.prdLoop.maxFixIterations": {
+          "type": "number",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10,
+          "description": "Maximum number of fix playlists the PRD verification loop may generate before halting for a human."
+        },
+        "agentTaskPlayer.prdLoop.gateCommands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Shell commands that must exit 0 before the PRD loop asks a model anything. Empty = auto-detect from package.json scripts or the detected test framework."
+        },
+        "agentTaskPlayer.prdLoop.gateTimeoutMs": {
+          "type": "number",
+          "default": 600000,
+          "minimum": 10000,
+          "description": "Timeout in milliseconds for each PRD loop gate command (default 10 minutes)."
+        },
+        "agentTaskPlayer.prdLoop.maxDiffChars": {
+          "type": "number",
+          "default": 40000,
+          "minimum": 2000,
+          "description": "Character budget for the diff evidence handed to the verification model."
+        },
+        "agentTaskPlayer.prdLoop.onManualGate": {
+          "type": "string",
+          "enum": [
+            "halt",
+            "skip"
+          ],
+          "default": "halt",
+          "description": "What the PRD loop does when a manual ship gate is waiting: halt for human approval, or skip the gate and continue."
+        },
+        "agentTaskPlayer.prdLoop.uat.mode": {
+          "type": "string",
+          "enum": [
+            "off",
+            "auto",
+            "required"
+          ],
+          "enumDescriptions": [
+            "Never run browser UAT.",
+            "Run browser UAT when Playwright or Cypress is detected; skip silently when it is not, leaving the verdict to the repository gates and the model.",
+            "Browser UAT must run and pass. If no tooling is detected, or no sandbox URL can be prepared, verification FAILS. On a repo without provisioned browsers this fails every iteration, and with --fix it costs one fix-generation model call before the no-progress guard catches it."
+          ],
+          "default": "auto",
+          "description": "Whether the PRD verification loop runs a browser UAT gate against a live sandbox."
+        },
+        "agentTaskPlayer.prdLoop.uat.command": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit browser UAT command. Overrides Playwright/Cypress auto-detection. Empty = auto-detect."
+        },
+        "agentTaskPlayer.prdLoop.uat.specPath": {
+          "type": "string",
+          "default": "",
+          "description": "Spec file or directory the browser UAT gate should run. Empty = the tool's default suite."
+        },
+        "agentTaskPlayer.prdLoop.uat.timeoutMs": {
+          "type": "number",
+          "default": 900000,
+          "minimum": 30000,
+          "description": "Timeout in milliseconds for the browser UAT gate (default 15 minutes). Separate from prdLoop.gateTimeoutMs because a browser suite is slower than a unit test run."
+        },
+        "agentTaskPlayer.browser.playwrightVersion": {
+          "type": "string",
+          "default": "1.62.1",
+          "description": "Playwright version installed by the \"MOAG: Provision Browsers\" command."
         },
         "agentTaskPlayer.maxHistoryEntries": {
           "type": "number",

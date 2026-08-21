@@ -17,6 +17,7 @@ function makeDeps(over: Partial<DaemonDeps> & { issuesByRepo?: Record<string, an
         // simulate every task completing
         for (const pl of plan.playlists) { for (const t of pl.tasks) { t.status = 'completed'; } }
       },
+      stop: () => events.push({ event: 'runner-stop' }),
     },
     TaskStatus: { Completed: 'completed' },
     fetchOpenIssues: ({ repo }) => issuesByRepo[repo] ?? [],
@@ -88,6 +89,69 @@ describe('runDaemon', () => {
     const { deps, events } = makeDeps();
     await runDaemon({ maxTicks: 1 }, deps);
     assert.ok(events.some((e) => e.event === 'daemon-started'));
+    assert.ok(events.some((e) => e.event === 'daemon-stopped'));
+  });
+
+  // ─── Bounded spend: the ceiling accumulates across ticks, not per play() ───
+
+  it('accumulates runner spend across ticks so a lifetime ceiling trips on a later tick', async () => {
+    const budget = 1;
+    let lifetime = 0;
+    let threshold: number | null = null;
+    let plays = 0;
+    const breaches: Array<{ play: number; totalCost: number }> = [];
+    const { deps, events } = makeDeps({
+      runner: {
+        // Mirrors TaskRunner.trackTaskCost: spend is lifetime, the ceiling re-arms.
+        play: async () => {
+          plays++;
+          lifetime += 0.6;
+          const armed = threshold ?? budget;
+          if (lifetime > armed) {
+            threshold = lifetime + budget;
+            breaches.push({ play: plays, totalCost: lifetime });
+          } else {
+            threshold = armed;
+          }
+        },
+        stop: () => { /* headless stops the current run; the daemon keeps its own flag */ },
+      },
+    });
+
+    const cfg: DaemonConfig = { maxTicks: 2, monitors: [{ name: 'prod', healthCheckUrl: 'http://h/health' }] };
+    await runDaemon(cfg, deps);
+
+    assert.equal(plays, 2, 'one monitor plan per tick');
+    assert.equal(breaches.length, 1, 'spend from tick 1 must still count on tick 2');
+    assert.equal(breaches[0].play, 2, 'ceiling trips only once cumulative spend passes the budget');
+    assert.ok(events.some((e) => e.event === 'daemon-stopped'));
+  });
+
+  it('does not start the next plan once a stop signal flips shouldStop', async () => {
+    let stopping = false;
+    let plays = 0;
+    let stopCalls = 0;
+    const stop = () => { stopCalls++; };
+    const { deps, events } = makeDeps({
+      shouldStop: () => stopping,
+      runner: {
+        // Stand-in for the CLI signal handler: flag first, then abort the live run.
+        play: async () => { plays++; if (plays === 1) { stopping = true; stop(); } },
+        stop,
+      },
+    });
+
+    const cfg: DaemonConfig = {
+      maxTicks: 3,
+      monitors: [
+        { name: 'a', healthCheckUrl: 'http://h/a' },
+        { name: 'b', healthCheckUrl: 'http://h/b' },
+      ],
+    };
+    await runDaemon(cfg, deps);
+
+    assert.equal(plays, 1, 'the second monitor must not be started after the stop signal');
+    assert.equal(stopCalls, 1);
     assert.ok(events.some((e) => e.event === 'daemon-stopped'));
   });
 });

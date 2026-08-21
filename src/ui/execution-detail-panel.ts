@@ -229,6 +229,13 @@ export class ExecutionDetailPanel {
   // ─── New conversation from session list ───
 
   private async _startNewConversation(text: string, engineId: EngineId): Promise<void> {
+    // Mirrors the guard in _sendReply(). A second concurrent start would reset
+    // webview.html mid-stream and orphan the in-flight AbortController.
+    // Safe to return before posting anything: this method has not yet sent a
+    // 'stream-start', and the sending webview does not block on a reply, so no
+    // 'stream-end'/'stream-error' is owed and nothing spins waiting for one.
+    if (this._isStreaming) { return; }
+
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const id = generateId();
     const taskName = text.length > 60 ? text.substring(0, 57) + '...' : text;
@@ -254,6 +261,7 @@ export class ExecutionDetailPanel {
         prompt: text,
         cwd,
         signal: this._abortController.signal,
+        costLabel: 'conversation',
         onOutput: (chunk, stream) => {
           if (!this._disposed && stream === 'stdout') {
             this._postMessage({ type: 'stream-chunk', text: chunk });
@@ -325,6 +333,7 @@ export class ExecutionDetailPanel {
         prompt: contextPrompt,
         cwd,
         signal: this._abortController.signal,
+        costLabel: 'conversation',
         onOutput: (chunk, stream) => {
           if (!this._disposed && stream === 'stdout') {
             this._postMessage({ type: 'stream-chunk', text: chunk });
