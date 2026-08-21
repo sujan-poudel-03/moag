@@ -21,5 +21,5 @@ export function registerAllEngines(): void {
 
 export { AnthropicAdapter } from './anthropic-adapter';
 
-export { getEngine, getAllEngines, checkEngineAvailability } from './engine';
-export type { EngineAdapter, EngineRunOptions, EngineAvailability } from './engine';
+export { getEngine, getAllEngines, checkEngineAvailability, withCostAccounting, setCeilingGuard } from './engine';
+export type { EngineAdapter, EngineRunOptions, EngineAvailability, CeilingGuard } from './engine';

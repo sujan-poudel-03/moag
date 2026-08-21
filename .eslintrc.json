@@ -15,7 +15,22 @@
     "@typescript-eslint/no-explicit-any": "warn",
     "@typescript-eslint/no-var-requires": "off",
     "prefer-const": "off",
-    "no-useless-escape": "off"
+    "no-useless-escape": "off",
+    "no-restricted-syntax": [
+      "error",
+      {
+        "selector": "NewExpression[callee.name=/Adapter$/]",
+        "message": "Get engines via getEngine()/getAllEngines() — direct construction bypasses cost accounting."
+      }
+    ]
   },
+  "overrides": [
+    {
+      "files": ["src/adapters/**/*.ts", "src/test/**/*.ts"],
+      "rules": {
+        "no-restricted-syntax": "off"
+      }
+    }
+  ],
   "ignorePatterns": ["out/", "node_modules/", "**/*.d.ts"]
 }

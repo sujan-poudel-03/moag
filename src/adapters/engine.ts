@@ -3,6 +3,7 @@
 import { EngineId, EngineResult } from '../models/types';
 import { OutputCallback } from './base-cli';
 import { commandExists } from '../utils/command-exists';
+import { costLedger } from '../utils/cost-ledger';
 
 /** Options passed to every engine adapter */
 export interface EngineRunOptions {
@@ -28,6 +29,8 @@ export interface EngineRunOptions {
   browserEnabled?: boolean;
   /** URL of the running sandbox — injected for visual-test tasks */
   sandboxUrl?: string;
+  /** Attribution label for cost accounting. Defaults to 'unattributed'. */
+  costLabel?: string;
 }
 
 /** Every engine adapter implements this interface */
@@ -39,11 +42,93 @@ export interface EngineAdapter {
   runTask(options: EngineRunOptions): Promise<EngineResult>;
 }
 
+// ─── Cost ceiling guard ──────────────────────────────────────────────────────
+
+/**
+ * Consulted before every engine call. Returning false blocks the call.
+ *
+ * MUST be synchronous and cheap — a plain latch read. Anything that awaits or
+ * shows UI would fire once per concurrent call under parallelPlaylists.
+ */
+export type CeilingGuard = (ctx: { engineId: EngineId; label: string }) => boolean;
+
+let ceilingGuard: CeilingGuard | null = null;
+
+/** Install (or clear, with null) the process-wide cost ceiling guard. */
+export function setCeilingGuard(guard: CeilingGuard | null): void {
+  ceilingGuard = guard;
+}
+
+/** Unset guard = allow. A guard that throws is treated as allow, never as block. */
+function isAllowedByCeiling(engineId: EngineId, label: string): boolean {
+  if (!ceilingGuard) {
+    return true;
+  }
+  try {
+    return ceilingGuard({ engineId, label });
+  } catch {
+    // A broken guard must not brick every engine call in the process.
+    return true;
+  }
+}
+
+/** Message surfaced on a blocked call — a synthetic failure, never a throw. */
+const CEILING_BLOCKED_MESSAGE =
+  'Cost ceiling reached — raise agentTaskPlayer.costBudgetUsd, or run the '
+  + '"MOAG: Reset Spend Counter" command to clear the block.';
+
+// ─── Cost accounting wrapper ─────────────────────────────────────────────────
+
+/** Marks an adapter instance as already wrapped, so wrapping is idempotent. */
+const WRAPPED = Symbol('moag.costAccounted');
+
+/**
+ * Wrap an adapter so every runTask() result is reported to the cost ledger.
+ *
+ * The registry stores wrapped adapters, which makes accounting impossible to
+ * bypass for anything reached through getEngine()/getAllEngines(). Wrapping is
+ * idempotent — re-wrapping an already-wrapped adapter returns it unchanged, so
+ * a re-registration cannot double-count.
+ */
+export function withCostAccounting(adapter: EngineAdapter): EngineAdapter {
+  if ((adapter as unknown as Record<symbol, boolean>)[WRAPPED]) {
+    return adapter;
+  }
+
+  const wrapped: EngineAdapter = {
+    id: adapter.id,
+    displayName: adapter.displayName,
+    getCommand: () => adapter.getCommand(),
+    async runTask(options: EngineRunOptions): Promise<EngineResult> {
+      const label = options.costLabel ?? 'unattributed';
+      if (!isAllowedByCeiling(adapter.id, label)) {
+        // Blocked: the engine is never invoked and nothing is recorded.
+        return { stdout: '', stderr: CEILING_BLOCKED_MESSAGE, exitCode: 1, durationMs: 0 };
+      }
+
+      // KNOWN BLIND SPOT: a rejection (abort, timeout kill, spawn failure)
+      // records nothing, because there is no EngineResult to read tokenUsage
+      // from. Tokens spent before the failure stay invisible to the ceiling,
+      // so the ledger under-counts on exactly the runs that cost the most.
+      const result = await adapter.runTask(options);
+      // Recorded even on a non-zero exit — a failed task still burned tokens.
+      costLedger.record(result.tokenUsage, {
+        engineId: adapter.id,
+        label: options.costLabel,
+      });
+      return result;
+    },
+  };
+
+  Object.defineProperty(wrapped, WRAPPED, { value: true, enumerable: false });
+  return wrapped;
+}
+
 /** Global registry of engine adapters */
 const registry = new Map<EngineId, EngineAdapter>();
 
 export function registerEngine(adapter: EngineAdapter): void {
-  registry.set(adapter.id, adapter);
+  registry.set(adapter.id, withCostAccounting(adapter));
 }
 
 export function getEngine(id: EngineId): EngineAdapter {
