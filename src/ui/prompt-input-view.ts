@@ -3645,7 +3645,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
             (isFailed && item.taskId ? '<button class="history-retry-btn" type="button" title="Retry this task">↺</button>' : '');
           btn.addEventListener('click', (e) => {
             // Retry button inside the row — don't open the item
-            if ((e.target as HTMLElement).classList.contains('history-retry-btn')) {
+            if (e.target && e.target.classList.contains('history-retry-btn')) {
               e.stopPropagation();
               if (item.taskId) { vscode.postMessage({ type: 'retryTask', taskId: item.taskId }); }
               return;
@@ -4269,8 +4269,11 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           doneBannerEl.innerHTML =
             '<span class="plan-done-check">✓ Plan complete</span>' +
             '<div class="plan-done-actions">' +
-              '<button class="plan-done-btn" onclick="vscode.postMessage({type:\'createPR\'})">Create PR</button>' +
-              '<button class="plan-done-btn ghost" onclick="vscode.postMessage({type:\'switchPlan\'})">New Sprint</button>' +
+              // Double-escaped on purpose: this line is inside a template literal, so a
+              // single \' collapses to ' before the webview ever sees it — which closes
+              // the JS string early and kills the whole script with a SyntaxError.
+              '<button class="plan-done-btn" onclick="vscode.postMessage({type:\\'createPR\\'})">Create PR</button>' +
+              '<button class="plan-done-btn ghost" onclick="vscode.postMessage({type:\\'switchPlan\\'})">New Sprint</button>' +
             '</div>';
           planOverviewEl.appendChild(doneBannerEl);
         }

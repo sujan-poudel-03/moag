@@ -1007,3 +1007,86 @@ describe('Regression: engine call-site census', () => {
     );
   });
 });
+
+// ─── Webview scripts must actually parse ──────────────────────────────────────
+//
+// The sidebar's JavaScript lives inside a TypeScript template literal, so `tsc`
+// never parses it — it is a string as far as the compiler is concerned. Two
+// different defects shipped that way and were invisible until a real VSIX was
+// installed, at which point the whole view went dead because a SyntaxError
+// aborts the entire script before a single handler attaches:
+//
+//   1. `(e.target as HTMLElement)` — a TypeScript cast, meaningless in a browser.
+//   2. `onclick="...({type:\'createPR\'})"` — inside a template literal the \'
+//      collapses to ' before the webview sees it, closing the JS string early.
+//
+// Pattern-matching for "suspicious syntax" caught the first and missed the
+// second. So this parses the real rendered script instead: new Function(body)
+// throws on any syntax error without executing anything.
+
+describe('Regression: rendered webview scripts parse as JavaScript', () => {
+  function renderSidebarHtml(): string {
+    const mod = proxyquire('../../ui/prompt-input-view', { vscode: vscodeMock });
+    const Provider = mod.PromptInputViewProvider;
+    const provider = new Provider(
+      { fsPath: '/tmp/ext', scheme: 'file', path: '/tmp/ext' },
+      async () => true,
+      () => undefined,
+      async () => undefined,
+      () => undefined,
+    );
+    return provider['_getHtml']();
+  }
+
+  /** Every <script> body in the document, in order. */
+  function scriptBodies(html: string): string[] {
+    const bodies: string[] = [];
+    const re = /<script\b[^>]*>([\s\S]*?)<\/script>/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html)) !== null) {
+      if (m[1].trim().length > 0) { bodies.push(m[1]); }
+    }
+    return bodies;
+  }
+
+  it('renders a sidebar document containing at least one script', () => {
+    const html = renderSidebarHtml();
+    assert.ok(html.length > 1000, 'the rendered document is implausibly small');
+    assert.ok(scriptBodies(html).length > 0, 'found no <script> bodies — the extractor is broken, not the code');
+  });
+
+  it('every rendered <script> body is syntactically valid JavaScript', () => {
+    const bodies = scriptBodies(renderSidebarHtml());
+    const failures: string[] = [];
+
+    bodies.forEach((body, i) => {
+      try {
+        // Parses without executing. Throws SyntaxError on malformed input.
+        new Function(body);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        failures.push(`script #${i + 1}: ${message}`);
+      }
+    });
+
+    assert.deepEqual(
+      failures,
+      [],
+      'A SyntaxError here kills the entire webview script — no handlers attach and the '
+      + 'view is inert, while tsc still reports success:\n' + failures.join('\n'),
+    );
+  });
+
+  it('the parser check actually rejects a broken script', () => {
+    // Guards the guard. Both real defects are represented.
+    const tsCast = "if ((e.target as HTMLElement).classList.contains('x')) {}";
+    const collapsedQuote = "el.innerHTML = '<button onclick=\"post({type:'createPR'})\">go</button>';";
+    for (const broken of [tsCast, collapsedQuote]) {
+      assert.throws(
+        () => new Function(broken),
+        /SyntaxError|Unexpected/,
+        `the parser check failed to reject: ${broken}`,
+      );
+    }
+  });
+});
