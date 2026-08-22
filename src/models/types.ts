@@ -1,7 +1,16 @@
 // ─── Core data models for Agent Task Player ───
 
-/** Supported agent engine identifiers */
-export type EngineId = 'codex' | 'claude' | 'gemini' | 'ollama' | 'custom' | 'copilot' | 'anthropic';
+/**
+ * Supported agent engine identifiers.
+ *
+ * The type is derived from the array so the two cannot drift. They already had:
+ * a hand-written `isEngineId` guard in extension.ts listed only five of the
+ * seven, so selecting Copilot or Anthropic silently fell back to the default
+ * engine. Any guard over EngineId must read ENGINE_IDS, never re-enumerate.
+ */
+export const ENGINE_IDS = ['codex', 'claude', 'gemini', 'ollama', 'custom', 'copilot', 'anthropic'] as const;
+
+export type EngineId = typeof ENGINE_IDS[number];
 
 /** Supported expert-role identifiers a plan, playlist, or task may declare */
 export type RoleId = 'architect' | 'designer' | 'engineer' | 'reviewer' | 'tester' | 'devops' | 'custom';

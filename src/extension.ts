@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { Plan, Playlist, RunnerState, EngineId, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task } from './models/types';
+import { Plan, Playlist, RunnerState, EngineId, ENGINE_IDS, HistoryEntry, TaskStatus, TaskType, FailurePolicy, Task } from './models/types';
 import {
   loadPlan, savePlan, dehydratePlan, hydratePlan, createEmptyPlan, createPlaylist, createTask,
   serializePlanForSharing, appendPrdVersion, MAX_PRD_VERSIONS,
@@ -744,11 +744,10 @@ function isTaskLocation(value: unknown): value is TaskLocation {
 }
 
 function isEngineId(value: string | undefined): value is EngineId {
-  return value === 'claude'
-    || value === 'codex'
-    || value === 'gemini'
-    || value === 'ollama'
-    || value === 'custom';
+  // Derived from ENGINE_IDS, never re-enumerated: the previous hand-written
+  // chain omitted 'copilot' and 'anthropic', so choosing either silently fell
+  // through to the default engine at both call sites.
+  return typeof value === 'string' && (ENGINE_IDS as readonly string[]).includes(value);
 }
 
 function findTaskLocation(taskId: string): TaskLocation | null {

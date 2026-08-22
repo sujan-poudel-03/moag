@@ -112,8 +112,12 @@ export class HistoryStore {
   }
 
   private getMaxHistoryStorageBytes(): number {
+    // Must match the declared default in package.json. It did not: the manifest
+    // says 400_000 while this fell back to 3_000_000, and the fallback is what
+    // headless actually hits — the shim reads .moag/config.json, which usually
+    // has no such key. So the CLI kept 7.5x the history VS Code did, silently.
     return vscode.workspace.getConfiguration('agentTaskPlayer')
-      .get<number>('maxHistoryStorageBytes', 3_000_000);
+      .get<number>('maxHistoryStorageBytes', 400_000);
   }
 
   private sanitizeEntry(entry: HistoryEntry): HistoryEntry {

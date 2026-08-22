@@ -1090,3 +1090,63 @@ describe('Regression: rendered webview scripts parse as JavaScript', () => {
     }
   });
 });
+
+// ─── Closed-enumeration guards must be derived, not re-enumerated ─────────────
+//
+// `isEngineId` in extension.ts was hand-written and listed five of the seven
+// EngineId members, so selecting Copilot or Anthropic silently fell through to
+// the default engine at both call sites. EngineId is now derived from
+// ENGINE_IDS so the two cannot drift, and any guard must read that array.
+//
+// The same class of defect motivated deriving isRoleId from ROLE_IDS.
+
+describe('Regression: closed-enumeration guards stay complete', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { ENGINE_IDS } = require('../../models/types');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { ROLE_IDS, isRoleId } = require('../../models/roles');
+
+  it('ENGINE_IDS carries every engine an adapter is registered for', () => {
+    // These are the seven the product ships. A new engine must be added here
+    // deliberately, which is the point — silent omission is what broke before.
+    const expected = ['codex', 'claude', 'gemini', 'ollama', 'custom', 'copilot', 'anthropic'];
+    assert.deepEqual([...ENGINE_IDS].sort(), expected.sort());
+  });
+
+  it('no source file re-enumerates engine ids in a boolean chain', () => {
+    const extSrc = fs.readFileSync(path.join(__dirname, '..', '..', 'extension.ts'), 'utf-8');
+    // The exact shape of the old bug: `value === 'claude' || value === 'codex' || ...`
+    const chain = /===\s*'(?:codex|claude|gemini|ollama|copilot|anthropic)'\s*\n?\s*\|\|/;
+    assert.equal(
+      chain.test(extSrc),
+      false,
+      'an engine-id guard is re-enumerating members by hand — read ENGINE_IDS instead, '
+      + 'or the next engine added will be silently rejected',
+    );
+  });
+
+  it('isRoleId accepts every member of ROLE_IDS and nothing else', () => {
+    for (const id of ROLE_IDS) {
+      assert.equal(isRoleId(id), true, `isRoleId rejected a real member: ${id}`);
+    }
+    for (const bogus of ['Engineer', 'senior-backend-engineer', '', 'role', undefined, null, 42]) {
+      assert.equal(isRoleId(bogus), false, `isRoleId accepted a non-member: ${String(bogus)}`);
+    }
+  });
+
+  it('the history storage cap agrees between the manifest and the code fallback', () => {
+    const pkgPath = path.join(__dirname, '..', '..', '..', 'package.json');
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf-8'));
+    const declared = pkg.contributes.configuration.properties['agentTaskPlayer.maxHistoryStorageBytes'].default;
+    const storeSrc = fs.readFileSync(path.join(__dirname, '..', '..', 'history', 'store.ts'), 'utf-8');
+    const match = storeSrc.match(/get<number>\('maxHistoryStorageBytes',\s*([\d_]+)\)/);
+    assert.ok(match, 'could not find the maxHistoryStorageBytes fallback in store.ts');
+    const fallback = Number(match![1].replace(/_/g, ''));
+    assert.equal(
+      fallback,
+      declared,
+      'headless reads .moag/config.json, which usually has no such key, so it hits this '
+      + 'fallback while VS Code gets the manifest default — they must be the same number',
+    );
+  });
+});
