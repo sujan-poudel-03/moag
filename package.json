@@ -584,6 +584,21 @@
         "title": "Commit & Push (PRD Workflow)",
         "category": "MOAG",
         "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "agentTaskPlayer.morningReview",
+        "title": "MOAG: Morning Review",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.resolveParkedItem",
+        "title": "MOAG: Resolve Parked Item",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.newThread",
+        "title": "MOAG: New Chat",
+        "category": "MOAG"
       }
     ],
     "viewsContainers": {

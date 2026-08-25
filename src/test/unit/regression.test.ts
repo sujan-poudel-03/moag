@@ -1173,3 +1173,57 @@ describe('Regression: closed-enumeration guards stay complete', () => {
     );
   });
 });
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const fsMod = require('fs');
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const pathMod = require('path');
+
+// `agentTaskPlayer.createPlan` was referenced from two buttons and registered
+// nowhere, so clicking "New Plan" silently did nothing. Nothing in the type
+// system connects a command id string to its registration, so check it here.
+describe('Regression: every command id referenced in code is registered', () => {
+  const SRC_DIR = "src";
+
+  function walk(dir: string): string[] {
+    const out: string[] = [];
+    for (const entry of fsMod.readdirSync(dir, { withFileTypes: true })) {
+      const full = pathMod.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name === "test") { continue; }
+        out.push(...walk(full));
+      } else if (entry.name.endsWith(".ts")) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  it('references no command that is neither registered nor declared', () => {
+    const files = walk(SRC_DIR);
+    const all = files.map((f) => fsMod.readFileSync(f, "utf-8")).join(String.fromCharCode(10));
+
+    const registered = new Set(
+      [...all.matchAll(/registerCommand\(\s*['\"`]([a-zA-Z.]+)/g)].map((m) => m[1]),
+    );
+    // Commands contributed by VS Code itself or other extensions are fine.
+    // Narrow to strings actually used as commands. `agentTaskPlayer.*` is also
+    // the prefix for settings keys and view ids, which are not commands at all.
+    const referenced = [
+      ...all.matchAll(/executeCommand\(\s*['\"`](agentTaskPlayer\.[a-zA-Z]+)/g),
+      ...all.matchAll(/command:\s*['\"`](agentTaskPlayer\.[a-zA-Z]+)/g),
+    ].map((m) => m[1]);
+
+    const manifest = new Set(
+      (JSON.parse(fsMod.readFileSync("package.json", "utf-8")).contributes.commands as Array<{ command: string }>)
+        .map((c) => c.command),
+    );
+
+    const dangling = [...new Set(referenced)]
+      .filter((id) => !registered.has(id) && !manifest.has(id))
+      .sort();
+
+    assert.deepEqual(dangling, [],
+      "these command ids are referenced but never registered — the button does nothing");
+  });
+});

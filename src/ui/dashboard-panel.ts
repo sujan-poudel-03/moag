@@ -566,9 +566,9 @@ export class DashboardPanel {
         vscode.commands.executeCommand('agentTaskPlayer.exportResults');
         break;
       case 'retry-failed':
-        vscode.commands.executeCommand('agentTaskPlayer.retryFailed').then(undefined, () => {
-          vscode.commands.executeCommand('agentTaskPlayer.play');
-        });
+        // agentTaskPlayer.retryFailed was never registered; this only appeared to
+        // work because the rejected promise fell through to a full replay.
+        vscode.commands.executeCommand('agentTaskPlayer.fixAllFailed');
         break;
       case 'open-settings':
         vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer');

@@ -14,6 +14,7 @@ import { registerAllEngines, checkEngineAvailability, getEngine, setCeilingGuard
 import { commandExists } from './utils/command-exists';
 import { ghSync, ghAsync } from './utils/gh';
 import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
+import { cmdResolveParkedItem, cmdShowMorningReview } from './ui/morning-review';
 import { TaskRunner, classifyFailure } from './runner/runner';
 import {
   createPrdLoop, HaltReason, PrdLoopConfig, PrdLoopController, PrdLoopReport, UatSession,
@@ -2142,6 +2143,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.analyzeContextWeights', cmdAnalyzeContextWeights),
     vscode.commands.registerCommand('agentTaskPlayer.reviewSelfIssues', cmdReviewSelfIssues),
     vscode.commands.registerCommand('agentTaskPlayer.createPR', createPRFromRun),
+    // The morning review: same digest the headless CLI prints, in the IDE.
+    // The sidebar's New Chat button posts this; it was never registered, so the
+    // button did nothing at all.
+    vscode.commands.registerCommand('agentTaskPlayer.newThread', () => {
+      currentSidebarThreadId = null;
+      schedulePromptProviderSidebarSync();
+    }),
+    vscode.commands.registerCommand('agentTaskPlayer.morningReview', cmdShowMorningReview),
+    vscode.commands.registerCommand('agentTaskPlayer.resolveParkedItem', cmdResolveParkedItem),
     vscode.commands.registerCommand('agentTaskPlayer.quickAddTask', cmdQuickAddTask),
     vscode.commands.registerCommand('agentTaskPlayer.addTaskFromSelection', cmdAddTaskFromSelection),
     vscode.commands.registerCommand('agentTaskPlayer.newPlanFromTemplate', cmdNewPlanFromTemplate),
