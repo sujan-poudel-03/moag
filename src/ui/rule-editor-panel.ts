@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { AiRule, RuleCategory, RuleScope } from '../ai-rules/rules-store';
 import { generateId } from '../models/plan';
 import { designSystemCssTokens } from './design-system';
+import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 export interface RuleEditorOptions {
   rule: AiRule | null;
@@ -89,11 +90,16 @@ export class RuleEditorPanel {
     const curText = rule?.text ?? '';
     const curName = rule?.name ?? '';
 
+    // The script is a compiled file, not an inline block; the CSP admits only it.
+    const scriptUri = webviewScriptUri(this._panel.webview, 'rule-editor');
+    const nonce = webviewNonce();
+    const csp = webviewCsp(this._panel.webview, nonce);
     this._panel.webview.html = /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  ${csp}
   <style>
     ${designSystemCssTokens()}
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -237,50 +243,7 @@ export class RuleEditorPanel {
     <button class="btn btn-primary" id="saveBtn">Save Rule</button>
   </div>
 
-  <script>
-    const vscode = acquireVsCodeApi();
-    const nameEl = document.getElementById('name');
-    const categoryEl = document.getElementById('category');
-    const textEl = document.getElementById('text');
-    const charCountEl = document.getElementById('charCount');
-    const previewEl = document.getElementById('preview');
-    const saveEl = document.getElementById('saveBtn');
-    const cancelEl = document.getElementById('cancelBtn');
-
-    function esc(s) {
-      return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-    }
-
-    function updatePreview() {
-      const n = nameEl.value.trim() || '(name)';
-      const t = textEl.value.trim() || '(rule text)';
-      previewEl.textContent = '### ' + n + '\\n' + t;
-      charCountEl.textContent = textEl.value.length + ' characters';
-    }
-
-    function validate() {
-      const ok = !!nameEl.value.trim() && !!textEl.value.trim();
-      saveEl.disabled = !ok;
-    }
-
-    nameEl.addEventListener('input', () => { updatePreview(); validate(); });
-    textEl.addEventListener('input', () => { updatePreview(); validate(); });
-    validate();
-
-    cancelEl.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
-    saveEl.addEventListener('click', () => {
-      const scope = document.querySelector('input[name="scope"]:checked')?.value || 'global';
-      vscode.postMessage({
-        type: 'save',
-        payload: {
-          name: nameEl.value.trim(),
-          category: categoryEl.value,
-          scope,
-          text: textEl.value.trim(),
-        },
-      });
-    });
-  </script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
   }

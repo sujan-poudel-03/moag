@@ -12,6 +12,7 @@ import { getModelSpec } from '../models/model-specs';
 import { getEngine } from '../adapters/index';
 import { generateId } from '../models/plan';
 import { designSystemCssTokens } from './design-system';
+import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 /** Tracks open panels by threadId so clicking the same thread reuses its panel. */
 const openPanels = new Map<string, ExecutionDetailPanel>();
@@ -248,7 +249,7 @@ export class ExecutionDetailPanel {
     this._panel.title = taskName;
 
     // Build a minimal thread view with streaming
-    this._panel.webview.html = buildThreadHtml([]);
+    this._panel.webview.html = buildThreadHtml(this._panel.webview, []);
     this._postMessage({ type: 'user-message', text });
     this._postMessage({ type: 'stream-start', engine: engineId });
 
@@ -386,19 +387,19 @@ export class ExecutionDetailPanel {
 
   private _renderThread(threadId: string): void {
     const entries = this._historyStore.getThread(threadId);
-    this._panel.webview.html = buildThreadHtml(entries);
+    this._panel.webview.html = buildThreadHtml(this._panel.webview, entries);
   }
 
   private _renderEmpty(): void {
     const heads = this._historyStore.getThreadHeads().slice(0, 20);
     const sessions = this._runSessionStore?.getAll().slice(0, 20) ?? [];
-    this._panel.webview.html = buildSessionListHtml(heads, sessions);
+    this._panel.webview.html = buildSessionListHtml(this._panel.webview, heads, sessions);
   }
 
   private _renderRun(runId: string): void {
     const session = this._runSessionStore?.get(runId);
     const entries = this._historyStore.getForRun(runId);
-    this._panel.webview.html = buildRunDetailHtml(session ?? null, entries);
+    this._panel.webview.html = buildRunDetailHtml(this._panel.webview, session ?? null, entries);
   }
 }
 
@@ -523,7 +524,11 @@ function colorDiff(diff: string): string {
 
 // ─── Mode 1: Session List HTML ───
 
-function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[]): string {
+function buildSessionListHtml(webview: vscode.Webview, threadHeads: HistoryEntry[], sessions: RunSession[]): string {
+  // The script is a compiled file; the CSP admits only the nonce it carries.
+  const sessionListUri = webviewScriptUri(webview, 'session-list');
+  const nonce = webviewNonce();
+  const csp = webviewCsp(webview, nonce);
   // Active session (if any)
   const activeSession = sessions.find(s => s.status === 'running');
   const pastSessions = sessions.filter(s => s.status !== 'running');
@@ -638,6 +643,7 @@ function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  ${csp}
   <title>Sessions</title>
   <style>${sharedStyles()}</style>
 </head>
@@ -673,14 +679,18 @@ function buildSessionListHtml(threadHeads: HistoryEntry[], sessions: RunSession[
     <button id="btnNewConversation" class="footer-send-btn" title="Start conversation">&#9654;</button>
   </div>
 
-  <script>${sessionListScript()}</script>
+  <script nonce="${nonce}" src="${sessionListUri}"></script>
 </body>
 </html>`;
 }
 
 // ─── Mode 2: Thread Detail HTML ───
 
-function buildThreadHtml(entries: HistoryEntry[]): string {
+function buildThreadHtml(webview: vscode.Webview, entries: HistoryEntry[]): string {
+  // The script is a compiled file; the CSP admits only the nonce it carries.
+  const threadViewUri = webviewScriptUri(webview, 'thread-view');
+  const nonce = webviewNonce();
+  const csp = webviewCsp(webview, nonce);
   const title = entries.length > 0 ? escHtml(entries[0].taskName) : 'Conversation';
   const engine = entries.length > 0 ? entries[0].engine : '';
   const turnCount = entries.length;
@@ -723,6 +733,7 @@ function buildThreadHtml(entries: HistoryEntry[]): string {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  ${csp}
   <title>${title}</title>
   <style>${sharedStyles()}</style>
 </head>
@@ -757,7 +768,7 @@ function buildThreadHtml(entries: HistoryEntry[]): string {
     <button id="btnSend" title="Send reply">Send</button>
   </div>
 
-  <script>${threadScript()}</script>
+  <script nonce="${nonce}" src="${threadViewUri}"></script>
 </body>
 </html>`;
 }
@@ -875,7 +886,11 @@ function buildTurnCard(entry: HistoryEntry): string {
 
 // ─── Run Detail HTML (session view with all tasks) ───
 
-function buildRunDetailHtml(session: RunSession | null, entries: HistoryEntry[]): string {
+function buildRunDetailHtml(webview: vscode.Webview, session: RunSession | null, entries: HistoryEntry[]): string {
+  // The script is a compiled file; the CSP admits only the nonce it carries.
+  const runDetailUri = webviewScriptUri(webview, 'run-detail');
+  const nonce = webviewNonce();
+  const csp = webviewCsp(webview, nonce);
   if (!session) {
     return buildErrorHtml('Run session not found');
   }
@@ -952,6 +967,7 @@ function buildRunDetailHtml(session: RunSession | null, entries: HistoryEntry[])
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  ${csp}
   <title>${escHtml(session.planName)}</title>
   <style>${sharedStyles()}</style>
 </head>
@@ -995,7 +1011,7 @@ function buildRunDetailHtml(session: RunSession | null, entries: HistoryEntry[])
     ${tasksHtml || '<p class="empty-hint-text">No task entries recorded for this run.</p>'}
   </div>
 
-  <script>${runDetailScript()}</script>
+  <script nonce="${nonce}" src="${runDetailUri}"></script>
 </body>
 </html>`;
 }
@@ -1655,267 +1671,5 @@ function sharedStyles(): string {
 
 // ─── Webview scripts ───
 
-function sessionListScript(): string {
-  return /* js */ `
-    (function() {
-      const vscode = acquireVsCodeApi();
 
-      // Session card clicks
-      document.querySelectorAll('.session-card').forEach(card => {
-        card.addEventListener('click', (e) => {
-          if (e.target.closest('.card-delete')) return;
-          const runId = card.getAttribute('data-run-id');
-          if (runId) {
-            vscode.postMessage({ type: 'open-run', runId });
-          }
-        });
-      });
 
-      // Thread card clicks
-      document.querySelectorAll('.thread-card').forEach(card => {
-        card.addEventListener('click', (e) => {
-          if (e.target.closest('.card-delete')) return;
-          const threadId = card.getAttribute('data-thread-id');
-          if (threadId) {
-            vscode.postMessage({ type: 'open-thread', threadId });
-          }
-        });
-      });
-
-      // Active run view-details button
-      document.querySelectorAll('.active-run-open').forEach(btn => {
-        btn.addEventListener('click', () => {
-          const runId = btn.getAttribute('data-run-id');
-          if (runId) {
-            vscode.postMessage({ type: 'open-run', runId });
-          }
-        });
-      });
-
-      // Delete buttons (sessions)
-      document.querySelectorAll('.card-delete[data-run-id]').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const runId = btn.getAttribute('data-run-id');
-          if (runId) {
-            vscode.postMessage({ type: 'delete-run', runId });
-          }
-        });
-      });
-
-      // Delete buttons (threads)
-      document.querySelectorAll('.card-delete[data-thread-id]').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          const threadId = btn.getAttribute('data-thread-id');
-          if (threadId) {
-            vscode.postMessage({ type: 'delete-thread', threadId });
-          }
-        });
-      });
-
-      // Search filtering
-      const searchInput = document.getElementById('searchInput');
-      const searchEmptyState = document.getElementById('searchEmptyState');
-      if (searchInput) {
-        const applySearchFilter = () => {
-          const query = searchInput.value.toLowerCase().trim();
-          let visibleCount = 0;
-
-          document.querySelectorAll('.active-run-card, .session-card, .thread-card').forEach(card => {
-            const text = (card.getAttribute('data-search-text') || card.textContent || '').toLowerCase();
-            const hidden = query.length > 0 && !text.includes(query);
-            card.classList.toggle('search-hidden', hidden);
-            if (!hidden) {
-              visibleCount++;
-            }
-          });
-
-          document.querySelectorAll('.section-header').forEach(header => {
-            const list = header.nextElementSibling;
-            if (!list) return;
-            const hasVisibleCards = !!list.querySelector('.session-card:not(.search-hidden), .thread-card:not(.search-hidden)');
-            header.classList.toggle('search-hidden', query.length > 0 && !hasVisibleCards);
-            if (list.classList.contains('session-list') || list.classList.contains('thread-list')) {
-              list.classList.toggle('search-hidden', query.length > 0 && !hasVisibleCards);
-            }
-          });
-          if (searchEmptyState) {
-            searchEmptyState.classList.toggle('search-hidden', query.length === 0 || visibleCount > 0);
-          }
-        };
-
-        searchInput.addEventListener('input', applySearchFilter);
-        applySearchFilter();
-      }
-
-      // New conversation from footer
-      const newPromptInput = document.getElementById('newPromptInput');
-      const btnNewConversation = document.getElementById('btnNewConversation');
-      const enginePicker = document.getElementById('enginePicker');
-
-      if (btnNewConversation && newPromptInput) {
-        function startConversation() {
-          const text = newPromptInput.value.trim();
-          if (!text) return;
-          const engine = enginePicker ? enginePicker.value : 'claude';
-          vscode.postMessage({ type: 'new-conversation', text, engine });
-          newPromptInput.value = '';
-        }
-        btnNewConversation.addEventListener('click', startConversation);
-        newPromptInput.addEventListener('keydown', (e) => {
-          if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            startConversation();
-          }
-        });
-      }
-    })();
-  `;
-}
-
-function threadScript(): string {
-  return /* js */ `
-    (function() {
-      const vscode = acquireVsCodeApi();
-      const chatArea = document.getElementById('chatArea');
-      const replyInput = document.getElementById('replyInput');
-      const btnSend = document.getElementById('btnSend');
-      const btnBack = document.getElementById('btnBack');
-      const streamingRow = document.getElementById('streamingRow');
-      const streamingBubble = document.getElementById('streamingBubble');
-      const streamingLabel = document.getElementById('streamingLabel');
-      let isStreaming = false;
-      let streamedText = '';
-
-      function scrollToBottom() {
-        const threshold = 50;
-        const nearBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < threshold;
-        if (nearBottom || !isStreaming) {
-          chatArea.scrollTop = chatArea.scrollHeight;
-        }
-      }
-      scrollToBottom();
-
-      function escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-      }
-
-      const btnDelete = document.getElementById('btnDelete');
-
-      btnBack.addEventListener('click', () => {
-        vscode.postMessage({ type: 'navigate-back' });
-      });
-
-      if (btnDelete) {
-        btnDelete.addEventListener('click', () => {
-          const threadId = btnDelete.getAttribute('data-thread-id');
-          if (threadId) {
-            vscode.postMessage({ type: 'delete-thread', threadId });
-          }
-        });
-      }
-
-      function sendReply() {
-        const text = replyInput.value.trim();
-        if (!text || isStreaming) return;
-        replyInput.value = '';
-        vscode.postMessage({ type: 'send-reply', text });
-      }
-
-      btnSend.addEventListener('click', sendReply);
-      replyInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          sendReply();
-        }
-      });
-
-      window.addEventListener('message', (event) => {
-        const msg = event.data;
-        switch (msg.type) {
-          case 'user-message': {
-            const row = document.createElement('div');
-            row.className = 'bubble-row user';
-            row.innerHTML = '<div><div class="bubble-label">You</div><div class="bubble">' + escapeHtml(msg.text) + '</div></div>';
-            chatArea.insertBefore(row, streamingRow);
-            scrollToBottom();
-            break;
-          }
-          case 'stream-start': {
-            isStreaming = true;
-            streamedText = '';
-            btnSend.disabled = true;
-            replyInput.disabled = true;
-            streamingLabel.textContent = msg.engine || '...';
-            streamingBubble.innerHTML = '<span class="typing-indicator">Thinking...</span>';
-            streamingRow.style.display = '';
-            scrollToBottom();
-            break;
-          }
-          case 'stream-chunk': {
-            if (streamedText === '') {
-              streamingBubble.textContent = '';
-            }
-            streamedText += msg.text;
-            streamingBubble.textContent = streamedText;
-            scrollToBottom();
-            break;
-          }
-          case 'stream-end': {
-            isStreaming = false;
-            btnSend.disabled = false;
-            replyInput.disabled = false;
-            streamingRow.style.display = 'none';
-
-            const row = document.createElement('div');
-            row.className = 'bubble-row assistant';
-            const stdout = (msg.entry && msg.entry.result && msg.entry.result.stdout) || streamedText || '(no output)';
-            row.innerHTML = '<div><div class="bubble-label">' + escapeHtml(streamingLabel.textContent) + '</div><div class="bubble">' + escapeHtml(stdout) + '</div></div>';
-            chatArea.insertBefore(row, streamingRow);
-            scrollToBottom();
-            replyInput.focus();
-            break;
-          }
-          case 'stream-error': {
-            isStreaming = false;
-            btnSend.disabled = false;
-            replyInput.disabled = false;
-            streamingRow.style.display = 'none';
-
-            const row = document.createElement('div');
-            row.className = 'bubble-row assistant';
-            row.innerHTML = '<div><div class="bubble-label">Error</div><div class="bubble stderr">' + escapeHtml(msg.error || 'Unknown error') + '</div></div>';
-            chatArea.insertBefore(row, streamingRow);
-            scrollToBottom();
-            break;
-          }
-        }
-      });
-    })();
-  `;
-}
-
-function runDetailScript(): string {
-  return /* js */ `
-    (function() {
-      const vscode = acquireVsCodeApi();
-
-      document.getElementById('btnBack').addEventListener('click', () => {
-        vscode.postMessage({ type: 'navigate-back' });
-      });
-
-      const btnDeleteRun = document.getElementById('btnDeleteRun');
-      if (btnDeleteRun) {
-        btnDeleteRun.addEventListener('click', () => {
-          const runId = btnDeleteRun.getAttribute('data-run-id');
-          if (runId) {
-            vscode.postMessage({ type: 'delete-run', runId });
-          }
-        });
-      }
-    })();
-  `;
-}

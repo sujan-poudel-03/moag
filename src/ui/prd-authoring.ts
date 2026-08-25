@@ -21,6 +21,7 @@ import * as UserMsg from '../utils/user-messages';
 import { MAX_PRD_VERSIONS } from '../models/plan';
 import { PromptInputViewProvider } from './prompt-input-view';
 import { ensureMoagDir } from '../workspace/moag-paths';
+import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 /** Everything this module needs from extension.ts, passed in explicitly. */
 export interface PrdAuthoringDeps {
@@ -202,7 +203,7 @@ export async function openPrdPanel(prefill = '', versions?: { version: string; t
     vscode.ViewColumn.One,
     { enableScripts: true, retainContextWhenHidden: false },
   );
-  panel.webview.html = buildPrdPanelHtml(prefill, resolvedVersions);
+  panel.webview.html = buildPrdPanelHtml(panel.webview, prefill, resolvedVersions);
   panel.webview.onDidReceiveMessage(async (message) => {
     if (message.type === 'openPrdFile') {
       const uris = await vscode.window.showOpenDialog({
@@ -506,14 +507,20 @@ export async function cmdPlanFromPRD(): Promise<void> {
 }
 
 // kept for direct invocation from old entry points
-export function buildPrdPanelHtml(prefill = '', versions: { version: string; text: string; createdAt: string }[] = []): string {
-  const escapedPrefill = prefill.replace(/`/g, '\\`').replace(/\$/g, '\\$');
-  const versionsJson = JSON.stringify(versions).replace(/</g, '\\u003c').replace(/>/g, '\\u003e');
+export function buildPrdPanelHtml(webview: vscode.Webview, prefill = '', versions: { version: string; text: string; createdAt: string }[] = []): string {
+  // Handed to the page as data. JSON.stringify escapes the content; the lone <
+  // is neutralised so a value can never close the block carrying it.
+  const prdBootstrap = JSON.stringify({ versions, prefill })
+    .replace(/</g, '\u003c');
+  const scriptUri = webviewScriptUri(webview, 'prd-panel');
+  const nonce = webviewNonce();
+  const csp = webviewCsp(webview, nonce);
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+${csp}
 <title>Generate Plan from PRD</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -620,116 +627,8 @@ AC3: Successful login redirects to dashboard"></textarea>
   </div>
   <button class="generate-btn" id="generateBtn" disabled>Generate Plan &rarr;</button>
 </div>
-<script>
-  var vscode = acquireVsCodeApi();
-  var ta = document.getElementById('prd');
-  var charCount = document.getElementById('charCount');
-  var generateBtn = document.getElementById('generateBtn');
-  var aiBtn = document.getElementById('aiBtn');
-  var versionBar = document.getElementById('versionBar');
-  var versionSelect = document.getElementById('versionSelect');
-  var versionSaveBtn = document.getElementById('versionSaveBtn');
-  var versions = ${versionsJson};
-  var sourceIssue = null;
-
-  function updateCount() {
-    var len = ta.value.length;
-    charCount.textContent = len + ' chars';
-    generateBtn.disabled = len < 20;
-  }
-  function updateAiBtn() {
-    aiBtn.textContent = ta.value.trim().length > 20 ? '\\u2728 Improve with AI' : '\\u2728 Draft with AI';
-  }
-  function renderVersionBar() {
-    if (versions.length > 0) {
-      versionBar.classList.add('visible');
-      versionSelect.innerHTML = versions.map(function(v) {
-        var d = new Date(v.createdAt).toLocaleDateString();
-        return '<option value="' + v.version + '">' + v.version + ' (' + d + ')</option>';
-      }).join('');
-      versionSaveBtn.textContent = 'Save as v' + (versions.length + 1) + '.0';
-    } else {
-      versionBar.classList.remove('visible');
-    }
-  }
-  renderVersionBar();
-
-  ta.value = \`${escapedPrefill}\`;
-  updateCount();
-  updateAiBtn();
-
-  ta.addEventListener('input', function() { updateCount(); updateAiBtn(); });
-
-  versionSelect.addEventListener('change', function() {
-    var ver = versions.find(function(v) { return v.version === versionSelect.value; });
-    if (ver) { ta.value = ver.text; updateCount(); updateAiBtn(); }
-  });
-
-  versionSaveBtn.addEventListener('click', function() {
-    var text = ta.value.trim();
-    if (!text) { return; }
-    var nextVersion = 'v' + (versions.length + 1) + '.0';
-    vscode.postMessage({ type: 'savePrdVersion', text: text, version: nextVersion });
-  });
-
-  aiBtn.addEventListener('click', function() {
-    var text = ta.value.trim();
-    if (text.length > 20) {
-      aiBtn.disabled = true;
-      aiBtn.textContent = 'Improving\\u2026';
-      vscode.postMessage({ type: 'prdAiImprove', text: text });
-    } else {
-      vscode.postMessage({ type: 'prdAiDraft' });
-    }
-  });
-
-  document.getElementById('browseBtn').addEventListener('click', function() {
-    vscode.postMessage({ type: 'openPrdFile' });
-  });
-
-  document.getElementById('issueBtn').addEventListener('click', function() {
-    vscode.postMessage({ type: 'loadFromGitHubIssue' });
-  });
-
-  document.getElementById('saveBtn').addEventListener('click', function() {
-    var text = ta.value.trim();
-    if (!text) { return; }
-    vscode.postMessage({ type: 'savePrdFile', text: text });
-  });
-
-  document.getElementById('browserBtn').addEventListener('click', function() {
-    var text = ta.value.trim();
-    if (!text) { return; }
-    vscode.postMessage({ type: 'openPrdInBrowser', text: text });
-  });
-
-  generateBtn.addEventListener('click', function() {
-    var text = ta.value.trim();
-    if (!text) { return; }
-    generateBtn.disabled = true;
-    generateBtn.textContent = 'Generating\\u2026';
-    vscode.postMessage({ type: 'generatePlanFromPrd', prdText: text, sourceIssue: sourceIssue });
-  });
-
-  window.addEventListener('message', function(e) {
-    if (e.data.type === 'prdFileContent') {
-      ta.value = e.data.text || ''; updateCount(); updateAiBtn(); ta.focus();
-      sourceIssue = null;
-    } else if (e.data.type === 'prdFromIssueLoaded') {
-      ta.value = e.data.text || ''; updateCount(); updateAiBtn(); ta.focus();
-      sourceIssue = e.data.sourceIssue || null;
-    } else if (e.data.type === 'prdAiImproveResult') {
-      ta.value = e.data.text || ta.value; updateCount(); updateAiBtn();
-      aiBtn.disabled = false; updateAiBtn();
-    } else if (e.data.type === 'prdVersionSaved') {
-      versions = e.data.versions || versions;
-      renderVersionBar();
-      if (e.data.version) { versionSelect.value = e.data.version; }
-    }
-  });
-
-  ta.focus();
-</script>
+  <script id="moag-prd-bootstrap" type="application/json">${prdBootstrap}</script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;}
 

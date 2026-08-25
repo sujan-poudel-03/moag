@@ -4,6 +4,7 @@
 import * as vscode from 'vscode';
 import { Task, TaskType, EngineId, FailurePolicy, TaskStatus } from '../models/types';
 import { designSystemCssTokens } from './design-system';
+import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 /** Options passed to TaskEditorPanel.open() */
 export interface TaskEditorOptions {
@@ -147,6 +148,10 @@ export class TaskEditorPanel {
   }
 
   private _getHtml(): string {
+    // The script is a compiled file, not an inline block; the CSP admits only it.
+    const scriptUri = webviewScriptUri(this._panel.webview, 'task-editor');
+    const nonce = webviewNonce();
+    const csp = webviewCsp(this._panel.webview, nonce);
     const t = this._task;
     const taskType = t.type || 'agent';
     const engine = t.engine || 'default';
@@ -166,6 +171,7 @@ export class TaskEditorPanel {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  ${csp}
 <style>
   ${designSystemCssTokens()}
   :root {
@@ -501,101 +507,7 @@ export class TaskEditorPanel {
     </div>
   </div>
 
-  <script>
-    const vscode = acquireVsCodeApi();
-
-    function toggleSection(header) {
-      header.classList.toggle('collapsed');
-      const body = header.nextElementSibling;
-      body.classList.toggle('hidden');
-    }
-
-    function onTypeChange() {
-      const type = document.getElementById('type').value;
-      // manual tasks have no command field — hide it to avoid confusion
-      document.getElementById('sectionCommand').style.display = (type !== 'agent' && type !== 'manual') ? 'block' : 'none';
-      document.getElementById('sectionService').style.display = type === 'service' ? 'block' : 'none';
-
-      // Update prompt hint
-      const hint = document.getElementById('promptHint');
-      if (type === 'agent') { hint.textContent = '(required for agent tasks)'; }
-      else if (type === 'manual') { hint.textContent = '(instructions shown to the user in the "Mark Complete" notification)'; }
-      else { hint.textContent = '(optional description)'; }
-    }
-
-    function validate() {
-      let valid = true;
-      const name = document.getElementById('name').value.trim();
-      const type = document.getElementById('type').value;
-      const prompt = document.getElementById('prompt').value.trim();
-      const command = document.getElementById('command').value.trim();
-
-      // Name required
-      const nameErr = document.getElementById('nameError');
-      if (!name) { nameErr.classList.add('visible'); valid = false; }
-      else { nameErr.classList.remove('visible'); }
-
-      // Prompt required for agent
-      const promptErr = document.getElementById('promptError');
-      if (type === 'agent' && !prompt) { promptErr.classList.add('visible'); valid = false; }
-      else { promptErr.classList.remove('visible'); }
-
-      // Command required for command/service/check — not for agent or manual
-      const cmdErr = document.getElementById('commandError');
-      if (type !== 'agent' && type !== 'manual' && !command) { cmdErr.classList.add('visible'); valid = false; }
-      else { cmdErr.classList.remove('visible'); }
-
-      return valid;
-    }
-
-    function collectFormData() {
-      return {
-        name: document.getElementById('name').value,
-        type: document.getElementById('type').value,
-        engine: document.getElementById('engine').value,
-        prompt: document.getElementById('prompt').value,
-        command: document.getElementById('command').value,
-        cwd: document.getElementById('cwd').value,
-        verifyCommand: document.getElementById('verifyCommand').value,
-        acceptanceCriteria: document.getElementById('acceptanceCriteria').value,
-        expectedArtifacts: document.getElementById('expectedArtifacts').value,
-        ownerNote: document.getElementById('ownerNote').value,
-        failurePolicy: document.getElementById('failurePolicy').value,
-        env: document.getElementById('env').value,
-        port: document.getElementById('port').value,
-        readyPattern: document.getElementById('readyPattern').value,
-        healthCheckUrl: document.getElementById('healthCheckUrl').value,
-        startupTimeoutMs: document.getElementById('startupTimeoutMs').value,
-        retryCount: document.getElementById('retryCount').value,
-        dependsOn: document.getElementById('dependsOn').value,
-        skipIfTaskId: document.getElementById('skipIfTaskId').value,
-        skipIfStatus: document.getElementById('skipIfStatus').value,
-        consensusEngines: document.getElementById('consensusEngines').value,
-        consensusStrategy: document.getElementById('consensusStrategy').value,
-      };
-    }
-
-    document.getElementById('btnSave').addEventListener('click', () => {
-      if (!validate()) return;
-      vscode.postMessage({ type: 'save', payload: collectFormData() });
-    });
-
-    document.getElementById('btnCancel').addEventListener('click', () => {
-      vscode.postMessage({ type: 'cancel' });
-    });
-
-    // Ctrl+Enter to save
-    document.addEventListener('keydown', (e) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-        if (validate()) {
-          vscode.postMessage({ type: 'save', payload: collectFormData() });
-        }
-      }
-      if (e.key === 'Escape') {
-        vscode.postMessage({ type: 'cancel' });
-      }
-    });
-  </script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
   }
