@@ -68,6 +68,8 @@ export interface Args {
   prBase?: string;
   /** Bare words after the command, e.g. `queue resolve <id>`. */
   positionals: string[];
+  /** Lower bound for `digest`, any value git --since understands. */
+  since?: string;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -109,6 +111,7 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--uat') { a.uatMode = 'required'; }
     else if (arg === '--no-uat') { a.uatMode = 'off'; }
     else if (arg === '--uat-spec') { const s = rest[++i]; if (s) { a.uatSpec = s; } }
+    else if (arg === '--since') { const v = rest[++i]; if (v) { a.since = v; } }
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
     else if (!arg.startsWith('--')) {
@@ -626,6 +629,49 @@ async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
   });
 }
 
+// ─── command: digest ─────────────────────────────────────────────────────────
+
+/**
+ * The morning review: what needs a decision, then what shipped, then cost.
+ *
+ * Exits 1 while anything is waiting on a person, so `moag digest || notify-me`
+ * is a complete morning workflow.
+ */
+async function cmdDigest(args: Args): Promise<number> {
+  const { buildDigest, collectCommits, renderDigest } = require('../runner/digest');
+  const { openItems } = require('../runner/park-queue');
+  const { spawn } = require('child_process');
+  const nodeFs = require('fs');
+
+  const git = (gitArgs: string[], cwd: string): Promise<string | null> => new Promise((resolve) => {
+    const proc = spawn('git', gitArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    proc.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+    proc.on('error', () => resolve(null));
+    proc.on('close', (code: number) => resolve(code === 0 ? out : null));
+  });
+
+  // The shim reads .moag/config.json, so digest sees the same branch prefix the
+  // runner used to create those branches.
+  installVscodeShim(args.cwd);
+  const prefix = require('vscode').workspace
+    .getConfiguration('agentTaskPlayer')
+    .get('git.branchPrefix', 'moag/') || 'moag/';
+  const commits = await collectCommits(args.cwd, prefix, args.since, git);
+  const digest = buildDigest(openItems(args.cwd, nodeFs), commits, args.since);
+
+  // Human-readable on stdout; the JSONL summary keeps it scriptable.
+  process.stdout.write(renderDigest(digest) + '\n');
+  emit({
+    event: 'digest',
+    needsDecision: digest.needsDecision.length,
+    shipped: digest.shipped.length,
+    branches: digest.branches.length,
+    totalCostUsd: Number(digest.totalCostUsd.toFixed(4)),
+  });
+  return digest.needsDecision.length > 0 ? 1 : 0;
+}
+
 // ─── command: queue ──────────────────────────────────────────────────────────
 
 /**
@@ -694,6 +740,9 @@ async function main(): Promise<number> {
   if (args.command === 'loop') {
     return cmdLoop(args, await setup(args));
   }
+  if (args.command === 'digest') {
+    return cmdDigest(args);
+  }
   if (args.command === 'queue') {
     return cmdQueue(args);
   }
@@ -701,12 +750,13 @@ async function main(): Promise<number> {
     return cmdDaemon(args, await setup(args));
   }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|queue> ...\n' +
+    'Usage: moag <run|verify|loop|daemon|queue|digest> ...\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
     '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
     '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
     '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
-    '  moag queue <list | resolve <id>>\n',
+    '  moag queue <list | resolve <id>>\n' +
+    '  moag digest [--since <when>]\n',
   );
   return 2;
 }
