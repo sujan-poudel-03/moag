@@ -54,7 +54,7 @@ Plan JSON  →  Runner (state machine)  →  Adapter (per engine)  →  CLI subp
 
 **Prompt input view** (`src/ui/prompt-input-view.ts`): Sidebar webview (PROMPT/PLAN/HISTORY tabs). Renders playlist and task rows, plan progress, queue, and inline task editing. All rendering is done in the webview JS (`renderPlanGroups`, `renderTasks`).
 
-**Extension entry** (`src/extension.ts`, ~1800 lines): Registers all commands, wires runner events to tree views and dashboard, manages sandbox/screenshot lifecycle.
+**Extension entry** (`src/extension.ts`, ~9,200 lines): Registers all commands, wires runner events to tree views and dashboard, manages sandbox/screenshot lifecycle. It is the largest file in the repo by a wide margin and the hardest place to find anything — prefer adding new logic to a focused module and wiring it here, rather than growing this file further.
 
 ### Testing conventions
 

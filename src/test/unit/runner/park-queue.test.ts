@@ -164,3 +164,22 @@ describe('park-queue — what the operator is asked', () => {
     }
   });
 });
+
+describe('park-queue — no reason is decorative', () => {
+  const SRC = [
+    'src/runner/runner.ts',
+    'src/runner/prd-loop.ts',
+  ].map((f) => require('fs').readFileSync(f, 'utf-8')).join(String.fromCharCode(10));
+
+  it('emits every reason it declares', () => {
+    // A reason nobody can produce is dead weight in a closed set: it looks
+    // handled at every switch while never reaching a user.
+    const ALL: ParkReason[] = [
+      'manual-gate', 'budget-exceeded', 'repeated-failure',
+      'missing-capability', 'gate-failure',
+    ];
+    const unreachable = ALL.filter((r) => !SRC.includes(`'${r}'`));
+    assert.deepStrictEqual(unreachable, [],
+      `these park reasons are declared but never emitted: ${unreachable.join(', ')}`);
+  });
+});

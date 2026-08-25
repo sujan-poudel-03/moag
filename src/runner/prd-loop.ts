@@ -12,6 +12,7 @@
 import { EngineResult, Plan, Playlist, Task, TaskStatus } from '../models/types';
 import * as nodeFs from 'fs';
 import { commandFactId, recordFact } from './knowledge';
+import { decisionFor, park, ParkReason } from './park-queue';
 import {
   captureBaseRef,
   checkArtifacts,
@@ -158,6 +159,8 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
   let gateCommandsEmpty = false;
   let uatRan = false;
   let uatSkipReason: string | null = null;
+  /** Set when the gate could not run at all, which is a different fix from a gate that ran and failed. */
+  let capabilityMissing = false;
   let lastFingerprint: string | null = null;
 
   const makeReport = (over: Partial<PrdLoopReport> = {}): PrdLoopReport => ({
@@ -337,6 +340,7 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
             uatRan = false;
             uatSkipReason = reason;
             if (cfg.uat.mode === 'required') {
+              capabilityMissing = true;
               failedGate = 'command';
               failureDetail = `Browser UAT is required but could not run.\n${reason}`;
               gates.push({
@@ -537,6 +541,13 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
     }
   };
 
+  /** Park a terminal gate failure exactly once, on the single terminal path. */
+  const parkIfGateFailed = (r: PrdLoopReport): void => {
+    if (r.passed || !r.failedGate) { return; }
+    const reason: ParkReason = capabilityMissing ? 'missing-capability' : 'gate-failure';
+    parkGateFailure(cfg.cwd, r.failedGate, r.suggestion ?? '', reason);
+  };
+
   const run = async (): Promise<PrdLoopReport> => {
     let report: PrdLoopReport | null = null;
     try {
@@ -544,10 +555,12 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
       return report;
     } finally {
       // Exactly one report on every terminal path, including a thrown error.
-      await deps.emitReport(report ?? makeReport({
+      const final = report ?? makeReport({
         haltReason: 'engine-error',
         suggestion: 'The verification loop ended unexpectedly.',
-      }));
+      });
+      parkIfGateFailed(final);
+      await deps.emitReport(final);
     }
   };
 
@@ -650,6 +663,34 @@ function parseFixTasks(result: EngineResult): Array<{ name: string; prompt: stri
     }
   }
   return out;
+}
+
+/**
+ * Record a verification that ended on a failed gate, so the operator finds it
+ * in the morning instead of only in a log line.
+ *
+ * A gate that could not RUN is a different problem from a gate that ran and
+ * failed — one needs a tool installed, the other needs code changed — so the
+ * two get different reasons and different decisions.
+ */
+function parkGateFailure(
+  cwd: string,
+  gate: string,
+  detail: string,
+  reason: ParkReason,
+): void {
+  const evidence = { gate, lastError: detail };
+  park(cwd, {
+    id: 'prd-' + Date.now().toString(36),
+    parkedAt: new Date().toISOString(),
+    reason,
+    planName: '',
+    playlistName: '',
+    taskId: '',
+    taskName: 'PRD verification',
+    decision: decisionFor(reason, evidence),
+    evidence,
+  }, nodeFs);
 }
 
 /**
