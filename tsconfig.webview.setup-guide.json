@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.webview.base.json",
+  "include": [
+    "src/webview/setup-guide.ts"
+  ]
+}

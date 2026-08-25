@@ -21,6 +21,7 @@ import { invalidateWeightsCache } from '../context/context-builder';
 import { ghSync } from '../utils/gh';
 import { getMoagDir } from '../workspace/moag-paths';
 import { RunSession } from '../models/run-session';
+import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 /** What a run cost in friction: retries, escalations, auto-fixes. */
 export interface RunFrictionReport {
@@ -473,18 +474,23 @@ export async function cmdReviewSelfIssues(): Promise<void> {
 
 // ─── Embedded report panel (replaces showInputBox for bug/feedback flows) ───
 
-export function buildReportPanelHtml(opts: {
+export function buildReportPanelHtml(webview: vscode.Webview, opts: {
   mode: 'bug' | 'feedback';
   title: string;
   subtitle: string;
   placeholder: string;
   contextHtml: string;
 }): string {
+  // The script is a compiled file; the CSP admits only the nonce it carries.
+  const scriptUri = webviewScriptUri(webview, 'report-panel');
+  const nonce = webviewNonce();
+  const csp = webviewCsp(webview, nonce);
   const { mode, title, subtitle, placeholder, contextHtml } = opts;
   const btnLabel = mode === 'bug' ? 'File Issue &rarr;' : 'Share Feedback &rarr;';
   const icon = mode === 'bug' ? '🐛' : '📊';
   return `<!DOCTYPE html><html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">${csp}
+  ${csp}
 <title>${title}</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
@@ -517,17 +523,7 @@ export function buildReportPanelHtml(opts: {
 <div class="footer">
   <button class="file-btn" id="fileBtn">${btnLabel}</button>
 </div>
-<script>
-  var vscode = acquireVsCodeApi();
-  var desc = document.getElementById('desc');
-  var fileBtn = document.getElementById('fileBtn');
-  fileBtn.addEventListener('click', function() {
-    fileBtn.disabled = true;
-    fileBtn.textContent = 'Filing\\u2026';
-    vscode.postMessage({ type: 'submitReport', description: desc.value.trim() });
-  });
-  desc.focus();
-</script></body></html>`;
+  <script nonce="${nonce}" src="${scriptUri}"></script></body></html>`;
 }
 
 export async function openReportPanel(
@@ -578,7 +574,7 @@ export async function openReportPanel(
     'moagReportIssue', `MOAG — ${panelTitle}`, vscode.ViewColumn.One,
     { enableScripts: true, retainContextWhenHidden: false },
   );
-  panel.webview.html = buildReportPanelHtml({ mode, title: panelTitle, subtitle, placeholder, contextHtml });
+  panel.webview.html = buildReportPanelHtml(panel.webview, { mode, title: panelTitle, subtitle, placeholder, contextHtml });
 
   panel.webview.onDidReceiveMessage(async (message) => {
     if (message.type !== 'submitReport') { return; }

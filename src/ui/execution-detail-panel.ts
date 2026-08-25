@@ -892,7 +892,7 @@ function buildRunDetailHtml(webview: vscode.Webview, session: RunSession | null,
   const nonce = webviewNonce();
   const csp = webviewCsp(webview, nonce);
   if (!session) {
-    return buildErrorHtml('Run session not found');
+    return buildErrorHtml(webview, 'Run session not found');
   }
 
   const statusClass = session.status === 'completed' ? 'status-ok'
@@ -1016,11 +1016,16 @@ function buildRunDetailHtml(webview: vscode.Webview, session: RunSession | null,
 </html>`;
 }
 
-function buildErrorHtml(message: string): string {
+function buildErrorHtml(webview: vscode.Webview, message: string): string {
+  // The script is a compiled file; the CSP admits only the nonce it carries.
+  const scriptUri = webviewScriptUri(webview, 'back-nav');
+  const nonce = webviewNonce();
+  const csp = webviewCsp(webview, nonce);
   return /* html */ `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
+  ${csp}
   <style>${sharedStyles()}</style>
 </head>
 <body>
@@ -1031,14 +1036,7 @@ function buildErrorHtml(message: string): string {
   <div class="empty-hint-container">
     <p class="empty-hint-title">${escHtml(message)}</p>
   </div>
-  <script>
-    (function() {
-      const vscode = acquireVsCodeApi();
-      document.getElementById('btnBack').addEventListener('click', () => {
-        vscode.postMessage({ type: 'navigate-back' });
-      });
-    })();
-  </script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
 </body>
 </html>`;
 }

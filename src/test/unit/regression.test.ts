@@ -1271,3 +1271,52 @@ describe('Regression: the dashboard webview script', () => {
     assert.ok(dash.includes('acquireVsCodeApi'), 'dashboard lost its runtime handle');
   });
 });
+
+describe('Regression: no webview carries inline JavaScript', () => {
+  // 4,211 lines of JavaScript once lived inside TypeScript template literals,
+  // where tsc never parsed them. Two SyntaxErrors reached users that way, and a
+  // ReferenceError came within one command of following. Every one of those
+  // scripts is now a compiled file — this keeps it that way.
+  //
+  // A <script> with attributes is fine: that is <script src>, or a
+  // type="application/json" data block. A bare <script> with a body is not.
+  const UI_DIR = 'src/ui';
+
+  it('every UI file renders scripts by src, never inline', () => {
+    const offenders: string[] = [];
+
+    for (const file of fsMod.readdirSync(UI_DIR).filter((f: string) => f.endsWith('.ts'))) {
+      const source = fsMod.readFileSync(pathMod.join(UI_DIR, file), 'utf-8');
+      for (const m of source.matchAll(/^[^\S\n]*<script>([\s\S]*?)<\/script>/gm)) {
+        const body = m[1].trim();
+        if (body.length > 0) {
+          offenders.push(`${file}: ${body.split(String.fromCharCode(10)).length} lines`);
+        }
+      }
+    }
+
+    assert.deepEqual(offenders, [],
+      'these carry inline JavaScript the compiler cannot see — move it to src/webview/ ' +
+      'and load it with <script src>, as every other panel does');
+  });
+
+  it('every compiled webview script is a plain browser script', () => {
+    const dir = 'out/webview';
+    assert.ok(fsMod.existsSync(dir), 'out/webview is missing — npm run compile must build them');
+
+    const scripts = fsMod.readdirSync(dir).filter((f: string) => f.endsWith('.js'));
+    assert.ok(scripts.length >= 8, `expected the full set of webview scripts, found ${scripts.length}`);
+
+    const broken: string[] = [];
+    for (const f of scripts) {
+      const js = fsMod.readFileSync(pathMod.join(dir, f), 'utf-8');
+      if (js.includes('Object.defineProperty(exports')) { broken.push(`${f}: CommonJS wrapper`); continue; }
+      try {
+        new Function(js);
+      } catch (err) {
+        broken.push(`${f}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    assert.deepEqual(broken, [], 'a webview cannot execute these');
+  });
+});

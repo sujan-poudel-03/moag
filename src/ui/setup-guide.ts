@@ -6,6 +6,7 @@
 
 import * as vscode from 'vscode';
 import { EngineId } from '../models/types';
+import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 export function cmdShowSetupGuide(ctx: vscode.ExtensionContext): void {
   const detected = ctx.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []);
@@ -63,9 +64,14 @@ export function cmdShowSetupGuide(ctx: vscode.ExtensionContext): void {
     { enableScripts: true },
   );
 
+  // The script is a compiled file; the CSP admits only the nonce it carries.
+  const scriptUri = webviewScriptUri(panel.webview, 'setup-guide');
+  const nonce = webviewNonce();
+  const csp = webviewCsp(panel.webview, nonce);
   panel.webview.html = `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+  ${csp}
 <title>MOAG Setup Guide</title>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -123,15 +129,7 @@ ${allGood
   <button class="btn-primary" id="recheckBtn">Re-check engines</button>
   <button class="btn-secondary" id="doneBtn">Start using MOAG</button>
 </div>
-<script>
-  var vscode = acquireVsCodeApi();
-  document.getElementById('recheckBtn').addEventListener('click', function() {
-    vscode.postMessage({ type: 'recheck' });
-  });
-  document.getElementById('doneBtn').addEventListener('click', function() {
-    vscode.postMessage({ type: 'done' });
-  });
-</script>
+  <script nonce="${nonce}" src="${scriptUri}"></script>
 </body></html>`;
 
   panel.webview.onDidReceiveMessage(async (msg) => {
