@@ -940,7 +940,10 @@ describe('Regression: engine call-site census', () => {
     // AbortSignal. src/adapters/engine.ts is excluded and asserted separately:
     // its single `.runTask(` is the accounting wrapper delegating inward.
     const ALLOWLIST = new Map<string, number>([
-      ['extension.ts', 12],
+      // 4 of these moved to ui/prd-authoring.ts when extension.ts was split;
+      // the total is unchanged at 17, which is what this census exists to prove.
+      ['extension.ts', 8],
+      ['ui/prd-authoring.ts', 4],
       ['runner/runner.ts', 2],
       ['ui/execution-detail-panel.ts', 2],
       ['headless/cli.ts', 1],

@@ -83,7 +83,11 @@ function memento() {
 describe('Extension activation', () => {
   let activated: Registered;
 
-  before(() => {
+  // This hook loads extension.ts and its entire dependency tree through ts-node
+  // and then runs activate(). On a loaded machine that exceeds mocha default 2s,
+  // which showed up as an intermittent failure rather than a real defect.
+  before(function () {
+    this.timeout(60_000);
     activated = activateExtension();
   });
 
