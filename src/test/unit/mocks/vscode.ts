@@ -112,6 +112,11 @@ export class Uri {
   static file(path: string) {
     return new Uri(path);
   }
+
+  /** Mirrors vscode.Uri.joinPath — used to build webview resource URIs. */
+  static joinPath(base: Uri, ...parts: string[]) {
+    return new Uri([base.fsPath.replace(/[\/]+$/, ''), ...parts].join('/'));
+  }
 }
 
 export const StatusBarAlignment = { Left: 1, Right: 2 };

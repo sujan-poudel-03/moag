@@ -1,0 +1,35 @@
+{
+  // ─── Webview scripts — compiled for a browser, not for Node ──────────────────
+  //
+  // The sidebar script used to live inside a template literal in
+  // src/ui/prompt-input-view.ts, which meant tsc never parsed it: 2,869 lines that
+  // were not typed, not linted, and not checked in any way until a browser ran
+  // them. Two SyntaxErrors reached users that way.
+  //
+  // The main tsconfig emits CommonJS for the extension host; a webview needs plain
+  // scripts, hence a second config rather than a shared one.
+  //
+  // Strictness is deliberately relaxed HERE and only here. Turning it on would
+  // demand a full typing pass over 2,869 lines of DOM code before any of the
+  // benefit lands. What this config already buys, at zero annotation cost, is the
+  // two failure modes that actually shipped: a syntax error now fails the build,
+  // and so does a reference to a name that does not exist. Tighten incrementally.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    // "none" emits a plain script with no module wrapper, which is what a
+    // <script src> in a webview can actually execute.
+    "module": "none",
+    "outDir": "out/webview",
+    "rootDir": "src/webview",
+    "strict": false,
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "sourceMap": true,
+    "removeComments": false,
+    "skipLibCheck": true,
+    // The extension host globals are not available in a webview.
+    "types": []
+  },
+  "include": ["src/webview/**/*.ts"]
+}

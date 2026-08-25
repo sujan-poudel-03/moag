@@ -1602,7 +1602,7 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
+    "compile": "npm run compile:ext && npm run compile:webview",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
     "test": "npm run test:unit",
@@ -1614,7 +1614,10 @@
     "moag": "node ./out/headless/cli.js",
     "headless:smoke": "npm run compile && node ./out/headless/cli.js run .moag/sample.plan.json --no-interactive --full-auto",
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
-    "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch"
+    "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch",
+    "compile:ext": "tsc -p ./",
+    "compile:webview": "tsc -p tsconfig.webview.json",
+    "watch:webview": "tsc -watch -p tsconfig.webview.json"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0"

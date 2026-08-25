@@ -4,7 +4,9 @@
     "target": "ES2022",
     "outDir": "out",
     "rootDir": "src",
-    "lib": ["ES2022"],
+    "lib": [
+      "ES2022"
+    ],
     "sourceMap": true,
     "strict": true,
     "esModuleInterop": true,
@@ -14,6 +16,12 @@
     "declaration": true,
     "declarationMap": true
   },
-  "include": ["src/**/*"],
-  "exclude": ["node_modules", "out"]
+  "include": [
+    "src/**/*"
+  ],
+  "exclude": [
+    "node_modules",
+    "out",
+    "src/webview"
+  ]
 }

@@ -1028,7 +1028,16 @@ describe('Regression: engine call-site census', () => {
 // second. So this parses the real rendered script instead: new Function(body)
 // throws on any syntax error without executing anything.
 
-describe('Regression: rendered webview scripts parse as JavaScript', () => {
+describe('Regression: the sidebar webview script', () => {
+  // The script used to be 2,869 lines inside a template literal in
+  // prompt-input-view.ts, where tsc never parsed it. Two SyntaxErrors reached
+  // users that way and a ReferenceError came within one command of doing so.
+  //
+  // It is now src/webview/sidebar.ts, compiled by tsconfig.webview.json — so the
+  // compiler is the primary guard and these are the backstop. They check the
+  // shipped artifact and the wiring that loads it, neither of which tsc covers.
+  const COMPILED = 'out/webview/sidebar.js';
+
   function renderSidebarHtml(): string {
     const mod = proxyquire('../../ui/prompt-input-view', { vscode: vscodeMock });
     const Provider = mod.PromptInputViewProvider;
@@ -1039,83 +1048,74 @@ describe('Regression: rendered webview scripts parse as JavaScript', () => {
       async () => undefined,
       () => undefined,
     );
-    return provider['_getHtml']();
+    // _getHtml now needs a webview to build the script URI and a CSP source.
+    return provider['_getHtml']({
+      asWebviewUri: (u: { fsPath?: string }) => 'vscode-resource://' + (u.fsPath ?? 'x'),
+      cspSource: 'vscode-resource:',
+    });
   }
 
-  /** Every <script> body in the document, in order. */
-  function scriptBodies(html: string): string[] {
-    const bodies: string[] = [];
-    const re = /<script\b[^>]*>([\s\S]*?)<\/script>/g;
-    let m: RegExpExecArray | null;
-    while ((m = re.exec(html)) !== null) {
-      if (m[1].trim().length > 0) { bodies.push(m[1]); }
-    }
-    return bodies;
+  function compiled(): string {
+    return fsMod.readFileSync(COMPILED, 'utf-8');
   }
 
-  it('renders a sidebar document containing at least one script', () => {
-    const html = renderSidebarHtml();
-    assert.ok(html.length > 1000, 'the rendered document is implausibly small');
-    assert.ok(scriptBodies(html).length > 0, 'found no <script> bodies — the extractor is broken, not the code');
+  it('is emitted as a real file by the build', () => {
+    assert.ok(fsMod.existsSync(COMPILED),
+      `${COMPILED} is missing — run npm run compile, which must build the webview too`);
+    assert.ok(compiled().length > 50_000, 'the compiled script is implausibly small');
   });
 
-  // new Function() only PARSES. An identifier that is used but never declared
-  // is a ReferenceError at runtime and sails straight through it — which is how
-  // an ICON_PAUSED that was never declared nearly shipped. Constants follow a
-  // strict naming convention here, so they can be checked without executing.
-  it('every ICON_* constant used in the webview is also declared there', () => {
-    const bodies = scriptBodies(renderSidebarHtml());
-    const undeclared: string[] = [];
+  it('emits a plain browser script, not a CommonJS module', () => {
+    // module: "none" matters — a webview cannot execute exports/require.
+    const js = compiled();
+    assert.ok(!js.includes('Object.defineProperty(exports'), 'CommonJS wrapper would not run in a webview');
+    assert.ok(!/^\s*require\(/m.test(js), 'require() would not resolve in a webview');
+  });
 
-    bodies.forEach((body, i) => {
-      const declared = new Set(
-        [...body.matchAll(/\bconst (ICON_[A-Z_]+)\s*=/g)].map((m) => m[1]),
-      );
-      const used = new Set([...body.matchAll(/\b(ICON_[A-Z_]+)\b/g)].map((m) => m[1]));
-      for (const name of used) {
-        if (!declared.has(name)) { undeclared.push(`script #${i + 1}: ${name}`); }
-      }
-    });
+  it('parses as JavaScript', () => {
+    // Redundant with tsc today, and deliberately so: it asserts the ARTIFACT is
+    // valid, which survives someone changing how it is produced.
+    try {
+      new Function(compiled());
+    } catch (err) {
+      assert.fail(`compiled sidebar script does not parse: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
 
+  it('uses no ICON_ constant it does not declare', () => {
+    const js = compiled();
+    const declared = new Set([...js.matchAll(/\bconst (ICON_[A-Z_]+)\s*=/g)].map((m) => m[1]));
+    const used = new Set([...js.matchAll(/\b(ICON_[A-Z_]+)\b/g)].map((m) => m[1]));
+    const undeclared = [...used].filter((n) => !declared.has(n));
     assert.deepEqual(undeclared, [],
-      'these constants are used in the webview but never declared, which is a ReferenceError at runtime');
+      'used in the webview but never declared — a ReferenceError at runtime');
   });
 
-  it('every rendered <script> body is syntactically valid JavaScript', () => {
-    const bodies = scriptBodies(renderSidebarHtml());
-    const failures: string[] = [];
+  it('is loaded by the rendered page with a nonce the CSP admits', () => {
+    const html = renderSidebarHtml();
+    const tag = /<script\b([^>]*)>/.exec(html);
+    assert.ok(tag, 'the rendered page loads no script at all');
 
-    bodies.forEach((body, i) => {
-      try {
-        // Parses without executing. Throws SyntaxError on malformed input.
-        new Function(body);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        failures.push(`script #${i + 1}: ${message}`);
-      }
-    });
+    const nonce = /nonce="([^"]+)"/.exec(tag![1]);
+    assert.ok(nonce, 'the script tag carries no nonce');
+    assert.ok(/src="[^"]*sidebar\.js"/.test(tag![1]), 'the script tag does not point at sidebar.js');
 
-    assert.deepEqual(
-      failures,
-      [],
-      'A SyntaxError here kills the entire webview script — no handlers attach and the '
-      + 'view is inert, while tsc still reports success:\n' + failures.join('\n'),
-    );
+    const csp = /Content-Security-Policy[^>]*content="([^"]*)"/.exec(html);
+    assert.ok(csp, 'the page declares no Content-Security-Policy');
+    assert.ok(csp![1].includes(`nonce-${nonce![1]}`),
+      'the CSP does not admit the nonce on the script tag, so it would not execute');
   });
 
-  it('the parser check actually rejects a broken script', () => {
-    // Guards the guard. Both real defects are represented.
-    const tsCast = "if ((e.target as HTMLElement).classList.contains('x')) {}";
-    const collapsedQuote = "el.innerHTML = '<button onclick=\"post({type:'createPR'})\">go</button>';";
-    for (const broken of [tsCast, collapsedQuote]) {
-      assert.throws(
-        () => new Function(broken),
-        /SyntaxError|Unexpected/,
-        `the parser check failed to reject: ${broken}`,
-      );
-    }
+  it('inlines no script body, which is what the compiler could not see', () => {
+    const html = renderSidebarHtml();
+    const inline = [...html.matchAll(/<script\b[^>]*>([\s\S]*?)<\/script>/g)]
+      .map((m) => m[1].trim())
+      .filter((b) => b.length > 0);
+    assert.deepEqual(inline, [],
+      'an inline script body is unchecked JavaScript — put it in src/webview/ instead');
   });
 });
+
 
 // ─── Closed-enumeration guards must be derived, not re-enumerated ─────────────
 //
