@@ -1230,3 +1230,44 @@ describe('Regression: every command id referenced in code is registered', () => 
       "these command ids are referenced but never registered — the button does nothing");
   });
 });
+
+describe('Regression: the dashboard webview script', () => {
+  // Same story as the sidebar: 1,338 lines inside a template literal the compiler
+  // never parsed. It is now src/webview/dashboard.ts. Unlike the sidebar it DID
+  // interpolate two values, which now arrive as a JSON block the page carries as
+  // data — so lifting it did not push executable code back inline.
+  const COMPILED = 'out/webview/dashboard.js';
+
+  it('is emitted as a real file by the build', () => {
+    assert.ok(fsMod.existsSync(COMPILED),
+      `${COMPILED} is missing — npm run compile must build both webview projects`);
+  });
+
+  it('emits a plain browser script, not a CommonJS module', () => {
+    const js = fsMod.readFileSync(COMPILED, 'utf-8');
+    assert.ok(!js.includes('Object.defineProperty(exports'), 'a CommonJS wrapper would not run in a webview');
+  });
+
+  it('parses as JavaScript', () => {
+    try {
+      new Function(fsMod.readFileSync(COMPILED, 'utf-8'));
+    } catch (err) {
+      assert.fail(`compiled dashboard script does not parse: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  });
+
+  it('reads its host values from the bootstrap block, not from interpolation', () => {
+    const js = fsMod.readFileSync(COMPILED, 'utf-8');
+    assert.ok(js.includes('MOAG_BOOTSTRAP'), 'the script no longer reads the values the host provides');
+    assert.ok(js.includes('moag-bootstrap'), 'the script does not look up the bootstrap element');
+  });
+
+  it('is compiled as its own program, separate from the sidebar', () => {
+    // module "none" shares one global scope, so compiling both together makes
+    // every top-level `const vscode` collide even though the pages never coexist.
+    const sidebar = fsMod.readFileSync('out/webview/sidebar.js', 'utf-8');
+    const dash = fsMod.readFileSync(COMPILED, 'utf-8');
+    assert.ok(sidebar.includes('acquireVsCodeApi'), 'sidebar lost its runtime handle');
+    assert.ok(dash.includes('acquireVsCodeApi'), 'dashboard lost its runtime handle');
+  });
+});

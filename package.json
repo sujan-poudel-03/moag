@@ -1616,7 +1616,7 @@
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch",
     "compile:ext": "tsc -p ./",
-    "compile:webview": "tsc -p tsconfig.webview.json",
+    "compile:webview": "tsc -p tsconfig.webview.json && tsc -p tsconfig.webview.dashboard.json",
     "watch:webview": "tsc -watch -p tsconfig.webview.json"
   },
   "dependencies": {

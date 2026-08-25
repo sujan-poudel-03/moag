@@ -1,0 +1,23 @@
+// Each webview script is its OWN program. With module "none" they share one
+// global scope, so compiling them together makes every top-level `const vscode`
+// collide — even though the two pages never coexist at runtime. Separate
+// projects model what is actually true.
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": [
+      "ES2022",
+      "DOM",
+      "DOM.Iterable"
+    ],
+    "module": "none",
+    "outDir": "out/webview",
+    "strict": false,
+    "noImplicitAny": false,
+    "strictNullChecks": false,
+    "sourceMap": true,
+    "removeComments": false,
+    "skipLibCheck": true,
+    "types": []
+  }
+}

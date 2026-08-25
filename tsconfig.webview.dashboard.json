@@ -1,6 +1,6 @@
 {
   "extends": "./tsconfig.webview.base.json",
   "include": [
-    "src/webview/sidebar.ts"
+    "src/webview/dashboard.ts"
   ]
 }
