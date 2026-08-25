@@ -49,16 +49,36 @@ function loadConfig(): Record<string, unknown> {
 }
 
 /** Walk a nested object by a dotted path (e.g. "agentTaskPlayer.issueSync.enabled"). */
+/**
+ * Look up a dotted setting id, accepting every shape a config file is written in.
+ *
+ * This used to walk segment by segment, which only ever matched a FULLY nested
+ * object. VS Code itself writes settings flat — `"agentTaskPlayer.git.autoCommit":
+ * true` at the top level — and a user sectioning by extension writes
+ * `{ agentTaskPlayer: { "git.autoCommit": true } }`. Both silently returned the
+ * default, so every setting the daemon reads could quietly disagree with the same
+ * setting in the IDE. Auto-commit reading `false` that way means an unattended run
+ * does a night of work and commits none of it.
+ *
+ * So try each split point: for `a.b.c`, look for `a.b.c`, then `a` + `b.c`, then
+ * `a.b` + `c`, recursing into whichever prefix exists.
+ */
 function resolvePath(root: Record<string, unknown>, dotted: string): unknown {
-  let cur: unknown = root;
-  for (const part of dotted.split('.')) {
-    if (cur && typeof cur === 'object' && part in (cur as Record<string, unknown>)) {
-      cur = (cur as Record<string, unknown>)[part];
-    } else {
-      return undefined;
+  if (!root || typeof root !== 'object') { return undefined; }
+  // Longest prefix first: an explicit flat key beats a coincidental nesting.
+  if (dotted in root) { return root[dotted]; }
+
+  const parts = dotted.split('.');
+  for (let i = parts.length - 1; i >= 1; i--) {
+    const head = parts.slice(0, i).join('.');
+    const rest = parts.slice(i).join('.');
+    const next = root[head];
+    if (next && typeof next === 'object') {
+      const found = resolvePath(next as Record<string, unknown>, rest);
+      if (found !== undefined) { return found; }
     }
   }
-  return cur;
+  return undefined;
 }
 
 class Configuration {

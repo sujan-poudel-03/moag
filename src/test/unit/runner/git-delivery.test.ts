@@ -6,6 +6,7 @@ import {
   describePrepareFailure,
   prepareBranch,
   slugify,
+  foreignChanges,
   GitRunner,
   PrepareFailure,
 } from '../../../runner/git-delivery';
@@ -201,5 +202,38 @@ describe('git-delivery — reporting', () => {
       assert.ok(!seen.has(text), `${r} reuses another reason's text`);
       seen.add(text);
     }
+  });
+});
+
+describe('git-delivery — MOAG output is not the user work', () => {
+  // MOAG writes .moag/ as it runs. On a repo that does not ignore .moag/, that
+  // made the tree dirty and MOAG then refused to deliver because of files it
+  // had just written itself. Found by running an unattended build for real.
+  const nl = String.fromCharCode(10);
+
+  it('ignores .moag bookkeeping', () => {
+    const status = ['?? .moag/queue.jsonl', '?? .moag/headless-state.json', ' M .moag/plan.json'].join(nl);
+    assert.deepStrictEqual(foreignChanges(status), []);
+  });
+
+  it('still blocks on uncommitted work the user cares about', () => {
+    const status = ['?? .moag/queue.jsonl', ' M src/app.ts'].join(nl);
+    assert.deepStrictEqual(foreignChanges(status), ['src/app.ts']);
+  });
+
+  it('reads the destination of a rename, not the source', () => {
+    assert.deepStrictEqual(foreignChanges('R  old.ts -> new.ts'), ['new.ts']);
+  });
+
+  it('strips the quotes git adds to a path with spaces', () => {
+    assert.deepStrictEqual(foreignChanges('?? ' + JSON.stringify('a b.ts')), ['a b.ts']);
+  });
+
+  it('treats an empty status as clean', () => {
+    assert.deepStrictEqual(foreignChanges(''), []);
+  });
+
+  it('does not mistake a file merely named like .moag for MOAG output', () => {
+    assert.deepStrictEqual(foreignChanges('?? .moagrc'), ['.moagrc']);
   });
 });

@@ -96,6 +96,38 @@ export function buildCommitMessage(req: CommitRequest): string {
   return lines.join('\n');
 }
 
+/** True for MOAG's own bookkeeping, which must never count as the user's work. */
+function isOwnOutput(file: string): boolean {
+  return file === '.moag' || file.startsWith('.moag/') || file.startsWith('.moag\\');
+}
+
+/**
+ * Paths in `git status --porcelain` that are not MOAG's own output.
+ *
+ * MOAG writes .moag/ as it runs — the plan, the park queue, headless state. On a
+ * target repo that does not ignore .moag/, that made the tree dirty and MOAG then
+ * refused to deliver because of changes it had made itself. evidence.ts already
+ * excludes .moag/ from changed files for the same reason.
+ *
+ * Everything else still blocks: the guard exists so an agent's commit cannot
+ * sweep in work the user had open.
+ */
+export function foreignChanges(porcelain: string): string[] {
+  return porcelain
+    .split('\n')
+    .map((line) => line.trimEnd())
+    .filter((line) => line.length > 3)
+    // Porcelain v1 is `XY <path>`; a rename is `R  old -> new`, and the
+    // destination is the one that matters.
+    .map((line) => {
+      const p = line.slice(3).trim();
+      const arrow = p.indexOf(' -> ');
+      return arrow >= 0 ? p.slice(arrow + 4).trim() : p;
+    })
+    .map((p) => p.replace(/^"|"$/g, ''))
+    .filter((p) => p.length > 0 && !isOwnOutput(p));
+}
+
 /**
  * Arm delivery for a run: confirm the repo is in a state we may write to, then
  * put the run on its own branch.
@@ -120,11 +152,12 @@ export async function prepareBranch(
   if (status === null) {
     return { ok: false, reason: 'not-a-repo', detail: 'git status failed.' };
   }
-  if (status.trim().length > 0) {
+  const foreign = foreignChanges(status);
+  if (foreign.length > 0) {
     return {
       ok: false,
       reason: 'dirty-tree',
-      detail: 'Working tree has uncommitted changes. Commit or stash them first.',
+      detail: `Working tree has uncommitted changes (${foreign.slice(0, 3).join(', ')}). Commit or stash them first.`,
     };
   }
 
