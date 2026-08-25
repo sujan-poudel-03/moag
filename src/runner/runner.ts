@@ -22,6 +22,7 @@ import {
 } from '../models/types';
 import { generateId } from '../models/plan';
 import { commitTask, describePrepareFailure, prepareBranch, DeliveryConfig } from './git-delivery';
+import { park, decisionFor, ParkReason, ParkedItem } from './park-queue';
 import {
   createWorktrees,
   describeIsolationFailure,
@@ -317,6 +318,8 @@ export class TaskRunner {
   /** Set once per run when auto-commit is armed; null when delivery is off. */
   private _deliveryBranch: string | null = null;
   /** Worktrees created for this run; emptied on teardown. */
+  /** Task currently executing, so a run-level halt can still name one. */
+  private _currentTask: Task | null = null;
   private _worktrees: Worktree[] = [];
   /** playlistId -> isolated checkout path. */
   private _playlistCwd = new Map<string, string>();
@@ -499,6 +502,10 @@ export class TaskRunner {
 
     // Re-arm one budget-worth above current spend so the ceiling repeats instead of latching.
     this._budgetNextThresholdUsd = e.lifetimeUsd + budget;
+    this.parkTask(this._currentTask, 'budget-exceeded', {
+      costUsd: e.lifetimeUsd,
+      budgetUsd: budget,
+    });
     this.emit('budget-exceeded', { totalCost: e.lifetimeUsd, budget });
   }
 
@@ -1007,6 +1014,15 @@ export class TaskRunner {
     if (task.status !== TaskStatus.Completed && this.getTaskType(task) === 'agent' && (autoFixEnabled || fullAuto)) {
       await this.autoFixTask(task, playlist, plan);
     }
+
+    // Every retry and the one auto-fix are spent and it still has not passed.
+    // Park it rather than letting the failure vanish into the log.
+    if (task.status === TaskStatus.Failed) {
+      this.parkTask(task, 'repeated-failure', {
+        attempts: effectiveMaxAttempts,
+        lastError: this._taskFailureContext.get(task.id),
+      });
+    }
   }
 
   private async autoFixTask(task: Task, playlist: Playlist, plan: Plan): Promise<void> {
@@ -1216,6 +1232,7 @@ export class TaskRunner {
       : basePrompt;
 
     task.status = TaskStatus.Running;
+    this._currentTask = task;
     const startedAt = new Date().toISOString();
     this.emit('task-started', task, playlist, executionDescription);
 
@@ -1650,6 +1667,7 @@ export class TaskRunner {
       `  → Click "Skip" to bypass this step and continue.\n`,
       'stdout');
 
+    this.parkTask(task, 'manual-gate');
     this.emit('manual-gate', task);
 
     const startMs = Date.now();
@@ -3011,6 +3029,36 @@ export class TaskRunner {
     this._worktrees = [];
     this._playlistCwd.clear();
     this._taskCwdRoot.clear();
+  }
+
+  /**
+   * Record a halt so it survives until a human comes back.
+   *
+   * Best-effort by design: the run has already stopped and the operator has
+   * already been told through the live event. Failing to write the record must
+   * not also break the halt.
+   */
+  private parkTask(
+    task: Task | null,
+    reason: ParkReason,
+    evidence?: ParkedItem['evidence'],
+  ): void {
+    const plan = this._plan;
+    const playlist = plan?.playlists.find((pl) => pl.tasks.some((t) => t.id === task?.id));
+    const item: ParkedItem = {
+      id: generateId(),
+      parkedAt: new Date().toISOString(),
+      reason,
+      planName: plan?.name ?? '',
+      playlistName: playlist?.name ?? '',
+      taskId: task?.id ?? '',
+      // A ceiling can trip from an authoring call with no task in flight.
+      taskName: task?.name ?? '(no task in flight)',
+      decision: decisionFor(reason, evidence),
+      runId: this._currentRunId || undefined,
+      evidence,
+    };
+    park(this.resolveCwd(undefined), item, fs);
   }
 
   private runGitCommand(args: string[], cwd: string): Promise<string | null> {

@@ -66,6 +66,8 @@ export interface Args {
   pr?: boolean;
   /** Target branch for --pr; gh picks the repo default when omitted. */
   prBase?: string;
+  /** Bare words after the command, e.g. `queue resolve <id>`. */
+  positionals: string[];
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -80,7 +82,7 @@ function normalizeUatMode(value: unknown): 'off' | 'auto' | 'required' {
 
 export function parseArgs(argv: string[]): Args {
   const a: Args = {
-    command: argv[0] ?? '', cwd: process.cwd(),
+    command: argv[0] ?? '', cwd: process.cwd(), positionals: [],
     noInteractive: false, fullAuto: false, intervalSec: 300, once: false,
     verify: false, fix: false, gates: [],
   };
@@ -109,7 +111,11 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--uat-spec') { const s = rest[++i]; if (s) { a.uatSpec = s; } }
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
-    else if (!arg.startsWith('--') && !a.planPath) { a.planPath = path.resolve(a.cwd, arg); }
+    else if (!arg.startsWith('--')) {
+      // `queue` reads its verb from positionals; `run`/`verify` take a plan path.
+      a.positionals.push(arg);
+      if (!a.planPath) { a.planPath = path.resolve(a.cwd, arg); }
+    }
   }
   return a;
 }
@@ -620,6 +626,56 @@ async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
   });
 }
 
+// ─── command: queue ──────────────────────────────────────────────────────────
+
+/**
+ * List or clear parked work.
+ *
+ * The morning-review surface for the headless side: everything the run stopped
+ * on, newest first, with the decision each item is waiting for.
+ */
+function cmdQueue(args: Args): number {
+  const { openItems, readQueue, resolveItem, describeParkReason } = require('../runner/park-queue');
+  const nodeFs = require('fs');
+  const verb = args.positionals[0] ?? 'list';
+
+  if (verb === 'resolve') {
+    const id = args.positionals[1];
+    if (!id) {
+      process.stderr.write('Usage: moag queue resolve <id>\n');
+      return 2;
+    }
+    if (!resolveItem(args.cwd, id, new Date().toISOString(), nodeFs)) {
+      process.stderr.write('No open parked item with id ' + id + '\n');
+      return 1;
+    }
+    emit({ event: 'queue-resolved', id });
+    return 0;
+  }
+
+  if (verb !== 'list') {
+    process.stderr.write('Usage: moag queue <list | resolve <id>>\n');
+    return 2;
+  }
+
+  const open = openItems(args.cwd, nodeFs);
+  emit({ event: 'queue-listed', open: open.length, total: readQueue(args.cwd, nodeFs).length });
+  for (const item of open) {
+    emit({
+      event: 'queue-item',
+      id: item.id,
+      parkedAt: item.parkedAt,
+      reason: item.reason,
+      summary: describeParkReason(item.reason),
+      task: item.taskName,
+      playlist: item.playlistName,
+      decision: item.decision,
+    });
+  }
+  // Exit 1 when work is waiting, so a wrapper script can branch on it.
+  return open.length > 0 ? 1 : 0;
+}
+
 // ─── entry ───────────────────────────────────────────────────────────────────
 
 async function main(): Promise<number> {
@@ -638,15 +694,19 @@ async function main(): Promise<number> {
   if (args.command === 'loop') {
     return cmdLoop(args, await setup(args));
   }
+  if (args.command === 'queue') {
+    return cmdQueue(args);
+  }
   if (args.command === 'daemon') {
     return cmdDaemon(args, await setup(args));
   }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon> ...\n' +
+    'Usage: moag <run|verify|loop|daemon|queue> ...\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
     '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
     '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
-    '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n',
+    '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
+    '  moag queue <list | resolve <id>>\n',
   );
   return 2;
 }
