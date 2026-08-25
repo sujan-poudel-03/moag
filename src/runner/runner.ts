@@ -21,6 +21,7 @@ import {
   VerificationResult,
 } from '../models/types';
 import { generateId } from '../models/plan';
+import { commitTask, describePrepareFailure, prepareBranch, DeliveryConfig } from './git-delivery';
 import { resolveRoleCharter } from '../models/roles';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
 import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName, ProfileConfig } from '../models/execution-profiles';
@@ -306,6 +307,8 @@ export class TaskRunner {
   private _pauseResolve: (() => void) | null = null;
   private _playLock = false;
   private _taskGitRefs = new Map<string, { ref: string; cwd: string }>();
+  /** Set once per run when auto-commit is armed; null when delivery is off. */
+  private _deliveryBranch: string | null = null;
   private _serviceProcesses = new Map<string, ServiceHandle>();
   private _currentRunId: string | null = null;
   private _sessionCostUsd = 0;
@@ -511,6 +514,7 @@ export class TaskRunner {
     this._abortController = new AbortController();
     this.resetRunBudgetTracking();
     this._currentRunId = generateId();
+    await this.armGitDelivery(plan);
     this.setState(RunnerState.Playing);
 
     try {
@@ -1440,6 +1444,7 @@ export class TaskRunner {
       if (task.status === TaskStatus.Completed) {
         // Gap 6: Clear failure context on success
         this._taskFailureContext.delete(task.id);
+        await this.commitCompletedTask(task, playlist, cwd, changedFiles, result);
         this.emit('task-completed', task, result);
       } else {
         // Classify and store failure context for retry/auto-fix
@@ -2848,6 +2853,76 @@ export class TaskRunner {
       return `Hint: Rate limited by the "${engineId}" API. Wait a moment and try again.`;
     }
     return null;
+  }
+
+
+  /**
+   * Arm per-task commits for this run, if the user opted in.
+   *
+   * Every refusal is a warning, never a failure: delivery being unavailable is
+   * not a reason to abandon the work. The run proceeds exactly as it does today
+   * and the user keeps their diff.
+   */
+  private async armGitDelivery(plan: Plan): Promise<void> {
+    this._deliveryBranch = null;
+
+    const cfg = this.getDeliveryConfig();
+    if (!cfg.enabled) { return; }
+
+    const cwd = this.resolveCwd(undefined);
+    const outcome = await prepareBranch(
+      cwd,
+      plan.name,
+      this._currentRunId ?? 'run',
+      cfg,
+      (args, dir) => this.runGitCommand(args, dir),
+    );
+
+    if (!outcome.ok) {
+      this.emit('error', new Error(describePrepareFailure(outcome.reason)));
+      return;
+    }
+    this._deliveryBranch = outcome.branch;
+  }
+
+  /** Commit a task that just passed, when delivery is armed. */
+  private async commitCompletedTask(
+    task: Task,
+    playlist: Playlist,
+    cwd: string,
+    changedFiles: string[],
+    result: EngineResult,
+  ): Promise<void> {
+    if (!this._deliveryBranch) { return; }
+
+    const outcome = await commitTask(
+      {
+        cwd,
+        taskName: task.name,
+        playlistName: playlist.name,
+        engine: task.engine ?? playlist.engine ?? 'unknown',
+        changedFiles,
+        costUsd: result.tokenUsage?.estimatedCost,
+      },
+      (args, dir) => this.runGitCommand(args, dir),
+    );
+
+    if (outcome.committed) {
+      this.emit('task-output', task,
+        `[MOAG] Committed ${outcome.sha} on ${this._deliveryBranch}\n`, 'stdout');
+    } else if (outcome.reason === 'commit-failed') {
+      // Surface it, but never fail a task that already passed its gates.
+      this.emit('task-output', task,
+        `[MOAG] Auto-commit failed: ${outcome.detail}\n`, 'stderr');
+    }
+  }
+
+  private getDeliveryConfig(): DeliveryConfig {
+    const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+    return {
+      enabled: cfg.get<boolean>('git.autoCommit', false),
+      branchPrefix: cfg.get<string>('git.branchPrefix', 'moag/') || 'moag/',
+    };
   }
 
   private runGitCommand(args: string[], cwd: string): Promise<string | null> {

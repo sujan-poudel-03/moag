@@ -1493,6 +1493,16 @@
           "type": "boolean",
           "default": true,
           "description": "Maintain conversation history across tasks in the same playlist. Claude remembers previous tasks' context, improving coherence in multi-step plans."
+        },
+        "agentTaskPlayer.git.autoCommit": {
+          "type": "boolean",
+          "default": false,
+          "description": "Put each run on its own branch and commit after every task that passes. Turns a long unattended run into reviewable increments. Refuses to start when the working tree is dirty, when HEAD is detached, or outside a git repository. Never pushes."
+        },
+        "agentTaskPlayer.git.branchPrefix": {
+          "type": "string",
+          "default": "moag/",
+          "description": "Branch namespace used by agentTaskPlayer.git.autoCommit. Each run gets <prefix><plan-slug>-<run-id>."
         }
       }
     },
