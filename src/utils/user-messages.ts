@@ -22,7 +22,7 @@ export function noPlanLoaded(): UserMessage {
   return {
     text: 'No plan is loaded yet. Create a new plan or open an existing one.',
     actions: [
-      { label: 'New Plan', command: 'agentTaskPlayer.createPlan' },
+      { label: 'New Plan', command: 'agentTaskPlayer.newPlan' },
       { label: 'Open Plan', command: 'agentTaskPlayer.openPlan' },
     ],
   };

@@ -1056,6 +1056,28 @@ describe('Regression: rendered webview scripts parse as JavaScript', () => {
     assert.ok(scriptBodies(html).length > 0, 'found no <script> bodies — the extractor is broken, not the code');
   });
 
+  // new Function() only PARSES. An identifier that is used but never declared
+  // is a ReferenceError at runtime and sails straight through it — which is how
+  // an ICON_PAUSED that was never declared nearly shipped. Constants follow a
+  // strict naming convention here, so they can be checked without executing.
+  it('every ICON_* constant used in the webview is also declared there', () => {
+    const bodies = scriptBodies(renderSidebarHtml());
+    const undeclared: string[] = [];
+
+    bodies.forEach((body, i) => {
+      const declared = new Set(
+        [...body.matchAll(/\bconst (ICON_[A-Z_]+)\s*=/g)].map((m) => m[1]),
+      );
+      const used = new Set([...body.matchAll(/\b(ICON_[A-Z_]+)\b/g)].map((m) => m[1]));
+      for (const name of used) {
+        if (!declared.has(name)) { undeclared.push(`script #${i + 1}: ${name}`); }
+      }
+    });
+
+    assert.deepEqual(undeclared, [],
+      'these constants are used in the webview but never declared, which is a ReferenceError at runtime');
+  });
+
   it('every rendered <script> body is syntactically valid JavaScript', () => {
     const bodies = scriptBodies(renderSidebarHtml());
     const failures: string[] = [];

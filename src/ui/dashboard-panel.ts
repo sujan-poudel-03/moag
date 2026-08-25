@@ -560,7 +560,7 @@ export class DashboardPanel {
         vscode.commands.executeCommand('agentTaskPlayer.switchPlan');
         break;
       case 'new-plan':
-        vscode.commands.executeCommand('agentTaskPlayer.createPlan');
+        vscode.commands.executeCommand('agentTaskPlayer.newPlan');
         break;
       case 'export-results':
         vscode.commands.executeCommand('agentTaskPlayer.exportResults');

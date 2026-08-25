@@ -3850,7 +3850,13 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
           }
           return true;
         });
-        if (tasks.length === 0) {
+        // Hide a playlist only when a filter is narrowing the view. An
+        // unfiltered playlist with no tasks must still render, otherwise
+        // deleting its last task makes the playlist unreachable forever.
+        const filterIsNarrowing = planFilterMode === 'completed'
+          || planFilterMode === 'failed'
+          || planFilterMode === 'pending';
+        if (tasks.length === 0 && filterIsNarrowing) {
           continue;
         }
         const header = document.createElement('div');
@@ -3895,7 +3901,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
                 ? ICON_BLOCKED
                 : groupStatus === 'skipped'
                   ? ICON_SKIPPED
-                  : ICON_PENDING;
+                  : groupStatus === 'paused'
+                    ? ICON_PAUSE
+                    : ICON_PENDING;
         const groupLabel = (collapsed ? (ICON_COLLAPSED + ' ') : (ICON_EXPANDED + ' ')) + (group.name || 'Playlist');
         const totalCount = allTasks.length;
         const doneCount = allTasks.filter((t) => {
@@ -4043,7 +4051,9 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
                   ? ICON_BLOCKED
                   : status === 'skipped'
                     ? ICON_SKIPPED
-                    : ICON_PENDING;
+                    : status === 'paused'
+                      ? ICON_PAUSE
+                      : ICON_PENDING;
           const isFailedLike = status === 'failed' || status === 'blocked';
           const SVG_PLAY = '<svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor"><path d="M4.5 2.5l8 5.5-8 5.5V2.5z"/></svg>';
           const SVG_PAUSE = '<svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor"><rect x="3.5" y="2.5" width="3.5" height="11" rx="1"/><rect x="9" y="2.5" width="3.5" height="11" rx="1"/></svg>';
