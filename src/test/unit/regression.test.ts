@@ -6,6 +6,7 @@
 //   3. runRetrievalCascade — falls back to rg spans when semantic is absent or low-confidence
 
 import { strict as assert } from 'assert';
+import { SemanticSpan } from '../../context/semantic-provider';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -444,8 +445,8 @@ describe('Regression: runRetrievalCascade semantic fallback', () => {
 
     const result = await runRetrievalCascade(makeTask('Fix TaskRunner execution'), tmpDir, 50000);
     assert.equal(result.usedSemantic, false);
-    assert.ok(result.spans.some((s: any) => s.content.includes('TaskRunner')));
-    assert.ok(result.spans.every((s: any) => s.confidence <= 0.65));
+    assert.ok(result.spans.some((s: SemanticSpan) => s.content.includes('TaskRunner')));
+    assert.ok(result.spans.every((s: SemanticSpan) => s.confidence <= 0.65));
   });
 
   it('returns usedSemantic=false when all semantic spans are below confidence threshold', async () => {
@@ -462,7 +463,7 @@ describe('Regression: runRetrievalCascade semantic fallback', () => {
       50000,
     );
     assert.equal(result.usedSemantic, false);
-    assert.ok(result.spans.some((s: any) => s.content.includes('authenticate_user')));
+    assert.ok(result.spans.some((s: SemanticSpan) => s.content.includes('authenticate_user')));
   });
 
   it('returns usedSemantic=true and high-confidence spans when semantic has results', async () => {
@@ -475,7 +476,7 @@ describe('Regression: runRetrievalCascade semantic fallback', () => {
 
     const result = await runRetrievalCascade(makeTask('Fix TaskRunner'), tmpDir, 50000);
     assert.equal(result.usedSemantic, true);
-    assert.ok(result.spans.some((s: any) => s.confidence === 0.9));
+    assert.ok(result.spans.some((s: SemanticSpan) => s.confidence === 0.9));
   });
 
   it('keeps rg extras for files not covered by semantic spans', async () => {
@@ -495,9 +496,9 @@ describe('Regression: runRetrievalCascade semantic fallback', () => {
     );
     assert.equal(result.usedSemantic, true);
     // Semantic span for runner.ts
-    assert.ok(result.spans.some((s: any) => s.filePath === 'src/runner.ts' && s.confidence === 0.85));
+    assert.ok(result.spans.some((s: SemanticSpan) => s.filePath === 'src/runner.ts' && s.confidence === 0.85));
     // rg/hint span for config.ts (uncovered file)
-    assert.ok(result.spans.some((s: any) => s.filePath === 'src/config.ts'));
+    assert.ok(result.spans.some((s: SemanticSpan) => s.filePath === 'src/config.ts'));
   });
 
   it('returns empty spans when semantic is empty and prompt has only stop words', async () => {

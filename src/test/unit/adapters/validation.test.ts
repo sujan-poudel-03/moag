@@ -119,6 +119,7 @@ describe('getValidationAdapters', () => {
 
   it('should return empty array for unknown target', () => {
     // TypeScript would prevent this at compile time, but test runtime resilience
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any -- feeding a deliberately invalid value to exercise the runtime guard; the type system forbids it by design
     const adapters = getValidationAdapters(['unknown' as any]);
     assert.equal(adapters.length, 0);
   });
@@ -230,7 +231,7 @@ describe('semanticSearch fallback', () => {
   });
 
   it('should return filtered high-confidence spans when provider is ready', async () => {
-    const { semanticSearch, registerProvider, unregisterProvider, CONFIDENCE_THRESHOLD } = require('../../../context/semantic-provider');
+    const { semanticSearch, registerProvider, unregisterProvider } = require('../../../context/semantic-provider');
     const mockSpans = [
       { filePath: 'src/auth.ts', startLine: 10, endLine: 20, content: 'function login() {}', confidence: 0.9, label: 'login' },
       { filePath: 'src/other.ts', startLine: 1, endLine: 5, content: 'const x = 1;', confidence: 0.2 }, // below threshold

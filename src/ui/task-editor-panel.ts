@@ -3,7 +3,6 @@
 
 import * as vscode from 'vscode';
 import { Task, TaskType, EngineId, FailurePolicy, TaskStatus } from '../models/types';
-import { generateId } from '../models/plan';
 import { designSystemCssTokens } from './design-system';
 
 /** Options passed to TaskEditorPanel.open() */

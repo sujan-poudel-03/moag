@@ -8,7 +8,7 @@ import * as vscode from 'vscode';
 import { HistoryEntry, EngineId, TaskStatus } from '../models/types';
 import { HistoryStore } from '../history/store';
 import { RunSession, RunSessionStore } from '../models/run-session';
-import { getModelSpec, ModelSpec, getAllModelSpecs } from '../models/model-specs';
+import { getModelSpec } from '../models/model-specs';
 import { getEngine } from '../adapters/index';
 import { generateId } from '../models/plan';
 import { designSystemCssTokens } from './design-system';

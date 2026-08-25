@@ -4,9 +4,10 @@
 // error handling, abort/cancel, cwd propagation, long prompts, and engine switching.
 
 import { strict as assert } from 'assert';
+import { CliConfig } from '../../../adapters/base-cli';
 import * as sinon from 'sinon';
 import { setMockConfig, clearMockConfig } from '../mocks/vscode';
-import { EngineResult, TaskStatus, RunnerState, Plan } from '../../../models/types';
+import { TaskStatus, RunnerState, Plan, Playlist } from '../../../models/types';
 import { createEmptyPlan, createTask } from '../../../models/plan';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -34,20 +35,6 @@ function createCapturingRunCli() {
 
 function createFailingRunCli(exitCode = 1, stderr = 'something went wrong') {
   const runCli = () => Promise.resolve({ stdout: '', stderr, exitCode, durationMs: 50 });
-  return { runCli };
-}
-
-function createStreamingRunCli(chunks: Array<{ text: string; stream: 'stdout' | 'stderr' }>) {
-  const runCli = async (_config: unknown, _options: unknown, onOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void) => {
-    let stdout = '';
-    let stderr = '';
-    for (const chunk of chunks) {
-      if (onOutput) { onOutput(chunk.text, chunk.stream); }
-      if (chunk.stream === 'stdout') { stdout += chunk.text; }
-      else { stderr += chunk.text; }
-    }
-    return { stdout, stderr, exitCode: 0, durationMs: 200 };
-  };
   return { runCli };
 }
 
@@ -104,7 +91,7 @@ describe('Codex Task Execution', () => {
     assert.equal(args[0], 'exec', 'first arg should be "exec"');
     // Prompt should NOT be in args — piped via stdin
     assert.ok(!args.includes('fix the login bug'), 'prompt should not be in args when useStdin is true');
-    assert.equal((calls[0].config as any).useStdin, true, 'useStdin should be true');
+    assert.equal((calls[0].config as CliConfig).useStdin, true, 'useStdin should be true');
   });
 
   it('should include --full-auto when autoApprove is true (default)', async () => {
@@ -295,7 +282,7 @@ describe('Claude Task Execution', () => {
     assert.ok(args.includes('-p'), 'should include -p flag');
     // Prompt should NOT be in args — piped via stdin
     assert.ok(!args.includes('refactor the auth module'), 'prompt should not be in args when useStdin is true');
-    assert.equal((calls[0].config as any).useStdin, true, 'useStdin should be true');
+    assert.equal((calls[0].config as CliConfig).useStdin, true, 'useStdin should be true');
   });
 
   it('should include --dangerously-skip-permissions when autoApprove is true (default)', async () => {
@@ -740,7 +727,6 @@ describe('Runner Task Execution — engine integration', () => {
       });
 
       const historyStore = createMockHistoryStore();
-      let callIndex = 0;
       const { TaskRunner } = proxyquire('../../../runner/runner', {
         'vscode': vscodeMock,
         '../adapters/index': {
@@ -817,7 +803,7 @@ describe('Runner Task Execution — engine integration', () => {
 
       // Playlist 2: uses plan default (claude)
       const pl2 = { id: 'pl2', name: 'Claude Phase', autoplay: true, autoplayDelay: 0, tasks: [createTask('T2', 'task 2')] };
-      plan.playlists.push(pl2 as any);
+      plan.playlists.push(pl2 as unknown as Playlist);
 
       const runner = new TaskRunner(historyStore);
       await runner.play(plan);

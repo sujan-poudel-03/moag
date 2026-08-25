@@ -146,7 +146,7 @@ liveDescribe('Codex Live Execution', function () {
     const start = Date.now();
     setTimeout(() => controller.abort(), 5000);
 
-    const result = await runCli(
+    await runCli(
       config,
       { prompt: '', cwd: process.cwd(), signal: controller.signal },
     );
@@ -257,7 +257,7 @@ liveDescribe('Claude Live Execution', function () {
     const start = Date.now();
     setTimeout(() => controller.abort(), 5000);
 
-    const result = await runCli(
+    await runCli(
       config,
       { prompt: '', cwd: process.cwd(), signal: controller.signal },
     );

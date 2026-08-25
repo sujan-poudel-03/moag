@@ -333,6 +333,7 @@ describe('loadPlan / savePlan round-trip', () => {
           id: 't-1',
           name: 'Task',
           prompt: 'Prompt',
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any -- feeding a deliberately invalid value to exercise the runtime guard; the type system forbids it by design
           timeoutMs: '900000' as any,
         }],
       }],
@@ -438,6 +439,7 @@ describe('loadPlan / savePlan round-trip', () => {
       name: 'Bad Profile',
       defaultEngine: 'claude',
       validation: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- feeding a deliberately invalid value to exercise the runtime guard; the type system forbids it by design
         profile: 'bad-profile' as any,
       },
       playlists: [{
@@ -462,6 +464,7 @@ describe('loadPlan / savePlan round-trip', () => {
       name: 'Bad Targets',
       defaultEngine: 'claude',
       validation: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- feeding a deliberately invalid value to exercise the runtime guard; the type system forbids it by design
         targets: ['web', 'tv' as any],
       },
       playlists: [{
@@ -520,6 +523,7 @@ describe('loadPlan / savePlan round-trip', () => {
           name: 'Task',
           prompt: 'Prompt',
           validation: {
+            // eslint-disable-next-line @typescript-eslint/no-explicit-any -- feeding a deliberately invalid value to exercise the runtime guard; the type system forbids it by design
             profile: 'invalid' as any,
           },
         }],
@@ -603,6 +607,7 @@ describe('loadPlan / savePlan round-trip', () => {
       version: '1.0',
       name: 'Bad Versions',
       defaultEngine: 'claude',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- feeding a deliberately invalid value to exercise the runtime guard; the type system forbids it by design
       prdVersions: 'v1' as any,
       playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
     };
@@ -616,6 +621,7 @@ describe('loadPlan / savePlan round-trip', () => {
       version: '1.0',
       name: 'Bad Version Entry',
       defaultEngine: 'claude',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- feeding a deliberately invalid value to exercise the runtime guard; the type system forbids it by design
       prdVersions: [{ version: 1 } as any],
       playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks: [] }],
     };

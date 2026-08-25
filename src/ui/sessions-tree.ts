@@ -3,7 +3,7 @@
 // Copilot Chat sessions / Codex tasks / Claude Code conversations panels.
 
 import * as vscode from 'vscode';
-import { HistoryEntry, EngineId, TaskStatus } from '../models/types';
+import { HistoryEntry, TaskStatus } from '../models/types';
 import { HistoryStore } from '../history/store';
 import { RunSession, RunSessionStore } from '../models/run-session';
 import { getModelSpec } from '../models/model-specs';

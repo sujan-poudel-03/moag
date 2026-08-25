@@ -8,7 +8,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { HistoryEntry, TaskStatus } from '../models/types';
+import type { HistoryEntry } from '../models/types';
 
 export interface ContextWeights {
   version: number;

@@ -47,13 +47,11 @@ export class CodexAdapter implements EngineAdapter {
 
 function buildCodexArgs(extraArgs: string[], modelId?: string): string[] {
   const args = ['exec'];
-  let hasExplicitModel = false;
 
   for (let i = 0; i < extraArgs.length; i++) {
     const arg = extraArgs[i];
 
     if (arg === '-m' || arg === '--model') {
-      hasExplicitModel = true;
       const configuredModel = extraArgs[i + 1];
       args.push(arg);
       if (configuredModel !== undefined) {
@@ -64,7 +62,6 @@ function buildCodexArgs(extraArgs: string[], modelId?: string): string[] {
     }
 
     if (arg.startsWith('--model=')) {
-      hasExplicitModel = true;
       const configuredModel = arg.slice('--model='.length);
       args.push(shouldReplaceLegacyModel(configuredModel, modelId) ? `--model=${modelId}` : arg);
       continue;

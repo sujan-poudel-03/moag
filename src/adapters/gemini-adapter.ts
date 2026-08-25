@@ -23,7 +23,7 @@ export class GeminiAdapter implements EngineAdapter {
     const result = await runCli(
       {
         command,
-        buildArgs: (opts) => {
+        buildArgs: (_opts) => {
           const args = [...extraArgs];
           // Only pass --model if explicitly set in extraArgs by the user.
           // Otherwise let Gemini CLI use its own default model selection.

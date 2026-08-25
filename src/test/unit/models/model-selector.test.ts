@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
-import { selectModel, ReasoningPreset, ModelSelection } from '../../../models/model-selector';
-import { Task, TaskStatus, EngineId } from '../../../models/types';
+import { selectModel } from '../../../models/model-selector';
+import { Task, TaskStatus } from '../../../models/types';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -112,7 +112,10 @@ describe('model-selector', () => {
         prompt: 'test task',
         files: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts'],
       }), 'claude');
-      // More files should increase score (may or may not change preset)
+      // The reason carries the score, e.g. 'Score 25/100 (fast): ...'.
+      const score = (r: { reason: string }) => Number(r.reason.match(/Score (\d+)\/100/)![1]);
+      assert.ok(score(withFiles) > score(withoutFiles),
+        `files should raise the score: ${withoutFiles.reason} -> ${withFiles.reason}`);
       assert.ok(withFiles.reason.includes('file'));
     });
 

@@ -2,7 +2,8 @@ import { strict as assert } from 'assert';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as os from 'os';
-import { Plan, Playlist, Task, TaskStatus, HistoryEntry, EngineResult } from '../../../models/types';
+import { Plan, Playlist, Task, TaskStatus, HistoryEntry } from '../../../models/types';
+import { SemanticSpan } from '../../../context/semantic-provider';
 import { createEmptyPlan, createPlaylist, createTask } from '../../../models/plan';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -13,7 +14,6 @@ const vscodeMock = require('../mocks/vscode');
 // Load context-builder with mocked vscode (semantic provider returns no spans)
 const {
   buildContext,
-  getContextSettings,
   gatherPlanOverview,
   gatherCumulativeProgress,
   gatherChangedFiles,
@@ -238,7 +238,7 @@ describe('Context Builder', () => {
     });
 
     it('should deduplicate files and attribute to last writer', () => {
-      const { plan, playlist, tasks } = makePlanWithTasks();
+      const { playlist, tasks } = makePlanWithTasks();
       // Both task-1 and task-2 completed and changed package.json
       tasks[0].status = TaskStatus.Completed;
       tasks[1].status = TaskStatus.Completed;
@@ -513,8 +513,8 @@ describe('Context Builder', () => {
       ].join('\n'));
       const spans = gatherRgGlobSpans('Use MAX_RETRIES when retrying requests', tmpDir, 50000);
       assert.ok(spans.length > 0);
-      assert.ok(spans.some((s: any) => s.content.includes('MAX_RETRIES')));
-      assert.ok(spans.every((s: any) => s.confidence === 0.65));
+      assert.ok(spans.some((s: SemanticSpan) => s.content.includes('MAX_RETRIES')));
+      assert.ok(spans.every((s: SemanticSpan) => s.confidence === 0.65));
     });
 
     it('should find spans matching snake_case identifiers in prompt', () => {
@@ -525,7 +525,7 @@ describe('Context Builder', () => {
       ].join('\n'));
       const spans = gatherRgGlobSpans('implement task_runner logic for each task_id', tmpDir, 50000);
       assert.ok(spans.length > 0);
-      assert.ok(spans.some((s: any) => s.content.includes('task_runner')));
+      assert.ok(spans.some((s: SemanticSpan) => s.content.includes('task_runner')));
     });
 
     it('should return empty array when no matching keywords found', () => {
@@ -540,7 +540,7 @@ describe('Context Builder', () => {
       fs.writeFileSync(path.join(tmpDir, 'src', 'big.ts'), longContent);
       const tinyBudget = 50;
       const spans = gatherRgGlobSpans('line_number context', tmpDir, tinyBudget);
-      const totalChars = spans.reduce((sum: number, s: any) => sum + s.content.length, 0);
+      const totalChars = spans.reduce((sum: number, s: SemanticSpan) => sum + s.content.length, 0);
       assert.ok(totalChars <= tinyBudget);
     });
 
@@ -548,7 +548,7 @@ describe('Context Builder', () => {
       fs.writeFileSync(path.join(tmpDir, 'src', 'auth.ts'), 'function authenticate_user() {}');
       const spans = gatherRgGlobSpans('authenticate_user should validate tokens', tmpDir, 50000);
       for (const s of spans) {
-        assert.equal((s as any).confidence, 0.65);
+        assert.equal(s.confidence, 0.65);
       }
     });
   });
@@ -583,8 +583,8 @@ describe('Context Builder', () => {
       const higher = [makeSpan('a.ts', 1, 5, 0.65)];
       const result = mergeSpans(lower, higher);
       assert.equal(result.length, 2);
-      assert.ok(result.some((s: any) => s.filePath === 'a.ts'));
-      assert.ok(result.some((s: any) => s.filePath === 'b.ts'));
+      assert.ok(result.some((s: SemanticSpan) => s.filePath === 'a.ts'));
+      assert.ok(result.some((s: SemanticSpan) => s.filePath === 'b.ts'));
     });
 
     it('should keep non-overlapping lower spans in the same file', () => {
@@ -632,7 +632,7 @@ describe('Context Builder', () => {
       ].join('\n'));
       const spans = gatherSymbolHintSpans('Use TaskRunner to execute tasks', tmpDir, 50000);
       assert.ok(spans.length > 0);
-      assert.ok(spans.some((s: any) => s.content.includes('TaskRunner')));
+      assert.ok(spans.some((s: SemanticSpan) => s.content.includes('TaskRunner')));
     });
 
     it('should find spans for PascalCase identifiers in prompt', () => {
@@ -643,14 +643,14 @@ describe('Context Builder', () => {
       ].join('\n'));
       const spans = gatherSymbolHintSpans('HistoryStore should persist entries', tmpDir, 50000);
       assert.ok(spans.length > 0);
-      assert.ok(spans.some((s: any) => s.content.includes('HistoryStore')));
+      assert.ok(spans.some((s: SemanticSpan) => s.content.includes('HistoryStore')));
     });
 
     it('should assign confidence 0.6 to all spans', () => {
       fs.writeFileSync(path.join(tmpDir, 'src', 'auth.ts'), 'function AuthProvider() {}');
       const spans = gatherSymbolHintSpans('AuthProvider setup', tmpDir, 50000);
       for (const s of spans) {
-        assert.equal((s as any).confidence, 0.6);
+        assert.equal(s.confidence, 0.6);
       }
     });
 
@@ -665,7 +665,7 @@ describe('Context Builder', () => {
       fs.writeFileSync(path.join(tmpDir, 'src', 'big.ts'), content);
       const budget = 80;
       const spans = gatherSymbolHintSpans('MyFunc usage in code', tmpDir, budget);
-      const totalChars = spans.reduce((sum: number, s: any) => sum + s.content.length, 0);
+      const totalChars = spans.reduce((sum: number, s: SemanticSpan) => sum + s.content.length, 0);
       assert.ok(totalChars <= budget);
     });
 
@@ -679,7 +679,7 @@ describe('Context Builder', () => {
       ].join('\n'));
       const spans = gatherSymbolHintSpans('ContextBuilder should return an object', tmpDir, 50000);
       assert.ok(spans.length > 0);
-      const merged = spans.map((s: any) => s.content).join('\n');
+      const merged = spans.map((s: SemanticSpan) => s.content).join('\n');
       // Should include lines before/after the match
       assert.ok(merged.includes('BEFORE') || merged.includes('AFTER') || merged.includes('ContextBuilder'));
     });
@@ -708,7 +708,7 @@ describe('Context Builder', () => {
       const task = makeTask('implement TaskRunner logic');
       const result = await runCascadeWithSemantic(task, tmpDir, 50000);
       assert.equal(result.usedSemantic, true);
-      assert.ok(result.spans.some((s: any) => s.filePath === 'src/semantic.ts'));
+      assert.ok(result.spans.some((s: SemanticSpan) => s.filePath === 'src/semantic.ts'));
     });
 
     it('should return usedSemantic=false when no semantic provider', async () => {
@@ -732,7 +732,7 @@ describe('Context Builder', () => {
       const result = await runCascadeNoSemantic(task, tmpDir, 50000);
       assert.equal(result.usedSemantic, false);
       // Should still have rg/hint spans covering TaskRunner
-      assert.ok(result.spans.some((s: any) => s.content.includes('TaskRunner')));
+      assert.ok(result.spans.some((s: SemanticSpan) => s.content.includes('TaskRunner')));
     });
 
     it('should include deterministic spans for files not covered by semantic results', async () => {
@@ -745,10 +745,10 @@ describe('Context Builder', () => {
       const result = await runCascadeWithSemantic(task, tmpDir, 50000);
       assert.equal(result.usedSemantic, true);
       // Semantic span is present
-      assert.ok(result.spans.some((s: any) => s.filePath === 'src/semantic.ts'));
+      assert.ok(result.spans.some((s: SemanticSpan) => s.filePath === 'src/semantic.ts'));
       // Extras from other files may also be present
       // (src/other.ts is not covered by the semantic result)
-      const otherSpan = result.spans.find((s: any) => s.filePath === 'src/other.ts');
+      const otherSpan = result.spans.find((s: SemanticSpan) => s.filePath === 'src/other.ts');
       if (otherSpan) {
         assert.ok(otherSpan.content.includes('TaskHelper'));
       }
@@ -784,7 +784,7 @@ describe('Context Builder', () => {
     }
 
     it('collapses a fully-completed playlist to one summary line', () => {
-      const { plan, donePlaylist, currentPlaylist, currentTask } = makeMultiPlaylistPlan();
+      const { plan, currentPlaylist, currentTask } = makeMultiPlaylistPlan();
       const result = gatherPlanOverview(plan, currentPlaylist, currentTask);
       assert.ok(result.includes('✓ Playlist "Done Playlist" (2 done)'),
         'completed playlist should be collapsed');

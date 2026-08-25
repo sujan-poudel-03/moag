@@ -52,7 +52,7 @@ import { RunSessionStore, RunSession } from './models/run-session';
 import * as UserMsg from './utils/user-messages';
 import { SessionsTreeProvider, SessionsTreeItem } from './ui/sessions-tree';
 import { BUILT_IN_PLAN_TEMPLATES, PlanTemplate } from './templates/built-in-plans';
-import { PROFILE_META, ProfileName } from './models/execution-profiles';
+import { PROFILE_META } from './models/execution-profiles';
 import { PromptLibraryStore } from './templates/prompt-library';
 import { SandboxManager } from './sandbox/sandbox-manager';
 import { resolveBrowserRunner } from './sandbox/browser-driver';
@@ -99,7 +99,6 @@ let aiRulesStore: AiRulesStore | null = null;
 // ─── Sandbox state ───
 let sandboxManager: SandboxManager | null = null;
 /** Screenshot paths captured via the sandbox panel, cleared after injected into a task's context */
-let pendingScreenshotPaths: string[] = [];
 
 // ─── Watch mode state ───
 let watchModeActive = false;
@@ -1194,7 +1193,7 @@ async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<voi
     return;
   }
 
-  const { signals, suggestedRuleIds } = detectProjectRules(cwd);
+  const { signals } = detectProjectRules(cwd);
   if (signals.length === 0) { return; }
 
   void context.workspaceState.update(RULES_PROMPT_KEY, true);
@@ -1595,7 +1594,7 @@ export function activate(context: vscode.ExtensionContext): void {
     promptViewProvider?.postLiveOutputChunk(task.id, chunk);
   });
 
-  runner.on('engine-fallback', ({ taskId, fromEngine, toEngine }) => {
+  runner.on('engine-fallback', ({ fromEngine, toEngine }) => {
     vscode.window.showInformationMessage(`Rate limit hit on ${fromEngine}. Retrying with ${toEngine}.`);
     DashboardPanel.currentPanel?.postEngineFallback(fromEngine, toEngine);
   });
@@ -2578,57 +2577,6 @@ async function promptSaveBeforeNew(): Promise<boolean> {
   return true;
 }
 
-function formatTaskList(values?: string[]): string {
-  return values?.join('\n') ?? '';
-}
-
-function parseTaskList(raw: string | undefined): string[] | undefined {
-  if (!raw) {
-    return undefined;
-  }
-  const values = raw
-    .split(/\r?\n/)
-    .map(item => item.trim())
-    .filter(Boolean);
-  return values.length > 0 ? values : undefined;
-}
-
-function formatTaskEnv(env?: Record<string, string>): string {
-  if (!env) {
-    return '';
-  }
-  return Object.entries(env)
-    .map(([key, value]) => `${key}=${value}`)
-    .join('\n');
-}
-
-function parseTaskEnv(raw: string | undefined): Record<string, string> | undefined {
-  if (!raw) {
-    return undefined;
-  }
-  const envEntries = raw
-    .split(/\r?\n/)
-    .map(line => line.trim())
-    .filter(Boolean);
-  if (envEntries.length === 0) {
-    return undefined;
-  }
-
-  const env: Record<string, string> = {};
-  for (const entry of envEntries) {
-    const eqIndex = entry.indexOf('=');
-    if (eqIndex <= 0) {
-      continue;
-    }
-    const key = entry.slice(0, eqIndex).trim();
-    const value = entry.slice(eqIndex + 1).trim();
-    if (key) {
-      env[key] = value;
-    }
-  }
-  return Object.keys(env).length > 0 ? env : undefined;
-}
-
 function getTaskType(task: Task): TaskType {
   return task.type ?? 'agent';
 }
@@ -3601,7 +3549,7 @@ async function cmdNewPlan(): Promise<void> {
       content: '# Paste or write your project description here\n# Delete these comment lines, then save and close this tab\n# The more detail you provide, the better the generated plan\n\n',
       language: 'markdown',
     });
-    const editor = await vscode.window.showTextDocument(doc);
+    await vscode.window.showTextDocument(doc);
 
     // Wait for the user to close the tab
     rawIdea = await new Promise<string>((resolve) => {
@@ -4063,7 +4011,7 @@ async function cmdPreviewTaskPrompt(arg?: unknown): Promise<void> {
         ? Math.round((budgetUsage.totalCharsUsed / budgetUsage.totalCharsBudget) * 100)
         : 0;
 
-      const engine = task.engine ?? (playlist as any).engine ?? 'default';
+      const engine = task.engine ?? playlist.engine ?? 'default';
       const taskType = task.type ?? 'agent';
 
       const lines: string[] = [
@@ -4658,7 +4606,6 @@ async function cmdRunContextEval(): Promise<void> {
   const withCtx = instrumented.length;
 
   const completed = allEntries.filter((e: import('./models/types').HistoryEntry) => e.status === 'completed');
-  const failed    = allEntries.filter((e: import('./models/types').HistoryEntry) => e.status === 'failed');
   const autoFixed = allEntries.filter((e: import('./models/types').HistoryEntry) => (e as import('./models/types').HistoryEntry & { autoFixed?: boolean }).autoFixed);
 
   const successRate = total > 0 ? Math.round((completed.length / total) * 100) : 0;
@@ -8217,8 +8164,10 @@ function fetchUrl(url: string, isGistApi: boolean): Promise<string> {
               return;
             }
             // Pick the first .json file, or the first file
-            const jsonFile = Object.values(files).find((f: any) => f.filename?.endsWith('.json')) as any;
-            const firstFile = jsonFile || Object.values(files)[0] as any;
+            // Only the two fields we actually read off the GitHub Gist response.
+            const entries = Object.values(files) as Array<{ filename?: string; content: string }>;
+            const jsonFile = entries.find((f) => f.filename?.endsWith('.json'));
+            const firstFile = jsonFile ?? entries[0];
             resolve(firstFile.content);
           } catch {
             reject(new Error('Failed to parse Gist API response.'));
@@ -8402,7 +8351,7 @@ async function cmdDryRun(): Promise<void> {
   doc += '## Engine Availability\n\n';
   doc += '| Engine | Available | Command | Version |\n';
   doc += '|--------|-----------|---------|--------|\n';
-  for (const [id, info] of availability) {
+  for (const [, info] of availability) {
     const status = info.available ? 'Yes' : 'NO';
     doc += `| ${info.displayName} | ${status} | \`${info.command}\` | ${info.version || '-'} |\n`;
   }
@@ -8721,8 +8670,8 @@ async function cmdUndoTask(treeItem?: PlanTreeItem): Promise<void> {
       });
     });
     vscode.window.showInformationMessage(`Undo complete: "${taskName}" changes reverted.`);
-  } catch (err: any) {
-    vscode.window.showErrorMessage(`Undo failed: ${err.message ?? err}`);
+  } catch (err) {
+    vscode.window.showErrorMessage(`Undo failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 }
 

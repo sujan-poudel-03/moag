@@ -33,7 +33,7 @@ import {
 } from './worktree';
 import { resolveRoleCharter } from '../models/roles';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
-import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName, ProfileConfig } from '../models/execution-profiles';
+import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
 import { costLedger, CostEvent } from '../utils/cost-ledger';
 import { getValidationAdapters, validationResultToEngineResult } from '../adapters/validation/index';
@@ -47,7 +47,6 @@ import { TaskQueue } from './task-queue';
 import { ghSync } from '../utils/gh';
 import { fileIncidentIssue } from '../github/issue-sync';
 
-const DEFAULT_TASK_TIMEOUT_MS = 10 * 60 * 1000;
 const GIT_TIMEOUT_MS = 30_000;
 const VERIFY_TIMEOUT_MS = 30_000;
 
