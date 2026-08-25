@@ -62,6 +62,10 @@ export interface Args {
   uatMode?: 'off' | 'auto' | 'required';
   /** Spec filter for the browser UAT gate. */
   uatSpec?: string;
+  /** Open a pull request for the committed work once the run finishes. */
+  pr?: boolean;
+  /** Target branch for --pr; gh picks the repo default when omitted. */
+  prBase?: string;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -103,6 +107,8 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--uat') { a.uatMode = 'required'; }
     else if (arg === '--no-uat') { a.uatMode = 'off'; }
     else if (arg === '--uat-spec') { const s = rest[++i]; if (s) { a.uatSpec = s; } }
+    else if (arg === '--pr') { a.pr = true; }
+    else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
     else if (!arg.startsWith('--') && !a.planPath) { a.planPath = path.resolve(a.cwd, arg); }
   }
   return a;
@@ -441,6 +447,9 @@ async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   if (args.engine) { plan.defaultEngine = args.engine; }
 
   const events = wireEvents(ctx.runner);
+  // Captured before the run so --pr can report what the run actually touched.
+  const { captureBaseRef } = require('../runner/evidence');
+  const prBaseRef = args.pr ? await captureBaseRef(args.cwd) : null;
   emit({ event: 'run-started', plan: plan.name, planPath, fullAuto: args.fullAuto });
   try { await ctx.runner.play(plan); }
   catch (err) { emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
@@ -449,10 +458,47 @@ async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   emit({ event: 'run-finished', ...t, manualGateHit: events.manualGateHit() });
   const runCode = events.manualGateHit() ? 3 : (t.failed > 0 ? 1 : 0);
 
+  if (args.pr) { await openPullRequest(args, plan, prBaseRef); }
+
   if (!args.verify) { return runCode; }
   // A clean task tally is not evidence — fold the PRD verdict into the exit code.
   const verifyCode = await runVerifyCore(args, ctx, plan, events);
   return runCode !== 0 ? runCode : verifyCode;
+}
+
+/**
+ * Open a PR for whatever the run committed. Never throws and never changes the
+ * exit code: a run that succeeded did not fail because delivery was unavailable,
+ * so the reason is emitted and the caller decides what to do about it.
+ */
+async function openPullRequest(args: Args, plan: any, baseRef: string | null): Promise<void> {
+  const { createPullRequest, describeFailure } = require('../utils/pr');
+  const { collectDiffEvidence } = require('../runner/evidence');
+  const { TaskStatus } = require('../models/types');
+
+  const evidence = baseRef
+    ? await collectDiffEvidence(args.cwd, baseRef, { maxDiffChars: 1 })
+    : { changedFiles: [] };
+
+  const tasks = (plan.playlists ?? []).flatMap((pl: any) => pl.tasks ?? []).map((t: any) => ({
+    name: t.name,
+    completed: t.status === TaskStatus.Completed,
+  }));
+
+  const outcome = createPullRequest({
+    cwd: args.cwd,
+    title: plan.name || 'MOAG automated changes',
+    planName: plan.name ?? '',
+    tasks,
+    changedFiles: evidence.changedFiles,
+    base: args.prBase,
+  });
+
+  if (outcome.ok) {
+    emit({ event: 'pr-created', url: outcome.url });
+  } else {
+    emit({ event: 'pr-skipped', reason: outcome.reason, message: describeFailure(outcome) });
+  }
 }
 
 // ─── command: verify ─────────────────────────────────────────────────────────
@@ -597,7 +643,7 @@ async function main(): Promise<number> {
   }
   process.stderr.write(
     'Usage: moag <run|verify|loop|daemon> ...\n' +
-    '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix]\n' +
+    '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
     '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
     '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
     '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n',
