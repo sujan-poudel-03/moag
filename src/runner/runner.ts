@@ -22,6 +22,13 @@ import {
 } from '../models/types';
 import { generateId } from '../models/plan';
 import { commitTask, describePrepareFailure, prepareBranch, DeliveryConfig } from './git-delivery';
+import {
+  createWorktrees,
+  describeIsolationFailure,
+  isolationRequired,
+  removeWorktrees,
+  Worktree,
+} from './worktree';
 import { resolveRoleCharter } from '../models/roles';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
 import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName, ProfileConfig } from '../models/execution-profiles';
@@ -309,6 +316,12 @@ export class TaskRunner {
   private _taskGitRefs = new Map<string, { ref: string; cwd: string }>();
   /** Set once per run when auto-commit is armed; null when delivery is off. */
   private _deliveryBranch: string | null = null;
+  /** Worktrees created for this run; emptied on teardown. */
+  private _worktrees: Worktree[] = [];
+  /** playlistId -> isolated checkout path. */
+  private _playlistCwd = new Map<string, string>();
+  /** taskId -> isolated checkout path, because resolveCwd has no playlist. */
+  private _taskCwdRoot = new Map<string, string>();
   private _serviceProcesses = new Map<string, ServiceHandle>();
   private _currentRunId: string | null = null;
   private _sessionCostUsd = 0;
@@ -736,12 +749,18 @@ export class TaskRunner {
     const failSafe = this.isFailSafeMode();
     const concurrentPlaylists = vscode.workspace.getConfiguration('agentTaskPlayer')
       .get<number>('parallelPlaylists', 1);
-    const effectiveConcurrentPlaylists = failSafe ? 1 : concurrentPlaylists;
+    const requested = failSafe ? 1 : concurrentPlaylists;
+    // Concurrency is only granted once each playlist has its own checkout.
+    const effectiveConcurrentPlaylists = await this.armIsolation(plan, requested);
 
-    if (effectiveConcurrentPlaylists > 1 && plan.playlists.length > 1) {
-      await this.runPlaylistsConcurrently(plan, effectiveConcurrentPlaylists);
-    } else {
-      await this.runPlaylistsSequentially(plan);
+    try {
+      if (effectiveConcurrentPlaylists > 1 && plan.playlists.length > 1) {
+        await this.runPlaylistsConcurrently(plan, effectiveConcurrentPlaylists);
+      } else {
+        await this.runPlaylistsSequentially(plan);
+      }
+    } finally {
+      await this.releaseIsolation();
     }
 
     this.emit('all-completed');
@@ -1132,7 +1151,7 @@ export class TaskRunner {
 
     // Fix 4: Warn about missing context files before the agent starts
     if (task.files && task.files.length > 0 && (taskType === 'agent' || taskType === 'review')) {
-      const cwdForFiles = this.resolveCwd(task.cwd);
+      const cwdForFiles = this.resolveCwd(task.cwd, task);
       for (const filePath of task.files) {
         const resolved = path.isAbsolute(filePath) ? filePath : path.join(cwdForFiles, filePath);
         if (!fs.existsSync(resolved)) {
@@ -1172,7 +1191,7 @@ export class TaskRunner {
     // Store profile's model preset on the task for runAgentOnEngine to pick up
     (task as Task & { _profileModelPreset?: string })._profileModelPreset = profile.modelPreset;
 
-    const cwd = this.resolveCwd(task.cwd);
+    const cwd = this.resolveCwd(task.cwd, task);
 
     // Gap 3: Resolve inherited env files — merge before task.env (task.env wins)
     const workspaceRoot = this.resolveCwd(undefined);
@@ -1753,7 +1772,7 @@ export class TaskRunner {
 
     // BUG 2 fix: only pass file paths that actually exist on disk; invalid paths would cause
     // the adapter to report 0 context files and Claude would run with no context.
-    const resolvedCwd = this.resolveCwd(task.cwd);
+    const resolvedCwd = this.resolveCwd(task.cwd, task);
     const validFiles = task.files?.filter(f => {
       const abs = path.isAbsolute(f) ? f : path.join(resolvedCwd, f);
       return fs.existsSync(abs);
@@ -2211,7 +2230,7 @@ export class TaskRunner {
           task.incidentRepo,
           `Incident: ${task.name} unhealthy`,
           `Automated incident from a MOAG monitor task.\n\n${summary}\n\nEndpoint: ${url}`,
-          { label: task.incidentLabel ?? 'moag:incident', cwd: this.resolveCwd(task.cwd) },
+          { label: task.incidentLabel ?? 'moag:incident', cwd: this.resolveCwd(task.cwd, task) },
         );
         if (issueUrl) { this.emit('task-output', task, `[Incident] Filed ${issueUrl}\n`, 'stdout'); }
       }
@@ -2787,9 +2806,10 @@ export class TaskRunner {
     return sections.join('\n');
   }
 
-  private resolveCwd(taskCwd?: string): string {
+  private resolveCwd(taskCwd?: string, task?: Task): string {
     const workspaceFolders = vscode.workspace.workspaceFolders;
-    const root = workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const isolated = task ? this._taskCwdRoot.get(task.id) : undefined;
+    const root = isolated ?? workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     if (!taskCwd) {
       return root;
     }
@@ -2923,6 +2943,74 @@ export class TaskRunner {
       enabled: cfg.get<boolean>('git.autoCommit', false),
       branchPrefix: cfg.get<string>('git.branchPrefix', 'moag/') || 'moag/',
     };
+  }
+
+
+  /**
+   * Establish worktree isolation for a concurrent run, or refuse the concurrency.
+   *
+   * Returns the concurrency that may actually be used. Falling back to 1 is
+   * always safe; running N agents in one directory is not, so isolation failing
+   * downgrades the run rather than risking a tree nobody can attribute.
+   */
+  private async armIsolation(plan: Plan, requested: number): Promise<number> {
+    this._playlistCwd.clear();
+    this._worktrees = [];
+
+    if (!isolationRequired(requested, plan.playlists.length)) {
+      return requested;
+    }
+
+    // Isolation without delivery would strand each playlist's work in a
+    // throwaway checkout that teardown then has to keep. Refuse the concurrency
+    // instead of creating that situation.
+    if (!this.getDeliveryConfig().enabled) {
+      this.emit('error', new Error(describeIsolationFailure('delivery-off')));
+      return 1;
+    }
+
+    const repoRoot = this.resolveCwd(undefined);
+    const outcome = await createWorktrees(
+      repoRoot,
+      plan.playlists.map((pl) => ({ id: pl.id, name: pl.name })),
+      this._currentRunId ?? 'run',
+      this.getDeliveryConfig().branchPrefix,
+      (args, dir) => this.runGitCommand(args, dir),
+    );
+
+    if (!outcome.ok) {
+      this.emit('error', new Error(describeIsolationFailure(outcome.reason)));
+      return 1;
+    }
+
+    this._worktrees = outcome.worktrees;
+    for (const wt of outcome.worktrees) {
+      const playlist = plan.playlists.find((pl) => pl.id === wt.playlistId);
+      if (!playlist) { continue; }
+      this._playlistCwd.set(playlist.id, wt.path);
+      // Tasks reach resolveCwd without their playlist in scope, so map them here.
+      for (const task of playlist.tasks) {
+        this._taskCwdRoot.set(task.id, wt.path);
+      }
+    }
+    return requested;
+  }
+
+  /** Tear down this run's worktrees. Branches are kept — they hold the work. */
+  private async releaseIsolation(): Promise<void> {
+    if (this._worktrees.length === 0) { return; }
+    const repoRoot = this.resolveCwd(undefined);
+    const kept = await removeWorktrees(repoRoot, this._worktrees, (args, dir) => this.runGitCommand(args, dir));
+    if (kept.length > 0) {
+      // git refused to remove these because they still hold uncommitted work.
+      // Say where it is rather than letting it disappear from view.
+      this.emit('error', new Error(
+        'Kept ' + kept.length + ' worktree(s) holding uncommitted work: ' + kept.join(', '),
+      ));
+    }
+    this._worktrees = [];
+    this._playlistCwd.clear();
+    this._taskCwdRoot.clear();
   }
 
   private runGitCommand(args: string[], cwd: string): Promise<string | null> {
