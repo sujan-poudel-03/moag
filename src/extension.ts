@@ -3058,6 +3058,9 @@ async function runPromptSubmission(
     startProgressNotification();
 
     try {
+      // Accepted: every rejection path is behind us, so release the composer now.
+      // Clearing after play() would hold the text and image for the whole run.
+      promptViewProvider?.clear();
       await runner.play(promptPlan);
       return true;
     } catch (err) {
@@ -3099,6 +3102,9 @@ async function runPromptSubmission(
   startProgressNotification();
 
   try {
+    // Accepted: every rejection path is behind us, so release the composer now.
+    // Clearing after play() would hold the text and image for the whole run.
+    promptViewProvider?.clear();
     await runner.play(singleTaskPlan);
     return true;
   } catch (err) {
