@@ -75,6 +75,10 @@ export interface Args {
   prBase?: string;
   /** Lower bound for `digest`, any value git --since understands. */
   since?: string;
+  /** `land` only: actually merge, instead of reporting what would happen. */
+  merge?: boolean;
+  /** `land` only: the branch to land into; defaults to the current one. */
+  into?: string;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -118,6 +122,8 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--no-uat') { a.uatMode = 'off'; }
     else if (arg === '--uat-spec') { const s = rest[++i]; if (s) { a.uatSpec = s; } }
     else if (arg === '--since') { const v = rest[++i]; if (v) { a.since = v; } }
+    else if (arg === '--merge') { a.merge = true; }
+    else if (arg === '--into') { const v = rest[++i]; if (v) { a.into = v; } }
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
     else if (!arg.startsWith('--')) {
@@ -645,6 +651,74 @@ async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
   });
 }
 
+// ─── command: land ───────────────────────────────────────────────────────────
+
+/**
+ * Get the branches a run left behind back into the trunk.
+ *
+ * Reports by default and merges only when asked. Conflicts are detected with
+ * `git merge-tree`, which merges in memory — assessing never leaves the
+ * repository half-merged, which matters because this runs unattended.
+ *
+ * Exits 1 while anything still needs a person, so `moag land || notify-me` works
+ * the same way the digest does.
+ */
+async function cmdLand(args: Args): Promise<number> {
+  const { assessAll, landBranch, renderLandReport, resolveBase } = require('../runner/land');
+  const { spawn } = require('child_process');
+
+  // Keeps stdout on failure: git merge-tree reports conflicted paths there while
+  // exiting non-zero, and discarding them would throw away the useful half.
+  const git = (gitArgs: string[], cwd: string): Promise<{ ok: boolean; stdout: string }> =>
+    new Promise((resolve) => {
+      const proc = spawn('git', gitArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      let out = '';
+      proc.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+      proc.on('error', () => resolve({ ok: false, stdout: '' }));
+      proc.on('close', (code: number) => resolve({ ok: code === 0, stdout: out }));
+    });
+
+  installVscodeShim(args.cwd);
+  const prefix = require('vscode').workspace
+    .getConfiguration('agentTaskPlayer')
+    .get('git.branchPrefix', 'moag/') || 'moag/';
+
+  const base = await resolveBase(args.cwd, args.into, prefix, git);
+  if (!base) {
+    process.stderr.write('Could not determine a branch to land into; pass --into <branch>.\n');
+    return 2;
+  }
+
+  const report = await assessAll(args.cwd, prefix, base, git);
+  process.stdout.write(renderLandReport(report) + '\n');
+  emit({
+    event: 'land-assessed',
+    base,
+    ready: report.ready.length,
+    blocked: report.blocked.length,
+    alreadyLanded: report.alreadyLanded.length,
+  });
+
+  if (!args.merge) {
+    // Reporting is the default: merging is a write, and a write nobody asked
+    // for is exactly what an unattended tool must not do.
+    return report.blocked.length > 0 ? 1 : 0;
+  }
+
+  let landed = 0;
+  for (const b of report.ready) {
+    const outcome = await landBranch(args.cwd, b.branch, base, git);
+    if (outcome.merged) {
+      emit({ event: 'land-merged', branch: b.branch, into: base });
+      landed++;
+    } else {
+      emit({ event: 'land-failed', branch: b.branch, reason: outcome.reason, detail: outcome.detail });
+    }
+  }
+  emit({ event: 'land-finished', merged: landed, blocked: report.blocked.length });
+  return report.blocked.length > 0 || landed < report.ready.length ? 1 : 0;
+}
+
 // ─── command: digest ─────────────────────────────────────────────────────────
 
 /**
@@ -848,6 +922,9 @@ async function main(): Promise<number> {
   if (args.command === 'loop') {
     return cmdLoop(args, await setup(args));
   }
+  if (args.command === 'land') {
+    return cmdLand(args);
+  }
   if (args.command === 'digest') {
     return cmdDigest(args);
   }
@@ -861,7 +938,7 @@ async function main(): Promise<number> {
     return cmdConfig(args);
   }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest> ...\n' +
+    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land> ...\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
     '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
     '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
@@ -869,7 +946,8 @@ async function main(): Promise<number> {
     '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
     '  moag config <get-engine | set-engine <id>>\n' +
     '  moag queue <list | resolve <id>>\n' +
-    '  moag digest [--since <when>]\n',
+    '  moag digest [--since <when>]\n' +
+    '  moag land [--into <branch>] [--merge]\n',
   );
   return 2;
 }
