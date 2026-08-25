@@ -17,11 +17,13 @@ declare function acquireVsCodeApi(): {
 // project, and costs nothing that matters: the checks worth having — a syntax
 // error, and a reference to a name that does not exist — still fail the build.
 // Narrow these back per-element when the file is split into modules.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- declaration merging: the compiler uses these, eslint cannot see it
 interface Document {
   getElementById(elementId: string): any;
   querySelector(selectors: string): any;
   querySelectorAll(selectors: string): any;
 }
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- declaration merging, as above
 interface Element {
   closest(selectors: string): any;
   querySelector(selectors: string): any;
@@ -49,18 +51,18 @@ let activeFile = null; // { name, path } | null
 let activeFileDismissed = false;
 let pendingFixRef = null; // { playlistIndex, taskIndex } — set when Fix fills composer; routes Execute to task retry
 // PRD draft mode state
-var prdMode = false;
-var prdStep = 0; // 1 = waiting for feature description, 2 = waiting for follow-up answer
-var prdAnswers = []; // collected answers from user
+let prdMode = false;
+let prdStep = 0; // 1 = waiting for feature description, 2 = waiting for follow-up answer
+let prdAnswers = []; // collected answers from user
 
 function appendPrdMessage(role, text) {
   if (!chatFeedEl) { return; }
-  var wrap = document.createElement('div');
+  let wrap = document.createElement('div');
   wrap.className = 'prd-msg ' + (role === 'bot' ? 'prd-bot' : 'prd-user');
-  var author = document.createElement('div');
+  let author = document.createElement('div');
   author.className = 'prd-msg-author';
   author.textContent = role === 'bot' ? 'MOAG' : 'You';
-  var msg = document.createElement('div');
+  let msg = document.createElement('div');
   msg.className = 'prd-msg-text';
   msg.textContent = text;
   wrap.appendChild(author);
@@ -71,7 +73,7 @@ function appendPrdMessage(role, text) {
 
 function showPrdTyping() {
   if (!chatFeedEl) { return null; }
-  var el = document.createElement('div');
+  let el = document.createElement('div');
   el.className = 'prd-typing';
   el.innerHTML = '<span></span><span></span><span></span>';
   chatFeedEl.appendChild(el);
@@ -121,15 +123,12 @@ const planActiveNameEl = document.getElementById('planActiveName');
 const planExecCounterEl = document.getElementById('planExecCounter');
 const planRunnerBadgeEl = document.getElementById('planRunnerBadge');
 const planOpenPrdBtnEl = document.getElementById('planOpenPrdBtn');
-const planFilterBtnEl = null; // removed — filter now always visible in status bar
 const planFilterMenuEl = null; // removed
 const planSelectModeCbEl = document.getElementById('planSelectModeCb');
 const planFilterChipsEl = document.getElementById('planFilterChips');
 const planRunSelectedBtnEl = document.getElementById('planRunSelectedBtn');
 const planRunPendingBtnEl = document.getElementById('planRunPendingBtn');
 const planFixAllBtnEl = document.getElementById('planFixAllBtn');
-const planFixBarEl = null; // removed — merged into planStatusBar
-const planFixLabelEl = null; // removed
 const planFixAllBarBtnEl = document.getElementById('planFixAllBarBtn');
 const reportIssueBtnEl = document.getElementById('reportIssueBtn');
 const composerHintEl = document.getElementById('composerHint');
@@ -167,10 +166,8 @@ const prdProjectCardEl = document.getElementById('prdProjectCard');
 const prdProjectNameEl = document.getElementById('prdProjectName');
 const prdProjectStackEl = document.getElementById('prdProjectStack');
 const prdChipsRowEl = document.getElementById('prdChipsRow');
-var prdVersions = [];
+let prdVersions = [];
 const composerPrdBtnEl = document.getElementById('composerPrdBtn');
-const planToggleTasksBtnEl = document.getElementById('planToggleTasksBtn');
-const planToggleExpandBtnEl = document.getElementById('planToggleExpandBtn');
 const planSwitchBtnEl = document.getElementById('planSwitchBtn');
 const planOverviewEl = document.getElementById('planOverview');
 const planOverviewTitleEl = document.getElementById('planOverviewTitle');
@@ -203,8 +200,6 @@ const ctxCostEl = document.getElementById('ctxCost');
 const promptCharCountEl = document.getElementById('promptCharCount');
 let busy = false;
 let activeTab = 'chat';
-let chatItems = [];
-let planItems = [];
 let planGroups = [];
 let planAiRules = '';
 let planPrdSource = '';
@@ -214,7 +209,6 @@ let planFixIterations = 0;
 let prdProjectMeta = { name: '', stack: '' };
 let tttCriteriaChecked = [];
 let historyItems = [];
-let activeThreadId = '';
 let chatMessages = [];
 let runnerState = 'idle';
 let historyGroupBy = 'none';
@@ -230,7 +224,6 @@ let selectionMode = false;
 let selectedPlaylists = {};
 let selectedTasks = {};
 let activePlanName = '';
-let activePlaylistName = '';
 let actionMenuHandlersBound = false;
 let liveTaskId = '';
 let liveTaskName = '';
@@ -243,13 +236,7 @@ const ICON_FAILED = '\u2715';
 const ICON_BLOCKED = '!';
 const ICON_SKIPPED = '\u21BB';
 const ICON_PENDING = '\u25CB';
-const ICON_PLAY = '\u23F5';
 const ICON_PAUSE = '\u23F8';
-const ICON_RUN_PENDING = '\u25F7';
-const ICON_STOP = '\u23F9';
-const ICON_MENU = '\u22EF';
-const ICON_FILTER = '\u25BE';
-const ICON_LAYOUT = '\u21F5';
 const ICON_ARROW_RIGHT = '\u2192';
 const ICON_DOT = '\u2022';
 
@@ -294,32 +281,7 @@ function renderEngines(engines, selectedEngineId) {
   renderContextBar();
 }
 
-function itemDotClass(item, index) {
-  const s = String(item.status || '').toLowerCase();
-  if (s === 'running') { return 'active'; }
-  if (s === 'failed') { return 'failed'; }
-  return index < 3 ? 'recent' : '';
-}
 
-function renderItemList(targetEl, items) {
-  targetEl.textContent = '';
-  for (let i = 0; i < items.length; i++) {
-    const item = items[i];
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.className = 'item';
-    const dc = itemDotClass(item, i);
-    btn.innerHTML =
-      '<span class="item-title"><span class="item-dot' + (dc ? ' ' + dc : '') + '"></span>' + escHtml(item.title || 'Untitled') + '</span>' +
-      (item.subtitle ? '<span class="item-meta">' + escHtml(item.subtitle) + '</span>' : '');
-    btn.addEventListener('click', () => {
-      if (item.id) {
-        vscode.postMessage({ type: 'openItem', id: item.id, kind: item.kind || 'thread' });
-      }
-    });
-    targetEl.appendChild(btn);
-  }
-}
 
 function buildHistoryGroups(items) {
   const groups = new Map();
@@ -525,16 +487,16 @@ function renderPlanRulesSection() {
 
 function parsePrdCriteria(prdText) {
   if (!prdText) { return []; }
-  var lines = prdText.split('\\n');
-  var criteria = [];
-  var inCriteriaBlock = false;
-  for (var li = 0; li < lines.length; li++) {
-    var trimmed = lines[li].trim();
+  let lines = prdText.split('\\n');
+  let criteria = [];
+  let inCriteriaBlock = false;
+  for (let li = 0; li < lines.length; li++) {
+    let trimmed = lines[li].trim();
     if (trimmed.toLowerCase().indexOf('acceptance criteria') !== -1 || trimmed.toLowerCase().indexOf('## criteria') !== -1) { inCriteriaBlock = true; continue; }
     if (inCriteriaBlock && /^#{1,3} /.test(trimmed) && trimmed.toLowerCase().indexOf('criteria') === -1) { inCriteriaBlock = false; }
-    var cbm = trimmed.match(/^-[ ]*\\[[ x]\\][ ]*(.+)/i);
+    let cbm = trimmed.match(/^-[ ]*\\[[ x]\\][ ]*(.+)/i);
     if (cbm) { criteria.push(cbm[1].trim()); continue; }
-    var acm = trimmed.match(/^ac[0-9]*[:.] *(.+)/i);
+    let acm = trimmed.match(/^ac[0-9]*[:.] *(.+)/i);
     if (acm) { criteria.push(acm[1].trim()); continue; }
     if (inCriteriaBlock && (trimmed.charAt(0) === '-' || trimmed.charAt(0) === '*' || /^[0-9]/.test(trimmed)) && trimmed.length > 8) {
       criteria.push(trimmed.replace(/^[-*0-9.]+[ ]*/, '').trim());
@@ -563,25 +525,25 @@ function renderTttCriteria() {
   tttCriteriaSectionEl.classList.add('active');
   tttCriteriaListEl.textContent = '';
   criteria.forEach(function(text, i) {
-    var row = document.createElement('label');
+    let row = document.createElement('label');
     row.className = 'ttt-criterion' + (tttCriteriaChecked[i] ? ' checked' : '');
-    var cb = document.createElement('input');
+    let cb = document.createElement('input');
     cb.type = 'checkbox';
     cb.checked = !!tttCriteriaChecked[i];
     cb.addEventListener('change', function() {
       tttCriteriaChecked[i] = cb.checked;
       row.classList.toggle('checked', cb.checked);
       vscode.postMessage({ type: 'tttCriterionChecked', index: i, checked: cb.checked });
-      var allDone = tttCriteriaChecked.length > 0 && tttCriteriaChecked.every(Boolean);
+      let allDone = tttCriteriaChecked.length > 0 && tttCriteriaChecked.every(Boolean);
       tttVerifyBtnEl.style.display = allDone ? 'block' : 'none';
     });
-    var span = document.createElement('span');
+    let span = document.createElement('span');
     span.textContent = text;
     row.appendChild(cb);
     row.appendChild(span);
     tttCriteriaListEl.appendChild(row);
   });
-  var allDone = tttCriteriaChecked.length > 0 && tttCriteriaChecked.every(Boolean);
+  let allDone = tttCriteriaChecked.length > 0 && tttCriteriaChecked.every(Boolean);
   tttVerifyBtnEl.style.display = allDone ? 'block' : 'none';
 }
 
@@ -1048,7 +1010,7 @@ function renderPlanOverview(groups) {
     planOverviewEl.classList.add('done');
     if (planOverviewFailedMetaEl) { planOverviewFailedMetaEl.style.display = 'none'; }
     // Show done action row (Create PR / New Sprint)
-    var doneBannerEl = document.getElementById('planDoneBanner');
+    let doneBannerEl = document.getElementById('planDoneBanner');
     if (!doneBannerEl) {
       doneBannerEl = document.createElement('div');
       doneBannerEl.id = 'planDoneBanner';
@@ -1071,7 +1033,7 @@ function renderPlanOverview(groups) {
     planOverviewFillEl.style.width = pct + '%';
     planOverviewFillEl.classList.toggle('has-failed', taskFailed > 0);
     planOverviewEl.classList.remove('done');
-    var existingBanner = document.getElementById('planDoneBanner');
+    let existingBanner = document.getElementById('planDoneBanner');
     if (existingBanner) { existingBanner.style.display = 'none'; }
     if (planOverviewFailedMetaEl) {
       if (taskFailed > 0) {
@@ -1195,11 +1157,6 @@ function renderPlanTools() {
       return '<svg class="plan-icon-svg" viewBox="0 0 16 16" aria-hidden="true"><path d="M2.5 3.5h11l-4.5 5v3l-2 1v-4l-4.5-5z"></path></svg>';
     }
     return '';
-  };
-  const setIconButton = (el, icon, label) => {
-    el.textContent = icon;
-    el.title = label;
-    el.setAttribute('aria-label', label);
   };
   const label = activePlanName || 'Ad hoc';
   planActiveNameEl.textContent = label;
@@ -1558,7 +1515,6 @@ function renderChat(chatTitle, messages) {
     if (planHeader) {
       if (pendingTasks > 0) {
         planHeader.textContent = pendingTasks + ' task' + (pendingTasks > 1 ? 's' : '') + ' ready to run';
-        const hint = chatEmptyEl.querySelector('br + br') || chatEmptyEl.querySelector('br');
         // Replace static hint text
         const secondText = chatEmptyEl.childNodes[2];
         if (secondText && secondText.nodeType === Node.TEXT_NODE) { secondText.textContent = ''; }
@@ -1743,7 +1699,7 @@ function submit() {
     appendPrdMessage('user', text);
     promptEl.value = '';
     promptEl.style.height = '';
-    var typing = showPrdTyping();
+    showPrdTyping();
     prdAnswers.push(text);
     vscode.postMessage({ type: 'prdAnswer', answer: text, step: prdStep, answers: prdAnswers });
     prdStep++;
@@ -1976,7 +1932,7 @@ planPlayBtnEl.addEventListener('click', () => {
 });
 planAddTaskBtnEl.addEventListener('click', () => vscode.postMessage({ type: 'addTask' }));
 planNewBtnEl.addEventListener('click', () => vscode.postMessage({ type: 'newPlan' }));
-var prdScreenMode = 'generate'; // 'generate' | 'update'
+let prdScreenMode = 'generate'; // 'generate' | 'update'
 function openPrdInputScreen(mode) {
   prdScreenMode = mode;
   planManageMenuEl?.classList.remove('open');
@@ -1988,7 +1944,7 @@ function openPrdInputScreen(mode) {
     if (prdGenerateBtnEl) { prdGenerateBtnEl.textContent = 'Save to Plan'; }
     if (prdTextareaEl && planPrdSource) {
       prdTextareaEl.value = planPrdSource;
-      var len = planPrdSource.length;
+      let len = planPrdSource.length;
       if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
       if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
     }
@@ -2025,8 +1981,8 @@ prdModeCancelBtnEl?.addEventListener('click', exitPrdMode);
 prdBackBtnEl?.addEventListener('click', hidePrdInputScreen);
 function updatePrdAiBtn() {
   if (!prdAiBtnEl || !prdTextareaEl) { return; }
-  var t = prdTextareaEl.value.trim();
-  var looksLikePrd = t.length > 400 || /^#{1,3}\s|acceptance criteria|AC[0-9]*[:.]/im.test(t);
+  let t = prdTextareaEl.value.trim();
+  let looksLikePrd = t.length > 400 || /^#{1,3}\s|acceptance criteria|AC[0-9]*[:.]/im.test(t);
   prdAiBtnEl.textContent = looksLikePrd ? '✨ Improve with AI' : '✨ Draft with AI';
 }
 function renderPrdProjectCard() {
@@ -2042,13 +1998,13 @@ function renderPrdProjectCard() {
 function autoResizePrdTextarea() {
   if (!prdTextareaEl) { return; }
   prdTextareaEl.style.height = 'auto';
-  var h = Math.min(Math.max(prdTextareaEl.scrollHeight, 80), 220);
+  let h = Math.min(Math.max(prdTextareaEl.scrollHeight, 80), 220);
   prdTextareaEl.style.height = h + 'px';
 }
 if (prdChipsRowEl) {
   prdChipsRowEl.querySelectorAll('.prd-chip').forEach(function(chip) {
     chip.addEventListener('click', function() {
-      var prompt = chip.getAttribute('data-prompt');
+      let prompt = chip.getAttribute('data-prompt');
       if (prdTextareaEl && prompt) {
         prdTextareaEl.value = prompt;
         prdTextareaEl.dispatchEvent(new Event('input'));
@@ -2063,7 +2019,7 @@ function updatePrdVersionBar(vers) {
   if (prdVersions.length > 0) {
     prdVersionBarEl.classList.add('visible');
     prdVersionSelectEl.innerHTML = prdVersions.map(function(v) {
-      var d = new Date(v.createdAt).toLocaleDateString();
+      let d = new Date(v.createdAt).toLocaleDateString();
       return '<option value="' + v.version + '">' + v.version + ' (' + d + ')</option>';
     }).join('');
     prdVersionSaveBtnEl.textContent = 'Save as v' + (prdVersions.length + 1) + '.0';
@@ -2073,7 +2029,7 @@ function updatePrdVersionBar(vers) {
   }
 }
 prdTextareaEl?.addEventListener('input', function() {
-  var len = prdTextareaEl.value.length;
+  let len = prdTextareaEl.value.length;
   if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
   if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
   if (prdChipsRowEl) { prdChipsRowEl.style.display = len > 0 ? 'none' : 'flex'; }
@@ -2081,32 +2037,32 @@ prdTextareaEl?.addEventListener('input', function() {
   updatePrdAiBtn();
 });
 prdVersionSelectEl?.addEventListener('change', function() {
-  var ver = prdVersions.find(function(v) { return v.version === prdVersionSelectEl.value; });
+  let ver = prdVersions.find(function(v) { return v.version === prdVersionSelectEl.value; });
   if (ver && prdTextareaEl) {
     prdTextareaEl.value = ver.text;
-    var len = ver.text.length;
+    let len = ver.text.length;
     if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
     if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
     updatePrdAiBtn();
   }
 });
 prdVersionSaveBtnEl?.addEventListener('click', function() {
-  var text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
+  let text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
   if (!text) { return; }
-  var nextVersion = 'v' + (prdVersions.length + 1) + '.0';
+  let nextVersion = 'v' + (prdVersions.length + 1) + '.0';
   vscode.postMessage({ type: 'savePrdVersion', text: text, version: nextVersion });
 });
 prdAiBtnEl?.addEventListener('click', function() {
-  var text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
+  let text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
   if (!text) { vscode.postMessage({ type: 'planFromPrd' }); return; }
-  var looksLikePrd = text.length > 400 || /^#{1,3}\s|acceptance criteria|AC[0-9]*[:.]/im.test(text);
+  let looksLikePrd = text.length > 400 || /^#{1,3}\s|acceptance criteria|AC[0-9]*[:.]/im.test(text);
   prdAiBtnEl.disabled = true;
   prdAiBtnEl.textContent = looksLikePrd ? 'Improving…' : 'Drafting PRD…';
   vscode.postMessage({ type: 'prdAiImprove', text: text });
 });
 prdBrowseBtnEl?.addEventListener('click', () => vscode.postMessage({ type: 'openPrdFile' }));
 prdGenerateBtnEl?.addEventListener('click', function() {
-  var text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
+  let text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
   if (!text) { return; }
   hidePrdInputScreen();
   if (prdScreenMode === 'update') {
@@ -2222,35 +2178,35 @@ function renderSidebarRules(rules) {
     rulesEmptyEl.style.display = '';
   } else {
     rulesEmptyEl.style.display = 'none';
-    for (var i = 0; i < aiRules.length; i++) {
-      var rule = aiRules[i];
-      var item = document.createElement('div');
+    for (let i = 0; i < aiRules.length; i++) {
+      let rule = aiRules[i];
+      let item = document.createElement('div');
       item.className = 'rule-item';
       item.dataset.id = rule.id;
       item.dataset.scope = rule.scope;
-      var toggleBtn = document.createElement('button');
+      let toggleBtn = document.createElement('button');
       toggleBtn.type = 'button';
       toggleBtn.className = 'rule-toggle' + (rule.enabled ? ' enabled' : '');
       toggleBtn.title = rule.enabled ? 'Disable rule' : 'Enable rule';
       toggleBtn.dataset.id = rule.id;
       toggleBtn.dataset.scope = rule.scope;
-      var nameSpan = document.createElement('span');
+      let nameSpan = document.createElement('span');
       nameSpan.className = 'rule-name' + (rule.enabled ? '' : ' disabled');
       nameSpan.textContent = rule.name;
       nameSpan.title = rule.name + ' (' + rule.charCount + ' chars)';
-      var scopeBadge = document.createElement('span');
+      let scopeBadge = document.createElement('span');
       scopeBadge.className = 'rule-scope-badge' + (rule.scope === 'workspace' ? ' workspace' : '');
       scopeBadge.textContent = rule.scope === 'workspace' ? 'ws' : 'global';
-      var actions = document.createElement('div');
+      let actions = document.createElement('div');
       actions.className = 'rule-actions';
-      var editBtn = document.createElement('button');
+      let editBtn = document.createElement('button');
       editBtn.type = 'button';
       editBtn.className = 'rule-action-btn';
       editBtn.title = 'Edit rule';
       editBtn.textContent = '✏';
       editBtn.dataset.id = rule.id;
       editBtn.dataset.scope = rule.scope;
-      var deleteBtn = document.createElement('button');
+      let deleteBtn = document.createElement('button');
       deleteBtn.type = 'button';
       deleteBtn.className = 'rule-action-btn delete';
       deleteBtn.title = 'Delete rule';
@@ -2420,9 +2376,9 @@ function renderGhSync(state) {
     ghSyncCountEl.textContent = count != null && count > 0 ? count + ' issue' + (count !== 1 ? 's' : '') + ' tracked' : '';
   }
   // gh auth status row
-  var ghAuthEl = document.getElementById('ghSyncAuthStatus');
+  let ghAuthEl = document.getElementById('ghSyncAuthStatus');
   if (ghAuthEl) {
-    var authUser = state && state.ghAuthUser;
+    let authUser = state && state.ghAuthUser;
     if (authUser) {
       ghAuthEl.innerHTML = '<span class="gh-sync-auth-dot ok"></span><span class="gh-sync-auth-label">gh: ' + authUser + '</span>';
       ghAuthEl.title = 'GitHub CLI authenticated as ' + authUser;
@@ -2464,10 +2420,10 @@ function renderTavPanel() {
   if (tavTestToolEl) { tavTestToolEl.value = testTool; }
 
   // Sandbox state
-  var sbState = tavSandboxState;
-  var sbRunning = sbState && sbState.status === 'running';
-  var sbStarting = sbState && sbState.status === 'starting';
-  var sbActive = sbRunning || sbStarting;
+  let sbState = tavSandboxState;
+  let sbRunning = sbState && sbState.status === 'running';
+  let sbStarting = sbState && sbState.status === 'starting';
+  let sbActive = sbRunning || sbStarting;
   if (tavSbDotEl) { tavSbDotEl.className = 'tav-sb-dot ' + (sbState ? (sbState.status || 'stopped') : ''); }
   if (tavSbStatusEl) {
     tavSbStatusEl.style.display = sbRunning ? 'none' : '';
@@ -2487,25 +2443,25 @@ function renderTavPanel() {
   if (tavScreenshotEl) { tavScreenshotEl.style.display = sbRunning ? '' : 'none'; }
 
   // Test phase detection
-  var hasTestPlaylist = Array.isArray(planGroups) && planGroups.some(function(g) { return g.testPhase; });
-  var testPlaylistRunning = Array.isArray(planGroups) && planGroups.some(function(g) {
+  let hasTestPlaylist = Array.isArray(planGroups) && planGroups.some(function(g) { return g.testPhase; });
+  let testPlaylistRunning = Array.isArray(planGroups) && planGroups.some(function(g) {
     return g.testPhase && (g.playlistStatus === 'running' || g.playlistStatus === 'paused');
   });
 
   // State badge
-  var badgeText = testPlaylistRunning ? 'Running' : hasTestPlaylist ? 'Ready' : 'Setup';
-  var badgeClass = testPlaylistRunning ? 'running' : hasTestPlaylist ? 'done' : 'warn';
+  let badgeText = testPlaylistRunning ? 'Running' : hasTestPlaylist ? 'Ready' : 'Setup';
+  let badgeClass = testPlaylistRunning ? 'running' : hasTestPlaylist ? 'done' : 'warn';
   if (tavStateBadgeEl) { tavStateBadgeEl.textContent = badgeText; tavStateBadgeEl.className = 'tav-state-badge ' + badgeClass; }
 
   // PRD row
-  var hasPrd = !!(planPrdSource);
-  var prdLabel = detectedPrdFilePath ? detectedPrdFilePath.split(/[\\/]/).pop() : (hasPrd ? 'Stored in plan' : 'None linked');
+  let hasPrd = !!(planPrdSource);
+  let prdLabel = detectedPrdFilePath ? detectedPrdFilePath.split(/[\\/]/).pop() : (hasPrd ? 'Stored in plan' : 'None linked');
   if (tavPrdValEl) { tavPrdValEl.textContent = prdLabel; tavPrdValEl.style.color = hasPrd ? '' : 'var(--vscode-descriptionForeground)'; }
   if (tavOpenPrdEl) { tavOpenPrdEl.style.display = hasPrd ? '' : 'none'; }
 
   // Hint row
-  var hint = '';
-  var hintClass = '';
+  let hint = '';
+  let hintClass = '';
   if (!hasTestPlaylist) {
     hint = '⚠ No test playlist — right-click a playlist → Toggle Test Phase';
     hintClass = 'warn';
@@ -2521,19 +2477,19 @@ function renderTavPanel() {
 
   // Criteria — show when test playlist is running AND PRD exists
   if (tavCriteriaWrapEl) {
-    var showCriteria = testPlaylistRunning && hasPrd;
+    let showCriteria = testPlaylistRunning && hasPrd;
     tavCriteriaWrapEl.style.display = showCriteria ? '' : 'none';
     if (showCriteria) {
-      var criteria = parsePrdCriteria(planPrdSource);
+      let criteria = parsePrdCriteria(planPrdSource);
       if (tavCriteriaChecked.length !== criteria.length) { tavCriteriaChecked = new Array(criteria.length).fill(false); }
       tavCriteriaWrapEl.innerHTML = '';
       criteria.forEach(function(text, i) {
-        var row = document.createElement('label');
+        let row = document.createElement('label');
         row.className = 'tav-criterion' + (tavCriteriaChecked[i] ? ' checked' : '');
-        var cb = document.createElement('input');
+        let cb = document.createElement('input');
         cb.type = 'checkbox'; cb.checked = !!tavCriteriaChecked[i];
         cb.addEventListener('change', function() { tavCriteriaChecked[i] = cb.checked; row.classList.toggle('checked', cb.checked); });
-        var span = document.createElement('span');
+        let span = document.createElement('span');
         span.className = 'tav-criterion-text'; span.textContent = text;
         row.appendChild(cb); row.appendChild(span);
         tavCriteriaWrapEl.appendChild(row);
@@ -2556,7 +2512,7 @@ function renderTavPanel() {
   }
 
   // Hide old sandbox extras-seg when TAV is visible
-  var sbSegEl = document.getElementById('sidebarSandbox');
+  let sbSegEl = document.getElementById('sidebarSandbox');
   if (sbSegEl) { sbSegEl.style.display = activeTab === 'plan' ? 'none' : ''; }
 }
 sbUrlEl.addEventListener('click', () => {
@@ -2564,12 +2520,12 @@ sbUrlEl.addEventListener('click', () => {
   if (url) { vscode.postMessage({ type: 'openSandboxBrowser', url: url }); }
 });
 
-var sbThumbEl = document.getElementById('sbThumb');
+let sbThumbEl = document.getElementById('sbThumb');
 
 function renderSidebarSandbox(state) {
   if (!state) { return; }
   sbDotEl.className = 'sidebar-sandbox-dot ' + (state.status || 'stopped');
-  var labels = { stopped: 'Stopped', starting: 'Starting...', running: 'Running', error: 'Error' };
+  let labels = { stopped: 'Stopped', starting: 'Starting...', running: 'Running', error: 'Error' };
   sbStatusEl.textContent = state.error || labels[state.status] || state.status;
   sbFrameworkEl.textContent = state.projectInfo ? state.projectInfo.framework : '';
   if (state.url) {
@@ -2579,7 +2535,7 @@ function renderSidebarSandbox(state) {
   } else {
     sbUrlEl.style.display = 'none';
   }
-  var active = state.status === 'running' || state.status === 'starting';
+  let active = state.status === 'running' || state.status === 'starting';
   sbLaunchEl.style.display = active ? 'none' : 'inline-block';
   sbStopEl.style.display = active ? 'inline-block' : 'none';
   sbBadgeEl.textContent = active ? (state.status === 'running' ? 'Running' : 'Starting') : '';
@@ -2631,7 +2587,7 @@ window.addEventListener('message', (event) => {
   }
   if (msg.type === 'prdMoagQuestion') {
     // Remove typing indicator if present
-    var typingEl = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
+    let typingEl = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
     if (typingEl) { typingEl.remove(); }
     appendPrdMessage('bot', msg.question);
     promptEl.placeholder = 'Your answer...';
@@ -2639,28 +2595,28 @@ window.addEventListener('message', (event) => {
     return;
   }
   if (msg.type === 'prdConvertReady') {
-    var typingEl2 = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
+    let typingEl2 = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
     if (typingEl2) { typingEl2.remove(); }
     appendPrdMessage('bot', 'I have enough context to write your PRD. Opening the editor now...');
     exitPrdMode();
     return;
   }
   if (msg.type === 'prdError') {
-    var typingEl3 = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
+    let typingEl3 = chatFeedEl ? chatFeedEl.querySelector('.prd-typing') : null;
     if (typingEl3) { typingEl3.remove(); }
-    var errWrap = document.createElement('div');
+    let errWrap = document.createElement('div');
     errWrap.className = 'prd-msg prd-bot';
-    var errAuthor = document.createElement('div');
+    let errAuthor = document.createElement('div');
     errAuthor.className = 'prd-msg-author';
     errAuthor.textContent = 'MOAG';
-    var errText = document.createElement('div');
+    let errText = document.createElement('div');
     errText.className = 'prd-msg-text';
     errText.style.color = '#f48771';
     errText.textContent = msg.error || 'Something went wrong. Please try again.';
     errWrap.appendChild(errAuthor);
     errWrap.appendChild(errText);
     if (msg.action) {
-      var actionBtn = document.createElement('button');
+      let actionBtn = document.createElement('button');
       actionBtn.className = 'chat-empty-start-prd-btn';
       actionBtn.style.marginTop = '8px';
       actionBtn.textContent = msg.action.label;
@@ -2677,7 +2633,7 @@ window.addEventListener('message', (event) => {
   if (msg.type === 'prdFileContent') {
     if (prdTextareaEl && typeof msg.text === 'string') {
       prdTextareaEl.value = msg.text;
-      var len = msg.text.length;
+      let len = msg.text.length;
       if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
       if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len < 20; }
       prdTextareaEl.focus();
@@ -2687,7 +2643,7 @@ window.addEventListener('message', (event) => {
   if (msg.type === 'prdAiImproveResult') {
     if (prdTextareaEl && typeof msg.text === 'string' && msg.text) {
       prdTextareaEl.value = msg.text;
-      var len2 = msg.text.length;
+      let len2 = msg.text.length;
       if (prdCharCountEl) { prdCharCountEl.textContent = len2 + ' chars'; }
       if (prdGenerateBtnEl) { prdGenerateBtnEl.disabled = len2 < 20; }
     }
@@ -2714,8 +2670,6 @@ window.addEventListener('message', (event) => {
     }
   } else if (msg.type === 'syncState') {
     renderEngines(msg.engines || [], msg.selectedEngineId);
-    chatItems = msg.chatItems || [];
-    planItems = msg.planItems || [];
     planGroups = msg.planGroups || [];
     planAiRules = msg.planAiRules || '';
     planPrdSource = msg.planPrdSource || '';
@@ -2748,7 +2702,6 @@ window.addEventListener('message', (event) => {
       }
     });
     historyItems = msg.historyItems || [];
-    activeThreadId = msg.activeThreadId || '';
     chatMessages = msg.chatMessages || [];
     const incomingPlanName = msg.activePlanName || '';
     if (incomingPlanName !== activePlanName) {
@@ -2757,7 +2710,6 @@ window.addEventListener('message', (event) => {
       tttCriteriaChecked = [];
     }
     activePlanName = incomingPlanName;
-    activePlaylistName = msg.activePlaylistName || '';
     // Chat tab is conversation-first; no session strip row.
     renderPlanGroups(planListEl, planGroups);
     renderPlanOverview(planGroups);
@@ -2816,7 +2768,7 @@ window.addEventListener('message', (event) => {
     renderLivePanel();
     // Auto-switch to chat tab so the user sees the live stream
     setActiveTab('chat');
-    var block = document.getElementById('live-block-' + msg.taskId);
+    let block = document.getElementById('live-block-' + msg.taskId);
     if (!block) {
       block = document.createElement('div');
       block.id = 'live-block-' + msg.taskId;
@@ -2834,16 +2786,16 @@ window.addEventListener('message', (event) => {
     chatFeedEl.scrollTop = chatFeedEl.scrollHeight;
 
   } else if (msg.type === 'live-output-chunk') {
-    var bodyEl = document.getElementById('live-body-' + msg.taskId);
+    let bodyEl = document.getElementById('live-body-' + msg.taskId);
     if (bodyEl) {
       // Keep last 4000 chars to avoid unbounded DOM growth
-      var combined = (bodyEl.textContent || '') + (msg.text || '');
+      let combined = (bodyEl.textContent || '') + (msg.text || '');
       bodyEl.textContent = combined.length > 4000 ? combined.slice(-4000) : combined;
       bodyEl.scrollTop = bodyEl.scrollHeight;
     }
     // Update plan-tab live panel — split incoming text into lines, keep last 4
     if (msg.taskId === liveTaskId && msg.text) {
-      var newLines = msg.text.split('\\n');
+      let newLines = msg.text.split('\\n');
       liveOutputLines = liveOutputLines.concat(newLines).filter((l) => l.trim()).slice(-4);
       renderLivePanel();
     }
@@ -2865,14 +2817,14 @@ window.addEventListener('message', (event) => {
     }
 
   } else if (msg.type === 'live-output-end') {
-    var badge = document.getElementById('live-badge-' + msg.taskId);
+    let badge = document.getElementById('live-badge-' + msg.taskId);
     if (badge) {
-      var passed = msg.status === 'completed';
+      let passed = msg.status === 'completed';
       badge.textContent = passed ? 'done' : 'failed';
       badge.className = 'live-output-badge ' + (passed ? 'completed' : 'failed');
     }
     // Remove block after brief pause — syncState will re-render the real result card
-    var endBlock = document.getElementById('live-block-' + msg.taskId);
+    let endBlock = document.getElementById('live-block-' + msg.taskId);
     if (endBlock) {
       setTimeout(function() {
         if (endBlock.parentNode) { endBlock.parentNode.removeChild(endBlock); }
