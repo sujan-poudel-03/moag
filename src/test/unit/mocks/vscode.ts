@@ -123,3 +123,141 @@ export const commands = {
 export const extensions = {
   all: [],
 };
+
+// ─── Additions for the activation smoke test ─────────────────────────────────
+// activate() touches far more of the API than a focused unit test does. These
+// are inert stubs: enough shape for the extension to wire itself up, with no
+// behaviour, so the test asserts registration rather than side effects.
+
+export const ProgressLocation = { SourceControl: 1, Window: 10, Notification: 15 };
+export const ViewColumn = { Active: -1, Beside: -2, One: 1, Two: 2 };
+export const ConfigurationTarget = { Global: 1, Workspace: 2, WorkspaceFolder: 3 };
+export const TreeItemCheckboxState = { Unchecked: 0, Checked: 1 };
+export const UIKind = { Desktop: 1, Web: 2 };
+
+export class Disposable {
+  constructor(private readonly fn: () => void = () => {}) {}
+  dispose(): void { this.fn(); }
+  static from(...items: Array<{ dispose(): void }>): Disposable {
+    return new Disposable(() => items.forEach((i) => i.dispose()));
+  }
+}
+
+export class RelativePattern {
+  constructor(public base: unknown, public pattern: string) {}
+}
+
+export class Position {
+  constructor(public line: number, public character: number) {}
+}
+
+export class Range {
+  constructor(public start: Position, public end: Position) {}
+}
+
+export class Selection extends Range {}
+
+const noopWatcher = () => ({
+  onDidCreate: () => ({ dispose: () => {} }),
+  onDidChange: () => ({ dispose: () => {} }),
+  onDidDelete: () => ({ dispose: () => {} }),
+  dispose: () => {},
+});
+
+const noopChannel = () => ({
+  appendLine: () => {},
+  append: () => {},
+  clear: () => {},
+  show: () => {},
+  hide: () => {},
+  dispose: () => {},
+});
+
+const noopPanel = () => ({
+  webview: {
+    html: '',
+    options: {},
+    cspSource: '',
+    asWebviewUri: (u: unknown) => u,
+    onDidReceiveMessage: () => ({ dispose: () => {} }),
+    postMessage: async () => true,
+  },
+  onDidDispose: () => ({ dispose: () => {} }),
+  onDidChangeViewState: () => ({ dispose: () => {} }),
+  reveal: () => {},
+  dispose: () => {},
+  visible: true,
+  active: true,
+  title: '',
+  viewType: '',
+});
+
+Object.assign(window, {
+  createOutputChannel: noopChannel,
+  createWebviewPanel: noopPanel,
+  registerWebviewViewProvider: () => ({ dispose: () => {} }),
+  registerTreeDataProvider: () => ({ dispose: () => {} }),
+  showQuickPick: async () => undefined,
+  showInputBox: async () => undefined,
+  showOpenDialog: async () => undefined,
+  showSaveDialog: async () => undefined,
+  showTextDocument: async () => ({ document: {}, selection: null }),
+  withProgress: async (_o: unknown, task: (p: unknown, t: unknown) => unknown) =>
+    task({ report: () => {} }, { isCancellationRequested: false }),
+  onDidChangeActiveTextEditor: () => ({ dispose: () => {} }),
+  onDidChangeVisibleTextEditors: () => ({ dispose: () => {} }),
+  onDidChangeWindowState: () => ({ dispose: () => {} }),
+  activeTextEditor: undefined,
+  visibleTextEditors: [],
+  tabGroups: { all: [], close: async () => true, onDidChangeTabs: () => ({ dispose: () => {} }) },
+});
+
+Object.assign(workspace, {
+  createFileSystemWatcher: noopWatcher,
+  onDidChangeConfiguration: () => ({ dispose: () => {} }),
+  onDidSaveTextDocument: () => ({ dispose: () => {} }),
+  onDidOpenTextDocument: () => ({ dispose: () => {} }),
+  onDidCloseTextDocument: () => ({ dispose: () => {} }),
+  onDidChangeWorkspaceFolders: () => ({ dispose: () => {} }),
+  openTextDocument: async () => ({ getText: () => '', uri: Uri.file('/mock/doc'), fileName: '/mock/doc' }),
+  applyEdit: async () => true,
+  findFiles: async () => [],
+  asRelativePath: (p: unknown) => String(p),
+  fs: {
+    readFile: async () => new Uint8Array(),
+    writeFile: async () => {},
+    createDirectory: async () => {},
+    stat: async () => ({ type: 1, size: 0 }),
+    delete: async () => {},
+  },
+  name: 'mock-workspace',
+});
+
+Object.assign(commands, {
+  executeCommand: async () => undefined,
+  getCommands: async () => [],
+  registerTextEditorCommand: (_id: string, _h: unknown) => ({ dispose: () => {} }),
+});
+
+export const env = {
+  openExternal: async () => true,
+  clipboard: { writeText: async () => {}, readText: async () => '' },
+  appName: 'Mock VS Code',
+  uiKind: UIKind.Desktop,
+  machineId: 'mock-machine',
+  sessionId: 'mock-session',
+};
+
+export const languages = {
+  registerCodeLensProvider: () => ({ dispose: () => {} }),
+  createDiagnosticCollection: () => ({ set: () => {}, clear: () => {}, dispose: () => {} }),
+};
+
+export const version = '1.90.0';
+
+export const ExtensionMode = { Production: 1, Development: 2, Test: 3 };
+
+Object.assign(extensions, {
+  getExtension: () => undefined,
+  onDidChange: () => ({ dispose: () => {} }),
+});
