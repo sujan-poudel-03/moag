@@ -17,18 +17,16 @@ function readSetting(cfg: unknown, section: string, key: string, fallback: unkno
   fs.mkdirSync(path.join(dir, '.moag'), { recursive: true });
   fs.writeFileSync(path.join(dir, '.moag', 'config.json'), JSON.stringify(cfg), 'utf-8');
 
-  // __setWorkspaceRoot already invalidates the shim config cache, so point it at
-  // the fixture rather than clearing require.cache — wiping the whole module
-  // registry breaks every other suite sharing this process.
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { installVscodeShim } = require('../../../headless/install-shim');
-  installVscodeShim(dir);
+  // Talk to the shim module directly. installVscodeShim() must NOT be called
+  // here: it hooks Module._load globally and never uninstalls, so every later
+  // require('vscode') in the process would resolve to the headless shim instead
+  // of the test mock — which silently broke 65 runner tests downstream.
+  // __setWorkspaceRoot already invalidates the config cache, so this is enough.
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const shim = require('../../../headless/vscode-shim');
   shim.__setWorkspaceRoot(dir);
-  const vscode = shim;
   try {
-    return vscode.workspace.getConfiguration(section).get(key, fallback);
+    return shim.workspace.getConfiguration(section).get(key, fallback);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
