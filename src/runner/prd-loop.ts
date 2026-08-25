@@ -10,6 +10,8 @@
 // imports, so the extension command and the headless CLI run the exact same loop.
 
 import { EngineResult, Plan, Playlist, Task, TaskStatus } from '../models/types';
+import * as nodeFs from 'fs';
+import { commandFactId, recordFact } from './knowledge';
 import {
   captureBaseRef,
   checkArtifacts,
@@ -300,6 +302,9 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
             timeoutMs: cfg.gateTimeoutMs,
           });
           gates.push(result);
+          // A gate that ran is proof about this repository, whichever way it
+          // went. Recorded here because this is where a real exit code exists.
+          learnFromGate(cfg.cwd, result);
           if (!result.passed) {
             failedGate = 'command';
             failureDetail = `Gate command failed: ${result.command}\nExit code: ${result.exitCode}` +
@@ -646,3 +651,25 @@ function parseFixTasks(result: EngineResult): Array<{ name: string; prompt: stri
   }
   return out;
 }
+
+/**
+ * Turn one gate result into a durable fact.
+ *
+ * Only ever called where a command actually ran, so every fact it writes has
+ * a real exit code behind it — the invariant the knowledge base depends on.
+ */
+function learnFromGate(cwd: string, result: { command: string; passed: boolean; exitCode: number; timedOut: boolean }): void {
+  // A timeout says nothing about the command, only about how long we waited.
+  if (result.timedOut) { return; }
+  const kind = result.passed ? 'verified-command' : 'failing-command';
+  recordFact(cwd, {
+    id: commandFactId(kind, result.command),
+    kind,
+    statement: result.passed
+      ? '`' + result.command + '` passes here'
+      : '`' + result.command + '` fails here (exit ' + result.exitCode + ')',
+    provenBy: `${result.command} -> exit ${result.exitCode}`,
+    observedAt: new Date().toISOString(),
+  }, nodeFs);
+}
+

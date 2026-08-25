@@ -93,6 +93,8 @@ export interface ContextOptions {
   roleCharter?: string;
   /** Pre-formatted text from enabled AI rules — injected as the second-highest-priority context section. */
   aiRules?: string;
+  /** Facts this repository has proven about itself. See runner/knowledge.ts. */
+  knowledge?: string;
   /**
    * Prior turns from the same chat thread (oldest-first, excluding the current turn).
    * Injected as a high-priority section so the agent has conversational context.
@@ -191,6 +193,12 @@ export function buildContext(options: ContextOptions): string {
 
   if (options.aiRules && options.aiRules.trim()) {
     sections.push({ priority: -1, header: '## AI Rules', body: options.aiRules.trim() });
+  }
+
+  // Ranks just under AI Rules: the user's instructions outrank what the repo
+  // has proven, but both outrank anything the model would otherwise guess.
+  if (options.knowledge && options.knowledge.trim()) {
+    sections.push({ priority: -1, header: '## Verified Project Knowledge', body: options.knowledge.trim() });
   }
 
   if (options.priorThread && options.priorThread.length > 0) {

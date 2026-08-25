@@ -23,6 +23,7 @@ import {
 import { generateId } from '../models/plan';
 import { commitTask, describePrepareFailure, prepareBranch, DeliveryConfig } from './git-delivery';
 import { park, decisionFor, ParkReason, ParkedItem } from './park-queue';
+import { knowledgeBlockFor } from './knowledge';
 import {
   createWorktrees,
   describeIsolationFailure,
@@ -2674,6 +2675,8 @@ export class TaskRunner {
         pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
         roleCharter: roleCharter ?? undefined,
         aiRules: aiRules || undefined,
+        // What this repo has proven about itself, gathered from real exit codes.
+        knowledge: knowledgeBlockFor(cwd, fs) || undefined,
         priorThread: priorThread?.length ? priorThread : undefined,
         sandboxUrl: (playlist.testPhase && this._sandboxUrl) ? this._sandboxUrl : undefined,
       });
