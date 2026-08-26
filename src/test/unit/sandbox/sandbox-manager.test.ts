@@ -37,8 +37,44 @@ function makeFakeProc(): FakeProc {
 }
 
 /**
- * Assert `proc` was tree-killed, whichever platform the suite runs on:
- * win32 goes through `taskkill /T /F`, everything else through SIGTERM.
+ * POSIX group signals, recorded rather than sent.
+ *
+ * `killProcess` signals the process GROUP on POSIX — `process.kill(-pid)` — and
+ * proxyquire cannot stub a global. Against a test double's fake pid that would
+ * be a REAL signal to whatever group happens to own 12345 on this machine, so
+ * `process.kill` is swapped for the lifetime of this file.
+ */
+const groupSignals: Array<{ pid: number; signal: string }> = [];
+/** Pids whose group signal should fail, so the POSIX path can be made to throw. */
+const groupKillFailsFor = new Set<number>();
+let realProcessKill: typeof process.kill;
+
+before(() => {
+  realProcessKill = process.kill;
+  (process as unknown as { kill: unknown }).kill = (pid: number, signal: string) => {
+    groupSignals.push({ pid, signal });
+    if (groupKillFailsFor.has(Math.abs(pid))) {
+      throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+    }
+    return true;
+  };
+});
+
+after(() => {
+  (process as unknown as { kill: unknown }).kill = realProcessKill;
+});
+
+beforeEach(() => {
+  groupSignals.length = 0;
+  groupKillFailsFor.clear();
+});
+
+/**
+ * Assert `proc` was tree-killed, whichever platform the suite runs on.
+ *
+ * win32 goes through `taskkill /T /F`. POSIX signals the process GROUP — a bare
+ * SIGTERM to the child would reach the shell and orphan the dev server under it,
+ * which is the whole bug this asserts against.
  */
 function assertTreeKilled(proc: FakeProc, execSyncStub: sinon.SinonStub, label: string): void {
   if (process.platform === 'win32') {
@@ -49,8 +85,10 @@ function assertTreeKilled(proc: FakeProc, execSyncStub: sinon.SinonStub, label: 
     assert.ok(cmd.includes('/T'), `${label}: must pass /T so the tree dies, not just the shell`);
     assert.ok(cmd.includes('/F'), `${label}: must pass /F`);
   } else {
-    assert.ok(proc.kill.calledOnce, `${label}: expected a single kill`);
-    assert.equal(proc.kill.firstCall.args[0], 'SIGTERM', `${label}: must SIGTERM`);
+    const signalled = groupSignals.find((s) => s.pid === -proc.pid);
+    assert.ok(signalled,
+      `${label}: expected the process GROUP (-${proc.pid}) to be signalled, not just the child`);
+    assert.equal(signalled!.signal, 'SIGTERM', `${label}: must SIGTERM`);
   }
 }
 
@@ -341,8 +379,11 @@ describe('SandboxManager — stop() tree-kill', () => {
     spawnStub.onCall(2).returns(primary);
 
     const execSyncStub = sinon.stub();
-    // On win32 the first taskkill throws; the loop must still reach the rest.
+    // One kill fails; the loop must still reach the rest. Made to fail on BOTH
+    // paths — taskkill on win32, the group signal on POSIX — so the scenario is
+    // genuinely exercised wherever the suite runs, not just on Windows.
     execSyncStub.withArgs(sinon.match(/22222/)).throws(new Error('EPERM'));
+    groupKillFailsFor.add(22222);
 
     const { SandboxManager } = loadManager(spawnStub, execSyncStub);
     const mgr = new SandboxManager();
