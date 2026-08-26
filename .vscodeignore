@@ -2,7 +2,18 @@
 .vscode-test/**
 .claude/**
 src/**
-node_modules/**
+# Dev dependencies only. vsce packages `dependencies` and never
+# `devDependencies`, so the blanket exclusion that used to be here also stripped
+# @anthropic-ai/sdk — which anthropic-adapter.ts requires at runtime. The
+# adapter fails gracefully, telling the user to npm install inside the extension
+# directory, which is not something a Marketplace install can reasonably do.
+node_modules/.bin/**
+node_modules/.cache/**
+# TypeScript declarations are a build-time artifact. They arrive here because
+# the sdk declares @types/node, and the hoisted layout pulls the rest in with it.
+node_modules/@types/**
+node_modules/**/*.ts
+node_modules/**/*.map
 .gitignore
 tsconfig.json
 tsconfig.test.json
@@ -21,3 +32,13 @@ out/test/**
 .moag/**
 debug.log
 tmp_block.txt
+
+# Build configuration — the VSIX ships compiled output, never the recipe.
+tsconfig.webview*.json
+
+# Internal to developing MOAG, not to using it.
+CLAUDE.md
+scripts/**
+docs/**
+# ...except the manual, which is the one doc a user wants.
+!docs/MANUAL.md

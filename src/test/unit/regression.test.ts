@@ -1373,3 +1373,59 @@ describe('Regression: the docs do not contradict the code', () => {
     }
   });
 });
+
+describe('Regression: the published package is complete', () => {
+  // .vscodeignore used to exclude node_modules wholesale, which also stripped
+  // @anthropic-ai/sdk — a declared runtime dependency that anthropic-adapter.ts
+  // requires. The adapter fails gracefully, telling the user to npm install
+  // inside the extension directory, which a Marketplace install cannot do. The
+  // engine was simply broken for everyone who installed it.
+  const IGNORE = '.vscodeignore';
+
+  function ignoreRules(): string[] {
+    return fsMod.readFileSync(IGNORE, 'utf-8')
+      .split(String.fromCharCode(10))
+      .map((l: string) => l.trim())
+      .filter((l: string) => l.length > 0 && !l.startsWith('#'));
+  }
+
+  it('does not exclude runtime dependencies from the VSIX', () => {
+    const rules = ignoreRules();
+    const blanket = rules.filter((r: string) => r === 'node_modules/**' || r === 'node_modules/');
+    assert.deepEqual(blanket, [],
+      'a blanket node_modules exclusion strips production dependencies too — ' +
+      'exclude the dev-only subtrees instead');
+  });
+
+  it('every declared runtime dependency is actually required by shipped code', () => {
+    // A dependency nothing requires is dead weight in every install; one that is
+    // required but undeclared breaks at runtime. Both are worth knowing.
+    const deps = Object.keys(JSON.parse(fsMod.readFileSync('package.json', 'utf-8')).dependencies || {});
+    const src = walkTs('src').map((f: string) => fsMod.readFileSync(f, 'utf-8')).join(String.fromCharCode(10));
+    const unused = deps.filter((d: string) => !src.includes(d));
+    assert.deepEqual(unused, [],
+      'declared as runtime dependencies but never required — they ship to every user for nothing');
+  });
+
+  function walkTs(dir: string): string[] {
+    const out: string[] = [];
+    for (const e of fsMod.readdirSync(dir, { withFileTypes: true })) {
+      const full = pathMod.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name === 'test') { continue; }
+        out.push(...walkTs(full));
+      } else if (e.name.endsWith('.ts')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  it('excludes what a user has no use for', () => {
+    const rules = ignoreRules();
+    // Each of these shipped once and is pure noise in an install.
+    for (const unwanted of ['src/**', 'CLAUDE.md', 'scripts/**', 'tsconfig.webview*.json']) {
+      assert.ok(rules.includes(unwanted), `.vscodeignore no longer excludes ${unwanted}`);
+    }
+  });
+});
