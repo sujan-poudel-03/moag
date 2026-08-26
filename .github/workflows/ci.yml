@@ -31,6 +31,8 @@ jobs:
 
   test-unit:
     strategy:
+      # Never cancel the other platforms: this matrix exists to compare them.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -46,6 +48,8 @@ jobs:
   test-integration:
     needs: build
     strategy:
+      # Never cancel the other platforms: this matrix exists to compare them.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
