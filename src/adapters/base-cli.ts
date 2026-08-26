@@ -1,7 +1,7 @@
 // ─── Base CLI adapter — shared spawn logic for all CLI-based engines ───
 
-import { spawn, execSync } from 'child_process';
-import { SPAWN_DETACHED } from '../utils/process-kill';
+import { spawn } from 'child_process';
+import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 import { EngineResult } from '../models/types';
 import { EngineRunOptions } from './engine';
 
@@ -136,13 +136,10 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
     let abortHandler: (() => void) | null = null;
     if (options.signal) {
       abortHandler = () => {
-        if (process.platform === 'win32' && proc.pid) {
-          // On Windows, SIGTERM doesn't propagate to shell-spawned child trees.
-          // Use taskkill /T to terminate the entire process tree.
-          try { execSync(`taskkill /pid ${proc.pid} /T /F`, { stdio: 'ignore' }); } catch { /* already exited */ }
-        } else {
-          proc.kill('SIGTERM');
-        }
+        // The third copy of tree-kill in this codebase, and the last: a bare
+        // SIGTERM here reached only the shell, so an aborted engine CLI left its
+        // children holding the pipes and the run hung until its own timeout.
+        killProcess(proc);
       };
       options.signal.addEventListener('abort', abortHandler, { once: true });
     }
