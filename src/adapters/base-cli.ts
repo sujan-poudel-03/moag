@@ -1,6 +1,7 @@
 // ─── Base CLI adapter — shared spawn logic for all CLI-based engines ───
 
 import { spawn, execSync } from 'child_process';
+import { SPAWN_DETACHED } from '../utils/process-kill';
 import { EngineResult } from '../models/types';
 import { EngineRunOptions } from './engine';
 
@@ -73,6 +74,11 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
       env: { ...process.env, ...config.env },
       stdio: [config.useStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
       shell: isWin,
+      // Lead a process group on POSIX. An engine CLI forks children, and a bare
+      // SIGTERM reaches only the parent — the children keep the inherited pipes
+      // open, so `close` never fires and an aborted run hangs until its timeout.
+      // Windows needs no group: taskkill /T already walks the tree.
+      detached: SPAWN_DETACHED,
     });
 
     // Pipe prompt via stdin if configured (avoids Windows command-line length limit)
