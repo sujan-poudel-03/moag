@@ -49,25 +49,37 @@ const groupSignals: Array<{ pid: number; signal: string }> = [];
 const groupKillFailsFor = new Set<number>();
 let realProcessKill: typeof process.kill;
 
-before(() => {
-  realProcessKill = process.kill;
-  (process as unknown as { kill: unknown }).kill = (pid: number, signal: string) => {
-    groupSignals.push({ pid, signal });
-    if (groupKillFailsFor.has(Math.abs(pid))) {
-      throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
-    }
-    return true;
-  };
-});
+/**
+ * Install the recorder for the calling describe ONLY.
+ *
+ * These were once root-level hooks — `before` outside any `describe`, which mocha
+ * applies to the WHOLE run, not this file. That silently handed every other test
+ * in the suite a `process.kill` that records instead of signalling, and the one
+ * test that really does kill a real child (base-cli’s abort case) hung for its
+ * full timeout on POSIX while passing on Windows, where the tree-kill goes
+ * through taskkill instead. Scoping the hooks is what keeps that contained.
+ */
+function recordGroupSignals(): void {
+  before(() => {
+    realProcessKill = process.kill;
+    (process as unknown as { kill: unknown }).kill = (pid: number, signal: string) => {
+      groupSignals.push({ pid, signal });
+      if (groupKillFailsFor.has(Math.abs(pid))) {
+        throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+      }
+      return true;
+    };
+  });
 
-after(() => {
-  (process as unknown as { kill: unknown }).kill = realProcessKill;
-});
+  after(() => {
+    (process as unknown as { kill: unknown }).kill = realProcessKill;
+  });
 
-beforeEach(() => {
-  groupSignals.length = 0;
-  groupKillFailsFor.clear();
-});
+  beforeEach(() => {
+    groupSignals.length = 0;
+    groupKillFailsFor.clear();
+  });
+}
 
 /**
  * Assert `proc` was tree-killed, whichever platform the suite runs on.
@@ -136,6 +148,8 @@ function loadManager(
 }
 
 describe('SandboxManager', () => {
+  recordGroupSignals();
+
   afterEach(() => sinon.restore());
 
   it('starts in stopped state', () => {
@@ -356,6 +370,8 @@ describe('SandboxManager', () => {
 });
 
 describe('SandboxManager — stop() tree-kill', () => {
+  recordGroupSignals();
+
   afterEach(() => sinon.restore());
 
   it('does not throw when there is nothing running', () => {
