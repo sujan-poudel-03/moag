@@ -1227,9 +1227,9 @@
         },
         "agentTaskPlayer.costBudgetUsd": {
           "type": "number",
-          "default": 0,
+          "default": 10,
           "minimum": 0,
-          "description": "Estimated cost budget in USD for a run. Set to 0 to disable budget warnings."
+          "description": "Hard spend ceiling in USD, counted across every engine call in the process — plan tasks and authoring calls alike. When it is passed the run stops and parks, rather than warning and continuing. Raise it for a long unattended run; set it to 0 only if you genuinely want no ceiling at all."
         },
         "agentTaskPlayer.prdLoop.maxFixIterations": {
           "type": "number",

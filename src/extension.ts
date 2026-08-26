@@ -6718,7 +6718,7 @@ async function cmdDryRun(): Promise<void> {
 
   // Concurrency settings
   const concurrency = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('parallelPlaylists', 1);
-  const timeout = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('taskTimeoutMs', 600000);
+  const timeout = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('taskTimeoutMs', 1800000);
   doc += '## Settings\n\n';
   doc += `- **Parallel Playlists:** ${concurrency}\n`;
   doc += `- **Task Timeout:** ${formatDuration(timeout)}\n`;

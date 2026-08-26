@@ -10,7 +10,7 @@ import { detectProject, ProjectInfo } from './project-detector';
 import { SandboxConfig } from '../models/types';
 // One tree-kill implementation for the whole extension. `runner/evidence` is
 // dependency-free (fs/path/child_process only) so this import adds no cycle.
-import { killProcess } from '../utils/process-kill';
+import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 
 export type SandboxStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -114,7 +114,7 @@ export class SandboxManager extends EventEmitter {
   /** Start a background process without tracking its URL or state. */
   private _spawnBackground(command: string, cwd: string): void {
     const [cmd, ...args] = command.split(' ');
-    const proc = spawn(cmd, args, { cwd, shell: true, stdio: 'ignore', detached: false });
+    const proc = spawn(cmd, args, { cwd, shell: true, stdio: 'ignore', detached: SPAWN_DETACHED });
     this._backgroundProcesses.push(proc);
     const cleanup = () => {
       this._backgroundProcesses = this._backgroundProcesses.filter(p => p !== proc);

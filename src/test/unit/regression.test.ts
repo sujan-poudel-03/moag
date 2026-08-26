@@ -1429,3 +1429,60 @@ describe('Regression: the published package is complete', () => {
     }
   });
 });
+
+describe('Regression: settings defaults agree between manifest and code', () => {
+  // A code fallback that disagrees with package.json is a SILENT split. The IDE
+  // reads the manifest; the headless CLI reads the fallback, because
+  // .moag/config.json rarely names the key. Four had drifted apart, including
+  // the cost ceiling — declared as 10 and read as 0, meaning an unattended run
+  // had no spend limit at all while the IDE showed one.
+
+  function walkSrc(dir: string): string[] {
+    const out: string[] = [];
+    for (const e of fsMod.readdirSync(dir, { withFileTypes: true })) {
+      const full = pathMod.join(dir, e.name);
+      if (e.isDirectory()) {
+        if (e.name !== 'test') { out.push(...walkSrc(full)); }
+      } else if (e.name.endsWith('.ts')) {
+        out.push(full);
+      }
+    }
+    return out;
+  }
+
+  it('every get<T>(key, fallback) matches the declared default', () => {
+    const props = JSON.parse(fsMod.readFileSync('package.json', 'utf-8'))
+      .contributes.configuration.properties;
+    const call = /\.get<[^>]*>\(\s*'([a-zA-Z.]+)'\s*,\s*([^)]+?)\s*\)/g;
+    const mismatches: string[] = [];
+
+    for (const file of walkSrc('src')) {
+      const source = fsMod.readFileSync(file, 'utf-8');
+      for (const m of source.matchAll(call)) {
+        const declared = props['agentTaskPlayer.' + m[1]];
+        if (!declared) { continue; }
+        let fallback: unknown;
+        // Numeric separators are valid TypeScript but not JSON.
+        try { fallback = JSON.parse(m[2].split('_').join('')); } catch { continue; }
+        if (JSON.stringify(fallback) !== JSON.stringify(declared.default)) {
+          mismatches.push(
+            `${m[1]}: manifest=${JSON.stringify(declared.default)} code=${JSON.stringify(fallback)} (${file})`,
+          );
+        }
+      }
+    }
+
+    assert.deepEqual(mismatches, [],
+      'the IDE and the headless CLI would read different values for these');
+  });
+
+  it('ships a real spend ceiling, not an unlimited one', () => {
+    const props = JSON.parse(fsMod.readFileSync('package.json', 'utf-8'))
+      .contributes.configuration.properties;
+    const ceiling = props['agentTaskPlayer.costBudgetUsd'].default;
+    // 0 disables the ceiling. Shipping that default means a first unattended run
+    // has nothing between it and the user's bill.
+    assert.ok(typeof ceiling === 'number' && ceiling > 0,
+      `costBudgetUsd ships as ${ceiling}, which disables the ceiling for every new user`);
+  });
+});

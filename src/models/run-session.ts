@@ -138,7 +138,7 @@ export class RunSessionStore {
 
   private getMaxSessionStorageBytes(): number {
     return vscode.workspace.getConfiguration('agentTaskPlayer')
-      .get<number>('maxRunSessionStorageBytes', 800_000);
+      .get<number>('maxRunSessionStorageBytes', 200_000);
   }
 
   private sanitizeSession(session: RunSession): RunSession {

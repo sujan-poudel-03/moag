@@ -5,7 +5,7 @@ import * as http from 'http';
 import * as https from 'https';
 import * as net from 'net';
 import { EventEmitter } from 'events';
-import { ChildProcess, execSync, spawn } from 'child_process';
+import { ChildProcess, spawn } from 'child_process';
 import {
   Plan,
   Playlist,
@@ -36,6 +36,7 @@ import { selectModel, ReasoningPreset } from '../models/model-selector';
 import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
 import { costLedger, CostEvent } from '../utils/cost-ledger';
+import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 import { getValidationAdapters, validationResultToEngineResult } from '../adapters/validation/index';
 import { HistoryStore } from '../history/store';
 import { buildContext, getContextSettings, runRetrievalCascade, adaptiveContextBudget } from '../context/context-builder';
@@ -400,7 +401,7 @@ export class TaskRunner {
 
   stopAllServices(): void {
     for (const service of this._serviceProcesses.values()) {
-      this.killProcess(service.proc);
+      killProcess(service.proc);
     }
     this._serviceProcesses.clear();
   }
@@ -488,7 +489,7 @@ export class TaskRunner {
    * plan tasks and authoring calls alike.
    */
   private onCostRecorded(e: CostEvent): void {
-    const budget = getConfig('agentTaskPlayer').get<number>('costBudgetUsd', 0);
+    const budget = getConfig('agentTaskPlayer').get<number>('costBudgetUsd', 10);
     if (budget <= 0) {
       return;
     }
@@ -899,7 +900,7 @@ export class TaskRunner {
         // Autoplay delay only between non-synthetic original tasks
         if (!synthetic && playlist.autoplay && !queue.isEmpty) {
           const delay = taskPlaylist.autoplayDelay ??
-            getConfig('agentTaskPlayer').get<number>('autoplayDelay', 2000);
+            getConfig('agentTaskPlayer').get<number>('autoplayDelay', 500);
           await this.sleep(delay);
         }
       }
@@ -2273,6 +2274,9 @@ export class TaskRunner {
         shell: true,
         env: { ...process.env, ...(task.env ?? {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
+        // Lead a process group on POSIX so killProcess can signal the whole
+        // tree; a bare SIGTERM reaches the shell and orphans what it started.
+        detached: SPAWN_DETACHED,
       });
 
       let stdout = '';
@@ -2308,7 +2312,7 @@ export class TaskRunner {
             this._serviceProcesses.delete(task.id);
           });
         } else {
-          this.killProcess(proc);
+          killProcess(proc);
         }
 
         resolve(result);
@@ -2546,6 +2550,9 @@ export class TaskRunner {
         shell: true,
         env: { ...process.env, ...(options.env ?? {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
+        // Lead a process group on POSIX so killProcess can signal the whole
+        // tree; a bare SIGTERM reaches the shell and orphans what it started.
+        detached: SPAWN_DETACHED,
       });
 
       const finish = (result: EngineResult) => {
@@ -2558,7 +2565,7 @@ export class TaskRunner {
       };
 
       const onAbort = () => {
-        this.killProcess(proc);
+        killProcess(proc);
         finish({
           stdout,
           stderr: (stderr ? stderr + '\n' : '') + '[Command aborted]',
@@ -2604,24 +2611,6 @@ export class TaskRunner {
     });
   }
 
-  private killProcess(proc: ChildProcess): void {
-    if (proc.killed) {
-      return;
-    }
-    if (process.platform === 'win32' && proc.pid) {
-      try {
-        execSync(`taskkill /pid ${proc.pid} /T /F`, { stdio: 'ignore' });
-      } catch {
-        // ignore
-      }
-      return;
-    }
-    try {
-      proc.kill('SIGTERM');
-    } catch {
-      // ignore
-    }
-  }
 
   private async buildPrompt(task: Task, cwd: string, plan: Plan, playlist: Playlist): Promise<string> {
     const settings = getContextSettings();
@@ -3071,7 +3060,7 @@ export class TaskRunner {
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
-          this.killProcess(proc);
+          killProcess(proc);
           resolve(null);
         }
       }, GIT_TIMEOUT_MS);
