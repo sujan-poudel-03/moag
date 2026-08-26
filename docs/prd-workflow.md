@@ -335,18 +335,23 @@ interface PrdVerificationResult {
 
 ## Implementation Status
 
+Locations are given by file and symbol, not by line number. Line numbers in a
+document rot the moment anything above them moves — every number that used to
+be in this table was wrong within one refactor, and two of them pointed at the
+wrong file entirely after the PRD code moved out of `extension.ts`.
+
 | Component | Status | Location |
 |-----------|--------|----------|
-| `prdSource` / `fixIterations` types | ✓ Complete | `src/models/types.ts:183,185` |
-| `testPhase` / `prdContext` types | ✓ Complete | `src/models/types.ts:128,130` |
-| `PrdVerificationResult` interface | ✓ Complete | `src/models/types.ts:217-222` |
-| `planFromPrd` command | ✓ Complete | `src/extension.ts:~4593` |
-| `verifyAgainstPrd` command | ✓ Complete | `src/extension.ts:~4871` |
-| `suggestCommit` command | ✓ Complete | `src/extension.ts:~5108` |
-| `cmdGenerateFixTasks` + fix loop | ✓ Complete | `src/extension.ts:~5164` |
-| TTT checklist UI + criteria parsing | ✓ Complete | `src/ui/prompt-input-view.ts:~3170` |
-| Test phase detection + TTT routing | ✓ Complete | `src/extension.ts:~1573` |
-| `testTool` / `testToolCommand` settings | ✓ Complete | `package.json:849-859` |
+| `prdSource` / `fixIterations` types | ✓ Complete | `src/models/types.ts` |
+| `testPhase` / `prdContext` types | ✓ Complete | `src/models/types.ts` |
+| `PrdVerificationResult` interface | ✓ Complete | `src/models/types.ts` |
+| `planFromPrd` command | ✓ Complete | `src/ui/prd-authoring.ts` — `generatePlanFromPrdText` |
+| `verifyAgainstPrd` command | ✓ Complete | `src/extension.ts` — `cmdVerifyAgainstPrd` |
+| `suggestCommit` command | ✓ Complete | `src/extension.ts` — `cmdSuggestCommit` |
+| `cmdGenerateFixTasks` + fix loop | ✓ Complete | `src/extension.ts` — `cmdGenerateFixTasks` |
+| TTT checklist UI + criteria parsing | ✓ Complete | `src/webview/dashboard.ts` |
+| Test phase detection + TTT routing | ✓ Complete | `src/extension.ts` |
+| `testTool` / `testToolCommand` settings | ✓ Complete | `package.json` — `contributes.configuration` |
 | Anthropic adapter | ✓ Complete | `src/adapters/anthropic-adapter.ts` |
 | Memory extractor | ✓ Complete | `src/context/memory-extractor.ts` |
 | Task queue with `injectNext` | ✓ Complete | `src/runner/task-queue.ts` |

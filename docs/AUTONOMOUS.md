@@ -84,11 +84,26 @@ You need at least one agent CLI authenticated on the machine (`claude`, `codex`,
 
 ```
 moag run    <plan.json> [--full-auto] [--no-interactive] [--engine <id>] [--cwd <dir>]
+                        [--verify] [--fix] [--pr] [--pr-base <branch>]
+moag run    --prompt "<text>" [--engine <id>] [--full-auto]
+moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]
+                        [--uat | --no-uat] [--uat-spec <path>]
 moag loop   --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]
 moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]
+moag config <get-engine | set-engine <id>>
+moag queue  <list | resolve <id>>
+moag digest [--since <when>]
+moag land   [--into <branch>] [--merge]
 ```
 
-**Exit codes:** `0` success · `1` task(s) failed · `2` error/usage · `3` halted at ship gate.
+**Exit codes:** `0` success · `1` task(s) failed or work is waiting on a person ·
+`2` error/usage · `3` halted at ship gate · `4` halted on the cost ceiling.
+
+`digest` and `land` exit `1` while anything needs a decision, so
+`moag digest || notify-me` is a complete morning check.
+
+For the morning commands — `queue`, `digest`, `land` — and what they are for,
+see [MANUAL.md](MANUAL.md).
 
 ### `run` — execute a plan
 

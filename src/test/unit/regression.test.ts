@@ -1320,3 +1320,56 @@ describe('Regression: no webview carries inline JavaScript', () => {
     assert.deepEqual(broken, [], 'a webview cannot execute these');
   });
 });
+
+describe('Regression: the docs do not contradict the code', () => {
+  // Documentation that looks authoritative and is wrong is worse than none.
+  // Every line-number citation in docs/ was wrong within one refactor, and two
+  // pointed at the wrong file entirely once the PRD code moved out of
+  // extension.ts — so line numbers are banned, and the CLI surface is checked.
+  const DOCS = 'docs';
+
+  function docFiles(): string[] {
+    return fsMod.readdirSync(DOCS)
+      .filter((f: string) => f.endsWith('.md'))
+      .map((f: string) => pathMod.join(DOCS, f));
+  }
+
+  it('cites no source line numbers, which rot the moment anything moves', () => {
+    const offenders: string[] = [];
+    for (const file of docFiles()) {
+      const text = fsMod.readFileSync(file, 'utf-8');
+      for (const m of text.matchAll(/src\/[a-zA-Z0-9/_.-]+\.ts:~?\d+/g)) {
+        offenders.push(`${pathMod.basename(file)}: ${m[0]}`);
+      }
+    }
+    assert.deepEqual(offenders, [],
+      'cite a file and a symbol instead — a line number is wrong as soon as anything above it moves');
+  });
+
+  it('documents every command the CLI actually accepts', () => {
+    // The usage banner is the CLI's own statement of its surface.
+    const cli = fsMod.readFileSync('src/headless/cli.ts', 'utf-8');
+    const banner = /Usage: moag <([a-z|]+)>/.exec(cli);
+    assert.ok(banner, 'could not find the usage banner in cli.ts');
+    const commands = banner![1].split('|');
+    assert.ok(commands.length >= 8, `expected the full command set, got ${commands.join(',')}`);
+
+    const manual = fsMod.readFileSync(pathMod.join(DOCS, 'MANUAL.md'), 'utf-8');
+    const missing = commands.filter((c: string) => !manual.includes(`moag ${c}`));
+    assert.deepEqual(missing, [],
+      'MANUAL.md does not mention these commands, so a reader cannot discover them');
+  });
+
+  it('states the exit codes the CLI really uses', () => {
+    const cli = fsMod.readFileSync('src/headless/cli.ts', 'utf-8');
+    // cli.ts documents its own codes in the header comment.
+    assert.ok(/4 halted on cost ceiling/.test(cli), 'cli.ts no longer documents code 4 — update this test');
+
+    for (const doc of ['MANUAL.md', 'AUTONOMOUS.md']) {
+      const text = fsMod.readFileSync(pathMod.join(DOCS, doc), 'utf-8');
+      if (!/Exit codes/i.test(text)) { continue; }
+      assert.ok(/`?4`?[^\n]*ceiling/i.test(text),
+        `${doc} lists exit codes but omits 4 (cost ceiling), which a caller would never handle`);
+    }
+  });
+});
