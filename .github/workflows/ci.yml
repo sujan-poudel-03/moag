@@ -43,6 +43,10 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      # The suite asserts things about the SHIPPED artifacts — that every webview
+      # script is emitted, parses, and is a plain browser script — so out/ has to
+      # exist before it runs. Without this the guards fail on every platform.
+      - run: npm run compile
       - run: npm run test:unit
 
   test-integration:
