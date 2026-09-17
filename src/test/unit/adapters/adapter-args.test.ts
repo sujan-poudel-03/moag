@@ -151,6 +151,40 @@ describe('adapter argument building', () => {
       assert.deepEqual(args, ['run', 'llama3']);
       assert.equal(capturedConfig!.useStdin, true, 'useStdin should be true');
     });
+
+    it('should pass OLLAMA_HOST env when host is configured', async () => {
+      setMockConfig('agentTaskPlayer.engines.ollama', { model: 'llama3', host: '192.168.1.50:11434' });
+      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean; env?: Record<string, string> } | undefined;
+      const { OllamaAdapter: OA } = proxyquire('../../../adapters/ollama-adapter', {
+        vscode: vscodeMock,
+        './base-cli': {
+          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean; env?: Record<string, string> }) => {
+            capturedConfig = config;
+            return Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 });
+          },
+        },
+      });
+      const adapter = new OA();
+      await adapter.runTask({ prompt: 'hello', cwd: '/tmp' });
+      assert.deepEqual(capturedConfig!.env, { OLLAMA_HOST: '192.168.1.50:11434' });
+    });
+
+    it('should omit env entirely when host is not configured', async () => {
+      setMockConfig('agentTaskPlayer.engines.ollama', { model: 'llama3' });
+      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean; env?: Record<string, string> } | undefined;
+      const { OllamaAdapter: OA } = proxyquire('../../../adapters/ollama-adapter', {
+        vscode: vscodeMock,
+        './base-cli': {
+          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean; env?: Record<string, string> }) => {
+            capturedConfig = config;
+            return Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 });
+          },
+        },
+      });
+      const adapter = new OA();
+      await adapter.runTask({ prompt: 'hello', cwd: '/tmp' });
+      assert.equal(capturedConfig!.env, undefined);
+    });
   });
 
   describe('CustomAdapter', () => {

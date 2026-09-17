@@ -11,6 +11,7 @@ import {
   serializePlanForSharing,
 } from './models/plan';
 import { registerAllEngines, checkEngineAvailability, getEngine, setCeilingGuard } from './adapters/index';
+import { loadWorkspaceRoutingConfig, saveWorkspaceRoutingConfig, RoutingRuleConfig } from './routing/routing-store';
 import { commandExists } from './utils/command-exists';
 import { ghSync, ghAsync } from './utils/gh';
 import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
@@ -61,6 +62,9 @@ import { SandboxManager } from './sandbox/sandbox-manager';
 import { resolveBrowserRunner } from './sandbox/browser-driver';
 import { runGate } from './runner/evidence';
 import { captureScreenshot } from './sandbox/screenshot';
+import { resolveDeveloperEmail } from './utils/git-identity';
+import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
+import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
 
 // ─── Shared state ───
 
@@ -1409,6 +1413,23 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({ dispose: () => setCeilingGuard(null) });
   runner.setPromptLibrary(promptLibraryStore);
 
+  // Contribution Ledger: record per-engine-call usage facts to
+  // .moag/usage-log.jsonl. Best-effort — appendUsageEntry never throws, and
+  // the recorder itself is already wrapped by the runner's own try/catch.
+  // The recorded `record.prompt` is always the short human prompt the
+  // runner computes — never the assembled buildContext() prompt; this file
+  // is git-tracked, so anything wider than that would land in git history.
+  runner.setUsageRecorder((record) => {
+    const enabled = vscode.workspace.getConfiguration('agentTaskPlayer')
+      .get<boolean>('contributionLedger.enabled', true);
+    if (!enabled) { return; }
+    const moagDir = getMoagDir();
+    if (!moagDir) { return; }
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const developerEmail = resolveDeveloperEmail(cwd);
+    appendUsageEntry(moagDir, { ...record, developerEmail });
+  });
+
   // Initialize AI rules store
   aiRulesStore = new AiRulesStore(context.globalStorageUri.fsPath);
   runner.setAiRulesStore(aiRulesStore);
@@ -1716,6 +1737,7 @@ export function activate(context: vscode.ExtensionContext): void {
       task, entry?.result ?? _result, entry?.changedFiles, entry?.codeChanges, entry?.verification, entry?.artifacts,
       entry?.autoFixed, entry?.validationTargetResults,
     );
+    DashboardPanel.currentPanel?.pushContributionLedger();
     scheduleDashboardUpdate();
     // Update run session stats
     if (runner.currentRunId) {
@@ -2038,6 +2060,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.manageAiRules', () => {
       void handleRulesAction({ type: 'openLibrary' });
     }),
+    vscode.commands.registerCommand('agentTaskPlayer.configureAutoRouting', () => void cmdConfigureAutoRouting()),
     vscode.commands.registerCommand('agentTaskPlayer.switchEngine', cmdSwitchEngine),
     vscode.commands.registerCommand('agentTaskPlayer.playPlaylist', cmdPlayPlaylist),
     vscode.commands.registerCommand('agentTaskPlayer.playTask', cmdPlayTask),
@@ -2596,6 +2619,38 @@ function handleTttPhaseStart(playlist: Playlist): void {
       );
       break;
   }
+}
+
+/**
+ * Build the Contribution Ledger payload for the dashboard: reads
+ * .moag/usage-log.jsonl, cross-references task status from the active plan,
+ * and rolls it up into the rolling 7-day leaderboard + coaching cards.
+ * Returns null when there is no workspace .moag/ directory to read from.
+ */
+function buildContributionLedgerPayload(): ContributionLedgerPayload | null {
+  const moagDir = getMoagDir();
+  if (!moagDir) { return null; }
+
+  const entries = readAllUsageEntries(moagDir);
+
+  const taskStatusById = new Map<string, string>();
+  const plan = getActivePlan();
+  if (plan) {
+    for (const playlist of plan.playlists) {
+      for (const task of playlist.tasks) {
+        taskStatusById.set(task.id, task.status);
+      }
+    }
+  }
+
+  const leads = vscode.workspace.getConfiguration('agentTaskPlayer')
+    .get<string[]>('contributionLedger.leads', []);
+
+  return rollupContributionLedger(entries, {
+    now: new Date(),
+    taskStatusById,
+    leads,
+  });
 }
 
 function saveAndRefresh(): void {
@@ -5847,6 +5902,7 @@ function ensureDashboardOpen(): void {
     async (prompt: string) => {
       return generatePlanFromDashboardPrompt(prompt);
     },
+    () => buildContributionLedgerPayload(),
   );
   // Force a delayed update to ensure the webview receives the plan
   // even if the webview-ready handshake is slow
@@ -5892,6 +5948,77 @@ async function cmdSwitchEngine(): Promise<void> {
   refreshEngineStatusBar();
   scheduleDashboardUpdate();
   vscode.window.showInformationMessage(`Engine switched to ${pick.label.replace(' (current)', '')}.`);
+}
+
+const AUTO_ROUTING_ENGINE_LABELS: Record<EngineId, string> = {
+  codex: 'OpenAI Codex CLI',
+  claude: 'Claude Code CLI (recommended)',
+  gemini: 'Google Gemini CLI',
+  ollama: 'Ollama (local models)',
+  custom: 'Custom CLI command',
+  copilot: 'GitHub Copilot CLI',
+  anthropic: 'Anthropic API direct',
+};
+
+/**
+ * QuickPick-driven flow for `.moag/routing.json`, mirroring
+ * `ghSyncConfigureInteractive`'s shape: read current state, offer one action
+ * at a time, patch exactly the field that action changes, and write back —
+ * never a full overwrite of unrelated fields.
+ */
+async function cmdConfigureAutoRouting(): Promise<void> {
+  const cwd = getWorkspaceCwd();
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  const current = loadWorkspaceRoutingConfig(cwd);
+  const enabled = current.enabled ?? cfg.get<boolean>('autoRouting.enabled', false);
+  const simpleEngine = current.simpleEngine ?? cfg.get<EngineId>('autoRouting.simpleEngine', 'ollama');
+  const complexEngine = current.complexEngine ?? cfg.get<EngineId>('autoRouting.complexEngine', 'claude');
+  const threshold = current.complexityThreshold ?? cfg.get<number>('autoRouting.complexityThreshold', 50);
+
+  const pick = await vscode.window.showQuickPick([
+    {
+      label: enabled ? '$(debug-pause) Disable auto-routing for this workspace' : '$(play) Enable auto-routing for this workspace',
+      action: 'toggle' as const,
+    },
+    { label: `$(symbol-event) Simple-task engine — ${AUTO_ROUTING_ENGINE_LABELS[simpleEngine]}`, action: 'simple' as const },
+    { label: `$(symbol-event) Complex-task engine — ${AUTO_ROUTING_ENGINE_LABELS[complexEngine]}`, action: 'complex' as const },
+    { label: `$(settings-gear) Complexity threshold — ${threshold}`, action: 'threshold' as const },
+  ], { title: 'Configure Auto-Routing', placeHolder: 'Choose a setting to change' });
+  if (!pick) { return; }
+
+  // Re-read fresh from disk so this write only ever patches the one field the
+  // chosen action changes, never clobbering a concurrent edit to the others.
+  const patch: RoutingRuleConfig = { ...loadWorkspaceRoutingConfig(cwd) };
+
+  if (pick.action === 'toggle') {
+    patch.enabled = !enabled;
+  } else if (pick.action === 'simple' || pick.action === 'complex') {
+    const engineItems = ENGINE_IDS.map(id => ({ label: AUTO_ROUTING_ENGINE_LABELS[id], description: id, id }));
+    const engPick = await vscode.window.showQuickPick(engineItems, {
+      placeHolder: pick.action === 'simple' ? 'Engine for simple tasks' : 'Engine for complex tasks',
+    });
+    if (!engPick) { return; }
+    if (pick.action === 'simple') {
+      patch.simpleEngine = engPick.id;
+    } else {
+      patch.complexEngine = engPick.id;
+    }
+  } else {
+    const input = await vscode.window.showInputBox({
+      title: 'Complexity threshold (0-100)',
+      prompt: 'Tasks scoring at or below this are routed to the simple engine; above it, to the complex engine.',
+      value: String(threshold),
+      validateInput: v => {
+        const n = Number(v);
+        return v.trim() !== '' && Number.isFinite(n) && n >= 0 && n <= 100 ? undefined : 'Enter a number between 0 and 100';
+      },
+    });
+    if (input === undefined) { return; }
+    patch.complexityThreshold = Number(input);
+  }
+
+  saveWorkspaceRoutingConfig(cwd, patch);
+  vscode.window.showInformationMessage('Auto-routing configuration updated.');
 }
 
 function isPlaylistLikeItem(item: unknown): item is { kind?: string; playlistIndex: number } {

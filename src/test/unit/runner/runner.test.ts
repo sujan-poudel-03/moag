@@ -1,7 +1,8 @@
 import { strict as assert } from 'assert';
 import * as sinon from 'sinon';
-import { Plan, TaskStatus, RunnerState, EngineResult } from '../../../models/types';
+import { Plan, TaskStatus, RunnerState, EngineResult, EngineId } from '../../../models/types';
 import { createEmptyPlan, createPlaylist, createTask } from '../../../models/plan';
+import type { EngineCallUsage } from '../../../utils/usage-log';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const proxyquire = require('proxyquire').noCallThru();
@@ -116,25 +117,30 @@ function createMockHistoryStore() {
 }
 
 // Build TaskRunner with mocked dependencies
-function buildRunner() {
+function buildRunner(routingOverrides?: {
+  '../routing/routing-store'?: { loadWorkspaceRoutingConfig: (root: string) => unknown };
+}) {
   const historyStore = createMockHistoryStore();
   const mockEngine = createMockEngine();
   spawnStub = sinon.stub().callsFake(() => createSpawnProc());
 
+  let lastEngineId: string | undefined;
+
   const { TaskRunner } = proxyquire('../../../runner/runner', {
     'vscode': vscodeMock,
     '../adapters/index': {
-      getEngine: () => mockEngine,
+      getEngine: (id: string) => { lastEngineId = id; return mockEngine; },
     },
     '../context/context-builder': {
       buildContext: () => '',
       getContextSettings: () => ({ enabled: false }),
     },
     'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+    ...(routingOverrides ?? {}),
   });
 
   const runner = new TaskRunner(historyStore);
-  return { runner, historyStore, mockEngine };
+  return { runner, historyStore, mockEngine, getLastEngineId: () => lastEngineId };
 }
 
 function makePlan(): Plan {
@@ -1384,3 +1390,425 @@ describe('TaskRunner — role charter on review tasks', () => {
     assert.ok(!failures[0].stderr.includes('## Role'), 'the guard must return before role resolution');
   });
 });
+
+describe('TaskRunner — auto-routing engine resolution', () => {
+  const SIMPLE_PROMPT = 'rename variable foo to bar';
+  const COMPLEX_PROMPT = 'Refactor the entire authentication system to use OAuth2. ' +
+    'This involves redesigning the database schema, migrating existing users, ' +
+    'implementing security best practices, and optimizing performance. ' +
+    'The system architecture needs a complete overhaul with complex state management.';
+
+  function routingPlan(prompt: string, opts?: {
+    taskEngine?: EngineId;
+    playlistEngine?: EngineId;
+    planDefaultEngine?: EngineId;
+  }): Plan {
+    const plan = createEmptyPlan('Routing Plan');
+    // createEmptyPlan always sets defaultEngine to 'claude'; these tests need to
+    // clear it to isolate routing/playlist resolution, so the type is widened here.
+    plan.defaultEngine = opts?.planDefaultEngine as EngineId;
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    pl.engine = opts?.playlistEngine;
+    pl.tasks.push(createTask('Routed Task', prompt, opts?.taskEngine));
+    return plan;
+  }
+
+  function buildRoutedRunner(loadWorkspaceRoutingConfig: (root: string) => unknown) {
+    return buildRunner({
+      '../routing/routing-store': { loadWorkspaceRoutingConfig },
+    });
+  }
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  it('routes a simple-prompt task to simpleEngine when enabled and no workspace override exists', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT));
+
+    assert.equal(getLastEngineId(), 'ollama');
+  });
+
+  it('routes a complex-prompt task to complexEngine when enabled', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    const plan = routingPlan(COMPLEX_PROMPT);
+    plan.playlists[0].tasks[0].files = ['auth.ts', 'db.ts', 'middleware.ts', 'routes.ts', 'models.ts'];
+    plan.playlists[0].tasks[0].dependsOn = [];
+    plan.playlists[0].tasks[0].verifyCommand = 'npm test';
+
+    await runner.play(plan);
+
+    assert.equal(getLastEngineId(), 'claude');
+  });
+
+  it('lets an explicit task.engine override routing', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT, { taskEngine: 'codex' }));
+
+    assert.equal(getLastEngineId(), 'codex');
+  });
+
+  it('lets an explicit playlist.engine win over routing', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT, { playlistEngine: 'gemini' }));
+
+    assert.equal(getLastEngineId(), 'gemini');
+  });
+
+  it('lets an explicit plan.defaultEngine win over routing', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'gemini',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT, { planDefaultEngine: 'claude' }));
+
+    assert.equal(getLastEngineId(), 'claude');
+  });
+
+  it('regression pin: autoRouting disabled by default resolves to the pre-routing default engine', async () => {
+    // No 'autoRouting.*' keys set at all — mirrors an unconfigured workspace.
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT));
+
+    assert.equal(getLastEngineId(), 'claude');
+  });
+
+  it('two different workspace routing overrides against an identical task resolve to different engines', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+
+    const runA = buildRoutedRunner(() => ({}));
+    await runA.runner.play(routingPlan(SIMPLE_PROMPT));
+    const engineA = runA.getLastEngineId();
+
+    const runB = buildRoutedRunner(() => ({ simpleEngine: 'gemini' }));
+    await runB.runner.play(routingPlan(SIMPLE_PROMPT));
+    const engineB = runB.getLastEngineId();
+
+    assert.equal(engineA, 'ollama');
+    assert.equal(engineB, 'gemini');
+    assert.notEqual(engineA, engineB);
+  });
+
+  it('stamps engineRoutingReason on the history entry only when routing actually fired', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+
+    const routed = buildRoutedRunner(() => ({}));
+    await routed.runner.play(routingPlan(SIMPLE_PROMPT));
+    const routedEntry = routed.historyStore.add.firstCall.args[0];
+    assert.equal(typeof routedEntry.engineRoutingReason, 'string');
+    assert.ok(routedEntry.engineRoutingReason.length > 0);
+
+    const overridden = buildRoutedRunner(() => ({}));
+    await overridden.runner.play(routingPlan(SIMPLE_PROMPT, { taskEngine: 'codex' }));
+    const overriddenEntry = overridden.historyStore.add.firstCall.args[0];
+    assert.equal(overriddenEntry.engineRoutingReason, undefined);
+  });
+
+  describe('CLI-missing fallback (auto-routing tier substitution)', () => {
+    function autoRoutingCfg(threshold = 50) {
+      vscodeMock.setMockConfig('agentTaskPlayer', {
+        'autoRouting.enabled': true,
+        'autoRouting.simpleEngine': 'ollama',
+        'autoRouting.complexEngine': 'claude',
+        'autoRouting.complexityThreshold': threshold,
+      });
+    }
+
+    it('retries on the auto-routing complex tier when the auto-routed simple engine reports CLI-missing and no plan.fallbackEngine is set', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.onCall(0).resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'ollama: command not found',
+      });
+      engineRunStub.onCall(1).resolves(mockEngineResult);
+
+      const fallbackEvents: Array<{ taskId: string; fromEngine: string; toEngine: string }> = [];
+      runner.on('engine-fallback', (details: { taskId: string; fromEngine: string; toEngine: string }) => fallbackEvents.push(details));
+      const outputs: string[] = [];
+      runner.on('task-output', (_task: unknown, chunk: string) => outputs.push(chunk));
+
+      const plan = routingPlan(SIMPLE_PROMPT);
+      await runner.play(plan);
+
+      assert.equal(getLastEngineId(), 'claude');
+      assert.equal(fallbackEvents.length, 1);
+      assert.equal(fallbackEvents[0].fromEngine, 'ollama');
+      assert.equal(fallbackEvents[0].toEngine, 'claude');
+      assert.ok(outputs.some(o => o.includes('Engine CLI not found or unreachable') && o.includes('auto-routing')));
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    });
+
+    it('prefers an explicit plan.fallbackEngine over the auto-routing complex tier on CLI-missing', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.onCall(0).resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'ollama: command not found',
+      });
+      engineRunStub.onCall(1).resolves(mockEngineResult);
+
+      const plan = routingPlan(SIMPLE_PROMPT);
+      plan.fallbackEngine = 'gemini' as EngineId;
+      await runner.play(plan);
+
+      assert.equal(getLastEngineId(), 'gemini');
+    });
+
+    it('does not auto-substitute the other routing tier when the CLI-missing engine was an explicit task.engine override', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'codex: command not found',
+      });
+
+      const plan = routingPlan(SIMPLE_PROMPT, { taskEngine: 'codex' });
+      await runner.play(plan);
+
+      assert.equal(engineRunStub.callCount, 1);
+      assert.equal(getLastEngineId(), 'codex');
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    });
+
+    it('does not auto-substitute the other routing tier on a rate-limited auto-routed engine — only plan.fallbackEngine applies to rate-limit', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'Error: rate limit exceeded, please retry later',
+      });
+
+      const fallbackEvents: unknown[] = [];
+      runner.on('engine-fallback', (d: unknown) => fallbackEvents.push(d));
+
+      const plan = routingPlan(SIMPLE_PROMPT);
+      await runner.play(plan);
+
+      assert.equal(engineRunStub.callCount, 1);
+      assert.equal(getLastEngineId(), 'ollama');
+      assert.equal(fallbackEvents.length, 0);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    });
+
+    it('isCliMissing matches known CLI-missing phrasings and rejects unrelated stderr', () => {
+      const { runner } = buildRunner();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const isCliMissing = (result: EngineResult) => (runner as any).isCliMissing(result);
+
+      assert.equal(isCliMissing({ stdout: '', stderr: 'ollama: command not found', exitCode: 127, durationMs: 0 }), true);
+      assert.equal(isCliMissing({ stdout: '', stderr: "'foo' is not recognized as an internal or external command", exitCode: 1, durationMs: 0 }), true);
+      assert.equal(isCliMissing({ stdout: '', stderr: 'AssertionError: expected 1 to equal 2', exitCode: 1, durationMs: 0 }), false);
+    });
+  });
+});
+
+describe('TaskRunner — usage recorder', () => {
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  function singleTaskPlan(): Plan {
+    const plan = createEmptyPlan('Usage Recorder Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    pl.tasks.push(createTask('Solo Task', 'Do the one thing'));
+    return plan;
+  }
+
+  it('is called once on a normal successful agent task, with correct fields', async () => {
+    const { runner } = buildRunner();
+    engineRunStub.resolves({
+      ...mockEngineResult,
+      tokenUsage: { inputTokens: 10, outputTokens: 20, estimatedCost: 0.0015 },
+    });
+
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = singleTaskPlan();
+    await runner.play(plan);
+
+    assert.equal(records.length, 1);
+    const [record] = records;
+    assert.equal(record.taskId, plan.playlists[0].tasks[0].id);
+    assert.equal(record.taskName, 'Solo Task');
+    assert.equal(record.engine, 'claude');
+    assert.equal(record.prompt, 'Do the one thing');
+    assert.equal(record.tokenUsageAvailable, true);
+    assert.equal(record.inputTokens, 10);
+    assert.equal(record.outputTokens, 20);
+    assert.equal(record.estimatedCostUsd, 0.0015);
+  });
+
+  it('records tokenUsageAvailable:false and zero token fields when the adapter omits tokenUsage', async () => {
+    const { runner } = buildRunner();
+    // mockEngineResult (the default stub resolution) carries no tokenUsage.
+
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = singleTaskPlan();
+    await runner.play(plan);
+
+    assert.equal(records.length, 1);
+    assert.equal(records[0].tokenUsageAvailable, false);
+    assert.equal(records[0].inputTokens, 0);
+    assert.equal(records[0].outputTokens, 0);
+    assert.equal(records[0].estimatedCostUsd, 0);
+  });
+
+  it('is called twice for the same taskId, once per engine, when a rate-limit fallback fires', async () => {
+    const { runner } = buildRunner();
+    engineRunStub.onCall(0).resolves({
+      ...mockEngineResult,
+      exitCode: 1,
+      stderr: 'Error: rate limit exceeded, please retry later',
+    });
+    engineRunStub.onCall(1).resolves(mockEngineResult);
+
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = singleTaskPlan();
+    plan.defaultEngine = 'claude' as EngineId;
+    plan.fallbackEngine = 'codex' as EngineId;
+    await runner.play(plan);
+
+    assert.equal(records.length, 2);
+    assert.equal(records[0].taskId, records[1].taskId);
+    assert.notEqual(records[0].engine, records[1].engine);
+  });
+
+  it('is never called when no usage recorder has been set', async () => {
+    const { runner } = buildRunner();
+    const plan = singleTaskPlan();
+    // setUsageRecorder is never called — this must not throw or otherwise break the task.
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('does not fail the task when the recorder throws — task-completed still fires', async () => {
+    const { runner } = buildRunner();
+    runner.setUsageRecorder(() => { throw new Error('recorder boom'); });
+
+    const completed: string[] = [];
+    runner.on('task-completed', (task: { name: string }) => completed.push(task.name));
+
+    const plan = singleTaskPlan();
+    await runner.play(plan);
+
+    assert.deepEqual(completed, ['Solo Task']);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  // Regression pin for the HIGH finding: the recorder must receive only the
+  // short, human-written task prompt — never buildContext()'s assembled
+  // prompt (AI rules, retrieved code spans, prior outputs). Builds its own
+  // TaskRunner with context building actually enabled and a distinctive
+  // marker standing in for a large assembled-context blob, so a regression
+  // that starts passing `fullPrompt` again would fail this test even though
+  // every other test in this file stubs context building as disabled.
+  it('never records assembled buildContext() output — only the short task prompt', async () => {
+    const ASSEMBLED_CONTEXT_MARKER = 'ASSEMBLED-CONTEXT-'.repeat(200); // stands in for AI rules + retrieved code spans
+
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    const localSpawnStub = sinon.stub().callsFake(() => createSpawnProc());
+
+    const { TaskRunner } = proxyquire('../../../runner/runner', {
+      'vscode': vscodeMock,
+      '../adapters/index': {
+        getEngine: () => mockEngine,
+      },
+      '../context/context-builder': {
+        buildContext: () => ASSEMBLED_CONTEXT_MARKER,
+        getContextSettings: () => ({ enabled: true, maxFileContextChars: 2000, maxContextChars: 50000 }),
+        runRetrievalCascade: async () => ({ spans: [], usedSemantic: false }),
+        adaptiveContextBudget: () => 50000,
+      },
+      'child_process': { spawn: localSpawnStub, execSync: sinon.stub() },
+    });
+
+    const runner = new TaskRunner(historyStore);
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = createEmptyPlan('Assembled Context Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    pl.tasks.push(createTask('Context Task', 'Do the short thing'));
+
+    // Sanity: prove the assembled context actually flowed into task-started's
+    // fullPrompt, so a passing assertion below is not just an inert stub.
+    let observedFullPrompt = '';
+    runner.on('task-started', (_task: unknown, _playlist: unknown, fullPrompt: string) => {
+      observedFullPrompt = fullPrompt;
+    });
+
+    await runner.play(plan);
+
+    assert.ok(observedFullPrompt.includes(ASSEMBLED_CONTEXT_MARKER),
+      'test setup must actually exercise the assembled-context path');
+    assert.equal(records.length, 1);
+    assert.equal(records[0].prompt, 'Do the short thing');
+    assert.ok(!records[0].prompt.includes('ASSEMBLED-CONTEXT-'),
+      'usage recorder must never see assembled buildContext() output');
+    assert.ok(records[0].prompt.length < 100,
+      'the recorded prompt must be the short human prompt, not a large assembled blob');
+  });
+});
+

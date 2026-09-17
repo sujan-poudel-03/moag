@@ -33,6 +33,8 @@ import {
 } from './worktree';
 import { resolveRoleCharter } from '../models/roles';
 import { selectModel, ReasoningPreset } from '../models/model-selector';
+import { resolveAutoRoutedEngine, AutoRoutingConfig } from '../models/engine-router';
+import { loadWorkspaceRoutingConfig } from '../routing/routing-store';
 import { resolveProfile, resolveValidationProfile, resolveTaskTimeoutMs, ProfileName } from '../models/execution-profiles';
 import { getEngine } from '../adapters/index';
 import { costLedger, CostEvent } from '../utils/cost-ledger';
@@ -47,6 +49,8 @@ import { AiRulesStore } from '../ai-rules/rules-store';
 import { TaskQueue } from './task-queue';
 import { ghSync } from '../utils/gh';
 import { fileIncidentIssue } from '../github/issue-sync';
+// Type-only — zero runtime dependency, keeps the runner headless-safe.
+import type { EngineCallUsage } from '../utils/usage-log';
 
 const GIT_TIMEOUT_MS = 30_000;
 const VERIFY_TIMEOUT_MS = 30_000;
@@ -343,6 +347,8 @@ export class TaskRunner {
   private _aiRulesStore: AiRulesStore | null = null;
   private _pendingScreenshots: string[] = [];
   private _sandboxUrl: string | null = null;
+  /** Sink for per-engine-call usage facts (Contribution Ledger). Null = usage recording disabled. */
+  private _usageRecorder: ((record: EngineCallUsage) => void) | null = null;
   /** Stores failure context (stderr + verify output) from the last failed attempt, keyed by task id */
   private _taskFailureContext = new Map<string, string>();
   /** Pending manual gate resolvers — keyed by task id, resolved when user marks step complete */
@@ -377,6 +383,40 @@ export class TaskRunner {
 
   setSandboxUrl(url: string | null): void {
     this._sandboxUrl = url;
+  }
+
+  setUsageRecorder(fn: ((record: EngineCallUsage) => void) | null): void {
+    this._usageRecorder = fn;
+  }
+
+  /**
+   * Record one engine-call usage fact for the Contribution Ledger. No-ops
+   * instantly if no recorder is registered. A throwing recorder must never
+   * break task execution — wrapped in try/catch.
+   *
+   * `prompt` is always the short, human-written task prompt (the same value
+   * computed as `task.prompt?.trim() || task.name`) — NEVER the assembled
+   * `buildContext()` prompt (AI rules, retrieved code spans, prior outputs).
+   * `.moag/usage-log.jsonl` is git-tracked by design, so anything wider than
+   * that short prompt would be committed to git history forever, un-rotated.
+   * Do not widen this to accept a `fullPrompt` parameter again.
+   */
+  private emitUsageRecord(task: Task, engineId: string, result: EngineResult): void {
+    if (!this._usageRecorder) { return; }
+    try {
+      const record: EngineCallUsage = {
+        ts: new Date().toISOString(),
+        taskId: task.id,
+        taskName: task.name,
+        engine: engineId,
+        prompt: task.prompt?.trim() || task.name,
+        tokenUsageAvailable: result.tokenUsage !== undefined,
+        inputTokens: result.tokenUsage?.inputTokens ?? 0,
+        outputTokens: result.tokenUsage?.outputTokens ?? 0,
+        estimatedCostUsd: result.tokenUsage?.estimatedCost ?? 0,
+      };
+      this._usageRecorder(record);
+    } catch { /* a throwing recorder must never break task execution */ }
   }
 
   /**
@@ -1202,8 +1242,32 @@ export class TaskRunner {
     const profileName = cfg.get<string>('executionProfile', 'auto');
     const profile = resolveProfile(profileName as ProfileName);
 
-    // Engine: task-level override > playlist > plan > profile
-    const engineId = task.engine ?? playlist.engine ?? plan.defaultEngine ?? profile.preferredEngine;
+    // NOTE: uses this.resolveCwd(undefined) rather than the imported workspaceRoot()
+    // — a local `const workspaceRoot` is declared further down in this same function
+    // (for inherited env files) and would shadow the import for the whole function
+    // body due to let/const temporal-dead-zone hoisting, throwing at runtime.
+    const workspaceRootForRouting = this.resolveCwd(undefined);
+    const workspaceRouting = loadWorkspaceRoutingConfig(workspaceRootForRouting);
+    const autoRoutingConfig: AutoRoutingConfig = {
+      enabled: workspaceRouting.enabled ?? cfg.get<boolean>('autoRouting.enabled', false),
+      simpleEngine: workspaceRouting.simpleEngine ?? cfg.get<EngineId>('autoRouting.simpleEngine', 'ollama'),
+      complexEngine: workspaceRouting.complexEngine ?? cfg.get<EngineId>('autoRouting.complexEngine', 'claude'),
+      complexityThreshold: workspaceRouting.complexityThreshold ?? cfg.get<number>('autoRouting.complexityThreshold', 50),
+    };
+    const routing = resolveAutoRoutedEngine(task, autoRoutingConfig);
+
+    // Engine: task-level override > playlist > plan > auto-routing > profile
+    const engineId = task.engine ?? playlist.engine ?? plan.defaultEngine ?? routing?.engineId ?? profile.preferredEngine;
+
+    // Whether `engineId` was actually chosen by auto-routing (not an explicit
+    // task/playlist/plan override). Drives the auto-routing-tier fallback in
+    // runAgentTask — an explicit engine choice must never be silently
+    // substituted with the other routing tier.
+    const wasAutoRouted = !!(routing && !task.engine && !playlist.engine && !plan.defaultEngine);
+
+    if (wasAutoRouted && routing) {
+      (task as Task & { _routingReason?: string })._routingReason = routing.reason;
+    }
 
     // Store profile's model preset on the task for runAgentOnEngine to pick up
     (task as Task & { _profileModelPreset?: string })._profileModelPreset = profile.modelPreset;
@@ -1303,7 +1367,7 @@ export class TaskRunner {
       if (task.consensus && task.consensus.engines.length > 0 && taskType === 'agent') {
         result = await this.runConsensusTask(task, cwd, executionDescription, taskAbort.signal, plan);
       } else {
-        result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal, plan, playlist, plan.fallbackEngine, resolvedEnv);
+        result = await this.runTaskByType(taskType, task, engineId, cwd, executionDescription, taskAbort.signal, plan, playlist, plan.fallbackEngine, resolvedEnv, autoRoutingConfig, wasAutoRouted);
       }
 
       if (taskAbort.signal.aborted && !this._abortController?.signal.aborted) {
@@ -1466,6 +1530,7 @@ export class TaskRunner {
         runId: this._currentRunId || undefined,
         modelId: (task as Task & { _modelId?: string })._modelId,
         modelReason: (task as Task & { _modelReason?: string })._modelReason,
+        engineRoutingReason: (task as Task & { _routingReason?: string })._routingReason,
         validationTargetResults: (task as Task & { _validationTargetResults?: HistoryEntry['validationTargetResults'] })._validationTargetResults,
         summary: extractSummary(result.stdout, changedFiles.length > 0 ? changedFiles : undefined),
         contextBudgetUsage: (task as Task & { _budgetUsage?: HistoryEntry['contextBudgetUsage'] })._budgetUsage,
@@ -1622,10 +1687,12 @@ export class TaskRunner {
     playlist: Playlist,
     fallbackEngine?: EngineId,
     resolvedEnv?: Record<string, string>,
+    autoRoutingConfig?: AutoRoutingConfig,
+    wasAutoRouted?: boolean,
   ): Promise<EngineResult> {
     switch (taskType) {
       case 'agent':
-        return this.runAgentTask(task, engineId, cwd, fullPrompt, signal, fallbackEngine);
+        return this.runAgentTask(task, engineId, cwd, fullPrompt, signal, fallbackEngine, autoRoutingConfig, wasAutoRouted);
       case 'command':
         return this.runCommandTask(task, cwd, signal, resolvedEnv);
       case 'service':
@@ -1718,7 +1785,7 @@ export class TaskRunner {
     const cfg = getConfig('agentTaskPlayer.engines.anthropic');
     const model = cfg.get<string>('model', 'claude-sonnet-4-6');
 
-    return engine.runTask({
+    const result = await engine.runTask({
       prompt: fullPrompt,
       cwd,
       signal,
@@ -1731,6 +1798,15 @@ export class TaskRunner {
         this.emit('task-output', task, chunk, stream);
       },
     });
+
+    // Must stay here, not at the later HistoryEntry construction point: that
+    // point is downstream of fallback/consensus result-collapsing and would
+    // silently under-count exactly the multi-engine-call cases (retry,
+    // rate-limit fallback) this hook exists to capture. Do not "simplify"
+    // this back there. Only the short task prompt is recorded, never
+    // `fullPrompt` — see emitUsageRecord's doc comment.
+    this.emitUsageRecord(task, 'anthropic', result);
+    return result;
   }
 
   private async runAgentTask(
@@ -1740,19 +1816,47 @@ export class TaskRunner {
     fullPrompt: string,
     signal: AbortSignal,
     fallbackEngine?: EngineId,
+    autoRoutingConfig?: AutoRoutingConfig,
+    wasAutoRouted?: boolean,
   ): Promise<EngineResult> {
     const result = await this.runAgentOnEngine(task, engineId, cwd, fullPrompt, signal);
 
-    // Rate-limit fallback: retry once on a different engine
-    if (
-      result.exitCode !== 0 &&
-      fallbackEngine &&
-      fallbackEngine !== engineId &&
-      this.isRateLimited(result)
-    ) {
-      this.emit('engine-fallback', { taskId: task.id, fromEngine: engineId, toEngine: fallbackEngine });
-      this.emit('task-output', task, `\n[Fallback] Rate limit detected on "${engineId}", retrying with "${fallbackEngine}"...\n`, 'stderr');
-      return this.runAgentOnEngine(task, fallbackEngine, cwd, fullPrompt, signal);
+    if (result.exitCode !== 0) {
+      const rateLimited = this.isRateLimited(result);
+      const cliMissing = this.isCliMissing(result);
+
+      // Explicit plan.fallbackEngine, when configured, wins over any other
+      // fallback strategy — it is a deliberate user choice. Covers both the
+      // original rate-limit trigger and the newer CLI-missing trigger.
+      if ((rateLimited || cliMissing) && fallbackEngine && fallbackEngine !== engineId) {
+        const reason = rateLimited ? 'Rate limit detected' : 'Engine CLI not found or unreachable';
+        this.emit('engine-fallback', { taskId: task.id, fromEngine: engineId, toEngine: fallbackEngine });
+        this.emit('task-output', task, `\n[Fallback] ${reason} on "${engineId}", retrying with "${fallbackEngine}"...\n`, 'stderr');
+        return this.runAgentOnEngine(task, fallbackEngine, cwd, fullPrompt, signal);
+      }
+
+      // Auto-routing-tier fallback: only when the failure is CLI-missing (a
+      // rate-limited engine IS installed and reachable — plan.fallbackEngine
+      // already covers that case), only when no plan.fallbackEngine is
+      // configured, and only when this engine was picked by auto-routing
+      // rather than an explicit task/playlist/plan override — an explicit
+      // engine choice must never be silently substituted.
+      if (cliMissing && !fallbackEngine && wasAutoRouted && autoRoutingConfig) {
+        const otherTier: EngineId | undefined =
+          engineId === autoRoutingConfig.simpleEngine
+            ? autoRoutingConfig.complexEngine
+            : engineId === autoRoutingConfig.complexEngine
+              ? autoRoutingConfig.simpleEngine
+              : undefined;
+
+        if (otherTier && otherTier !== engineId) {
+          this.emit('engine-fallback', { taskId: task.id, fromEngine: engineId, toEngine: otherTier });
+          this.emit('task-output', task,
+            `\n[Fallback] Engine CLI not found or unreachable on "${engineId}", retrying with auto-routing's other tier "${otherTier}"...\n`,
+            'stderr');
+          return this.runAgentOnEngine(task, otherTier, cwd, fullPrompt, signal);
+        }
+      }
     }
 
     return result;
@@ -1761,6 +1865,18 @@ export class TaskRunner {
   private isRateLimited(result: EngineResult): boolean {
     const combined = ((result.stdout || '') + '\n' + (result.stderr || '')).toLowerCase();
     return /usage limit|rate limit|quota exceeded|too many requests/.test(combined);
+  }
+
+  /**
+   * True when the engine result indicates the CLI itself could not be
+   * invoked (not installed, not on PATH, or an unreachable remote host).
+   * Shares the same regex `classifyFailure()` uses for the 'cli-missing'
+   * error-log category (~line 157) — kept as one literal, not re-derived,
+   * so the fallback trigger and the error-log categorization never drift.
+   */
+  private isCliMissing(result: EngineResult): boolean {
+    const combined = (result.stdout || '') + '\n' + (result.stderr || '');
+    return /command not found|ENOENT|is not recognized as|cannot find.*command|no such file/i.test(combined);
   }
 
   private async runAgentOnEngine(
@@ -1815,6 +1931,14 @@ export class TaskRunner {
       modelMeta._modelId = this.parseReportedModelId(result);
     }
 
+    // Must stay here, not at the later HistoryEntry construction point: that
+    // point is downstream of fallback/consensus result-collapsing and would
+    // silently under-count exactly the multi-engine-call cases (retry,
+    // rate-limit fallback, auto-routing-tier fallback) this hook exists to
+    // capture. Do not "simplify" this back there. Only the short task
+    // prompt is recorded, never `fullPrompt` — see emitUsageRecord's doc
+    // comment.
+    this.emitUsageRecord(task, engineId, result);
     return result;
   }
 

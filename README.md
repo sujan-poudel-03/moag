@@ -200,6 +200,7 @@ Open `Ctrl+,` → search `agentTaskPlayer`:
 | `engines.*.command` | varies | CLI path per engine |
 | `engines.*.args` | varies | Extra CLI arguments |
 | `engines.ollama.model` | `codellama` | Ollama model name |
+| `engines.ollama.host` | `""` | Remote Ollama host (`host:port`) for OLLAMA_HOST |
 | `engines.custom.command` | `""` | Custom engine command |
 
 ---

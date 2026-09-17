@@ -166,6 +166,12 @@
         "icon": "$(list-unordered)"
       },
       {
+        "command": "agentTaskPlayer.configureAutoRouting",
+        "title": "Configure Auto-Routing",
+        "category": "MOAG",
+        "icon": "$(git-branch)"
+      },
+      {
         "command": "agentTaskPlayer.clearHistory",
         "title": "Clear History",
         "category": "MOAG",
@@ -817,6 +823,11 @@
           "command": "agentTaskPlayer.reloadWindow",
           "when": "view == agentTaskPlayer.promptView",
           "group": "9_manage@4"
+        },
+        {
+          "command": "agentTaskPlayer.configureAutoRouting",
+          "when": "view == agentTaskPlayer.promptView",
+          "group": "9_manage@5"
         }
       ],
       "view/item/context": [
@@ -1129,6 +1140,11 @@
           "default": "codellama",
           "description": "Model name for Ollama."
         },
+        "agentTaskPlayer.engines.ollama.host": {
+          "type": "string",
+          "default": "",
+          "description": "Remote Ollama host to connect to (e.g. \"192.168.1.50:11434\"), passed as the OLLAMA_HOST environment variable to the ollama CLI. Leave empty to use the CLI's own default (localhost)."
+        },
         "agentTaskPlayer.engines.custom.command": {
           "type": "string",
           "default": "",
@@ -1298,6 +1314,19 @@
           "minimum": 30000,
           "description": "Timeout in milliseconds for the browser UAT gate (default 15 minutes). Separate from prdLoop.gateTimeoutMs because a browser suite is slower than a unit test run."
         },
+        "agentTaskPlayer.contributionLedger.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Record per-engine-call usage (task, developer, prompt, tokens/cost) to .moag/usage-log.jsonl and show the Contribution Ledger in the dashboard."
+        },
+        "agentTaskPlayer.contributionLedger.leads": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Reserved for future role-based views. Has no effect on Contribution Ledger visibility or gating today — every viewer sees the same unredacted data."
+        },
         "agentTaskPlayer.browser.playwrightVersion": {
           "type": "string",
           "default": "1.62.1",
@@ -1380,6 +1409,64 @@
           ],
           "default": "auto",
           "description": "Default reasoning preset for model selection. 'auto' analyzes task complexity to pick the best model."
+        },
+        "agentTaskPlayer.autoRouting.enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically route tasks to a simple or complex engine based on task complexity analysis. Off by default; enable per workspace via .moag/routing.json or this setting."
+        },
+        "agentTaskPlayer.autoRouting.simpleEngine": {
+          "type": "string",
+          "default": "ollama",
+          "enum": [
+            "codex",
+            "claude",
+            "gemini",
+            "ollama",
+            "custom",
+            "copilot",
+            "anthropic"
+          ],
+          "enumDescriptions": [
+            "OpenAI Codex CLI",
+            "Claude Code CLI (recommended)",
+            "Google Gemini CLI",
+            "Ollama (local models)",
+            "Custom CLI command",
+            "GitHub Copilot CLI",
+            "Anthropic API direct (no CLI required, requires ANTHROPIC_API_KEY)"
+          ],
+          "description": "Engine to auto-route simple tasks (complexity score at or below the threshold) to when auto-routing is enabled."
+        },
+        "agentTaskPlayer.autoRouting.complexEngine": {
+          "type": "string",
+          "default": "claude",
+          "enum": [
+            "codex",
+            "claude",
+            "gemini",
+            "ollama",
+            "custom",
+            "copilot",
+            "anthropic"
+          ],
+          "enumDescriptions": [
+            "OpenAI Codex CLI",
+            "Claude Code CLI (recommended)",
+            "Google Gemini CLI",
+            "Ollama (local models)",
+            "Custom CLI command",
+            "GitHub Copilot CLI",
+            "Anthropic API direct (no CLI required, requires ANTHROPIC_API_KEY)"
+          ],
+          "description": "Engine to auto-route complex tasks (complexity score above the threshold) to when auto-routing is enabled."
+        },
+        "agentTaskPlayer.autoRouting.complexityThreshold": {
+          "type": "number",
+          "default": 50,
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Complexity score (0-100) at or below which a task is routed to the simple engine; above which it is routed to the complex engine."
         },
         "agentTaskPlayer.roles.enabled": {
           "type": "boolean",

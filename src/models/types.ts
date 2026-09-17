@@ -352,6 +352,8 @@ export interface HistoryEntry {
   modelId?: string;
   /** Why this model was selected by auto-selection */
   modelReason?: string;
+  /** Why auto-routing picked this engine (undefined when routing didn't fire) */
+  engineRoutingReason?: string;
   /** Whether this task was auto-fixed after initial failure */
   autoFixed?: boolean;
   /** Per-target pass/fail/skip breakdown for validate tasks */

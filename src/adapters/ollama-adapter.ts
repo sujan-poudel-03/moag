@@ -19,6 +19,7 @@ export class OllamaAdapter implements EngineAdapter {
     const config = getConfig('agentTaskPlayer.engines.ollama');
     const command = this.getCommand();
     const model = config.get<string>('model', 'codellama');
+    const host = config.get<string>('host', '');
 
     const result = await runCli(
       {
@@ -29,6 +30,7 @@ export class OllamaAdapter implements EngineAdapter {
           return ['run', effectiveModel];
         },
         useStdin: true,
+        ...(host ? { env: { OLLAMA_HOST: host } } : {}),
       },
       options,
       options.onOutput,

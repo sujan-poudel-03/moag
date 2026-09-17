@@ -34,7 +34,7 @@ const PRESET_TO_REASONING: Record<Exclude<ReasoningPreset, 'auto'>, ModelSpec['r
  * Compute a complexity score (0–100) from task signals.
  * Returns the score and a list of human-readable factors.
  */
-function computeComplexity(task: Task): { score: number; factors: string[] } {
+export function computeComplexity(task: Task): { score: number; factors: string[] } {
   let score = 0;
   const factors: string[] = [];
   const promptLen = task.prompt?.length ?? 0;
