@@ -48,7 +48,7 @@ Then, for each PRD version:
 3. From v2 on, if the server's `recommendedBump` differs from the scenario's intended bump, the product owner overrides it: `POST …/prd/versions/latest/bump`. This is an **unplanned** intervention.
 4. From v2 on, if `deltaScope` is null, there is nothing to plan and the version's outcome is `no-delta`.
 5. The product owner requests a plan: `POST …/plans {mode: initial | delta}`. The bench polls `GET /api/projects/:id` until the plan stops `generating`.
-6. The reviewer approves the plan with its `contentHash` (**required**), or rejects it (**unplanned** `plan-rejected`, the reason names every offending item) when the bench may not approve it unread: the server says it cannot be approved, the playlist is `parallel` (every budget guard assumes one engine call in flight), it has a `release` or `deploy` task, or its review lists any `command`/`verifyCommand` that is not exactly one of the scenario's `gateCommands` or `dryRun.planCommand`, or any `cwd` or side-effect field. Then the reviewer starts the run: `POST …/runs`.
+6. The reviewer approves the plan with its `contentHash` (**required**), or rejects it (**unplanned** `plan-rejected`, the reason names every offending item) when the bench may not approve it unread: the server says it cannot be approved (which includes any `parallel` playlist), the playlist is `parallel` by the bench's own check (every budget guard assumes one engine call in flight), it has a `release` or `deploy` task, or its review lists any `command`/`verifyCommand` that is not exactly one of the scenario's `gateCommands`, `allowedCommands` or `dryRun.planCommand` (see [The command allow-list](#the-command-allow-list)), or any `cwd` or side-effect field. Then the reviewer starts the run: `POST …/runs`.
 7. The bench polls the run. At every `awaiting-approval` halt:
    - It records `ship-approval` (**required**) when the halted gate is the server's own `Ship approval`, and `generated-manual-gate` (**unplanned**) for any other manual gate.
    - It runs the scenario's acceptance gates in the workspace.
@@ -65,7 +65,7 @@ A scenario is a JSON file. Relative paths resolve against the scenario's directo
 | Field | Meaning |
 |---|---|
 | `name`, `description` | Shown in the summary. |
-| `repo` | `{"kind":"template","templateDir":"template"}`: the folder is copied into a fresh directory, then `git init -b main` and one commit. `{"kind":"clone","path":"../../..","ref":"<branch>"}`: `git clone --no-hardlinks --branch <ref> --single-branch` into a fresh directory, then `git remote remove origin` so no push or tag push from the workspace can reach the source. The destination may never be, contain, or sit inside the clone source, so the live working tree is never used. Only **committed** work at that ref is cloned. |
+| `repo` | `{"kind":"template","templateDir":"template"}`: the folder is copied into a fresh directory, then `git init -b main` and one commit. `{"kind":"clone","path":"../../..","ref":"<branch>"}`: `git clone --no-hardlinks --branch <ref> --single-branch` into a fresh directory. The clone then loses every path back to its source: `git remote remove origin` (no push, tag push or fetch can reach it) and `git reflog expire --expire=now --all` (the reflog records `clone: from <source path>`). The bench checks both, and stops if a remote or any mention of the source path is left in the clone's git metadata. The destination may never be, contain, or sit inside the clone source, so the live working tree is never used. Only **committed** work at that ref is cloned. |
 | `setupCommands` | Shell commands run in the new workspace before anything else (for example `npm ci`). A failure stops the bench. |
 | `stack`, `engine` | The project's stack and engine. `custom` and `copilot` are refused, as the server refuses them. |
 | `budgetUsd` | Total budget, greater than 0 and at most 100. A paid run's cap is `min(--max-usd, budgetUsd)`. |
@@ -76,10 +76,25 @@ A scenario is a JSON file. Relative paths resolve against the scenario's directo
 | `passEnv` | Variable names passed to agents (`MOAG_RUN_ENV_PASSTHROUGH`). `CI` and `MOAG_*` are refused. |
 | `gateCommands` | The bench's **acceptance gates**: at least one. |
 | `gateTimeoutMs` | Default 600000, per gate command. |
+| `environmentProbes` | Optional. Commands MOAG's own verify is expected to run. The bench runs each once in the untouched workspace, before any plan. See [Environment probes](#environment-probes). Same format rules as `allowedCommands`. |
+| `allowedCommands` | Optional. Extra shell commands a generated plan may carry and still be approved unread. Exact strings, never patterns. See [The command allow-list](#the-command-allow-list). |
 | `versions[]` | `{id, prdFile, intendedBump, dryRunFixture?}`. The first version's bump must be `initial`, and only the first may be. Later versions use `patch`, `minor` or `major`. |
 | `dryRun.planCommand` | Dry-run only: the test command the fake planner puts in every plan. |
 
 Tag every requirement line explicitly (`- [R-3] …`). An untagged line whose wording changes gets a new id, which counts as a removal and makes the bump `major`.
+
+### The command allow-list
+
+The bench approves plans that no human has read, so it approves a plan only when every shell command in it is one the scenario author has already reviewed.
+
+- The planning prompt **requires** a Testing playlist with a `command` task that runs the test suite. A real plan therefore always carries commands such as `npm test`.
+- A command is allowed when it is exactly one of `gateCommands`, `allowedCommands` or `dryRun.planCommand`. Leading and trailing spaces are ignored; nothing else is. Matching is case-sensitive.
+- Entries are literal strings. `npm run *` allows only the command `npm run *`.
+- `npm test && git push` is not `npm test`: a listed command with anything added is refused.
+- Anything else makes the bench reject the plan through the reviewer route. The version is `plan-failed`, with an **unplanned** `plan-rejected` whose detail names each offending task and command.
+- Each `allowedCommands` entry must be a single line of at most 500 characters, and may be listed only once.
+
+Put a command in `allowedCommands` only if you would approve it in any plan for that repository. Never list a command that pushes, publishes, tags or deploys.
 
 ### The two scenarios in `bench/scenarios/`
 
@@ -87,6 +102,7 @@ Tag every requirement line explicitly (`- [R-3] …`). An untagged line whose wo
 
 - A Node + TypeScript command-line todo app, built from an empty repository.
 - The bench's acceptance gate is `npm test`.
+- Also allowed in a plan: `npm run test`, `npm run build`, `npm install`, `npm ci`, `npm install && npm test`, `npm run build && npm test`.
 - Versions:
   - v1 `initial`: add, list, complete, JSON persistence, tests.
   - v2 intended `patch`: Overview reworded, R-2 clarified, and a bugfix in R-3.
@@ -96,18 +112,41 @@ Tag every requirement line explicitly (`- [R-3] …`). An untagged line whose wo
 
 - A fresh clone of this repository at the HEAD of `feat/sdlc-automation`, followed by `npm ci`.
 - One small PRD: a `formatUsd` helper and its mocha test file.
-- The bench's acceptance gates are `npm run compile` and that one mocha file.
+- The bench's acceptance gates are `npm run compile` and that one mocha file (`npx mocha --require ts-node/register src/test/unit/utils/usd-format.test.ts`).
+- Also allowed in a plan: `npm run lint`, `npm test`, `npm run test`, and the same mocha command with the file path in double quotes.
 
 ## Two gate notions: never merged
 
 - **Bench acceptance gates** are the scenario's `gateCommands`. The bench runs them in the workspace at each ship-gate halt, as a careful approver would, and approves only when they are green. They are reported as `gateFirstRunPass`.
 - **MOAG's own verify gates** run inside the worker after an approved gate. The server never reads the repository's `.moag/config.json`, so these are **auto-detected** from `package.json`:
   - greenfield: `npm test`;
-  - brownfield: `npm run lint` and the **full** unit suite (`npm test`). **Run brownfield on Node 20** (the version `.nvmrc` and CI pin). On Node 22.6 or later, Node loads the suite's `.ts` files as ES modules. Neither `--no-experimental-strip-types` nor `--no-experimental-detect-module` fixes `npm test` when passed through `NODE_OPTIONS`: only direct `node` flags do, and `npm test` cannot take them. On Node 24.16 the brownfield dry-run therefore ends `run-gaps`, with `moagVerify.failedGate: "command"` (`npm test` exits 1 in about 2 s with `require is not defined in ES module scope`), while the bench's own single-file gate passes.
-  
+  - brownfield: `npm run lint` and the **full** unit suite (`npm test`).
+
   These are reported as `moagVerify`.
 
 The two can disagree, and both are reported. A brownfield version that MOAG refuses to ship because its own lint or full suite failed is a valid finding, not a harness failure.
+
+### Environment probes
+
+A command that the machine cannot run fails whatever MOAG does. The bench must not report that as a product failure.
+
+- A scenario lists such commands in `environmentProbes`. The bench runs `node --version` and then each probe, once, in the untouched workspace: after the setup commands, before any plan.
+- A failing probe never stops the bench. The results are in `summary.json` → `environment` (`node`, and per probe `command`, `exitCode`, `timedOut`, `durationMs`, `pass`, `detail`).
+- A version gets an `environment` entry only on evidence. The probe must have failed in the untouched workspace, **and** it must be exactly the command MOAG's verify stopped at (`moagVerify.failedCommand`) or the command of a task that failed.
+- The entry reads, for example: `environment: Node v24.16.0 cannot run "npm test": it exits 1 in the untouched workspace, before any plan (…). MOAG's own verify stopped at this command.`
+- The version's `outcome` and `endState` do not change: nothing shipped, and the summary says so. The `environment` entry says why that is not MOAG's doing.
+- Where the probe passes, a later failure of the same command stays a product failure.
+
+### Brownfield and the Node version
+
+The brownfield scenario probes `npm test`, because that is the full suite MOAG's verify auto-detects.
+
+- **Node 20** (the version `.nvmrc` and CI pin) **gives the full signal.** `npm test` runs, so the probe passes and MOAG's verify result is a real verdict on the work. The probe runs the whole suite once, which takes several minutes.
+- **Node 22.6 or later cannot start `npm test`.** Node loads the suite's `.ts` files as ES modules, and the run exits 1 in about 2 s with `require is not defined in ES module scope`. Neither `--no-experimental-strip-types` nor `--no-experimental-detect-module` fixes this when passed through `NODE_OPTIONS`. Only flags given directly to `node` do, and `npm test` cannot take them.
+- On such a machine the brownfield version ends `run-gaps` with `moagVerify.failedGate: "command"`, `moagVerify.failedCommand: "npm test"`, and an `environment` entry. Read it as "not measured here", not as a MOAG failure.
+- A plan task that runs `npm test` (the planner must emit one) fails on such a machine for the same reason, and is reported the same way.
+- The bench's own acceptance gate is one mocha file run through `npx mocha`, with no Node flag. With the dry-run fixture it passes on Node 20 and on Node 24.16. A flag given directly to `node` is not an option: Node 20 rejects `--no-experimental-strip-types` as a bad option.
+- On Node 22.6 or later that gate has the same limit as the full suite for one kind of file: a test that mixes ES `import` with `require(...)`, as many tests in this repository do, fails to load. In a paid run the agent writes the test file, so on such a machine a red acceptance gate (`gate-rejected`) can also be the machine's doing. No probe covers that case. Use Node 20 for a paid brownfield run.
 
 ## Metrics
 
@@ -121,7 +160,8 @@ There is one entry per PRD version in `summary.json` → `versions[]`.
 | `tasksGenerated` | Tasks in the generated playlist, not counting the server's ship gate. |
 | `tasksCompleted` / `tasksFailed` / `tasksBlocked` / `tasksSkipped` | From the final run detail, ship gate excluded. |
 | `gateFirstRunPass` | The bench acceptance gates at the first ship-gate halt, with per-command exit codes. Null if no halt was reached. |
-| `moagVerify` | The last `verify-finished` event: `passed` and `failedGate`. |
+| `moagVerify` | The last `verify-finished` event: `passed` and `failedGate`. `failedCommand` is the last gate command verify started before it reported `failedGate: "command"`; otherwise null. |
+| `environment` | Failures of this version that the machine caused, not the product. Empty unless a failed [environment probe](#environment-probes) matches. |
 | `fixIterations` | Sum of `verify-finished.iterations`. See [Why fix iterations are mostly invisible](#why-fix-iterations-are-mostly-invisible). |
 | `taskRestarts` | **Proxy** for retries and auto-fix: extra `task-started` events for a task id that already started. |
 | `wallClockMs` | From the PRD save to the poll that saw the run `completed` with every one of this version's ids `shipped`. Null otherwise. |
@@ -136,7 +176,7 @@ There is one entry per PRD version in `summary.json` → `versions[]`.
 | `outcome` | `shipped`, `partially-shipped`, `not-shipped`, `no-delta`, `plan-failed`, `not run (budget)` or `error`. |
 | `serverSpentUsd`, `notes` | What the server recorded for the version (for reconciliation with the SSE cost events), and anything odd. |
 
-The summary also has `totals`, the `budget` ledger snapshot, the engine's version, `stoppedForBudget`, `aborted` and `harnessError`.
+The summary also has `totals`, the `budget` ledger snapshot, the engine's version, the `environment` probe results, `stoppedForBudget`, `aborted` and `harnessError`.
 
 ### Why v2 of the greenfield scenario is expected to mismatch
 
@@ -178,11 +218,10 @@ This is by design and **not a regression**. It is the finding: deciding that a r
 
 ### Commands
 
-Run a dry-run with Git Bash. On Node 22.6 or later, the `NODE_OPTIONS` line is needed for the brownfield acceptance gate; see the note above about MOAG's own full-suite gate:
+Run a dry-run with Git Bash. No `NODE_OPTIONS` setting is needed, on Node 20 or on Node 24; see [Brownfield and the Node version](#brownfield-and-the-node-version) for what each Node version measures:
 
 ```bash
 npm run compile
-export NODE_OPTIONS=--no-experimental-strip-types
 node out/headless/cli.js bench bench/scenarios/greenfield-todo/scenario.json --dry-run --out <dir>/greenfield
 node out/headless/cli.js bench bench/scenarios/brownfield-moag/scenario.json --dry-run --out <dir>/brownfield
 ```
@@ -214,17 +253,17 @@ There are four layers:
 3. **Bench, between versions:** the next version's cap is `cap − upperBound − reserveFactor × perCallCapUsd`. Below `minVersionUsd`, that version and every later one are `not run (budget)`.
 4. **Bench watchdog:** on every SSE `cost` event, if `upperBound + perCallCapUsd > cap`, the reviewer stops the run (or the product owner cancels the generating plan) and the bench exits 4.
 
-Caveat: `--max-budget-usd` can overshoot by one turn, which is why the reserve is 1.5 per-call caps. Generated `parallel` playlists are rejected before approval, so at most one engine call is in flight.
+Caveat: `--max-budget-usd` can overshoot by one turn, which is why the reserve is 1.5 per-call caps. A generated `parallel` playlist cannot be approved: the server's own plan review refuses it for every project, and the bench checks it again. So at most one engine call is in flight.
 
 ### Steps (Windows PowerShell)
 
 1. Prepare. The brownfield scenario clones the HEAD of `feat/sdlc-automation`, so uncommitted work is not part of it:
 
    ```powershell
-   cd D:\Projects\moag
+   cd <path-to-moag-repo>
    git status
    npm ci; npm run compile
-   $env:NODE_OPTIONS = "--no-experimental-strip-types"   # only needed on Node 22.6+; prefer Node 20 (nvm use) for brownfield
+   node --version   # use Node 20 (nvm use) for brownfield: on Node 22.6+ MOAG's own verify cannot be measured
    ```
 
 2. Check `claude --version`. It must be 2.1.287 or later. Find out whether `claude` is billed through the API (Console) or a subscription.

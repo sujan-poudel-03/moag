@@ -187,7 +187,7 @@ export type StrippedGeneratedField = typeof STRIPPED_GENERATED_FIELDS[number];
 
 export interface PendingPlaylistReview {
   ok: boolean;
-  /** Engine violations; non-empty means the playlist must not be approved. */
+  /** Engine, `parallel` and `cwd` violations; non-empty means the playlist must not be approved. */
   errors: string[];
   /** Every command, cwd override and side-effect field in the playlist, verbatim. */
   commands: ReviewItem[];
@@ -231,8 +231,16 @@ export function cwdEscapesWorkspace(cwd: string): boolean {
 }
 
 /**
+ * Review error for a generated playlist marked `parallel`. Every server cost
+ * limit (the per-call cap, the per-version budget) assumes one engine call in
+ * flight at a time; a parallel playlist starts several at once.
+ */
+export const PARALLEL_PLAYLIST_ERROR = 'The generated plan runs its tasks in parallel. Server runs make one engine call at a time, because the cost limits depend on it, so this plan cannot be approved. Request a new plan.';
+
+/**
  * Check a generated playlist before it can be approved: every engine it names
- * must be in `allowedEngines` and never `custom`/`copilot`; every task `cwd`
+ * must be in `allowedEngines` and never `custom`/`copilot`; the playlist must
+ * not be `parallel` ({@link PARALLEL_PLAYLIST_ERROR}); every task `cwd`
  * must stay inside the project workspace ({@link cwdEscapesWorkspace}); and list
  * every shell string it would run (any task type, deploy and release included)
  * and every side-effect field (`healthCheckUrl`, `skipIf`, `failurePolicy`, and
@@ -250,6 +258,8 @@ export function validatePendingPlaylist(pl: PlanFilePlaylist, allowedEngines: re
     }
   };
   checkEngine(pl.engine, `Playlist "${pl.name}"`);
+  // Truthiness, exactly as the runner decides it (`playlist.parallel && !failSafe`).
+  if (pl.parallel) { errors.push(PARALLEL_PLAYLIST_ERROR); }
   for (const t of (pl.tasks ?? []) as PlanFileTask[]) {
     const where = `Task "${t.name}"`;
     checkEngine(t.engine, where);

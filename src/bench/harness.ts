@@ -29,7 +29,8 @@ import { SHIP_GATE_NAME } from '../server/prd-ops';
 import { BenchClient, BenchResponse, BenchSseEvent, redactForLog } from './client';
 import { BudgetLedger, CostEventSource } from './budget';
 import {
-  BenchSummary, GateRunObservation, Intervention, VersionObservation, buildVersionMetrics, emptyObservation, summarize,
+  BenchEnvironment, BenchSummary, GateRunObservation, Intervention, VersionObservation, buildVersionMetrics, emptyObservation,
+  environmentFindings, errorLine, summarize,
 } from './metrics';
 import { Scenario, dryRunProblem, parseScenario, BenchScenarioError } from './scenario';
 import { CommandResult, PreparedWorkspace, gatesGreen, prepareWorkspace, runCommand, runGates } from './workspace';
@@ -107,8 +108,17 @@ const UNREVIEWED_TASK_TYPES = new Set(['release', 'deploy']);
 
 /** The parts of a generated plan the bench inspects before it plays the reviewer. */
 export interface GeneratedPlanForApproval {
-  playlist?: { parallel?: unknown; tasks?: Array<{ name?: string; type?: string }> };
+  playlist?: { parallel?: unknown; tasks?: Array<{ id?: string; name?: string; type?: string; command?: unknown }> };
   review?: { ok?: boolean; errors?: string[]; commands?: Array<{ taskName?: string; field?: string; value?: string }> };
+}
+
+/**
+ * Every shell command a generated plan may carry and still be approved unread:
+ * the scenario's gate commands, its author-reviewed `allowedCommands`, and the
+ * dry-run plan command. Exact strings only; nothing here is a pattern.
+ */
+export function scenarioAllowedCommands(scenario: Pick<Scenario, 'gateCommands' | 'allowedCommands' | 'dryRun'>): string[] {
+  return [...scenario.gateCommands, ...scenario.allowedCommands, ...(scenario.dryRun ? [scenario.dryRun.planCommand] : [])];
 }
 
 /**
@@ -117,15 +127,17 @@ export interface GeneratedPlanForApproval {
  * a review the server flagged; a missing review; a `parallel` playlist (every
  * budget guard assumes one engine call in flight at a time); any release or
  * deploy task; and any reviewed entry (`command`, `verifyCommand`, `cwd` or a
- * side-effect field) that is not exactly one of `allowedCommands` — the
- * scenario's own gate commands and dry-run plan command.
+ * side-effect field) that is not exactly one of `allowedCommands`
+ * ({@link scenarioAllowedCommands}). Each refusal names the offending value.
  */
 export function planApprovalProblems(plan: GeneratedPlanForApproval, allowedCommands: readonly string[]): string[] {
   const problems: string[] = [];
   const review = plan.review;
   if (!review) { problems.push('the server returned no review for the plan.'); }
   if (review && review.ok === false) { problems.push(...(review.errors ?? [])); }
-  if (plan.playlist?.parallel === true) {
+  // Truthiness, exactly as the runner decides it (`playlist.parallel && !failSafe`):
+  // a plan saying "true" or 1 runs in parallel there, so it is refused here.
+  if (plan.playlist?.parallel) {
     problems.push('the playlist runs its tasks in parallel, which the bench budget guards cannot bound.');
   }
   for (const t of plan.playlist?.tasks ?? []) {
@@ -240,6 +252,10 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
   // a job's last `cost` events stream before its `job-end`, so waiting for it settles the budget.
   let jobsStarted = 0;
   let jobEnds = 0;
+  // What the scenario's environment probes found in the untouched workspace.
+  const environment: BenchEnvironment = { node: null, probes: [] };
+  // The last gate command MOAG's verify announced (`verify-progress`, phase `gate`).
+  let lastVerifyGateCommand: string | null = null;
   const at = (): string => new Date(deps.now()).toISOString();
 
   log.write({ kind: 'bench-start', scenario: scenario.name, file: scenario.file, mode, capUsd, perCallCapUsd: scenario.perCallCapUsd });
@@ -297,13 +313,23 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
         current?.unplanned.push({ kind: 'task-escalate', at: at(), detail: `${String(ev.name ?? ev.id)}` });
         break;
       case 'verify': {
+        if (ev.name === 'verify-started') { lastVerifyGateCommand = null; }
+        if (ev.name === 'verify-progress' && ev.data) {
+          // Verify stops at the first failing gate command, so the last one it
+          // announced is the one that failed. A browser UAT gate is not a repo command.
+          if (ev.data.phase === 'gate' && typeof ev.data.detail === 'string') { lastVerifyGateCommand = ev.data.detail; }
+          if (ev.data.phase === 'uat') { lastVerifyGateCommand = null; }
+        }
         if (ev.name === 'verify-finished' && ev.data) {
           const d = ev.data;
+          const failedGate = typeof d.failedGate === 'string' ? d.failedGate : null;
           current?.verifyFinished.push({
             passed: d.passed === true,
-            failedGate: typeof d.failedGate === 'string' ? d.failedGate : null,
+            failedGate,
             iterations: typeof d.iterations === 'number' ? d.iterations : 0,
+            failedCommand: failedGate === 'command' ? lastVerifyGateCommand : null,
           });
+          lastVerifyGateCommand = null;
         }
         break;
       }
@@ -348,6 +374,25 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     workspace = await deps.prepareWorkspace(scenario, server.projectsRoot, 'bench-ws', server.serverEnv);
     log.write({ kind: 'workspace', dir: workspace.dir, head: workspace.head, setup: workspace.setup.map((s) => ({ command: s.command, exitCode: s.exitCode, ms: s.durationMs })) });
     check();
+
+    // ── Environment probes: the untouched workspace, before any plan ──
+    // A probe that fails here fails whatever MOAG does next, so a later failure
+    // of the same command is the machine's, not the product's. Never fatal.
+    if (scenario.environmentProbes.length > 0) {
+      progress('probing the environment in the untouched workspace…');
+      const [nodeProbe, ...probed] = await deps.runGates(['node --version', ...scenario.environmentProbes], workspace.dir, server.serverEnv, scenario.gateTimeoutMs);
+      const nodeLine = nodeProbe?.exitCode === 0 ? nodeProbe.tail.trim().split(/\r?\n/)[0]?.trim() ?? '' : '';
+      environment.node = /^v\d+\.\d+\.\d+/.test(nodeLine) ? nodeLine : null;
+      environment.probes = probed.map((r) => {
+        const pass = r.exitCode === 0 && !r.timedOut;
+        return { command: r.command, exitCode: r.exitCode, timedOut: r.timedOut, durationMs: r.durationMs, pass, detail: pass ? null : errorLine(r.tail) };
+      });
+      log.write({ kind: 'environment-probes', node: environment.node, probes: probed.map((r) => ({ command: r.command, exitCode: r.exitCode, timedOut: r.timedOut, ms: r.durationMs, tail: r.tail.slice(-4000) })) });
+      for (const p of environment.probes.filter((x) => !x.pass)) {
+        progress(`environment: "${p.command}" fails in the untouched workspace (${p.timedOut ? 'timed out' : `exit ${p.exitCode}`})${environment.node ? ` on Node ${environment.node}` : ''}`);
+      }
+      check();
+    }
 
     // ── People (setup, not interventions) ──
     const adminPw = randomPassword();
@@ -462,6 +507,7 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     exitCode,
     workspace: workspace ? { dir: workspace.dir, head: workspace.head } : null,
     engine: { id: scenario.engine, version: engineCheck?.shellVersion ?? null, probeVersion: engineCheck?.probeVersion ?? null },
+    environment,
     eventsTruncated: log.truncated,
     notes,
   });
@@ -561,7 +607,7 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     }
     const playlist = plan.playlist as GeneratedPlanForApproval['playlist'];
     obs.tasksGenerated = (playlist?.tasks ?? []).filter((t) => !(t.type === 'manual' && t.name === SHIP_GATE_NAME)).length;
-    const allowedCommands = [...scenario.gateCommands, ...(scenario.dryRun ? [scenario.dryRun.planCommand] : [])];
+    const allowedCommands = scenarioAllowedCommands(scenario);
     const problems = planApprovalProblems({ playlist, review: plan.review as GeneratedPlanForApproval['review'] }, allowedCommands);
     if (problems.length > 0) {
       // The bench never approves what no human has read: a refusal goes through
@@ -667,6 +713,14 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     } else {
       obs.endState = `run-${status}`;
     }
+    // A failure the untouched workspace already had is the machine's, not the product's.
+    const lastVerify = obs.verifyFinished[obs.verifyFinished.length - 1];
+    const failedTasks = obs.finalTasks.filter((t) => t.status === 'failed').flatMap((t) => {
+      const command = (playlist?.tasks ?? []).find((p) => p.id === t.id)?.command;
+      return typeof command === 'string' ? [{ name: t.name, command }] : [];
+    });
+    obs.environment = environmentFindings(environment, lastVerify && !lastVerify.passed ? lastVerify.failedCommand ?? null : null, failedTasks);
+    for (const finding of obs.environment) { progress(`${v.id}: ${finding}`); }
     const sseUsd = obs.costEvents.reduce((n, e) => n + (Number.isFinite(e.usd) ? e.usd : 0), 0);
     if (obs.serverSpentUsd !== null && Math.abs(obs.serverSpentUsd - sseUsd) > 0.005) {
       obs.notes.push(`cost mismatch: SSE events sum to $${sseUsd.toFixed(4)}, the server recorded $${obs.serverSpentUsd.toFixed(4)} (plan generation and every segment are both in the server figure)`);

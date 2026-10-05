@@ -2,7 +2,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { runBench, BenchDeps, EventLog, planApprovalProblems } from '../../../bench/harness';
+import { runBench, BenchDeps, EventLog, planApprovalProblems, scenarioAllowedCommands } from '../../../bench/harness';
 import { Scenario, ScenarioVersion } from '../../../bench/scenario';
 import { CommandResult } from '../../../bench/workspace';
 import { FakeEngine } from '../../../bench/fake-engine';
@@ -28,6 +28,8 @@ interface Script {
   costs: Cost[][];
   /** Edits the generated playlist of plan job `n` (1-based) before it is written. */
   patch?: (playlist: Record<string, unknown>, tasks: Array<Record<string, unknown>>, n: number) => void;
+  /** When set, MOAG's own verify (segment 2) runs `npm run lint`, then stops at this gate command: the run ends with gaps. */
+  verifyFailsAt?: string;
 }
 
 /** Scripted workers: plan jobs write an outcome, run segment 1 halts at the ship gate, segment 2 ships. */
@@ -73,6 +75,15 @@ function scriptWorkers(h: Harness, script: Script, seen: { plans: number; runs: 
       return;
     }
     for (const t of pl.tasks) { t.status = TaskStatus.Completed; }
+    if (script.verifyFailsAt) {
+      fs.writeFileSync(job.planPath, JSON.stringify(dehydratePlan(snap), null, 2));
+      w.line({ event: 'verify-started', plan: 'p', fix: false });
+      w.line({ event: 'verify-progress', phase: 'gate', detail: 'npm run lint' });
+      w.line({ event: 'verify-progress', phase: 'gate', detail: script.verifyFailsAt });
+      w.line({ event: 'verify-finished', passed: false, score: 0, failedGate: 'command', iterations: 1 });
+      w.exit(1);
+      return;
+    }
     recordGateResults(snap, [{ command: 'npm test', exitCode: 0, timedOut: false }], new Date().toISOString());
     fs.writeFileSync(job.planPath, JSON.stringify(dehydratePlan(snap), null, 2));
     w.line({ event: 'verify-finished', passed: true, score: 100, failedGate: null, iterations: 1 });
@@ -101,7 +112,7 @@ describe('bench harness (scripted workers behind the real app)', function () {
     return {
       file: path.join(tmp, 'scenario.json'), dir: tmp, name: 'bench-test', description: '', repo: { kind: 'template', templateDir: tmp },
       setupCommands: [], stack: 'node-ts', engine: 'claude', budgetUsd: 10, perCallCapUsd: 1, minVersionUsd: 1, reserveFactor: 1.5,
-      versionTimeoutMin: 5, passEnv: [], gateCommands: ['npm test'], gateTimeoutMs: 10_000,
+      versionTimeoutMin: 5, passEnv: [], gateCommands: ['npm test'], gateTimeoutMs: 10_000, allowedCommands: [], environmentProbes: [],
       versions: Array.from({ length: n }, (_, i) => ({ id: `v${i + 1}`, prdFile: path.join(tmp, `v${i + 1}.md`), intendedBump: bumps[i], dryRunFixture: path.join(tmp, 'fx') })),
       dryRun: { planCommand: 'npm test' },
       ...over,
@@ -160,6 +171,9 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.equal(s.versions[0].tasksCompleted, 2);
     assert.deepEqual(s.versions[0].trace, { 'R-1': 'shipped', 'R-2': 'shipped' });
     assert.equal(s.budget.upperBoundUsd, 1);
+    assert.deepEqual(s.environment, { node: null, probes: [] }, 'a scenario without probes runs none');
+    assert.deepEqual(s.versions.map((v) => v.environment), [[], [], []]);
+    assert.deepEqual(s.versions[0].moagVerify, { passed: true, failedGate: null, failedCommand: null });
     assert.ok(fs.existsSync(r.summaryPath!));
     const events = fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8');
     assert.ok(events.includes('"kind":"sse"'));
@@ -301,6 +315,89 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.equal(seen.runs, 1);
   });
 
+  /** One version whose MOAG verify stops at `npm test`, with `npm test` probed first in the untouched workspace. */
+  async function verifyStopsAtNpmTest(probeExit: number, node = 'v24.16.0') {
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]], verifyFailsAt: 'npm test' }, seen);
+    const calls: string[][] = [];
+    const runGates: BenchDeps['runGates'] = async (commands) => {
+      calls.push([...commands]);
+      return commands.map((command): CommandResult => {
+        if (command === 'node --version') { return { command, exitCode: 0, timedOut: false, durationMs: 1, tail: `${node}\n` }; }
+        if (command === 'npm test') {
+          return { command, exitCode: probeExit, timedOut: false, durationMs: 2000, tail: probeExit === 0 ? '2080 passing' : ' Exception during run: ReferenceError: require is not defined in ES module scope\n    at file:///x.ts:4:20\n' };
+        }
+        return { command, exitCode: 0, timedOut: false, durationMs: 5, tail: 'ok' };
+      });
+    };
+    const r = await runBench(scenario({ gateCommands: ['npm run compile'], environmentProbes: ['npm test'] }, 1),
+      { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({ runGates }));
+    return { r, v: r.summary!.versions[0], calls, seen };
+  }
+
+  it('a verify failure at a command the untouched workspace already could not run is recorded as environment, not product', async () => {
+    const { r, v, calls, seen } = await verifyStopsAtNpmTest(1);
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    assert.deepEqual(calls[0], ['node --version', 'npm test'], 'the probes run first, before any plan');
+    assert.deepEqual(calls[1], ['npm run compile'], 'the acceptance gates are still only the scenario gate commands');
+    assert.equal(seen.plans, 1, 'a failing probe does not stop the bench');
+    assert.equal(r.summary!.environment.node, 'v24.16.0');
+    assert.deepEqual(r.summary!.environment.probes, [{
+      command: 'npm test', exitCode: 1, timedOut: false, durationMs: 2000, pass: false,
+      detail: 'Exception during run: ReferenceError: require is not defined in ES module scope',
+    }]);
+    assert.deepEqual(v.moagVerify, { passed: false, failedGate: 'command', failedCommand: 'npm test' });
+    assert.equal(v.environment.length, 1, JSON.stringify(v.environment));
+    assert.match(v.environment[0], /^environment: Node v24\.16\.0 cannot run "npm test": it exits 1 in the untouched workspace, before any plan .*MOAG's own verify stopped at this command\.$/);
+    assert.equal(v.gateFirstRunPass?.pass, true, 'the bench acceptance gate passed and is reported separately');
+    assert.equal(v.outcome, 'not-shipped', 'nothing shipped, and the outcome says so');
+    assert.equal(v.endState, 'run-gaps');
+    const events = fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8');
+    assert.ok(events.includes('"kind":"environment-probes"'));
+  });
+
+  it('the same verify failure where the probe passed (Node 20) stays a product failure', async () => {
+    const { r, v } = await verifyStopsAtNpmTest(0, 'v20.20.2');
+    assert.equal(r.summary!.environment.node, 'v20.20.2');
+    assert.equal(r.summary!.environment.probes[0].pass, true);
+    assert.deepEqual(v.moagVerify, { passed: false, failedGate: 'command', failedCommand: 'npm test' });
+    assert.deepEqual(v.environment, [], 'no environment excuse when the untouched workspace ran the suite');
+    assert.equal(v.endState, 'run-gaps');
+  });
+
+  it('a command the scenario author listed in allowedCommands is approved; one that is not is rejected by name (unplanned)', async () => {
+    const seen = { plans: 0, runs: 0 };
+    const patch: NonNullable<Script['patch']> = (_pl, tasks, n) => {
+      // Plan 1 carries only listed commands; plan 2 adds a near-miss of a listed one.
+      tasks.push({ id: `lint-${n}`, name: 'Lint', type: 'command', command: 'npm run lint', prompt: 'lint' });
+      tasks.push({ id: `suite-${n}`, name: 'Suite', type: 'agent', verifyCommand: ' npm test ', prompt: 'suite' });
+      if (n === 2) { tasks.push({ id: 'near', name: 'Near miss', type: 'command', command: 'npm run lint -- --fix', prompt: 'x' }); }
+    };
+    scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]], patch }, seen);
+    const r = await runBench(scenario({ allowedCommands: ['npm run lint'] }, 2), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    const [v1, v2] = r.summary!.versions;
+    assert.equal(v1.outcome, 'shipped', JSON.stringify(v1.interventions));
+    assert.deepEqual(v1.interventions.unplanned, [], 'a listed command is not an intervention');
+    assert.equal(v2.outcome, 'plan-failed');
+    assert.equal(v2.endState, 'plan-rejected');
+    assert.match(rejectedDetail(v2), /task "Near miss" command: npm run lint -- --fix/);
+    assert.doesNotMatch(rejectedDetail(v2), /"Lint"|"Suite"/, 'the listed commands are not named as problems');
+    assert.deepEqual(v2.interventions.required, [], 'no approval is recorded for the rejected plan');
+    assert.equal(seen.runs, 1, 'only the first plan ran');
+  });
+
+  it('scenarioAllowedCommands is gate commands + allowedCommands + the dry-run plan command, and nothing is a pattern', () => {
+    const s = scenario({ gateCommands: ['npm test'], allowedCommands: ['npm run *'], dryRun: { planCommand: 'node t.js' } });
+    assert.deepEqual(scenarioAllowedCommands(s), ['npm test', 'npm run *', 'node t.js']);
+    const review = (value: string) => ({ review: { ok: true, commands: [{ taskName: 'T', field: 'command', value }] } });
+    assert.deepEqual(planApprovalProblems(review('npm run *'), scenarioAllowedCommands(s)), [], 'the literal string itself matches');
+    assert.deepEqual(planApprovalProblems(review('npm run publish'), scenarioAllowedCommands(s)), ['task "T" command: npm run publish'],
+      'an entry with a wildcard matches nothing but itself');
+    assert.equal(planApprovalProblems(review('npm test && git push'), scenarioAllowedCommands(s)).length, 1, 'a listed command with a suffix is refused');
+    assert.equal(planApprovalProblems(review('NPM TEST'), scenarioAllowedCommands(s)).length, 1, 'matching is case-sensitive');
+    assert.deepEqual(scenarioAllowedCommands(scenario({ dryRun: undefined })), ['npm test']);
+  });
+
   it('planApprovalProblems: a missing or flagged review, non-command fields and unknown commands are refusals', () => {
     assert.deepEqual(planApprovalProblems({ playlist: { tasks: [] }, review: { ok: true, commands: [] } }, ['npm test']), []);
     assert.equal(planApprovalProblems({ playlist: { tasks: [] } }, []).length, 1, 'no review');
@@ -310,6 +407,26 @@ describe('bench harness (scripted workers behind the real app)', function () {
       'a cwd or side-effect field is never covered by the allow-list');
     assert.equal(planApprovalProblems({ review: { ok: true, commands: [{ taskName: 'T', field: 'command', value: 'npm publish' }] } }, ['npm test']).length, 1);
     assert.equal(planApprovalProblems({ playlist: { parallel: true, tasks: [{ name: 'D', type: 'deploy' }] }, review: { ok: true } }, []).length, 2);
+  });
+
+  it('planApprovalProblems treats parallel by truthiness, as the runner does', () => {
+    const problems = (parallel: unknown) => planApprovalProblems({ playlist: { parallel, tasks: [] }, review: { ok: true, commands: [] } }, []);
+    for (const truthy of [true, 'true', 'false', 1, {}, []]) {
+      assert.equal(problems(truthy).length, 1, `parallel: ${JSON.stringify(truthy)} runs in parallel in the runner`);
+      assert.match(problems(truthy)[0], /parallel/);
+    }
+    for (const falsy of [false, 0, '', null, undefined]) {
+      assert.deepEqual(problems(falsy), [], `parallel: ${JSON.stringify(falsy)} is sequential`);
+    }
+  });
+
+  it('a playlist whose parallel flag is a truthy non-boolean is rejected, never run', async () => {
+    const { v, seen, serverPlan } = await oneVersionWith((pl) => { pl.parallel = 'yes'; });
+    assert.equal(v.outcome, 'plan-failed');
+    assert.equal(v.endState, 'plan-rejected');
+    assert.match(rejectedDetail(v), /parallel/);
+    assert.equal(seen.runs, 0);
+    assert.equal(serverPlan.status, 'rejected');
   });
 
   it('a paid run without --max-usd exits 2 before any server start', async () => {

@@ -2,6 +2,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { parseScenario, dryRunProblem } from '../../../bench/scenario';
+import { scenarioAllowedCommands } from '../../../bench/harness';
 import { parseRequirements } from '../../../models/requirements';
 
 const REPO = path.resolve(__dirname, '..', '..', '..', '..');
@@ -17,6 +18,7 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     assert.equal(s.repo.kind, 'template');
     assert.deepEqual(s.gateCommands, ['npm test']);
     assert.deepEqual(s.versions.map((v) => v.intendedBump), ['initial', 'patch', 'minor']);
+    assert.deepEqual(s.allowedCommands, ['npm run test', 'npm run build', 'npm install', 'npm ci', 'npm install && npm test', 'npm run build && npm test']);
     assert.equal(dryRunProblem(s), null);
     assert.ok(fs.existsSync(path.join(SCENARIOS, 'greenfield-todo', 'template', '.gitignore')));
   });
@@ -33,9 +35,31 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     assert.equal(s.gateCommands.length, 2);
     assert.equal(s.gateCommands[0], 'npm run compile');
     assert.match(s.gateCommands[1], /mocha .*src\/test\/unit\/utils\/usd-format\.test\.ts$/);
+    // The acceptance gate is the one targeted file, never the full suite (which
+    // Node 22.6+ cannot start); it carries no Node flag, so Node 20 runs it too.
+    assert.equal(s.gateCommands.includes('npm test'), false);
+    assert.doesNotMatch(s.gateCommands.join('\n'), /--no-experimental/);
+    // The full suite is what MOAG's own verify auto-detects: probed in the
+    // untouched clone so a machine that cannot run it is reported as such.
+    assert.deepEqual(s.environmentProbes, ['npm test']);
     assert.deepEqual(s.versions.map((v) => v.intendedBump), ['initial']);
     assert.equal(dryRunProblem(s), null);
+    // What the real planner must emit for this repository (a Testing playlist
+    // with a command task running the suite) is approvable; nothing that
+    // publishes, pushes or installs is.
+    const allowed = scenarioAllowedCommands(s);
+    for (const c of ['npm run compile', 'npm run lint', 'npm test', 'npx mocha --require ts-node/register src/test/unit/utils/usd-format.test.ts']) {
+      assert.ok(allowed.includes(c), c);
+    }
+    for (const c of allowed) { assert.doesNotMatch(c, /push|publish|deploy|install|npm ci|[*?]/, c); }
   });
+
+  for (const name of ['greenfield-todo', 'brownfield-moag']) {
+    it(`${name}: no allow-listed command pushes, publishes, deploys or is a pattern`, () => {
+      const s = parseScenario(path.join(SCENARIOS, name, 'scenario.json'));
+      for (const c of scenarioAllowedCommands(s)) { assert.doesNotMatch(c, /git |push|publish|deploy|release|[*?;|`$<>]/, c); }
+    });
+  }
 
   for (const name of ['greenfield-todo', 'brownfield-moag']) {
     it(`${name}: every PRD and fixture exists, and every requirement line carries an explicit tag`, () => {

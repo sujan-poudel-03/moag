@@ -13,6 +13,14 @@
   "passEnv": [],
   "gateCommands": ["npm test"],
   "gateTimeoutMs": 600000,
+  "allowedCommands": [
+    "npm run test",
+    "npm run build",
+    "npm install",
+    "npm ci",
+    "npm install && npm test",
+    "npm run build && npm test"
+  ],
   "versions": [
     { "id": "v1", "prdFile": "prd/v1.md", "intendedBump": "initial", "dryRunFixture": "dry-run/v1" },
     { "id": "v2", "prdFile": "prd/v2.md", "intendedBump": "patch", "dryRunFixture": "dry-run/v2" },

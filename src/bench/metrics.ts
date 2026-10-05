@@ -38,6 +38,24 @@ export interface GateRunObservation {
   results: Array<{ command: string; exitCode: number | null; timedOut: boolean; durationMs: number }>;
 }
 
+/** One scenario `environmentProbes` command, run in the untouched workspace before any plan. */
+export interface EnvironmentProbeResult {
+  command: string;
+  exitCode: number | null;
+  timedOut: boolean;
+  durationMs: number;
+  pass: boolean;
+  /** The last output line that mentions an error (at most 300 characters), when the probe failed. */
+  detail: string | null;
+}
+
+/** What the bench learned about the machine before it planned anything. */
+export interface BenchEnvironment {
+  /** `node --version` as the workspace's commands resolve it; null when it was not probed or not readable. */
+  node: string | null;
+  probes: EnvironmentProbeResult[];
+}
+
 /** Everything the harness observed for one PRD version. */
 export interface VersionObservation {
   id: string;
@@ -52,8 +70,13 @@ export interface VersionObservation {
   /** Tasks of the final run detail (the ship gate is excluded when counting). */
   finalTasks: ObservedTask[];
   gateFirstRun: GateRunObservation | null;
-  /** Every `verify-finished` event of the version's run, in order. */
-  verifyFinished: Array<{ passed: boolean; failedGate: string | null; iterations: number }>;
+  /**
+   * Every `verify-finished` event of the version's run, in order. `failedCommand`
+   * is the last gate command verify started before it reported `failedGate: "command"`.
+   */
+  verifyFinished: Array<{ passed: boolean; failedGate: string | null; iterations: number; failedCommand?: string | null }>;
+  /** Failures the machine caused, not the product ({@link environmentFindings}); each starts with `environment:`. */
+  environment: string[];
   /** Every `task-started` id, in order (repeats included). */
   taskStarts: string[];
   /** Every `cost` event attributed to this version. */
@@ -92,7 +115,9 @@ export interface VersionMetrics {
   tasksBlocked: number;
   tasksSkipped: number;
   gateFirstRunPass: GateRunObservation | null;
-  moagVerify: { passed: boolean; failedGate: string | null } | null;
+  moagVerify: { passed: boolean; failedGate: string | null; failedCommand: string | null } | null;
+  /** Non-empty when a failure of this version is the machine's, not the product's. */
+  environment: string[];
   fixIterations: number;
   /** Labelled proxy for retries / auto-fix: extra `task-started` events for an already-started id. */
   taskRestarts: number;
@@ -127,6 +152,8 @@ export interface BenchSummary {
   budget: BudgetSnapshot;
   workspace: { dir: string; head: string | null } | null;
   engine: { id: string; version: string | null; probeVersion: string | null };
+  /** The scenario's environment probes; `probes` is empty when the scenario declares none. */
+  environment: BenchEnvironment;
   versions: VersionMetrics[];
   totals: {
     requirementsShipped: number;
@@ -150,6 +177,41 @@ export function costPerRequirementShipped(costUsd: number | 'unknown', shipped: 
   if (costUsd === 'unknown') { return 'unknown'; }
   if (shipped <= 0) { return null; }
   return costUsd / shipped;
+}
+
+/** The last output line that mentions an error, trimmed to 300 characters; null when none does. */
+export function errorLine(tail: string): string | null {
+  const lines = tail.split(/\r?\n/).map((l) => l.trim()).filter((l) => /error/i.test(l));
+  return lines.length > 0 ? lines[lines.length - 1].slice(0, 300) : null;
+}
+
+/**
+ * Failures of one version that the machine caused rather than the product. A
+ * command counts only on evidence: it is a scenario `environmentProbes` entry
+ * that already failed in the untouched workspace, before any plan, AND it is
+ * exactly the command MOAG's own verify stopped at (`failedVerifyCommand`) or
+ * the command of a task that failed. Anything else stays a product outcome.
+ */
+export function environmentFindings(
+  env: BenchEnvironment,
+  failedVerifyCommand: string | null,
+  failedTasks: ReadonlyArray<{ name: string; command: string }>,
+): string[] {
+  const out: string[] = [];
+  for (const p of env.probes) {
+    if (p.pass) { continue; }
+    const cmd = p.command.trim();
+    const where: string[] = [];
+    if (failedVerifyCommand !== null && failedVerifyCommand.trim() === cmd) { where.push("MOAG's own verify stopped at this command"); }
+    for (const t of failedTasks) {
+      if (t.command.trim() === cmd) { where.push(`task "${t.name}" runs this command and failed`); }
+    }
+    if (where.length === 0) { continue; }
+    const how = p.timedOut ? 'it times out' : p.exitCode === null ? 'it does not start' : `it exits ${p.exitCode}`;
+    out.push(`environment: ${env.node ? `Node ${env.node}` : 'this machine'} cannot run "${cmd}": ${how} in the untouched workspace, before any plan`
+      + `${p.detail ? ` (${p.detail})` : ''}. ${where.join('; ')}.`);
+  }
+  return out;
 }
 
 const isShipGate = (t: ObservedTask): boolean => t.type === 'manual' && t.name === SHIP_GATE_NAME;
@@ -206,7 +268,8 @@ export function buildVersionMetrics(o: VersionObservation, perCallCapUsd: number
     tasksBlocked: count('blocked'),
     tasksSkipped: count('skipped'),
     gateFirstRunPass: o.gateFirstRun,
-    moagVerify: lastVerify ? { passed: lastVerify.passed, failedGate: lastVerify.failedGate } : null,
+    moagVerify: lastVerify ? { passed: lastVerify.passed, failedGate: lastVerify.failedGate, failedCommand: lastVerify.failedCommand ?? null } : null,
+    environment: [...o.environment],
     fixIterations: o.verifyFinished.reduce((n, v) => n + (Number.isFinite(v.iterations) ? v.iterations : 0), 0),
     taskRestarts,
     wallClockMs,
@@ -256,7 +319,7 @@ export function emptyObservation(id: string, intendedBump: IntendedBump): Versio
   return {
     id, intendedBump, recommendedBump: null, bumpOverridden: false,
     requirementsAdded: [], requirementsChanged: [], tasksGenerated: null, finalTasks: [],
-    gateFirstRun: null, verifyFinished: [], taskStarts: [], costEvents: [],
+    gateFirstRun: null, verifyFinished: [], environment: [], taskStarts: [], costEvents: [],
     savedAtMs: null, shippedAtMs: null, endState: null, required: [], unplanned: [], trace: {},
     serverSpentUsd: null, notes: [],
   };

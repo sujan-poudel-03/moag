@@ -2,7 +2,7 @@ import { strict as assert } from 'assert';
 import {
   savePrdVersion, overrideBump, withSyntheticBaseline, mergeRunSnapshot, validatePendingPlaylist, cwdEscapesWorkspace, contentHash,
   stableStringify, MAX_PRD_TEXT_CHARS, PrdSaveSuccess, Refusal, BumpOverrideSuccess, appendShipGate, SHIP_GATE_NAME, stripGeneratedSideEffects,
-  redactStringsDeep,
+  redactStringsDeep, PARALLEL_PLAYLIST_ERROR,
 } from '../../../server/prd-ops';
 import { describeDeltaScope } from '../../../runner/prd-plan';
 import { latestRequirements } from '../../../models/requirement-trace';
@@ -227,6 +227,25 @@ describe('prd-ops', () => {
       const r = validatePendingPlaylist(cop, ['claude', 'copilot']);
       assert.equal(r.ok, false);
       assert.match(r.errors[0], /copilot/);
+    });
+
+    it('a parallel playlist cannot be approved (truthiness, as the runner decides it); a sequential one can', () => {
+      const ok = (over: Partial<PlanFilePlaylist>) => {
+        const p = pl(over);
+        p.tasks[2].cwd = 'packages/api';
+        return validatePendingPlaylist(p, ['claude']);
+      };
+      for (const parallel of [true, 'true', 'false', 1] as unknown[]) {
+        const r = ok({ parallel } as Partial<PlanFilePlaylist>);
+        assert.equal(r.ok, false, JSON.stringify(parallel));
+        assert.deepEqual(r.errors, [PARALLEL_PLAYLIST_ERROR], JSON.stringify(parallel));
+        assert.equal(r.commands.length, 4, 'the commands are still listed for the reviewer');
+      }
+      for (const parallel of [false, 0, '', null, undefined] as unknown[]) {
+        const r = ok({ parallel } as Partial<PlanFilePlaylist>);
+        assert.equal(r.ok, true, `${JSON.stringify(parallel)}: ${r.errors.join(' ')}`);
+      }
+      assert.match(PARALLEL_PLAYLIST_ERROR, /parallel.*one engine call at a time.*Request a new plan/);
     });
   });
 

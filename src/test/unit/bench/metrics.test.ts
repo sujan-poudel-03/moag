@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 import {
-  buildVersionMetrics, costPerRequirementShipped, emptyObservation, summarize, VersionObservation,
+  buildVersionMetrics, costPerRequirementShipped, emptyObservation, environmentFindings, errorLine, summarize, VersionObservation,
 } from '../../../bench/metrics';
 import { BudgetLedger } from '../../../bench/budget';
 
@@ -49,7 +49,46 @@ describe('bench metrics', () => {
     assert.deepEqual(m.interventions.unplanned.map((i) => i.kind), ['bump-override']);
     assert.equal(m.fixIterations, 1);
     assert.equal(m.taskRestarts, 1, 'a was started twice');
-    assert.deepEqual(m.moagVerify, { passed: true, failedGate: null });
+    assert.deepEqual(m.moagVerify, { passed: true, failedGate: null, failedCommand: null });
+    assert.deepEqual(m.environment, []);
+  });
+
+  it('environmentFindings: only a probe that failed in the untouched workspace AND is the failing command counts', () => {
+    const failing = { command: 'npm test', exitCode: 1, timedOut: false, durationMs: 2000, pass: false, detail: 'ReferenceError: require is not defined in ES module scope' };
+    const passing = { command: 'npm run lint', exitCode: 0, timedOut: false, durationMs: 9000, pass: true, detail: null };
+    const env = { node: 'v24.16.0', probes: [passing, failing] };
+    const verify = environmentFindings(env, ' npm test ', []);
+    assert.equal(verify.length, 1);
+    assert.match(verify[0], /^environment: Node v24\.16\.0 cannot run "npm test": it exits 1 in the untouched workspace, before any plan \(ReferenceError: require is not defined in ES module scope\)\. MOAG's own verify stopped at this command\.$/);
+    assert.deepEqual(environmentFindings(env, 'npm run lint', []), [], 'a probe that passed is never an environment failure');
+    assert.deepEqual(environmentFindings(env, 'npm test -- --grep x', []), [], 'a different command is a product outcome');
+    assert.deepEqual(environmentFindings(env, null, []), [], 'no failed command, no finding');
+    assert.deepEqual(environmentFindings({ node: 'v20.20.2', probes: [{ ...failing, pass: true, exitCode: 0, detail: null }] }, 'npm test', []), [],
+      'where the suite runs (Node 20), a verify failure stays a product failure');
+    const task = environmentFindings(env, null, [{ name: 'Run tests', command: 'npm test' }, { name: 'Lint', command: 'npm run lint' }]);
+    assert.equal(task.length, 1);
+    assert.match(task[0], /task "Run tests" runs this command and failed\.$/);
+    assert.match(environmentFindings({ node: null, probes: [{ ...failing, exitCode: null, timedOut: true, detail: null }] }, 'npm test', [])[0],
+      /^environment: this machine cannot run "npm test": it times out in the untouched workspace, before any plan\. /);
+    assert.match(environmentFindings({ node: null, probes: [{ ...failing, exitCode: null, detail: null }] }, 'npm test', [])[0], /it does not start/);
+  });
+
+  it('errorLine picks the last line that mentions an error, capped at 300 characters', () => {
+    assert.equal(errorLine('ok\n Exception during run: ReferenceError: require is not defined\n    at file:///x.ts:4:20\n'), 'Exception during run: ReferenceError: require is not defined');
+    assert.equal(errorLine('all good\n'), null);
+    assert.equal(errorLine(`Error: ${'x'.repeat(400)}`)?.length, 300);
+  });
+
+  it('a failed verify carries the command it stopped at and the environment findings into the metrics', () => {
+    const m = buildVersionMetrics(shippedV2({
+      trace: {}, endState: 'run-gaps',
+      verifyFinished: [{ passed: false, failedGate: 'command', iterations: 1, failedCommand: 'npm test' }],
+      environment: ['environment: Node v24.16.0 cannot run "npm test": it exits 1 in the untouched workspace, before any plan. MOAG\'s own verify stopped at this command.'],
+    }), 1);
+    assert.deepEqual(m.moagVerify, { passed: false, failedGate: 'command', failedCommand: 'npm test' });
+    assert.equal(m.environment.length, 1);
+    assert.equal(m.outcome, 'not-shipped', 'the outcome is not rewritten: nothing shipped');
+    assert.equal(m.endState, 'run-gaps');
   });
 
   it('any unreported or estimated call makes the cost unknown, keeping the reported part', () => {
@@ -95,7 +134,8 @@ describe('bench metrics', () => {
     const v = [buildVersionMetrics(shippedV2(), 1), buildVersionMetrics({ ...emptyObservation('v3', 'minor'), notRunBudget: true }, 1)];
     const meta = {
       scenario: 's', scenarioFile: 'f', mode: 'dry-run' as const, startedAt: AT, endedAt: AT, aborted: false, stoppedForBudget: false,
-      harnessError: null, exitCode: 0, workspace: null, engine: { id: 'claude', version: null, probeVersion: null }, eventsTruncated: false, notes: [],
+      harnessError: null, exitCode: 0, workspace: null, engine: { id: 'claude', version: null, probeVersion: null },
+      environment: { node: null, probes: [] }, eventsTruncated: false, notes: [],
     };
     const s = summarize(v, b.snapshot(), meta);
     assert.equal(s.totals.requirementsShipped, 2);

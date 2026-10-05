@@ -341,6 +341,7 @@ Names must match `^[A-Z_][A-Z0-9_]*$`. `MOAG_*` and `CI` are rejected at boot. A
   - If the project's default engine changed while the plan was pending, approval is refused with `409 engine-changed`. Switch the project back or request a new plan.
   - After approval the engine stays locked. A run, or a resumed segment, on a project whose engine has since changed is also refused with `409 engine-changed`.
   - A plan with a task `cwd` outside the workspace cannot be approved at all.
+  - A plan whose playlist is marked `parallel` cannot be approved at all. Server runs make one engine call at a time, because the per-call cap and the per-version budget depend on it. The review card says so; request a new plan.
 - **Starting a run** (reviewer, admin) is where repository code and repository config become live: the run's agent starts inside the repo and loads what the repo ships. **A reviewer must trust the repository before approving its first run.** The plan review card warns, listing each of these entries the repo has:
   - engine config: `.claude/`, `.mcp.json`, `.gemini/`, `.codex/`
   - agent instruction files: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules`

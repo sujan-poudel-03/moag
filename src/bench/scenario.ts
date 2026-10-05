@@ -54,6 +54,18 @@ export interface Scenario {
   /** The bench's own acceptance gates, run in the workspace at each ship-gate halt. */
   gateCommands: string[];
   gateTimeoutMs: number;
+  /**
+   * Extra shell commands a generated plan may carry and still be approved
+   * unread, each one reviewed by the scenario author. Exact strings (compared
+   * after trimming), never patterns; `gateCommands` are always allowed too.
+   */
+  allowedCommands: string[];
+  /**
+   * Commands MOAG's own verify is expected to run (it auto-detects them). The
+   * bench runs each once in the untouched workspace, before any plan, so a
+   * command the environment cannot run is told apart from a product failure.
+   */
+  environmentProbes: string[];
   versions: ScenarioVersion[];
   dryRun?: { planCommand: string };
 }
@@ -70,6 +82,8 @@ export class BenchScenarioError extends Error {
 export const MAX_SCENARIO_BUDGET_USD = 100;
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 const VERSION_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+/** Longest command an `allowedCommands` or `environmentProbes` entry may be. */
+export const MAX_SCENARIO_COMMAND_CHARS = 500;
 
 // ─── Field readers ───
 
@@ -107,6 +121,23 @@ function stringArray(o: Obj, key: string, at: string, opts: { min?: number } = {
     return x;
   });
   if (out.length < (opts.min ?? 0)) { throw new BenchScenarioError(at, `needs at least ${opts.min} entr${opts.min === 1 ? 'y' : 'ies'}`); }
+  return out;
+}
+
+/**
+ * A list of exact shell commands (`allowedCommands`, `environmentProbes`):
+ * each a single line of at most {@link MAX_SCENARIO_COMMAND_CHARS} characters,
+ * with no entry listed twice. Entries are literal strings, never patterns.
+ */
+function commandList(o: Obj, key: string, at: string): string[] {
+  const out = stringArray(o, key, at);
+  const seen = new Set<string>();
+  out.forEach((c, i) => {
+    if (/[\r\n]/.test(c)) { throw new BenchScenarioError(`${at}[${i}]`, 'must be a single-line command'); }
+    if (c.length > MAX_SCENARIO_COMMAND_CHARS) { throw new BenchScenarioError(`${at}[${i}]`, `must be at most ${MAX_SCENARIO_COMMAND_CHARS} characters`); }
+    if (seen.has(c.trim())) { throw new BenchScenarioError(`${at}[${i}]`, `duplicate command "${c.trim()}"`); }
+    seen.add(c.trim());
+  });
   return out;
 }
 
@@ -214,6 +245,9 @@ export function validateScenario(raw: unknown, file: string): Scenario {
     throw new BenchScenarioError('gateTimeoutMs', 'must be between 1000 and 3600000');
   }
 
+  const allowedCommands = commandList(raw, 'allowedCommands', 'allowedCommands');
+  const environmentProbes = commandList(raw, 'environmentProbes', 'environmentProbes');
+
   // versions
   if (!Array.isArray(raw.versions) || raw.versions.length === 0) {
     throw new BenchScenarioError('versions', 'must be a non-empty array');
@@ -257,7 +291,7 @@ export function validateScenario(raw: unknown, file: string): Scenario {
     file: path.resolve(file), dir, name, description, repo, setupCommands,
     stack: stack as StackId, engine: engine as EngineId,
     budgetUsd, perCallCapUsd, minVersionUsd, reserveFactor, versionTimeoutMin,
-    passEnv, gateCommands, gateTimeoutMs, versions,
+    passEnv, gateCommands, gateTimeoutMs, allowedCommands, environmentProbes, versions,
     ...(dryRun ? { dryRun } : {}),
   };
 }

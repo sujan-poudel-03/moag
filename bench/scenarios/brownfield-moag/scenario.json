@@ -15,6 +15,13 @@
     "npm run compile",
     "npx mocha --require ts-node/register src/test/unit/utils/usd-format.test.ts"
   ],
+  "allowedCommands": [
+    "npm run lint",
+    "npm test",
+    "npm run test",
+    "npx mocha --require ts-node/register \"src/test/unit/utils/usd-format.test.ts\""
+  ],
+  "environmentProbes": ["npm test"],
   "versions": [
     { "id": "v1", "prdFile": "prd/v1.md", "intendedBump": "initial", "dryRunFixture": "dry-run/v1" }
   ],

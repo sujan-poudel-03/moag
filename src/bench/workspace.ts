@@ -5,6 +5,8 @@
 // repository, or a local repository cloned at a named ref. The live working
 // tree is never used: the destination may not equal, contain, or sit inside
 // the clone source (compared as real paths, case-insensitively on Windows).
+// A clone keeps no path back to its source: the `origin` remote is removed and
+// the reflog (which records "clone: from <path>") is expired, then both are checked.
 //
 // git runs through execFile with array arguments (no shell). Setup and gate
 // commands are scenario-authored shell commands; each gets a timeout and a
@@ -85,6 +87,48 @@ export function cloneGuardProblem(source: string, dest: string): string | null {
   return null;
 }
 
+/** Most bytes read from one git metadata file when looking for the clone source. */
+const TRACE_SCAN_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Git metadata files of the clone at `dir` that still name `source` (relative
+ * to `.git`): the config, the ref and fetch bookkeeping, the alternates file
+ * and every reflog. Separators and, on Windows, letter case are ignored. An
+ * empty list means the clone keeps no path back to the repository it came from.
+ */
+export function cloneSourceTraces(dir: string, source: string): string[] {
+  const gitDir = path.join(dir, '.git');
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, '/');
+    return process.platform === 'win32' ? slashed.toLowerCase() : slashed;
+  };
+  const needles = [...new Set([path.resolve(source), realish(source)].map((p) => norm(p).replace(/\/+$/, '')))];
+  const files = ['config', 'packed-refs', 'FETCH_HEAD', 'ORIG_HEAD', path.join('objects', 'info', 'alternates')];
+  const walk = (rel: string): void => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(path.join(gitDir, rel), { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const child = path.join(rel, e.name);
+      if (e.isDirectory()) { walk(child); } else if (e.isFile()) { files.push(child); }
+    }
+  };
+  walk('logs');
+  const hits: string[] = [];
+  for (const rel of files) {
+    let text: string;
+    try {
+      const fd = fs.openSync(path.join(gitDir, rel), 'r');
+      try {
+        const buf = Buffer.alloc(Math.min(TRACE_SCAN_BYTES, fs.fstatSync(fd).size));
+        fs.readSync(fd, buf, 0, buf.length, 0);
+        text = norm(buf.toString('utf-8'));
+      } finally { fs.closeSync(fd); }
+    } catch { continue; }
+    if (needles.some((n) => text.includes(n))) { hits.push(rel.replace(/\\/g, '/')); }
+  }
+  return hits;
+}
+
 /**
  * Create the scenario's workspace at `<projectsRoot>/<name>` and run its setup
  * commands. Throws {@link BenchWorkspaceError} on any refusal or failure.
@@ -108,8 +152,15 @@ export async function prepareWorkspace(
     if (problem) { throw new BenchWorkspaceError(problem); }
     await git(['-c', 'core.longpaths=true', 'clone', '--no-hardlinks', '--branch', scenario.repo.ref, '--single-branch', '--', scenario.repo.path, dir], path.resolve(projectsRoot), env);
     // The clone source is the user's live repository: no remote may point back
-    // at it, so nothing a run does (a push, a tag push) can write into it.
+    // at it, so nothing a run does (a push, a tag push, a fetch) can reach it.
     await git(['remote', 'remove', 'origin'], dir, env);
+    // `git clone` also writes "clone: from <source path>" into the reflog, which
+    // would hand an agent the live repository's path: expire every entry.
+    await git(['reflog', 'expire', '--expire=now', '--all'], dir, env);
+    const remotes = (await git(['remote'], dir, env)).trim();
+    if (remotes !== '') { throw new BenchWorkspaceError(`the clone still has a remote (${remotes.split(/\s+/).join(', ')})`); }
+    const traces = cloneSourceTraces(dir, scenario.repo.path);
+    if (traces.length > 0) { throw new BenchWorkspaceError(`the clone still names its source in ${traces.join(', ')}`); }
   }
   head = (await git(['rev-parse', 'HEAD'], dir, env)).trim() || null;
 

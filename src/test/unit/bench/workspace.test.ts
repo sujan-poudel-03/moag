@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import { execFileSync } from 'child_process';
 import {
-  prepareWorkspace, runCommand, runGates, gatesGreen, cloneGuardProblem, BenchWorkspaceError,
+  prepareWorkspace, runCommand, runGates, gatesGreen, cloneGuardProblem, cloneSourceTraces, BenchWorkspaceError,
 } from '../../../bench/workspace';
 import { Scenario } from '../../../bench/scenario';
 
@@ -22,7 +22,7 @@ function scenarioWith(over: Partial<Scenario>): Scenario {
   return {
     file: '/x/scenario.json', dir: '/x', name: 't', description: '', repo: { kind: 'template', templateDir: '/x/template' },
     setupCommands: [], stack: 'node-ts', engine: 'claude', budgetUsd: 1, perCallCapUsd: 1, minVersionUsd: 1, reserveFactor: 1.5,
-    versionTimeoutMin: 1, passEnv: [], gateCommands: ['true'], gateTimeoutMs: 10_000, versions: [], ...over,
+    versionTimeoutMin: 1, passEnv: [], gateCommands: ['true'], gateTimeoutMs: 10_000, allowedCommands: [], environmentProbes: [], versions: [], ...over,
   };
 }
 
@@ -108,6 +108,62 @@ describe('bench workspace', function () {
     const srcBranches = g('branch', '--list');
     assert.throws(() => execFileSync('git', ['push', 'origin', 'HEAD:refs/heads/pushed'], { cwd: ws.dir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }));
     assert.equal(g('branch', '--list'), srcBranches, 'the source gained no branch');
+    assert.throws(() => execFileSync('git', ['fetch', 'origin'], { cwd: ws.dir, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }), 'nothing to fetch from');
+  });
+
+  it('a clone keeps no path back to its source: no remote, no reflog entry, nothing in git metadata names it', async function () {
+    if (!hasGit()) { this.skip(); return; }
+    const src = path.join(tmp, 'live-repo');
+    fs.mkdirSync(src);
+    const g = (cwd: string, ...args: string[]) => execFileSync('git', args, { cwd, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
+    g(src, 'init', '-b', 'main');
+    fs.writeFileSync(path.join(src, 'a'), '1');
+    g(src, 'add', '-A'); g(src, ...GIT_ID, 'commit', '-m', 'one');
+    fs.writeFileSync(path.join(src, 'a'), '2');
+    g(src, 'add', '-A'); g(src, ...GIT_ID, 'commit', '-m', 'two');
+    const ws = await prepareWorkspace(scenarioWith({ repo: { kind: 'clone', path: src, ref: 'main' } }), path.join(tmp, 'workspaces'), 'clone');
+
+    assert.equal(g(ws.dir, 'remote'), '');
+    assert.equal(g(ws.dir, 'reflog'), '', 'the "clone: from <source>" reflog entry is gone');
+    assert.deepEqual(cloneSourceTraces(ws.dir, src), []);
+    // Independent of cloneSourceTraces: no file under .git/logs, nor the config, mentions the source folder.
+    const texts = [fs.readFileSync(path.join(ws.dir, '.git', 'config'), 'utf-8')];
+    const walk = (d: string): void => {
+      for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+        if (e.isDirectory()) { walk(path.join(d, e.name)); } else { texts.push(fs.readFileSync(path.join(d, e.name), 'utf-8')); }
+      }
+    };
+    if (fs.existsSync(path.join(ws.dir, '.git', 'logs'))) { walk(path.join(ws.dir, '.git', 'logs')); }
+    for (const t of texts) { assert.equal(t.includes('live-repo'), false, t.slice(0, 300)); }
+    assert.equal(fs.existsSync(path.join(ws.dir, '.git', 'objects', 'info', 'alternates')), false, 'objects are copied, not borrowed from the source');
+
+    // The clone is still a complete, usable repository.
+    assert.equal(g(ws.dir, 'rev-list', '--count', 'HEAD'), '2');
+    assert.equal(ws.head, g(src, 'rev-parse', 'HEAD'));
+    fs.writeFileSync(path.join(ws.dir, 'b'), 'x');
+    g(ws.dir, 'add', '-A'); g(ws.dir, ...GIT_ID, 'commit', '-m', 'three');
+    assert.equal(g(ws.dir, 'rev-list', '--count', 'HEAD'), '3');
+    assert.equal(g(src, 'rev-list', '--count', 'HEAD'), '2', 'the source is untouched');
+  });
+
+  it('cloneSourceTraces finds the source in a reflog, the config or an alternates file, whatever the separators', function () {
+    const ws = path.join(tmp, 'ws');
+    const src = path.join(tmp, 'live-repo');
+    fs.mkdirSync(path.join(ws, '.git', 'logs', 'refs', 'heads'), { recursive: true });
+    fs.mkdirSync(path.join(ws, '.git', 'objects', 'info'), { recursive: true });
+    fs.mkdirSync(src);
+    fs.writeFileSync(path.join(ws, '.git', 'config'), '[core]\n\tbare = false\n');
+    assert.deepEqual(cloneSourceTraces(ws, src), []);
+    assert.deepEqual(cloneSourceTraces(path.join(tmp, 'no-such-clone'), src), [], 'a missing .git has no traces and does not throw');
+    fs.writeFileSync(path.join(ws, '.git', 'logs', 'refs', 'heads', 'main'), `0000 1111 t <t@t> 1 +0000\tclone: from ${src.replace(/\\/g, '/')}\n`);
+    assert.deepEqual(cloneSourceTraces(ws, src), ['logs/refs/heads/main']);
+    fs.writeFileSync(path.join(ws, '.git', 'config'), `[remote "origin"]\n\turl = ${src}\n`);
+    fs.writeFileSync(path.join(ws, '.git', 'objects', 'info', 'alternates'), `${path.join(src, '.git', 'objects')}\n`);
+    assert.deepEqual(cloneSourceTraces(ws, src).sort(), ['config', 'logs/refs/heads/main', 'objects/info/alternates']);
+    if (process.platform === 'win32') {
+      fs.writeFileSync(path.join(ws, '.git', 'config'), `[remote "origin"]\n\turl = ${src.toUpperCase()}\n`);
+      assert.ok(cloneSourceTraces(ws, src).includes('config'), 'case-insensitive on Windows');
+    }
   });
 
   it('runCommand reports the exit code, and runGates keeps going after a failure', async function () {

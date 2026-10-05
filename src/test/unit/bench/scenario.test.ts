@@ -62,7 +62,23 @@ describe('bench scenario', () => {
     assert.equal(s.versionTimeoutMin, 60);
     assert.equal(s.gateTimeoutMs, 600_000);
     assert.deepEqual(s.passEnv, []);
+    assert.deepEqual(s.allowedCommands, []);
+    assert.deepEqual(s.environmentProbes, []);
     assert.equal(dryRunProblem(s), null);
+  });
+
+  it('allowedCommands and environmentProbes are exact single-line strings: kept verbatim, bad entries rejected by path', () => {
+    const s = parseScenario(write({ ...base(), allowedCommands: ['npm run build', 'npm install && npm test'], environmentProbes: ['npm test'] }));
+    assert.deepEqual(s.allowedCommands, ['npm run build', 'npm install && npm test']);
+    assert.deepEqual(s.environmentProbes, ['npm test']);
+    for (const key of ['allowedCommands', 'environmentProbes']) {
+      rejects((d) => { d[key] = 'npm test'; }, key);
+      rejects((d) => { d[key] = ['npm test', 7]; }, `${key}[1]`);
+      rejects((d) => { d[key] = ['  ']; }, `${key}[0]`);
+      rejects((d) => { d[key] = ['npm test\ngit push']; }, `${key}[0]`);
+      rejects((d) => { d[key] = ['x'.repeat(501)]; }, `${key}[0]`);
+      rejects((d) => { d[key] = ['npm test', ' npm test ']; }, `${key}[1]`);
+    }
   });
 
   it('rejects each invalid field with its path', () => {

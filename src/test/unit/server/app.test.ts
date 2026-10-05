@@ -712,6 +712,30 @@ describe('server app', function () {
     assert.equal(h.state.loadCanonicalPlan(id, 'Acme').playlists.some((p) => p.id === 'pl-delta-test'), false, 'nothing reached the canonical plan');
   });
 
+  it('a generated parallel playlist cannot be approved or run: one engine call in flight is a server budget assumption', async () => {
+    const id = await newProject();
+    await h.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    const pl = gatedPlaylist();
+    (pl as Record<string, unknown>).parallel = true;
+    h.onSpawn = planWorker({ kind: 'appended', playlist: pl, rejected: [] });
+    const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+    const planId = (g.body.plan as { id: string }).id;
+    await waitFor(() => h.state.load(id).plans[0]?.status === 'pending');
+    const review = h.state.load(id).plans[0];
+    assert.equal(review.review?.ok, false);
+    assert.match(review.review!.errors.join(' '), /runs its tasks in parallel.*one engine call at a time/);
+    const spawned = h.workers.length;
+    const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: review.contentHash } });
+    assert.equal(r.status, 409);
+    assert.match(String(r.body.message ?? ''), /parallel/, 'the reviewer is told why');
+    assert.equal(h.state.load(id).plans[0].status, 'pending', 'nothing was approved');
+    assert.equal(h.state.loadCanonicalPlan(id, 'Acme').playlists.some((p) => p.parallel), false, 'no parallel playlist reached the canonical plan');
+    const run = await h.request('POST', `/api/projects/${id}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(run.status, 409);
+    assert.equal(run.body.error, 'plan-not-approved');
+    assert.equal(h.workers.length, spawned, 'no run worker was spawned');
+  });
+
   // ─── Runs ───
 
   it('starting a run on an unapproved plan is 409 and spawns nothing', async () => {
