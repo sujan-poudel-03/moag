@@ -12,12 +12,13 @@
 // shipping task downstream of the gate — each `release`/`deploy` task and
 // everything that depends on one — is set to Skipped instead of Pending, so
 // the runner never executes it and `stampApprovedShip` sees an uncompleted
-// release. Only an approver's `approve` resets the shipping work to Pending.
-// The approve/skip distinction also lives in the audit log and the run record.
+// release or deploy task. Only an approver's `approve` resets the shipping
+// work to Pending. The approve/skip distinction also lives in the audit log
+// and the run record.
 
 import { Plan, PlanFileTask, TaskStatus } from '../models/types';
 import { stampRelease } from '../models/requirement-trace';
-import { shippingTaskIds } from './prd-ops';
+import { SHIPPING_TASK_TYPES, shippingTaskIds } from './prd-ops';
 
 const RESETTABLE = new Set<TaskStatus>([TaskStatus.Blocked, TaskStatus.Skipped, TaskStatus.Failed]);
 
@@ -104,14 +105,14 @@ export function serverShipTag(runId: string): string {
  * (the gate included) are Completed and its latest recorded gates are non-empty
  * and all green. Returns the requirement ids stamped.
  *
- * Release tasks run only after the ship gate, so a run's ship also needs its
- * release to have happened: when any `release` task in the run's playlist
- * (`playlistIndex`; every playlist when omitted) is not Completed — failed,
- * skipped, blocked or never reached — nothing is stamped.
+ * Release and deploy tasks run only after the ship gate, so a run's ship also
+ * needs them to have happened: when any `release` or `deploy` task in the
+ * run's playlist (`playlistIndex`; every playlist when omitted) is not
+ * Completed — failed, skipped, blocked or never reached — nothing is stamped.
  */
 export function stampApprovedShip(snapshot: Plan, runId: string, at: string, playlistIndex?: number): string[] {
   const playlists = playlistIndex === undefined ? snapshot.playlists : [snapshot.playlists[playlistIndex]].filter(Boolean);
-  const releasePending = playlists.some((pl) => pl.tasks.some((t) => t.type === 'release' && t.status !== TaskStatus.Completed));
-  if (releasePending) { return []; }
+  const shippingPending = playlists.some((pl) => pl.tasks.some((t) => SHIPPING_TASK_TYPES.has(t.type ?? 'agent') && t.status !== TaskStatus.Completed));
+  if (shippingPending) { return []; }
   return stampRelease(snapshot, serverShipTag(runId), at).shipped;
 }

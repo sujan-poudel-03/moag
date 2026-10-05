@@ -28,7 +28,24 @@ export interface CostEvent {
   label: string;
   /** Running lifetime total *including* this event. */
   lifetimeUsd: number;
+  /** 'reported' when the engine supplied the figure itself; otherwise 'estimated'. */
+  costSource: 'reported' | 'estimated';
 }
+
+/**
+ * An engine call that produced NO usable cost figure: the result had no (or a
+ * malformed) `estimatedCost`, or the call rejected (abort, timeout kill, spawn
+ * failure). Delivered on a separate channel so budget listeners that sum
+ * `onRecord` events are unaffected; consumers that must bound spend (the
+ * hosted server, the benchmark) count these and apply their own upper bound.
+ */
+export interface UnreportedCostEvent {
+  engineId: string;
+  label: string;
+}
+
+/** Notified synchronously on every unreported call. */
+export type UnreportedCostListener = (event: UnreportedCostEvent) => void;
 
 /** Notified synchronously on every recorded cost event. */
 export type CostListener = (event: CostEvent) => void;
@@ -38,6 +55,7 @@ interface CostUsage {
   inputTokens?: number;
   outputTokens?: number;
   estimatedCost?: number;
+  costSource?: 'reported' | 'estimated';
 }
 
 /** Attribution metadata supplied by the recording call site. */
@@ -49,6 +67,7 @@ interface CostMeta {
 class CostLedger {
   private _lifetimeUsd = 0;
   private _listeners = new Set<CostListener>();
+  private _unreportedListeners = new Set<UnreportedCostListener>();
 
   /**
    * Add a call's cost to the lifetime total and notify listeners.
@@ -70,6 +89,7 @@ class CostLedger {
       engineId: meta.engineId,
       label: meta.label ?? 'unattributed',
       lifetimeUsd: this._lifetimeUsd,
+      costSource: usage?.costSource === 'reported' ? 'reported' : 'estimated',
     };
 
     // Each listener is isolated: one that throws must break neither the
@@ -91,6 +111,29 @@ class CostLedger {
     };
   }
 
+  /**
+   * Note an engine call that reported no usable cost. The lifetime total is
+   * untouched; only {@link onUnreported} listeners hear about it, each isolated.
+   */
+  recordUnreported(meta: CostMeta): void {
+    const event: UnreportedCostEvent = { engineId: meta.engineId, label: meta.label ?? 'unattributed' };
+    for (const listener of Array.from(this._unreportedListeners)) {
+      try {
+        listener(event);
+      } catch {
+        // Swallowed on purpose: accounting never breaks the engine call.
+      }
+    }
+  }
+
+  /** Subscribe to unreported-call events. Returns an idempotent unsubscribe function. */
+  onUnreported(listener: UnreportedCostListener): () => void {
+    this._unreportedListeners.add(listener);
+    return () => {
+      this._unreportedListeners.delete(listener);
+    };
+  }
+
   /** Total estimated spend since process start (or since the last reset()). */
   getLifetimeUsd(): number {
     return this._lifetimeUsd;
@@ -104,6 +147,11 @@ class CostLedger {
   /** Number of active listeners — test introspection only. */
   listenerCount(): number {
     return this._listeners.size;
+  }
+
+  /** Number of active unreported-call listeners — test introspection only. */
+  unreportedListenerCount(): number {
+    return this._unreportedListeners.size;
   }
 }
 

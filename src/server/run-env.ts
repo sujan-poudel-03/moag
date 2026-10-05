@@ -83,7 +83,21 @@ export interface WorkerConfig {
     'prdLoop.onManualGate': 'halt';
     'prdLoop.versionBudgetUsd': number;
     'prdLoop.uat.mode': 'off';
+    /** Claude reports its own total_cost_usd only in JSON mode; every server job uses it. */
+    'engines.claude.outputFormat': 'json';
+    /** `--max-budget-usd` for every Claude call (0 = none); see {@link perCallBudgetUsd}. */
+    'engines.claude.maxBudgetUsdPerCall': number;
   };
+}
+
+/**
+ * The per-call engine cap for a job: the smaller of the job's remaining cost
+ * cap (when one is set) and the server-wide `MOAG_MAX_USD_PER_ENGINE_CALL`
+ * (when set); 0 (no per-call cap) when neither is.
+ */
+export function perCallBudgetUsd(capUsd: number, maxUsdPerCall: number | null): number {
+  const perCall = Math.min(capUsd > 0 ? capUsd : Infinity, maxUsdPerCall ?? Infinity);
+  return Number.isFinite(perCall) ? perCall : 0;
 }
 
 /**
@@ -95,8 +109,15 @@ export interface WorkerConfig {
  * Throws when the project HAS a cap but nothing remains: the runner reads a
  * ceiling of 0 as "unlimited" (`runner.ts` `onCostRecorded`), so passing an
  * exhausted remainder through would silently lift the cap.
+ *
+ * Claude always runs in JSON output mode, so the cap is enforced against the
+ * CLI's own reported `total_cost_usd`, and every Claude call gets
+ * `--max-budget-usd` = {@link perCallBudgetUsd} — the only bound on a call that
+ * reports no cost (killed, timed out, unparsable).
  */
-export function buildWorkerConfig(project: Pick<ProjectRecord, 'defaultEngine' | 'versionBudgetUsd'>, remainingUsd: number): WorkerConfig {
+export function buildWorkerConfig(
+  project: Pick<ProjectRecord, 'defaultEngine' | 'versionBudgetUsd'>, remainingUsd: number, maxUsdPerCall: number | null = null,
+): WorkerConfig {
   let cap = 0;
   if (project.versionBudgetUsd > 0) {
     if (!(remainingUsd > 0)) { throw new Error('The per-version cost cap is exhausted.'); }
@@ -110,6 +131,8 @@ export function buildWorkerConfig(project: Pick<ProjectRecord, 'defaultEngine' |
       'prdLoop.onManualGate': 'halt',
       'prdLoop.versionBudgetUsd': cap,
       'prdLoop.uat.mode': 'off',
+      'engines.claude.outputFormat': 'json',
+      'engines.claude.maxBudgetUsdPerCall': perCallBudgetUsd(cap, maxUsdPerCall),
     },
   };
 }
@@ -162,13 +185,18 @@ export const CLAUDE_PLAN_ARGS: readonly string[] = Object.freeze([
 ]);
 
 /**
- * Engines a plan-generation job can run with NO file or tool access, so the
- * server's repository listing in the prompt is the planner's only repo context:
- * Claude ({@link CLAUDE_PLAN_ARGS}), Codex ({@link CODEX_PLAN_ARGS}: no shell
- * tool, read-only sandbox), Ollama (`ollama run` is a plain completion with no
- * tools). Gemini CLI has no flag that removes its file tools, and the Anthropic
- * API adapter always offers read_file/list_directory/run_bash — both are
- * refused for plan generation unless an admin turns on `allowPlannerFileAccess`.
+ * Engines a plan-generation job may run on by default, because their tools can
+ * be locked down so the server's repository listing in the prompt is meant to
+ * be the planner's only repo context: Claude ({@link CLAUDE_PLAN_ARGS}: every
+ * built-in tool removed, no MCP server), Codex ({@link CODEX_PLAN_ARGS}: no
+ * shell or exec tool, read-only sandbox — whether Codex can still read files
+ * through a non-shell built-in is UNVERIFIED), Ollama (`ollama run` is a plain
+ * completion with no tools). Gemini CLI has no flag that removes its file
+ * tools, and the Anthropic API adapter always offers read_file, write_file,
+ * list_directory and run_bash (plus take_screenshot and run_playwright_test) —
+ * both are refused for plan generation unless an admin turns on
+ * `allowPlannerFileAccess`, which for anthropic grants shell execution and
+ * file writes, not just reads.
  */
 export const PLANNER_LOCKED_ENGINES: readonly EngineId[] = Object.freeze(['claude', 'codex', 'ollama'] as EngineId[]);
 
@@ -178,8 +206,16 @@ export const PLANNER_LOCKED_ENGINES: readonly EngineId[] = Object.freeze(['claud
  */
 export function plannerFileAccessRefusal(engine: EngineId, allowPlannerFileAccess: boolean): string | null {
   if (PLANNER_LOCKED_ENGINES.includes(engine) || allowPlannerFileAccess) { return null; }
-  return `${engine} can't be stopped from reading files while it plans, so this server won't use it for plan generation. `
-    + 'Switch the project to Claude Code, Codex or Ollama, or ask an admin to turn on planner file access.';
+  const alternatives = 'Switch the project to Claude Code, Codex or Ollama, or ask an admin to turn on planner file access';
+  if (engine === 'anthropic') {
+    return `anthropic can't plan without its file and shell tools (read, write, run commands), so this server won't use it for plan generation. `
+      + `${alternatives}, which lets this planner read and write files and run shell commands on the server.`;
+  }
+  if (engine === 'gemini') {
+    return `gemini can't plan without its file tools, so this server won't use it for plan generation. `
+      + `${alternatives}, which lets this planner use its full default tool set on the server.`;
+  }
+  return `${engine} can't be stopped from reading files while it plans, so this server won't use it for plan generation. ${alternatives}.`;
 }
 
 /** {@link WorkerConfig} for a plan-generation job: the same, with every engine's auto-approve forced off. */
@@ -205,8 +241,10 @@ export interface PlanWorkerConfig {
  * `--yolo`). The engines still answer in print/exec mode — generation only
  * needs text.
  */
-export function buildPlanWorkerConfig(project: Pick<ProjectRecord, 'defaultEngine' | 'versionBudgetUsd'>, remainingUsd: number): PlanWorkerConfig {
-  const base = buildWorkerConfig(project, remainingUsd);
+export function buildPlanWorkerConfig(
+  project: Pick<ProjectRecord, 'defaultEngine' | 'versionBudgetUsd'>, remainingUsd: number, maxUsdPerCall: number | null = null,
+): PlanWorkerConfig {
+  const base = buildWorkerConfig(project, remainingUsd, maxUsdPerCall);
   return {
     agentTaskPlayer: {
       ...base.agentTaskPlayer,

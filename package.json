@@ -1579,6 +1579,21 @@
           "default": false,
           "description": "When enabled, instructs Claude to use extended step-by-step thinking for complex tasks. Increases token usage but improves output quality."
         },
+        "agentTaskPlayer.engines.claude.outputFormat": {
+          "type": "string",
+          "enum": [
+            "text",
+            "json"
+          ],
+          "default": "text",
+          "description": "How Claude Code prints its answer. 'text' streams live output to the dashboard but reports no reliable cost. 'json' (--output-format json) reports Claude's own total_cost_usd for every call, so cost ceilings use the real figure, but streams no live output: the answer appears when the call ends."
+        },
+        "agentTaskPlayer.engines.claude.maxBudgetUsdPerCall": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Per-call spend cap passed to Claude Code as --max-budget-usd (USD). 0 = off. Claude may overshoot it by up to one turn."
+        },
         "agentTaskPlayer.engines.anthropic.apiKey": {
           "type": "string",
           "default": "",

@@ -13,8 +13,9 @@
  *                                   [--full-auto] [--engine <id>] [--cwd <dir>]
  *   moag config <get-engine | set-engine <id>>
  *   moag trace  [<plan.json> | --plan <path>] [--req R-<n>]
+ *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]
  *
- * `run`    executes a single plan file, or a one-shot prompt (`--prompt`) which is
+ * `run`   executes a single plan file, or a one-shot prompt (`--prompt`) which is
  *          turned into a single agent task and run through the selected engine.
  * `verify` runs the deterministic PRD gates (change / command / artifact / status)
  *          and only then asks a model for a verdict; with `--fix` it generates and
@@ -25,6 +26,9 @@
  * `config` reads/sets the persistent default engine in `.moag/config.json`.
  * `trace`  prints one JSONL line per PRD requirement (shipped / in-progress / not-shipped /
  *          untracked / removed) with its PRD version, release tag, tasks and gate exit codes.
+ * `bench`  drives the hosted server end to end through one benchmark scenario
+ *          (docs/benchmark.md). `--dry-run` uses a fake engine and spends nothing;
+ *          a paid run requires `--max-usd`.
  * `loop`   polls a GitHub repo for open issues, turns each new issue into a task,
  *          runs them, then reports the outcome back to the issue (comment + close on
  *          success; comment + label on failure) — the closed autonomous loop.
@@ -87,6 +91,12 @@ export interface Args {
   req?: string;
   /** `--plan` was given without a path (end of argv, or followed by another flag). */
   planFlagMissing?: boolean;
+  /** `bench` only: use the fake engine (zero spend). */
+  dryRun?: boolean;
+  /** `bench` only: output directory, resolved against the final --cwd ('' when the flag had no value). */
+  out?: string;
+  /** `bench` only: hard spend cap in USD; NaN when the value was not a positive number. */
+  maxUsd?: number;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -107,6 +117,7 @@ export function parseArgs(argv: string[]): Args {
   };
   const rest = argv.slice(1);
   let planFlag: string | undefined;
+  let outFlag: string | undefined;
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === '--no-interactive') { a.noInteractive = true; }
@@ -132,6 +143,15 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--uat-spec') { const s = rest[++i]; if (s) { a.uatSpec = s; } }
     else if (arg === '--since') { const v = rest[++i]; if (v) { a.since = v; } }
     else if (arg === '--merge') { a.merge = true; }
+    else if (arg === '--dry-run') { a.dryRun = true; }
+    else if (arg === '--out') {
+      const v = rest[i + 1];
+      if (v === undefined || v === '' || v.startsWith('--')) { outFlag = ''; } else { outFlag = v; i++; }
+    }
+    else if (arg === '--max-usd') {
+      const n = Number(rest[++i]);
+      a.maxUsd = Number.isFinite(n) && n > 0 ? n : NaN;
+    }
     else if (arg === '--into') { const v = rest[++i]; if (v) { a.into = v; } }
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
@@ -156,6 +176,7 @@ export function parseArgs(argv: string[]): Args {
     a.planPath = path.resolve(a.cwd, a.positionals[0]);
   }
   if (planFlag !== undefined) { a.planPath = path.resolve(a.cwd, planFlag); }
+  if (outFlag !== undefined) { a.out = outFlag === '' ? '' : path.resolve(a.cwd, outFlag); }
   return a;
 }
 
@@ -1080,6 +1101,14 @@ async function cmdConfig(args: Args): Promise<number> {
 
 async function main(): Promise<number> {
   const args = parseArgs(process.argv.slice(2));
+  if (args.command === 'bench') {
+    // No setup() and no shim: the bench drives the hosted server over HTTP and never loads vscode.
+    if (args.out === '' || (args.maxUsd !== undefined && Number.isNaN(args.maxUsd))) {
+      process.stderr.write('Usage: moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]  (--max-usd must be a positive number)\n');
+      return 2;
+    }
+    return require('../bench/harness').cmdBench(args);
+  }
   if (args.command === 'run') {
     if (!args.planPath && !args.prompt) {
       process.stderr.write('Usage: moag run <plan.json | --prompt "<text>"> [--full-auto] [--engine <id>] [--cwd <dir>]\n');
@@ -1116,7 +1145,7 @@ async function main(): Promise<number> {
     return cmdTrace(args);
   }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace> ...\n' +
+    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|bench> ...\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
     '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
     '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
@@ -1126,7 +1155,8 @@ async function main(): Promise<number> {
     '  moag queue <list | resolve <id>>\n' +
     '  moag digest [--since <when>]\n' +
     '  moag land [--into <branch>] [--merge]\n' +
-    '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n',
+    '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n' +
+    '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]\n',
   );
   return 2;
 }

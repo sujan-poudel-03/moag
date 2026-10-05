@@ -32,6 +32,7 @@ export const AUDIT_ACTIONS = [
   'engine.key-set',
   'engine.key-clear',
   'settings.update',
+  'job.lock-force-release',
 ] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 

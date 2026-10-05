@@ -93,6 +93,7 @@ export const ROUTES: readonly RouteSpec[] = Object.freeze([
   { method: 'DELETE', path: '/api/admin/engines/:engine/key', action: 'engines.manage', mutating: true, auth: 'session' },
   { method: 'GET', path: '/api/admin/settings', action: 'engines.manage', mutating: false, auth: 'session' },
   { method: 'PATCH', path: '/api/admin/settings', action: 'engines.manage', mutating: true, auth: 'session' },
+  { method: 'POST', path: '/api/admin/projects/:id/lock/release', action: 'jobs.force-release', mutating: true, auth: 'session' },
   { method: 'GET', path: '/api/engines/availability', action: null, mutating: false, auth: 'session' },
   { method: 'GET', path: '/api/users/approvers', action: null, mutating: false, auth: 'session' },
   { method: 'GET', path: '/api/projects', action: null, mutating: false, auth: 'session' },
@@ -154,6 +155,8 @@ export interface AppDeps {
   killProcess: (proc: WorkerProcess) => void;
   /** Workers lead their own process group (POSIX `detached`); the job lock records it. */
   workerLeadsProcessGroup?: boolean;
+  /** Liveness probe for job-lock holders (tests inject it); default: `process.kill(pid, 0)`. */
+  isPidAlive?: (pid: number) => boolean;
   /** The server's environment (already scrubbed of MOAG secrets). */
   serverEnv: NodeJS.ProcessEnv;
   /** Injected for tests (spy); defaults to the scrypt verifier. */
@@ -243,6 +246,7 @@ const S = {
   gateSkip: obj({ reason: LONG_TEXT }),
   setKey: obj({ value: str(8, 512, API_KEY_RE) }),
   patchSettings: obj({ allowPlannerFileAccess: opt(bool()) }),
+  forceRelease: obj({ reason: LONG_TEXT }),
 };
 
 /** `POST /api/projects` body: a source union the generic `obj` cannot express. */
@@ -307,6 +311,7 @@ export function createApp(deps: AppDeps): App {
     runsDisabledReason: config.runsDisabledReason,
     killProcess: deps.killProcess,
     workerLeadsProcessGroup: deps.workerLeadsProcessGroup,
+    ...(deps.isPidAlive ? { isPidAlive: deps.isPidAlive } : {}),
     recordSpend: (projectId, key, usd) => {
       state.update(projectId, (s) => { s.versionSpend[key] = (s.versionSpend[key] ?? 0) + usd; });
     },
@@ -408,7 +413,9 @@ export function createApp(deps: AppDeps): App {
   /** `kind: 'plan'` turns every engine's auto-approve off (plan generation is PO-triggered; see buildPlanWorkerConfig). */
   const writeWorkerConfig = (dir: string, project: ProjectRecord, remaining: number, kind: 'run' | 'plan' = 'run'): string => {
     const configPath = path.join(dir, 'config.json');
-    const doc = kind === 'plan' ? buildPlanWorkerConfig(project, remaining) : buildWorkerConfig(project, remaining);
+    const doc = kind === 'plan'
+      ? buildPlanWorkerConfig(project, remaining, config.maxUsdPerEngineCall)
+      : buildWorkerConfig(project, remaining, config.maxUsdPerEngineCall);
     writeFileAtomicSync(configPath, JSON.stringify(doc, null, 2), 0o600);
     return configPath;
   };
@@ -1019,6 +1026,30 @@ export function createApp(deps: AppDeps): App {
     sendJson(ctx.res, 200, settingsDto());
   };
 
+  // ─── Admin: force-release a project's job lock ───
+
+  // Deletes job.lock when task pids outlived their job (or a predecessor's
+  // holder is stuck). Kills NOTHING: the admin confirms the recorded processes
+  // are gone (or tree-kills them) first. Refused while a job runs here.
+  H['POST /api/admin/projects/:id/lock/release'] = async (ctx) => {
+    const p = getProject(ctx.params.id);
+    const b = await body(ctx, S.forceRelease);
+    if (jobs.isActive(p.id)) { throw new HttpError(409, 'job-active', 'A job is running in this project. Stop it instead.'); }
+    const r = jobs.forceReleaseLock(p.id);
+    if (!r.ok) {
+      if (r.reason === 'job-active') { throw new HttpError(409, 'job-active', 'A job is running in this project. Stop it instead.'); }
+      throw new HttpError(409, 'not-locked', 'This project has no job lock to release.');
+    }
+    const before = r.before;
+    writeAudit(ctx, {
+      action: 'job.lock-force-release', projectId: p.id, target: p.name,
+      before: { taskPids: before?.taskPids ?? [], workerPid: before?.workerPid ?? null, lingering: before?.lingering ?? false, expired: before?.expired ?? false },
+      after: { reason: b.reason },
+    });
+    log(`project ${p.id}: job lock force-released by ${ctx.user?.username ?? '?'}`);
+    sendJson(ctx.res, 200, { released: true });
+  };
+
   H['GET /api/engines/availability'] = async (ctx) => {
     const snap = engineCache.snapshot();
     sendJson(ctx.res, 200, {
@@ -1106,6 +1137,8 @@ export function createApp(deps: AppDeps): App {
       spend: spendFor(p, st, latest?.createdAt),
       runsDisabledReason: config.runsDisabledReason,
       activeJob: jobs.activeKind(p.id),
+      // A live holder (e.g. task pids that outlived their job) keeps job.lock: a start would 409.
+      lockHeld: jobs.isLockHeld(p.id),
       // Engine config the repo ships; an approved run loads it (the plan review card warns).
       repoEngineConfig: detectRepoEngineConfig(p.workspacePath),
     });

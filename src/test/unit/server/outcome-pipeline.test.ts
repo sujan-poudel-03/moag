@@ -93,7 +93,7 @@ describe('stack evidence pipeline (worker → JobManager → outcomes.jsonl)', (
       getEngine: () => ({ runTask: async () => ({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 }) }),
       generateDeltaPlan: async () => ({ kind: 'no-delta' }),
       checkAvailability: async () => [],
-      costLedger: { onRecord: () => () => { /* none */ } },
+      costLedger: { onRecord: () => () => { /* none */ }, onUnreported: () => () => { /* none */ } },
       runVerifyCore: async () => 0,
       emit: (o) => proc.stdout.emit('data', Buffer.from(JSON.stringify(o) + '\n')),
       onStop: (cb) => {

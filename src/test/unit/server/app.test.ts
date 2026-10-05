@@ -1451,7 +1451,7 @@ describe('server app', function () {
         const g = await hx.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
         assert.equal(g.status, 409, g.raw);
         assert.equal(g.body.error, 'planner-file-access');
-        assert.match(String(g.body.message), /reading files/);
+        assert.match(String(g.body.message), new RegExp(`^${engine} can't plan without its file`));
         assert.equal(hx.workers.length, spawned, 'no worker spawned');
         assert.deepEqual(hx.state.load(id).plans, [], 'no plan record');
         assert.equal(hx.auditEntries().some((e) => e.action === 'plan.generate'), false);
@@ -1808,6 +1808,80 @@ describe('server app', function () {
     const d = await h.request('GET', '/api/projects/recommendation?path=other', { as: 'po' });
     const drec = d.body.recommendation as { state: string; stack: string; stackSource: string; detectedStack: string };
     assert.deepEqual([drec.state, drec.stack, drec.stackSource, drec.detectedStack], ['detected-differs', 'go', 'detected', 'go']);
+  });
+});
+
+// ─── Admin force-release of a project's job.lock ───
+
+describe('server app — job lock force-release', function () {
+  this.timeout(20000);
+  const LIVE_TASK_PID = 31337;
+  let h: Harness;
+
+  beforeEach(async () => { h = await startHarness({ isPidAlive: (pid) => pid === LIVE_TASK_PID }); });
+  afterEach(async () => { await h.close(); });
+
+  const release = (projectId: string, body: unknown = { reason: 'agent confirmed dead via ps' }, as = 'admin') =>
+    h.request('POST', `/api/admin/projects/${projectId}/lock/release`, { as, body });
+
+  it('409 job-active while a run is going, and nothing is audited', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    await waitFor(() => h.app.jobs.isActive(projectId));
+    const x = await release(projectId);
+    assert.equal(x.status, 409, x.raw);
+    assert.equal(x.body.error, 'job-active');
+    assert.equal(h.auditEntries().some((e) => e.action === 'job.lock-force-release'), false);
+    h.workers.at(-1)!.exit(0);
+    await waitFor(() => !h.app.jobs.isActive(projectId));
+  });
+
+  it('409 not-locked when the project has no lock', async () => {
+    const { projectId } = await approvedProject(h);
+    const x = await release(projectId);
+    assert.equal(x.status, 409, x.raw);
+    assert.equal(x.body.error, 'not-locked');
+  });
+
+  it('releases a lock held by a live task pid, shows lockHeld, and audits the before state and the reason', async () => {
+    const { projectId } = await approvedProject(h);
+    const lockPath = h.app.jobs.lockPath(projectId);
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, JSON.stringify({ serverPid: process.pid, workerPid: 999991, taskPids: [LIVE_TASK_PID] }));
+    const before = await h.request('GET', `/api/projects/${projectId}`, { as: 'po' });
+    assert.equal(before.body.lockHeld, true, 'the project DTO tells callers a start would 409');
+
+    const x = await release(projectId);
+    assert.equal(x.status, 200, x.raw);
+    assert.deepEqual(x.body, { released: true });
+    assert.equal(fs.existsSync(lockPath), false);
+    const entry = h.auditEntries().find((e) => e.action === 'job.lock-force-release')!;
+    assert.ok(entry, 'audited');
+    assert.equal(entry.projectId, projectId);
+    assert.equal(entry.actorUsername, 'admin');
+    assert.deepEqual((entry.before as { taskPids: number[] }).taskPids, [LIVE_TASK_PID]);
+    assert.deepEqual(entry.after, { reason: 'agent confirmed dead via ps' });
+    const after = await h.request('GET', `/api/projects/${projectId}`, { as: 'po' });
+    assert.equal(after.body.lockHeld, false);
+  });
+
+  it('a missing reason is a 400 and the lock stays', async () => {
+    const { projectId } = await approvedProject(h);
+    const lockPath = h.app.jobs.lockPath(projectId);
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    fs.writeFileSync(lockPath, JSON.stringify({ serverPid: process.pid, taskPids: [LIVE_TASK_PID] }));
+    const x = await release(projectId, {});
+    assert.equal(x.status, 400, x.raw);
+    assert.ok(fs.existsSync(lockPath));
+    assert.equal(h.auditEntries().some((e) => e.action === 'job.lock-force-release'), false);
+  });
+
+  it('only an admin may force-release', async () => {
+    const { projectId } = await approvedProject(h);
+    for (const as of ['po', 'reviewer', 'approver']) {
+      assert.equal((await release(projectId, undefined, as)).status, 403, as);
+    }
   });
 });
 

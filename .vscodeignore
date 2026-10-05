@@ -48,3 +48,7 @@ web/**
 out/server/**
 Dockerfile
 .dockerignore
+
+# Benchmark harness and its scenarios: a development tool, not part of the extension.
+bench/**
+out/bench/**

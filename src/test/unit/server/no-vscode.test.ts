@@ -142,3 +142,29 @@ describe('G4: server modules never load vscode', () => {
     assert.equal(/['"]vscode['"]/.test(fs.readFileSync(path.join(SERVER, 'run-worker.ts'), 'utf-8')), false);
   });
 });
+
+// ─── The benchmark harness (`moag bench`) drives the server over HTTP: never vscode ───
+
+const BENCH = path.join(SRC, 'bench');
+const benchFiles = fs.existsSync(BENCH) ? fs.readdirSync(BENCH).filter((n) => n.endsWith('.ts')).map((n) => path.join(BENCH, n)) : [];
+
+describe('bench modules never load vscode', () => {
+  it('finds the bench modules (non-vacuous)', () => {
+    assert.ok(benchFiles.length >= 6, `found ${benchFiles.length}`);
+    for (const name of ['harness.ts', 'client.ts', 'scenario.ts', 'fake-claude.ts']) {
+      assert.ok(benchFiles.some((f) => f.endsWith(name)), name);
+    }
+  });
+
+  for (const file of benchFiles) {
+    it(`bench/${path.basename(file)} reaches no vscode import at load time`, () => {
+      const offenders = [...reachable(file)].filter((f) => importsVscode(fs.readFileSync(f, 'utf-8')));
+      assert.deepEqual(offenders.map((f) => path.relative(SRC, f)), []);
+    });
+  }
+
+  it('the server the bench loads lazily (server/main.ts) reaches no vscode either', () => {
+    const offenders = [...reachable(path.join(SERVER, 'main.ts'))].filter((f) => importsVscode(fs.readFileSync(f, 'utf-8')));
+    assert.deepEqual(offenders, []);
+  });
+});

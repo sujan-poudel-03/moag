@@ -5,6 +5,7 @@ import {
   getAllEngines,
   checkEngineAvailability,
   withCostAccounting,
+  setCeilingGuard,
   EngineAdapter,
   EngineRunOptions,
 } from '../../../adapters/engine';
@@ -149,8 +150,16 @@ describe('withCostAccounting', () => {
     assert.equal(costLedger.getLifetimeUsd(), 0.5);
   });
 
-  it('records nothing when the result carries no tokenUsage', async () => {
+  /** Count unreported-call events for the rest of the test. */
+  function collectUnreported(): Array<{ engineId: string; label: string }> {
+    const seen: Array<{ engineId: string; label: string }> = [];
+    unsubs.push(costLedger.onUnreported((e) => seen.push(e)));
+    return seen;
+  }
+
+  it('records nothing when the result carries no tokenUsage, and reports the call as unreported once', async () => {
     const seen = collect();
+    const unreported = collectUnreported();
     const wrapped = withCostAccounting(
       makeCostAdapter('gemini', async () => ({
         stdout: '', stderr: '', exitCode: 0, durationMs: 1,
@@ -161,10 +170,52 @@ describe('withCostAccounting', () => {
 
     assert.equal(seen.length, 0);
     assert.equal(costLedger.getLifetimeUsd(), 0);
+    assert.deepEqual(unreported, [{ engineId: 'gemini', label: 'unattributed' }]);
   });
 
-  it('records nothing and re-throws when the inner runTask rejects', async () => {
+  it('a malformed cost (NaN, negative) is unreported, not recorded', async () => {
     const seen = collect();
+    const unreported = collectUnreported();
+    for (const estimatedCost of [NaN, -1]) {
+      const wrapped = withCostAccounting(makeCostAdapter('claude', async () => ({
+        stdout: '', stderr: '', exitCode: 0, durationMs: 1, tokenUsage: { estimatedCost },
+      })));
+      await wrapped.runTask({ prompt: 'p', cwd: '.', costLabel: 'task' });
+    }
+    assert.equal(seen.length, 0);
+    assert.equal(unreported.length, 2);
+  });
+
+  it('a reported cost is recorded once and never also reported as unreported', async () => {
+    const unreported = collectUnreported();
+    const sources: string[] = [];
+    unsubs.push(costLedger.onRecord((e) => sources.push(e.costSource)));
+    const wrapped = withCostAccounting(makeCostAdapter('claude', async () => ({
+      stdout: '', stderr: '', exitCode: 0, durationMs: 1, tokenUsage: { estimatedCost: 0.2, costSource: 'reported' },
+    })));
+    await wrapped.runTask({ prompt: 'p', cwd: '.' });
+    assert.deepEqual(sources, ['reported']);
+    assert.equal(unreported.length, 0);
+  });
+
+  it('a ceiling-blocked call fires neither onRecord nor onUnreported', async () => {
+    const seen = collect();
+    const unreported = collectUnreported();
+    let invoked = 0;
+    setCeilingGuard(() => false);
+    try {
+      const wrapped = withCostAccounting(makeCostAdapter('claude', async () => { invoked++; return { stdout: '', stderr: '', exitCode: 0, durationMs: 1, tokenUsage: usage }; }));
+      const r = await wrapped.runTask({ prompt: 'p', cwd: '.', costLabel: 'task' });
+      assert.equal(r.exitCode, 1);
+    } finally { setCeilingGuard(null); }
+    assert.equal(invoked, 0);
+    assert.equal(seen.length, 0);
+    assert.equal(unreported.length, 0);
+  });
+
+  it('records no cost, reports the call as unreported, and re-throws when the inner runTask rejects', async () => {
+    const seen = collect();
+    const unreported = collectUnreported();
     const wrapped = withCostAccounting(
       makeCostAdapter('claude', async () => {
         throw new Error('aborted');
@@ -175,8 +226,9 @@ describe('withCostAccounting', () => {
       () => wrapped.runTask({ prompt: 'p', cwd: '.', costLabel: 'task' }),
       /aborted/
     );
-    assert.equal(seen.length, 0, 'known blind spot: a rejection records nothing');
+    assert.equal(seen.length, 0, 'a rejection has no cost figure to record');
     assert.equal(costLedger.getLifetimeUsd(), 0);
+    assert.deepEqual(unreported, [{ engineId: 'claude', label: 'task' }], 'but it is counted as an unreported call');
   });
 
   it('does not double-count when wrapped twice', async () => {

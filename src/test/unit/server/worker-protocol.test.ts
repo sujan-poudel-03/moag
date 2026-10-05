@@ -34,6 +34,16 @@ describe('worker-protocol', () => {
       assert.equal(parseWorkerLine(line({ event: 'state', state: 'hacked' })), null);
       assert.equal(parseWorkerLine(line({ event: 'cost', usd: -1 })), null);
       assert.equal(parseWorkerLine(line({ event: 'cost', usd: 'NaN' })), null);
+    });
+
+    it('keeps a cost source only from the closed set; a line without one still parses', () => {
+      for (const source of ['reported', 'estimated', 'none']) {
+        assert.deepEqual(parseWorkerLine(line({ event: 'cost', usd: 0.5, source })), { event: 'cost', usd: 0.5, source });
+      }
+      assert.deepEqual(parseWorkerLine(line({ event: 'cost', usd: 0.5, source: 'guessed' })), { event: 'cost', usd: 0.5 });
+      assert.deepEqual(parseWorkerLine(line({ event: 'cost', usd: 0.5, source: 7 })), { event: 'cost', usd: 0.5 });
+      assert.deepEqual(parseWorkerLine(line({ event: 'cost', usd: 0.5 })), { event: 'cost', usd: 0.5 });
+      assert.deepEqual(parseWorkerLine(line({ event: 'cost', usd: 0, source: 'none' })), { event: 'cost', usd: 0, source: 'none' });
       assert.equal(parseWorkerLine(line({ event: 'task-engine', id: 't', engine: 'rm' })), null);
       assert.equal(parseWorkerLine(line({ event: 'plan-outcome', kind: 'approved' })), null);
       assert.equal(parseWorkerLine(line({ event: 'verify-' })), null);

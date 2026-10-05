@@ -16,6 +16,15 @@
 // server crash no longer hard-kills the worker out from under its agent. A lock
 // may also list `taskPids` (agent processes); while any of them is alive the
 // lock is held even if the worker itself is gone.
+//
+// The same rule holds while THIS server is up: when a job ends with recorded
+// task pids still alive (a tree-kill that missed a grandchild, an agent that
+// ignored its signal), the lock is NOT released. It is rewritten to name only
+// the live task pids and re-checked every `TASK_PID_LINGER_POLL_MS`, and is
+// released once they are all gone. After `TASK_PID_LINGER_MAX_MS` the watch
+// gives up but KEEPS the lock: an admin can force-release it
+// (`forceReleaseLock`, an audited route) after confirming or killing the
+// processes, or `acquireLock` reclaims it lazily once they die.
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -34,6 +43,10 @@ export const STOP_KILL_AFTER_MS = 30_000;
 export const LOCK_FILE = 'job.lock';
 /** How often a boot-time watch re-checks a job.lock still held by a predecessor's worker. */
 export const HELD_LOCK_POLL_MS = 5_000;
+/** How often a finished job's lock is re-checked while its recorded task pids are alive. */
+export const TASK_PID_LINGER_POLL_MS = 1_000;
+/** How long that re-check runs before it stops and leaves the lock for an admin to force-release. */
+export const TASK_PID_LINGER_MAX_MS = 5 * 60_000;
 
 /** The slice of ChildProcess the manager uses (fakeable in tests). */
 export interface WorkerProcess extends EventEmitter {
@@ -115,7 +128,35 @@ export interface JobManagerOptions {
   isPidAlive?: (pid: number) => boolean;
   /** Workers lead their own process group (POSIX `detached: true`); recorded in the lock as `workerPgid`. */
   workerLeadsProcessGroup?: boolean;
+  /** Linger re-check interval (default {@link TASK_PID_LINGER_POLL_MS}; tests override). */
+  lingerPollMs?: number;
+  /** Linger give-up time (default {@link TASK_PID_LINGER_MAX_MS}; tests override). */
+  lingerMaxMs?: number;
   log?: (message: string) => void;
+}
+
+/** What a project's job.lock records, for the API (`lockHeld`) and the force-release audit entry. */
+export interface JobLockStatus {
+  /** A live process other than this server holds it (see {@link JobManager.isLockHeld}). */
+  held: boolean;
+  taskPids: number[];
+  workerPid: number | null;
+  /** This server kept the lock after its job ended because recorded task pids were alive. */
+  lingering: boolean;
+  /** The linger watch gave up (max wait passed) and left the lock in place. */
+  expired: boolean;
+}
+
+export type ForceReleaseResult =
+  | { ok: true; before: JobLockStatus | null }
+  | { ok: false; reason: 'job-active' | 'not-locked' };
+
+interface LingeringLock {
+  timer: NodeJS.Timeout | null;
+  pids: number[];
+  since: number;
+  lockPath: string;
+  expired: boolean;
 }
 
 interface ActiveJob {
@@ -148,6 +189,8 @@ export class JobManager {
   private readonly active = new Map<string, ActiveJob>();
   private readonly subscribers = new Map<string, Set<(n: JobNotice) => void>>();
   private readonly isPidAlive: (pid: number) => boolean;
+  /** Locks kept after their job ended because recorded task pids were still alive. */
+  private readonly lingering = new Map<string, LingeringLock>();
 
   constructor(private readonly opts: JobManagerOptions) {
     this.isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
@@ -180,6 +223,9 @@ export class JobManager {
     if (!this.acquireLock(lockPath)) {
       return { ok: false, status: 409, reason: 'project-locked', message: 'This project is locked by another process.' };
     }
+    // The lock is ours now: a linger watch left by the previous job (whose
+    // pids died before its next tick) must never delete it.
+    this.cancelLinger(projectId);
 
     let proc: WorkerProcess;
     try {
@@ -248,6 +294,39 @@ export class JobManager {
   }
 
   subscriberCount(projectId: string): number { return this.subscribers.get(projectId)?.size ?? 0; }
+
+  /**
+   * What the project's job.lock records, or null when there is no lock file.
+   * An unreadable lock reports `held: false` with no pids.
+   */
+  lockInfo(projectId: string): JobLockStatus | null {
+    const info = readLock(this.lockPath(projectId));
+    if (info === undefined) { return null; }
+    const linger = this.lingering.get(projectId);
+    return {
+      held: info !== null && this.lockHeld(info),
+      taskPids: info?.taskPids ?? [],
+      workerPid: info?.workerPid ?? null,
+      lingering: linger !== undefined,
+      expired: linger?.expired === true,
+    };
+  }
+
+  /**
+   * Admin escape hatch: delete the project's job.lock and stop any linger
+   * watch. Refused while this server runs a job there. Kills NOTHING — the
+   * caller must have confirmed (or tree-killed) the recorded processes first.
+   */
+  forceReleaseLock(projectId: string): ForceReleaseResult {
+    if (this.active.has(projectId)) { return { ok: false, reason: 'job-active' }; }
+    const before = this.lockInfo(projectId);
+    const wasLingering = this.lingering.has(projectId);
+    this.cancelLinger(projectId);
+    if (before === null && !wasLingering) { return { ok: false, reason: 'not-locked' }; }
+    this.releaseLock(this.lockPath(projectId));
+    this.opts.log?.(`project ${projectId}: job lock force-released (task pids ${before?.taskPids.join(',') || '-'})`);
+    return { ok: true, before };
+  }
 
   /**
    * Boot-time: remove lock files left by a crashed predecessor. A lock whose
@@ -383,6 +462,71 @@ export class JobManager {
     try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
   }
 
+  // ─── Lock linger (task pids outliving their job) ───
+
+  /**
+   * A job ended: release its lock now, or — when any recorded task pid is
+   * still alive — keep it, rewritten to name only those pids, and re-check on
+   * an unref'd interval until they die or the max wait passes.
+   */
+  private releaseWhenTasksExit(a: ActiveJob): void {
+    const alive = [...a.taskPids].filter((p) => p !== process.pid && this.isPidAlive(p));
+    if (alive.length === 0) {
+      this.releaseLock(a.lockPath);
+      return;
+    }
+    const workerPid = a.proc.pid ?? null;
+    try {
+      writeFileAtomicSync(a.lockPath, JSON.stringify({
+        serverPid: process.pid,
+        ...(workerPid ? { workerPid } : {}),
+        ...(workerPid && this.opts.workerLeadsProcessGroup ? { workerPgid: workerPid } : {}),
+        taskPids: alive,
+      }), 0o600);
+    } catch (err) { this.opts.log?.(`job.lock linger write for project ${a.projectId}: ${(err as Error).message}`); }
+    this.opts.log?.(`project ${a.projectId}: job ended but task pid(s) ${alive.join(',')} are still alive; keeping job.lock until they exit`);
+    this.cancelLinger(a.projectId);
+    const now = this.opts.now ?? Date.now;
+    const maxMs = this.opts.lingerMaxMs ?? TASK_PID_LINGER_MAX_MS;
+    const entry: LingeringLock = { timer: null, pids: alive, since: now(), lockPath: a.lockPath, expired: false };
+    const stopTimer = (): void => { if (entry.timer) { clearInterval(entry.timer); entry.timer = null; } };
+    const tick = (): void => {
+      if (this.lingering.get(a.projectId) !== entry) { stopTimer(); return; }
+      try {
+        if (this.active.has(a.projectId)) {
+          // A new job owns the lock now; never touch it.
+          stopTimer();
+          this.lingering.delete(a.projectId);
+          return;
+        }
+        entry.pids = entry.pids.filter((p) => this.isPidAlive(p));
+        if (entry.pids.length === 0) {
+          stopTimer();
+          this.lingering.delete(a.projectId);
+          this.releaseLock(entry.lockPath);
+          this.opts.log?.(`project ${a.projectId}: lingering task pids exited; job.lock released`);
+          return;
+        }
+        if (now() - entry.since >= maxMs) {
+          stopTimer();
+          entry.expired = true;
+          this.opts.log?.(`project ${a.projectId}: job.lock still held by task pid(s) ${entry.pids.join(',')} after ${Math.round(maxMs / 1000)} s; an admin can force-release it`);
+        }
+      } catch (err) { this.opts.log?.(`lock linger ${a.projectId}: ${(err as Error).message}`); }
+    };
+    entry.timer = setInterval(tick, this.opts.lingerPollMs ?? TASK_PID_LINGER_POLL_MS);
+    entry.timer.unref?.();
+    this.lingering.set(a.projectId, entry);
+  }
+
+  /** Stop a project's linger watch (if any) without touching its lock file. */
+  private cancelLinger(projectId: string): void {
+    const entry = this.lingering.get(projectId);
+    if (!entry) { return; }
+    if (entry.timer) { clearInterval(entry.timer); entry.timer = null; }
+    this.lingering.delete(projectId);
+  }
+
   private wire(a: ActiveJob, input: StartJobInput): void {
     const { proc } = a;
     const redact = input.redact ?? [];
@@ -454,7 +598,7 @@ export class JobManager {
       proc.removeListener('close', onClose);
       proc.removeListener('error', onError);
       if (this.active.get(a.projectId) === a) { this.active.delete(a.projectId); }
-      this.releaseLock(a.lockPath);
+      this.releaseWhenTasksExit(a);
       const end: JobEnd = {
         jobId: a.jobId,
         projectId: a.projectId,

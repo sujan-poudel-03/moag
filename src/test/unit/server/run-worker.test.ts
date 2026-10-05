@@ -59,12 +59,15 @@ interface Harness {
   unsubscribed: number;
   stopDisposed: number;
   triggerStop: () => void;
-  costListener: ((e: { estimatedCostUsd: number }) => void) | null;
+  costListener: ((e: { estimatedCostUsd: number; costSource?: 'reported' | 'estimated' }) => void) | null;
+  unreportedListener: ((e: { engineId: string; label: string }) => void) | null;
+  unsubscribedUnreported: number;
 }
 
 function harness(runner: FakeRunner, over: Partial<WorkerDeps> = {}, plan = mkPlan()): Harness {
   const h: Harness = {
     events: [], saves: 0, verifyCalls: 0, unsubscribed: 0, stopDisposed: 0, triggerStop: () => {}, costListener: null,
+    unreportedListener: null, unsubscribedUnreported: 0,
     deps: undefined as unknown as WorkerDeps,
   };
   h.deps = {
@@ -74,7 +77,10 @@ function harness(runner: FakeRunner, over: Partial<WorkerDeps> = {}, plan = mkPl
     getEngine: () => ({ runTask: async () => ({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 }) }),
     generateDeltaPlan: async () => ({ kind: 'no-delta' }),
     checkAvailability: async () => [],
-    costLedger: { onRecord: (l) => { h.costListener = l; return () => { h.unsubscribed++; h.costListener = null; }; } },
+    costLedger: {
+      onRecord: (l) => { h.costListener = l; return () => { h.unsubscribed++; h.costListener = null; }; },
+      onUnreported: (l) => { h.unreportedListener = l; return () => { h.unsubscribedUnreported++; h.unreportedListener = null; }; },
+    },
     runVerifyCore: async () => { h.verifyCalls++; return 0; },
     emit: (o) => { h.events.push(o); },
     onStop: (cb) => { h.triggerStop = cb; return () => { h.stopDisposed++; }; },
@@ -196,6 +202,26 @@ describe('run-worker', () => {
       }
     });
 
+    it('forwards the cost source, and an unreported call as a usd 0 source none line', async () => {
+      let h!: Harness;
+      const runner = new FakeRunner(async () => {
+        h.costListener?.({ estimatedCostUsd: 0.5, costSource: 'reported' });
+        h.costListener?.({ estimatedCostUsd: 0.1 });
+        h.unreportedListener?.({ engineId: 'claude', label: 'task' });
+      });
+      h = harness(runner);
+      await runJob(RUN_JOB, h.deps);
+      const costs = h.events.filter((e) => e.event === 'cost');
+      assert.deepEqual(costs, [
+        { event: 'cost', usd: 0.5, source: 'reported' },
+        { event: 'cost', usd: 0.1, source: 'estimated' },
+        { event: 'cost', usd: 0, source: 'none' },
+      ]);
+      for (const e of costs) { assert.deepEqual(parseWorkerLine(JSON.stringify(e)), e, 'the protocol keeps the source'); }
+      assert.equal(h.unsubscribed, 1);
+      assert.equal(h.unsubscribedUnreported, 1);
+    });
+
     it('refuses with exit 2 and never plays when CI is set', async () => {
       const runner = new FakeRunner(async () => {});
       const h = harness(runner, { env: { CI: 'true' } });
@@ -211,6 +237,7 @@ describe('run-worker', () => {
       const h = harness(runner);
       assert.equal(await runJob(RUN_JOB, h.deps), 2);
       assert.equal(h.unsubscribed, 1);
+      assert.equal(h.unsubscribedUnreported, 1, 'the unreported subscription is disposed too');
       assert.equal(h.stopDisposed, 1);
       assert.equal(runner.ee.eventNames().length, 0, 'no runner listeners left');
       assert.ok(h.events.some((e) => e.event === 'error' && e.message === 'kaboom'));
@@ -221,6 +248,7 @@ describe('run-worker', () => {
       const h = harness(new FakeRunner(async () => {}), { loadPlan: () => { throw new Error('bad plan'); } });
       assert.equal(await runJob(RUN_JOB, h.deps), 2);
       assert.equal(h.costListener, null);
+      assert.equal(h.unreportedListener, null);
     });
 
     it('an IPC stop request calls runner.stop()', async () => {
@@ -526,6 +554,7 @@ describe('run-worker', () => {
       const h = harness(new FakeRunner(async () => {}), { generateDeltaPlan: async () => { throw new Error('gen blew up'); } });
       assert.equal(await runJob({ kind: 'plan', mode: 'delta', workspace: dir, planPath: '/p', outPath: path.join(dir, 'o.json'), engine: 'claude' }, h.deps), 2);
       assert.equal(h.unsubscribed, 1);
+      assert.equal(h.unsubscribedUnreported, 1);
       assert.ok(h.events.some((e) => e.event === 'error'));
     });
   });

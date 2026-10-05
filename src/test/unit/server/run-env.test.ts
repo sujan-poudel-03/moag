@@ -4,7 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   buildWorkerEnv, buildWorkerConfig, buildPlanWorkerConfig, referencedEngines, isForbiddenWorkerEnvName, CODEX_PLAN_ARGS,
-  CLAUDE_PLAN_ARGS, PLANNER_LOCKED_ENGINES, plannerFileAccessRefusal,
+  CLAUDE_PLAN_ARGS, PLANNER_LOCKED_ENGINES, plannerFileAccessRefusal, perCallBudgetUsd,
 } from '../../../server/run-env';
 import { ENGINE_IDS } from '../../../models/types';
 import { workspace as shimWorkspace, __setWorkspaceRoot } from '../../../headless/vscode-shim';
@@ -135,6 +135,19 @@ describe('run-env', () => {
       assert.throws(() => buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 10 }, NaN), /exhausted/);
     });
 
+    it('runs Claude in JSON mode with a per-call cap of min(remaining cap, server per-call max)', () => {
+      const per = (cap: number, remaining: number, max: number | null) =>
+        buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: cap }, remaining, max).agentTaskPlayer['engines.claude.maxBudgetUsdPerCall'];
+      assert.equal(per(10, 5, null), 5, 'cap 5 remaining, no server max');
+      assert.equal(per(10, 5, 1.5), 1.5, 'the server max is smaller');
+      assert.equal(per(10, 0.75, 1.5), 0.75, 'the remaining cap is smaller');
+      assert.equal(per(0, 99, null), 0, 'no cap and no max: no per-call flag');
+      assert.equal(per(0, 99, 2), 2, 'no project cap: the server max alone');
+      assert.equal(buildWorkerConfig({ defaultEngine: 'codex', versionBudgetUsd: 0 }, 0).agentTaskPlayer['engines.claude.outputFormat'], 'json');
+      assert.equal(perCallBudgetUsd(5, null), 5);
+      assert.equal(perCallBudgetUsd(0, null), 0);
+    });
+
     it('a run config leaves engine auto-approve at its defaults', () => {
       const c = buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0).agentTaskPlayer as Record<string, unknown>;
       assert.equal('engines.claude.autoApprove' in c, false);
@@ -160,6 +173,12 @@ describe('run-env', () => {
       assert.throws(() => buildPlanWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 10 }, 0), /exhausted/);
     });
 
+    it('inherits JSON mode and the per-call cap', () => {
+      const c = buildPlanWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 10 }, 4, 1).agentTaskPlayer;
+      assert.equal(c['engines.claude.outputFormat'], 'json');
+      assert.equal(c['engines.claude.maxBudgetUsdPerCall'], 1);
+    });
+
     it('the headless shim reads the plan config the way the adapters ask for it', () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-plancfg-'));
       const prev = process.env.MOAG_CONFIG_PATH;
@@ -176,6 +195,9 @@ describe('run-env', () => {
         assert.deepEqual(shimWorkspace.getConfiguration('agentTaskPlayer.engines.codex').get<string[]>('args', []), [...CODEX_PLAN_ARGS]);
         // Claude: the exact lookup in claude-adapter.ts (default ['-p']) yields the no-tools args.
         assert.deepEqual(shimWorkspace.getConfiguration('agentTaskPlayer.engines.claude').get<string[]>('args', ['-p']), [...CLAUDE_PLAN_ARGS]);
+        // JSON mode and the per-call cap: the exact lookups in claude-adapter.ts (defaults 'text' / 0).
+        assert.equal(shimWorkspace.getConfiguration('agentTaskPlayer.engines.claude').get<string>('outputFormat', 'text'), 'json');
+        assert.equal(shimWorkspace.getConfiguration('agentTaskPlayer.engines.claude').get<number>('maxBudgetUsdPerCall', 0), 0);
       } finally {
         if (prev === undefined) { delete process.env.MOAG_CONFIG_PATH; } else { process.env.MOAG_CONFIG_PATH = prev; }
         __setWorkspaceRoot(process.cwd());
@@ -189,9 +211,26 @@ describe('run-env', () => {
       assert.deepEqual([...PLANNER_LOCKED_ENGINES].sort(), ['claude', 'codex', 'ollama']);
       for (const e of ['claude', 'codex', 'ollama'] as const) { assert.equal(plannerFileAccessRefusal(e, false), null, e); }
       for (const e of ['gemini', 'anthropic'] as const) {
-        assert.match(plannerFileAccessRefusal(e, false) ?? '', /reading files/, e);
+        assert.match(plannerFileAccessRefusal(e, false) ?? '', /can't plan without its file/, e);
         assert.equal(plannerFileAccessRefusal(e, true), null, `${e} with the admin override`);
       }
+    });
+
+    it('the anthropic refusal says the override grants shell execution and file writes', () => {
+      const msg = plannerFileAccessRefusal('anthropic', false) ?? '';
+      assert.match(msg, /shell/);
+      assert.match(msg, /write/);
+      assert.match(msg, /^anthropic /);
+    });
+
+    it('the gemini refusal names its file tools and does not mention shell', () => {
+      const msg = plannerFileAccessRefusal('gemini', false) ?? '';
+      assert.match(msg, /^gemini can't plan without its file tools/);
+      assert.doesNotMatch(msg, /shell/i);
+    });
+
+    it('custom and copilot are still refused with the generic message', () => {
+      for (const e of ['custom', 'copilot'] as const) { assert.match(plannerFileAccessRefusal(e, false) ?? '', /reading files/, e); }
     });
 
     it('every server engine is classified: locked down, or refused unless overridden', () => {

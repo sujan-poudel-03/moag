@@ -106,16 +106,28 @@ export function withCostAccounting(adapter: EngineAdapter): EngineAdapter {
         return { stdout: '', stderr: CEILING_BLOCKED_MESSAGE, exitCode: 1, durationMs: 0 };
       }
 
-      // KNOWN BLIND SPOT: a rejection (abort, timeout kill, spawn failure)
-      // records nothing, because there is no EngineResult to read tokenUsage
-      // from. Tokens spent before the failure stay invisible to the ceiling,
-      // so the ledger under-counts on exactly the runs that cost the most.
-      const result = await adapter.runTask(options);
-      // Recorded even on a non-zero exit — a failed task still burned tokens.
-      costLedger.record(result.tokenUsage, {
-        engineId: adapter.id,
-        label: options.costLabel,
-      });
+      // Contract: every call that reaches the engine is accounted exactly once.
+      // A result with a finite, non-negative cost is recorded (even on a
+      // non-zero exit: a failed task still burned tokens). A result without one,
+      // or a rejection (abort, timeout kill, spawn failure), is reported on the
+      // ledger's separate unreported channel: its spend is unknown, so consumers
+      // that must bound it (server, bench) count it against a per-call cap.
+      let result: EngineResult;
+      try {
+        result = await adapter.runTask(options);
+      } catch (err) {
+        costLedger.recordUnreported({ engineId: adapter.id, label: options.costLabel });
+        throw err;
+      }
+      const cost = result.tokenUsage?.estimatedCost;
+      if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+        costLedger.record(result.tokenUsage, {
+          engineId: adapter.id,
+          label: options.costLabel,
+        });
+      } else {
+        costLedger.recordUnreported({ engineId: adapter.id, label: options.costLabel });
+      }
       return result;
     },
   };

@@ -56,7 +56,10 @@ export interface WorkerDeps {
     signal: AbortSignal;
   }): Promise<DeltaOutcomeLike>;
   checkAvailability(): Promise<ProbeRow[]>;
-  costLedger: { onRecord(listener: (e: { estimatedCostUsd: number }) => void): () => void };
+  costLedger: {
+    onRecord(listener: (e: { estimatedCostUsd: number; costSource?: 'reported' | 'estimated' }) => void): () => void;
+    onUnreported(listener: (e: { engineId: string; label: string }) => void): () => void;
+  };
   /** `cli.runVerifyCore` bound to this job's args/ctx with persist = 'plan'. */
   runVerifyCore(plan: PlanLike, events: RunEventState): Promise<number>;
   emit(obj: Record<string, unknown>): void;
@@ -123,6 +126,24 @@ export async function runJob(job: WorkerJob, deps: WorkerDeps): Promise<number> 
   } finally {
     disposeChildren?.();
   }
+}
+
+/**
+ * Forward every engine call's cost to the server: a recorded cost as
+ * `{event:'cost', usd, source}` (source 'reported' or 'estimated'), and a call
+ * that reported none as `{event:'cost', usd: 0, source: 'none'}` so the server
+ * and the benchmark can count it. Returns one disposer for both subscriptions.
+ */
+function subscribeCost(deps: WorkerDeps): () => void {
+  const offRecord = deps.costLedger.onRecord((e) => deps.emit({ event: 'cost', usd: e.estimatedCostUsd, source: e.costSource ?? 'estimated' }));
+  let offUnreported: (() => void) | null = null;
+  try {
+    offUnreported = deps.costLedger.onUnreported(() => deps.emit({ event: 'cost', usd: 0, source: 'none' }));
+  } catch (err) {
+    offRecord();
+    throw err;
+  }
+  return () => { offRecord(); offUnreported?.(); };
 }
 
 // ─── Run mode ───
@@ -221,7 +242,7 @@ async function runRunJob(job: RunJob, deps: WorkerDeps): Promise<number> {
   let unsubscribeCost: (() => void) | null = null;
   let disposeStop: (() => void) | null = null;
   try {
-    unsubscribeCost = deps.costLedger.onRecord((e) => deps.emit({ event: 'cost', usd: e.estimatedCostUsd }));
+    unsubscribeCost = subscribeCost(deps);
     for (const [ev, fn] of listeners) { runner.on(ev, fn); }
     // IPC stop or parent disconnect: stop the runner and let play() settle — it
     // aborts and tree-kills the running task — before this function returns.
@@ -320,7 +341,7 @@ async function runPlanJob(job: PlanJob, deps: WorkerDeps): Promise<number> {
   let unsubscribeCost: (() => void) | null = null;
   let disposeStop: (() => void) | null = null;
   try {
-    unsubscribeCost = deps.costLedger.onRecord((e) => deps.emit({ event: 'cost', usd: e.estimatedCostUsd }));
+    unsubscribeCost = subscribeCost(deps);
     disposeStop = deps.onStop(() => abort.abort());
     const engine = deps.getEngine(job.engine);
     const outcome = await deps.generateDeltaPlan(copy, {

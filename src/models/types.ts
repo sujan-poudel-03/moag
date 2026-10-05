@@ -315,6 +315,13 @@ export interface TokenUsage {
   totalTokens?: number;
   /** Estimated cost in USD (if computable) */
   estimatedCost?: number;
+  /**
+   * Where `estimatedCost` came from: 'reported' = the engine's own billing
+   * figure (e.g. Claude JSON `total_cost_usd`), 'estimated' = derived by MOAG
+   * (price table, text scraping). Absent = treated as 'estimated'. Runtime
+   * only — not a plan-file field.
+   */
+  costSource?: 'reported' | 'estimated';
 }
 
 /** Result of an AI-driven PRD verification pass */

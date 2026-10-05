@@ -435,6 +435,32 @@ describe('prd-ops', () => {
       // 'g' was free when the gate was built, so the id is reused and not duplicated.
       assert.deepEqual(byId(pl, 'rel').dependsOn, ['impl', 'g']);
     });
+
+    // ─── Stable partition: planner order within each group is preserved ───
+
+    it('is a stable partition: an interleaved playlist keeps planner order within each group', () => {
+      const pl: PlanFilePlaylist = { id: 'pl', name: 'x', autoplay: true, tasks: [
+        { id: 'n1', name: 'N1', prompt: 'n1' },
+        { id: 'rel', name: 'Release', prompt: '', type: 'release', command: 'x', dependsOn: ['n1'] },
+        { id: 'n2', name: 'N2', prompt: 'n2' },
+        { id: 'dep', name: 'Deploy', prompt: '', type: 'deploy', command: 'y', dependsOn: ['rel'] },
+        { id: 'n3', name: 'N3', prompt: 'n3', dependsOn: ['n2'] },
+        { id: 'n4', name: 'N4', prompt: 'n4' },
+      ] };
+      appendShipGate(pl, 'gate');
+      assert.deepEqual(pl.tasks.map((t) => t.id), ['n1', 'n2', 'n3', 'n4', 'gate', 'rel', 'dep']);
+    });
+
+    it('does not re-sort non-shipping tasks the planner placed in reverse dependency order', () => {
+      const pl: PlanFilePlaylist = { id: 'pl', name: 'x', autoplay: true, tasks: [
+        { id: 'z', name: 'Z', prompt: 'z', dependsOn: ['y'] },
+        { id: 'rel', name: 'Release', prompt: '', type: 'release', command: 'x' },
+        { id: 'y', name: 'Y', prompt: 'y', dependsOn: ['x'] },
+        { id: 'x', name: 'X', prompt: 'x' },
+      ] };
+      appendShipGate(pl, 'gate');
+      assert.deepEqual(pl.tasks.map((t) => t.id), ['z', 'y', 'x', 'gate', 'rel']);
+    });
   });
 });
 

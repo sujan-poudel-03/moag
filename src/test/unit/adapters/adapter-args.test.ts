@@ -146,6 +146,106 @@ describe('adapter argument building', () => {
     });
   });
 
+  describe('ClaudeAdapter JSON output mode and per-call budget', () => {
+    type Captured = { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean };
+    /** A ClaudeAdapter whose runCli returns `out` and captures its config. */
+    function claudeWith(out: { stdout: string; stderr?: string; exitCode?: number }): { adapter: { runTask: (o: { prompt: string; cwd: string }) => Promise<import('../../../models/types').EngineResult> }; captured: () => Captured } {
+      let captured: Captured | undefined;
+      const { ClaudeAdapter: CA } = proxyquire('../../../adapters/claude-adapter', {
+        vscode: vscodeMock,
+        fs: { mkdirSync: () => undefined, writeFileSync: () => undefined, existsSync: () => false, readFileSync: () => '', unlinkSync: () => undefined },
+        './base-cli': {
+          runCli: (config: Captured) => {
+            captured = config;
+            return Promise.resolve({ stdout: out.stdout, stderr: out.stderr ?? '', exitCode: out.exitCode ?? 0, durationMs: 1 });
+          },
+        },
+      });
+      return { adapter: new CA(), captured: () => captured! };
+    }
+    const jsonLine = (o: Record<string, unknown>) => JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'done', total_cost_usd: 0.42, usage: { input_tokens: 10, output_tokens: 5 }, ...o });
+
+    it('appends --output-format json and --max-budget-usd with two decimals', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false, outputFormat: 'json', maxBudgetUsdPerCall: 1.5 });
+      const c = claudeWith({ stdout: jsonLine({}) });
+      await c.adapter.runTask({ prompt: 'hello', cwd: '/tmp' });
+      const args = c.captured().buildArgs({ prompt: 'hello' });
+      assert.deepEqual(args, ['-p', '--output-format', 'json', '--max-budget-usd', '1.50']);
+      assert.equal(c.captured().useStdin, true);
+      assert.ok(!args.includes('hello'));
+    });
+
+    it('never duplicates flags the args already carry', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', {
+        args: ['-p', '--output-format', 'json', '--max-budget-usd=0.25'], autoApprove: false, outputFormat: 'json', maxBudgetUsdPerCall: 1.5,
+      });
+      const c = claudeWith({ stdout: jsonLine({}) });
+      await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
+      assert.deepEqual(c.captured().buildArgs({ prompt: 'p' }), ['-p', '--output-format', 'json', '--max-budget-usd=0.25']);
+    });
+
+    it('a zero or negative per-call cap adds no flag', async () => {
+      for (const maxBudgetUsdPerCall of [0, -1]) {
+        setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false, maxBudgetUsdPerCall });
+        const c = claudeWith({ stdout: 'x' });
+        await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
+        assert.deepEqual(c.captured().buildArgs({ prompt: 'p' }), ['-p']);
+      }
+    });
+
+    it('a JSON success sets stdout to the result text and reports the CLI cost as reported', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false, outputFormat: 'json' });
+      const c = claudeWith({ stdout: `some banner\n${jsonLine({ result: '{"tasks":[]}' })}\n` });
+      const r = await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
+      assert.equal(r.stdout, '{"tasks":[]}');
+      assert.equal(r.exitCode, 0);
+      assert.deepEqual(r.tokenUsage, { inputTokens: 10, outputTokens: 5, estimatedCost: 0.42, costSource: 'reported' });
+    });
+
+    it('is_error with exit 0 fails the call with the subtype in stderr', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false, outputFormat: 'json' });
+      const c = claudeWith({ stdout: jsonLine({ is_error: true, subtype: 'error_max_budget_usd', result: 'budget hit', total_cost_usd: 1.51 }), stderr: 'warn' });
+      const r = await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
+      assert.equal(r.exitCode, 1);
+      assert.match(r.stderr, /^warn\n\[claude\] error_max_budget_usd: budget hit$/);
+      assert.equal(r.tokenUsage?.estimatedCost, 1.51, 'a failed call still reports what it spent');
+    });
+
+    it('a non-zero exit is kept as is when is_error is set', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false, outputFormat: 'json' });
+      const c = claudeWith({ stdout: jsonLine({ is_error: true }), exitCode: 2 });
+      assert.equal((await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' })).exitCode, 2);
+    });
+
+    it('garbage stdout in JSON mode leaves stdout raw and gives no tokenUsage', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false, outputFormat: 'json' });
+      const c = claudeWith({ stdout: 'not json {oops' });
+      const r = await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
+      assert.equal(r.stdout, 'not json {oops');
+      assert.equal(r.tokenUsage, undefined);
+    });
+
+    it('prose with a dollar figure is never scraped in JSON mode', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false, outputFormat: 'json' });
+      const noCost = claudeWith({ stdout: 'This change will cost: $3.50 per month. input_tokens: 1200 output_tokens: 300' });
+      assert.equal((await noCost.adapter.runTask({ prompt: 'p', cwd: '/tmp' })).tokenUsage, undefined);
+      const badCost = claudeWith({ stdout: jsonLine({ result: 'Costs $3.50', total_cost_usd: 'n/a' }) });
+      const r = await badCost.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
+      assert.equal(r.stdout, 'Costs $3.50');
+      assert.equal(r.tokenUsage, undefined, 'a missing total_cost_usd is unreported, not estimated');
+    });
+
+    it('text mode is unchanged: still scrapes cost and adds no JSON flag', async () => {
+      setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false });
+      const c = claudeWith({ stdout: 'All done. cost: $0.04' });
+      const r = await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
+      assert.deepEqual(c.captured().buildArgs({ prompt: 'p' }), ['-p']);
+      assert.equal(r.stdout, 'All done. cost: $0.04');
+      assert.equal(r.tokenUsage?.estimatedCost, 0.04);
+      assert.equal(r.tokenUsage?.costSource, undefined);
+    });
+  });
+
   describe('ClaudeAdapter in a plan-generation job', () => {
     it('gets no tools and no MCP servers, never skips permissions, and writes no settings.local.json', async () => {
       // eslint-disable-next-line @typescript-eslint/no-var-requires

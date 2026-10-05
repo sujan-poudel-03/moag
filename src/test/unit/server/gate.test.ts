@@ -102,7 +102,7 @@ describe('prepareGateResume', () => {
 
 describe('stampApprovedShip', () => {
   const AT = '2026-10-04T00:00:00.000Z';
-  function shipPlan(releaseStatus: TaskStatus | null): Plan {
+  function shipPlan(releaseStatus: TaskStatus | null, deployStatus: TaskStatus | null = null): Plan {
     const plan = createEmptyPlan('Ship');
     plan.prdVersions = [{ version: '1.0.0', text: '## Requirements\n- [R-1] login\n', createdAt: AT }];
     plan.playlists[0].tasks.push(
@@ -111,6 +111,10 @@ describe('stampApprovedShip', () => {
     );
     if (releaseStatus !== null) {
       plan.playlists[0].tasks.push(task('rel', releaseStatus, { type: 'release', dependsOn: ['ship'], command: 'npm run release' }));
+    }
+    if (deployStatus !== null) {
+      const deps = releaseStatus !== null ? ['rel'] : ['ship'];
+      plan.playlists[0].tasks.push(task('dep', deployStatus, { type: 'deploy', dependsOn: deps, command: 'npm run deploy' }));
     }
     recordGateResults(plan, [{ command: 'npm test', exitCode: 0, timedOut: false }], AT);
     return plan;
@@ -128,6 +132,27 @@ describe('stampApprovedShip', () => {
       assert.equal((plan.requirementTrace ?? []).every((r) => r.releases.length === 0), true);
     });
   }
+
+  for (const s of [TaskStatus.Failed, TaskStatus.Skipped, TaskStatus.Blocked, TaskStatus.Pending]) {
+    it(`never stamps while the run's deploy is ${s}, even with the release Completed`, () => {
+      const plan = shipPlan(TaskStatus.Completed, s);
+      assert.deepEqual(stampApprovedShip(plan, 'r1', AT, 0), []);
+      assert.equal((plan.requirementTrace ?? []).every((r) => r.releases.length === 0), true, 'no release stamped');
+    });
+  }
+
+  it('stamps when the only shipping task is a Completed deploy', () => {
+    assert.deepEqual(stampApprovedShip(shipPlan(null, TaskStatus.Completed), 'r1', AT, 0), ['R-1']);
+  });
+
+  it('a failed deploy in a different playlist does not block when an index is given', () => {
+    const plan = shipPlan(TaskStatus.Completed, TaskStatus.Completed);
+    const other = createPlaylist('Other');
+    other.tasks.push(task('other-dep', TaskStatus.Failed, { type: 'deploy', command: 'x' }));
+    plan.playlists.push(other);
+    assert.deepEqual(stampApprovedShip(plan, 'r1', AT, 0), ['R-1']);
+    assert.deepEqual(stampApprovedShip(plan, 'r1', AT), [], 'whole plan: the other playlist\'s failed deploy blocks');
+  });
 
   it('checks only the run\'s playlist when an index is given, every playlist otherwise', () => {
     const plan = shipPlan(TaskStatus.Completed);

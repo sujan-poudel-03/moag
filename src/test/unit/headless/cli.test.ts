@@ -50,6 +50,34 @@ describe('headless CLI: parseArgs', () => {
   });
 });
 
+describe('headless CLI: moag bench flags', () => {
+  it('parses the scenario, --dry-run, --out (against the final --cwd) and --max-usd', () => {
+    const base = path.resolve(os.tmpdir(), 'bench-cwd');
+    const a = parseArgs(['bench', 'scn/scenario.json', '--dry-run', '--out', 'res', '--max-usd', '4.95', '--cwd', base]);
+    assert.equal(a.command, 'bench');
+    assert.equal(a.dryRun, true);
+    assert.equal(a.maxUsd, 4.95);
+    assert.equal(a.out, path.join(base, 'res'));
+    assert.equal(a.planPath, path.resolve(process.cwd(), 'scn/scenario.json'), 'the positional resolves against the cwd at the time it was read');
+  });
+
+  it('a bad --max-usd becomes NaN (a usage error), never a silent cap', () => {
+    for (const bad of ['0', '-1', 'abc', 'Infinity', '']) {
+      assert.ok(Number.isNaN(parseArgs(['bench', 's.json', '--max-usd', bad]).maxUsd), bad);
+    }
+    assert.ok(Number.isNaN(parseArgs(['bench', 's.json', '--max-usd']).maxUsd), 'missing value');
+  });
+
+  it('a bare --out is recorded as empty (a usage error), and no flags leave the bench fields unset', () => {
+    assert.equal(parseArgs(['bench', 's.json', '--out']).out, '');
+    assert.equal(parseArgs(['bench', 's.json', '--out', '--dry-run']).out, '');
+    const plain = parseArgs(['bench', 's.json']);
+    assert.equal(plain.dryRun, undefined);
+    assert.equal(plain.out, undefined);
+    assert.equal(plain.maxUsd, undefined);
+  });
+});
+
 describe('headless CLI: buildPromptPlan', () => {
   it('creates a single agent task carrying the full prompt', () => {
     const plan = buildPromptPlan('summarize the readme', 'claude');

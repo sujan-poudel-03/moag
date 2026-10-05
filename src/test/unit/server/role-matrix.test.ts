@@ -84,6 +84,7 @@ describe('role matrix (ROUTES × WEB_ROLES)', function () {
       'users.manage': ['admin'],
       'audit.view': ['admin'],
       'engines.manage': ['admin'],
+      'jobs.force-release': ['admin'],
     };
     assert.deepEqual(Object.keys(PINNED).sort(), [...SERVER_ACTIONS].sort());
     for (const a of SERVER_ACTIONS) { assert.deepEqual([...ROLE_MATRIX[a]].sort(), PINNED[a], a); }

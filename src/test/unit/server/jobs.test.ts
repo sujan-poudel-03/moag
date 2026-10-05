@@ -417,6 +417,123 @@ describe('JobManager', () => {
     assert.deepEqual(m.reclaimStaleLocks(['p2']), ['p2'], 'garbage is reclaimed');
   });
 
+  // ─── Lock linger: task pids outliving their job ───
+
+  describe('lock linger', () => {
+    const POLL = 1_000;
+    const MAX = 10_000;
+    const lingerMk = (alive: Set<number>, logs: string[] = []) =>
+      mk({ isPidAlive: (pid) => alive.has(pid), lingerPollMs: POLL, lingerMaxMs: MAX, log: (x) => logs.push(x) });
+    const lockOf = (m: JobManager) => JSON.parse(fs.readFileSync(m.lockPath('p1'), 'utf-8'));
+
+    it('a finish with a live task pid keeps the lock, naming only the live pids, and a new start is 409 project-locked', () => {
+      const clock = sinon.useFakeTimers();
+      const alive = new Set<number>([5001]);
+      const m = lingerMk(alive);
+      start(m, 'p1');
+      procs[0].line({ event: 'task-pid', pid: 5001, alive: true });
+      procs[0].line({ event: 'task-pid', pid: 5002, alive: true });
+      procs[0].emit('close', 0);
+      assert.equal(m.isActive('p1'), false, 'the job itself ended');
+      assert.ok(fs.existsSync(m.lockPath('p1')), 'the lock is kept');
+      assert.deepEqual(lockOf(m).taskPids, [5001], 'only the live pid is recorded');
+      const r = start(m, 'p1');
+      assert.deepEqual([r.ok, (r as { status: number }).status, (r as { reason: string }).reason], [false, 409, 'project-locked']);
+      assert.equal(spawn.callCount, 1);
+      assert.deepEqual(m.lockInfo('p1'), { held: true, taskPids: [5001], workerPid: 99999, lingering: true, expired: false });
+      assert.equal(clock.countTimers(), 1, 'one linger interval');
+    });
+
+    it('when the pid dies, the next tick removes the lock and stops polling', () => {
+      const clock = sinon.useFakeTimers();
+      const alive = new Set<number>([5001]);
+      const m = lingerMk(alive);
+      start(m, 'p1');
+      procs[0].line({ event: 'task-pid', pid: 5001, alive: true });
+      procs[0].emit('close', 0);
+      clock.tick(POLL);
+      assert.ok(fs.existsSync(m.lockPath('p1')), 'still alive: still locked');
+      alive.clear();
+      clock.tick(POLL);
+      assert.equal(fs.existsSync(m.lockPath('p1')), false);
+      assert.equal(clock.countTimers(), 0, 'no leaked interval');
+      assert.equal(m.lockInfo('p1'), null);
+      assert.equal(start(m, 'p1').ok, true, 'a new job is admitted');
+    });
+
+    it('at the max wait the lock is kept, the interval is cleared, and an admin hint is logged', () => {
+      const clock = sinon.useFakeTimers();
+      const logs: string[] = [];
+      const m = lingerMk(new Set([5001]), logs);
+      start(m, 'p1');
+      procs[0].line({ event: 'task-pid', pid: 5001, alive: true });
+      procs[0].emit('close', 0);
+      clock.tick(MAX + POLL);
+      assert.ok(fs.existsSync(m.lockPath('p1')), 'kept after expiry');
+      assert.equal(clock.countTimers(), 0, 'no leaked interval');
+      assert.equal(m.lockInfo('p1')?.expired, true);
+      assert.ok(logs.some((l) => /still held/.test(l) && /force-release/.test(l)), logs.join('\n'));
+      assert.equal((start(m, 'p1') as { reason: string }).reason, 'project-locked');
+    });
+
+    it('race: the pid dies, a new job starts before the tick, and the stale tick leaves the new lock intact', () => {
+      const clock = sinon.useFakeTimers();
+      const alive = new Set<number>([5001]);
+      const m = lingerMk(alive);
+      start(m, 'p1');
+      procs[0].line({ event: 'task-pid', pid: 5001, alive: true });
+      procs[0].emit('close', 0);
+      alive.clear();
+      assert.equal(start(m, 'p1').ok, true, 'acquireLock reclaims the dead lingering lock');
+      const newLock = fs.readFileSync(m.lockPath('p1'), 'utf-8');
+      clock.tick(POLL * 5);
+      assert.equal(fs.readFileSync(m.lockPath('p1'), 'utf-8'), newLock, 'the new job\'s lock is untouched');
+      assert.equal(clock.countTimers(), 0, 'the old linger watch was cancelled');
+      assert.equal(m.lockInfo('p1')?.lingering, false);
+    });
+
+    it('forceReleaseLock: job-active while a job runs, not-locked without a lock, and releases a lingering lock', () => {
+      const clock = sinon.useFakeTimers();
+      const m = lingerMk(new Set([5001]));
+      assert.deepEqual(m.forceReleaseLock('p1'), { ok: false, reason: 'not-locked' });
+      start(m, 'p1');
+      assert.deepEqual(m.forceReleaseLock('p1'), { ok: false, reason: 'job-active' });
+      assert.ok(fs.existsSync(m.lockPath('p1')), 'refusal touches nothing');
+      procs[0].line({ event: 'task-pid', pid: 5001, alive: true });
+      procs[0].emit('close', 0);
+      const r = m.forceReleaseLock('p1');
+      assert.equal(r.ok, true);
+      assert.deepEqual((r as { before: unknown }).before, { held: true, taskPids: [5001], workerPid: 99999, lingering: true, expired: false });
+      assert.equal(fs.existsSync(m.lockPath('p1')), false);
+      assert.equal(clock.countTimers(), 0, 'the linger timer is cleared');
+      assert.equal(kill.callCount, 0, 'force-release kills nothing');
+      assert.deepEqual(m.forceReleaseLock('p1'), { ok: false, reason: 'not-locked' });
+    });
+
+    it('forceReleaseLock also releases a lock left by a predecessor (no linger watch)', () => {
+      const m = lingerMk(new Set([7777]));
+      fs.mkdirSync(path.dirname(m.lockPath('p1')), { recursive: true });
+      fs.writeFileSync(m.lockPath('p1'), JSON.stringify({ serverPid: 5555, workerPid: 7777 }));
+      const r = m.forceReleaseLock('p1');
+      assert.equal(r.ok, true);
+      assert.equal((r as { before: { lingering: boolean } }).before.lingering, false);
+      assert.equal(fs.existsSync(m.lockPath('p1')), false);
+    });
+
+    it('regression: a finish with no task pids (or only dead ones) releases at once and starts no timer', () => {
+      const clock = sinon.useFakeTimers();
+      const m = lingerMk(new Set());
+      start(m, 'p1');
+      procs[0].emit('close', 0);
+      assert.equal(fs.existsSync(m.lockPath('p1')), false);
+      start(m, 'p2');
+      procs[1].line({ event: 'task-pid', pid: 6001, alive: true });
+      procs[1].emit('close', 0);
+      assert.equal(fs.existsSync(m.lockPath('p2')), false, 'a recorded but dead pid does not linger');
+      assert.equal(clock.countTimers(), 0);
+    });
+  });
+
   it('records task outcomes only for tasks the engine ran to a verdict', () => {
     const outcomes: Array<{ taskId: string; status: string }> = [];
     const m = mk({ onTaskOutcome: (o) => outcomes.push(o) });

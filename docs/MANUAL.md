@@ -336,11 +336,17 @@ moag queue <list | resolve <id>>
 moag digest [--since <when>]
 moag land [--into <branch>] [--merge]
 moag trace [<plan.json> | --plan <path>] [--req R-<n>]
+moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]
 ```
 
 `moag trace` prints one JSON line per PRD requirement — shipped, in-progress,
 not-shipped, untracked or removed — with the PRD version and release tag that
 shipped it, its tasks and its latest gate exit codes. It only reads the plan.
+
+`moag bench` drives the hosted server end to end through a benchmark scenario
+(PRD versions, plans, runs and ship gates, played by separate users) and writes
+per-version metrics. `--dry-run` uses a fake engine and costs nothing; a paid
+run needs `--max-usd`. See docs/benchmark.md.
 
 `moag` reaches your PATH via `npm link` from the repository root.
 

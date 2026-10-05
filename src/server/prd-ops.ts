@@ -323,7 +323,7 @@ const SHIP_GATE_PROMPT = 'Ship gate: an approver reviews the completed work for 
   + 'Added by the server to every generated plan; the run halts here until a human decides.';
 
 /** Task types that ship: they run only after the ship gate is approved. */
-const SHIPPING_TASK_TYPES: ReadonlySet<string> = new Set(['release', 'deploy']);
+export const SHIPPING_TASK_TYPES: ReadonlySet<string> = new Set(['release', 'deploy']);
 
 /**
  * Ids of every `release`/`deploy` task in `tasks` plus everything that
@@ -354,8 +354,8 @@ export function shippingTaskIds(tasks: readonly PlanFileTask[]): Set<string> {
  * (so, transitively, on every task that is not a release/deploy task or
  * downstream of one), and every release/deploy task — and everything that
  * depends on one — gains a `dependsOn` on the gate. The playlist is reordered
- * to non-shipping tasks, then the gate, then shipping tasks (each group keeps
- * its relative order), because the sequential runner executes in array order
+ * to non-shipping tasks, then the gate, then shipping tasks (a stable
+ * partition: planner order within each group is preserved), because the sequential runner executes in array order
  * and would otherwise reach a release before its gate. With no release/deploy
  * task the gate is terminal and last. Mutates `pl`; returns the gate.
  */

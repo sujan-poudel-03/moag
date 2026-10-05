@@ -25,6 +25,7 @@ export const SERVER_ACTIONS = [
   'users.manage',
   'audit.view',
   'engines.manage',
+  'jobs.force-release',
 ] as const;
 export type ServerAction = typeof SERVER_ACTIONS[number];
 
@@ -50,6 +51,8 @@ export const ROLE_MATRIX: Readonly<Record<ServerAction, readonly WebRole[]>> = O
   'audit.view': ['admin'],
   // Engine status, re-check and API keys (S3).
   'engines.manage': ['admin'],
+  // Delete a project's job.lock held by lingering task pids (audited; kills nothing).
+  'jobs.force-release': ['admin'],
 });
 
 export interface Actor { id: string; roles: readonly WebRole[]; }

@@ -96,6 +96,8 @@ export async function startHarness(over: {
   scryptSaturated?: () => boolean;
   /** SSE heartbeat / session re-check interval (default: the app's 25 s). */
   sseHeartbeatMs?: number;
+  /** Job-lock liveness probe (default: the real one). */
+  isPidAlive?: (pid: number) => boolean;
 } = {}): Promise<Harness> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-app-'));
   const dataDir = path.join(tmp, 'data');
@@ -107,7 +109,7 @@ export async function startHarness(over: {
   const config: ServerConfig = {
     dataDir, projectsRoot: root, publicUrl: 'http://127.0.0.1/', publicOrigin: 'http://127.0.0.1', secureCookies: false,
     host: '127.0.0.1', port: 0, trustProxy: false, bootstrapToken: null, masterKey: null, maxConcurrentJobs: 4,
-    runEnvPassthrough: [], allowSshClone: false, runsDisabledReason: null,
+    runEnvPassthrough: [], allowSshClone: false, runsDisabledReason: null, maxUsdPerEngineCall: null,
     ...(over.config ?? {}),
   };
 
@@ -145,6 +147,7 @@ export async function startHarness(over: {
     ...(over.secrets ? { secrets: over.secrets(dataDir) } : {}),
     ...(over.scryptSaturated ? { scryptSaturated: over.scryptSaturated } : {}),
     ...(over.sseHeartbeatMs ? { sseHeartbeatMs: over.sseHeartbeatMs } : {}),
+    ...(over.isPidAlive ? { isPidAlive: over.isPidAlive } : {}),
   });
   await new Promise<void>((r) => app.server.listen(0, '127.0.0.1', () => r()));
   const { port } = app.server.address() as AddressInfo;

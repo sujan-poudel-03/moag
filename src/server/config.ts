@@ -12,6 +12,8 @@ export const DEFAULT_PORT = 8080;
 export const DEFAULT_MAX_CONCURRENT_JOBS = 2;
 export const MAX_CONCURRENT_JOBS_LIMIT = 8;
 export const MIN_BOOTSTRAP_TOKEN_LENGTH = 24;
+/** Upper bound for `MOAG_MAX_USD_PER_ENGINE_CALL` (a typo guard, not a policy). */
+export const MAX_USD_PER_ENGINE_CALL_LIMIT = 1000;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 
 /** Why runs are refused server-wide, or null when runs are allowed. */
@@ -35,6 +37,8 @@ export interface ServerConfig {
   runEnvPassthrough: string[];
   allowSshClone: boolean;
   runsDisabledReason: RunsDisabledReason;
+  /** `MOAG_MAX_USD_PER_ENGINE_CALL`: server-wide cap on one engine call (Claude `--max-budget-usd`), or null. */
+  maxUsdPerEngineCall: number | null;
 }
 
 export type ServerConfigResult = { ok: true; config: ServerConfig } | { ok: false; error: string };
@@ -121,6 +125,15 @@ export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfigResult {
     maxConcurrentJobs = n;
   }
 
+  let maxUsdPerEngineCall: number | null = null;
+  if (env.MOAG_MAX_USD_PER_ENGINE_CALL !== undefined && env.MOAG_MAX_USD_PER_ENGINE_CALL.trim() !== '') {
+    const n = Number(env.MOAG_MAX_USD_PER_ENGINE_CALL);
+    if (!Number.isFinite(n) || n <= 0 || n > MAX_USD_PER_ENGINE_CALL_LIMIT) {
+      return fail(`MOAG_MAX_USD_PER_ENGINE_CALL must be a number greater than 0 and at most ${MAX_USD_PER_ENGINE_CALL_LIMIT}.`);
+    }
+    maxUsdPerEngineCall = n;
+  }
+
   const runEnvPassthrough: string[] = [];
   for (const name of (env.MOAG_RUN_ENV_PASSTHROUGH ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
     if (!ENV_NAME_RE.test(name)) { return fail(`MOAG_RUN_ENV_PASSTHROUGH: "${name}" is not a valid variable name.`); }
@@ -146,6 +159,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfigResult {
       runEnvPassthrough,
       allowSshClone: flag(env.MOAG_ALLOW_SSH_CLONE),
       runsDisabledReason: env.CI === 'true' ? 'ci' : null,
+      maxUsdPerEngineCall,
     },
   };
 }

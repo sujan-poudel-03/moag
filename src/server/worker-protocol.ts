@@ -96,7 +96,12 @@ export type WorkerEvent =
   | { event: 'error'; message: string }
   | { event: 'budget-exceeded'; totalCost: number; budget: number }
   | { event: 'manual-gate'; id: string; name: string }
-  | { event: 'cost'; usd: number }
+  /**
+   * Spend of one engine call. `source`: 'reported' = the engine's own figure,
+   * 'estimated' = derived by MOAG, 'none' = the call reported no cost (usd 0;
+   * its real spend is bounded only by the per-call cap). Absent on old lines.
+   */
+  | { event: 'cost'; usd: number; source?: CostSource }
   | { event: 'task-engine'; id: string; engine: EngineId }
   | { event: 'task-error-tail'; id: string; tail: string }
   | { event: 'plan-outcome'; kind: DeltaOutcomeKind }
@@ -106,6 +111,10 @@ export type WorkerEvent =
   /** A task child process (engine CLI, shell/gate command) started or ended. Server-internal: recorded in job.lock, never fanned out. */
   | { event: 'task-pid'; pid: number; alive: boolean }
   | { event: 'verify'; name: string; data: Record<string, unknown> };
+
+/** Closed set of `cost` event sources. */
+export const COST_SOURCES = ['reported', 'estimated', 'none'] as const;
+export type CostSource = typeof COST_SOURCES[number];
 
 const RUNNER_STATES = new Set<string>(Object.values(RunnerState));
 const TASK_STATUSES = new Set<string>(Object.values(TaskStatus));
@@ -152,7 +161,9 @@ export function parseWorkerLine(line: string): WorkerEvent | null {
     case 'manual-gate':
       return isStr(o.id) ? { event: ev, id: o.id, name: str(o.name) } : null;
     case 'cost':
-      return finite(o.usd) && o.usd >= 0 ? { event: 'cost', usd: o.usd } : null;
+      return finite(o.usd) && o.usd >= 0
+        ? { event: 'cost', usd: o.usd, ...((COST_SOURCES as readonly unknown[]).includes(o.source) ? { source: o.source as CostSource } : {}) }
+        : null;
     case 'task-engine':
       return isStr(o.id) && isEngine(o.engine) ? { event: ev, id: o.id, engine: o.engine } : null;
     case 'task-error-tail':

@@ -102,6 +102,16 @@ describe('server config', () => {
     }
   });
 
+  it('validates MOAG_MAX_USD_PER_ENGINE_CALL to a number in (0, 1000]', () => {
+    assert.equal(ok(base()).maxUsdPerEngineCall, null, 'unset: no per-call cap');
+    assert.equal(ok({ ...base(), MOAG_MAX_USD_PER_ENGINE_CALL: '' }).maxUsdPerEngineCall, null);
+    assert.equal(ok({ ...base(), MOAG_MAX_USD_PER_ENGINE_CALL: '1.5' }).maxUsdPerEngineCall, 1.5);
+    assert.equal(ok({ ...base(), MOAG_MAX_USD_PER_ENGINE_CALL: '1000' }).maxUsdPerEngineCall, 1000);
+    for (const bad of ['0', '-1', 'abc', '1001', 'Infinity', 'NaN']) {
+      assert.match(err({ ...base(), MOAG_MAX_USD_PER_ENGINE_CALL: bad }), /MOAG_MAX_USD_PER_ENGINE_CALL/, bad);
+    }
+  });
+
   it('validates MOAG_PORT', () => {
     assert.equal(ok({ ...base(), MOAG_PORT: '0' }).port, 0);
     assert.match(err({ ...base(), MOAG_PORT: '70000' }), /MOAG_PORT/);
