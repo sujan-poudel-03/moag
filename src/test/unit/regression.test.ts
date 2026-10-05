@@ -216,6 +216,33 @@ describe('Regression: legacy plan hydration', () => {
     const tasks = plan.playlists[0].tasks;
     assert.notEqual(tasks[0].id, tasks[1].id);
   });
+
+  it('loads legacy vN.0 PRD versions with no bumps, requirement IDs or trace, and re-emits none', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Legacy PRD Plan',
+      defaultEngine: 'claude',
+      prdVersions: [
+        { version: 'v1.0', text: '## Requirements\n- login', createdAt: '2026-01-01T00:00:00.000Z' },
+        { version: 'v2.0', text: '## Requirements\n- login\n- logout', createdAt: '2026-01-02T00:00:00.000Z' },
+      ],
+      playlists: [{
+        id: 'pl-1', name: 'Tasks', autoplay: true,
+        tasks: [{ id: 't-1', name: 'Build', prompt: 'p' }],
+      }],
+    };
+    const plan = hydratePlan(raw, 'legacy-prd.agent-plan.json');
+    assert.equal(plan.prdVersions.length, 2);
+    assert.equal(plan.requirementTrace, undefined);
+    assert.equal(plan.playlists[0].tasks[0].requirementIds, undefined);
+
+    const file = dehydratePlan(plan);
+    for (const v of file.prdVersions) {
+      assert.deepEqual(Object.keys(v).sort(), ['createdAt', 'text', 'version']);
+    }
+    assert.ok(!('requirementTrace' in file), 'legacy plan must not gain a requirementTrace key');
+    assert.ok(!('requirementIds' in file.playlists[0].tasks[0]), 'legacy task must not gain requirementIds');
+  });
 });
 
 // ─── 2. Adapter capability: isAvailable() + skipped run() ─────────────────────
@@ -935,23 +962,25 @@ describe('Regression: engine call-site census', () => {
     assert.ok(files.some((f) => relative(f) === 'adapters/engine.ts'), 'scan must reach src/adapters');
   });
 
-  it('holds the engine call-site allowlist at exactly 17 sites, each labelled', () => {
+  it('holds the engine call-site allowlist at exactly 18 sites, each labelled', () => {
     // Every entry is a call site that must carry a costLabel and a reachable
     // AbortSignal. src/adapters/engine.ts is excluded and asserted separately:
     // its single `.runTask(` is the accounting wrapper delegating inward.
     const ALLOWLIST = new Map<string, number>([
       // 4 of these moved to ui/prd-authoring.ts when extension.ts was split;
-      // the total is unchanged at 17, which is what this census exists to prove.
+      // the total was unchanged at 17 by that split, which is what this census exists to prove.
       ['extension.ts', 8],
       ['ui/prd-authoring.ts', 4],
       ['runner/runner.ts', 2],
       ['ui/execution-detail-panel.ts', 2],
       ['headless/cli.ts', 1],
+      // Hosted-server plan generation: costLabel 'plan-generation', signal aborted by IPC stop.
+      ['server/run-worker.ts', 1],
     ]);
     const ACCOUNTING_LAYER = 'adapters/engine.ts';
 
     const expectedTotal = Array.from(ALLOWLIST.values()).reduce((a, b) => a + b, 0);
-    assert.equal(expectedTotal, 17, 'the allowlist itself must total 17');
+    assert.equal(expectedTotal, 18, 'the allowlist itself must total 18');
 
     const found = census(RUN_TASK, productionFiles());
 
@@ -987,7 +1016,7 @@ describe('Regression: engine call-site census', () => {
     }
 
     const total = Array.from(found.values()).reduce((a, b) => a + b, 0);
-    assert.equal(total, 17, `expected 17 engine call sites outside the accounting layer, found ${total}`);
+    assert.equal(total, 18, `expected 18 engine call sites outside the accounting layer, found ${total}`);
   });
 
   it('has no inline `new AbortController().signal` in production code', () => {
@@ -1104,6 +1133,66 @@ describe('Regression: the sidebar webview script', () => {
     assert.ok(csp, 'the page declares no Content-Security-Policy');
     assert.ok(csp![1].includes(`nonce-${nonce![1]}`),
       'the CSP does not admit the nonce on the script tag, so it would not execute');
+  });
+
+  it('builds PRD version <option>s as text nodes, so a hostile label never becomes markup', () => {
+    // Extract the two functions from the shipped artifact and run them against a fake DOM.
+    const js = compiled();
+    const extract = (name: string): string => {
+      const start = js.indexOf(`function ${name}(`);
+      assert.ok(start >= 0, `${name} is missing from the compiled sidebar`);
+      let depth = 0;
+      for (let i = js.indexOf('{', start); i < js.length; i++) {
+        if (js[i] === '{') { depth++; }
+        if (js[i] === '}' && --depth === 0) { return js.slice(start, i + 1); }
+      }
+      throw new Error(`unbalanced braces in ${name}`);
+    };
+
+    type FakeEl = { tag: string; value: string; textContent: string; children: FakeEl[] };
+    const noMarkup = (el: object): void => {
+      for (const prop of ['innerHTML', 'outerHTML']) {
+        Object.defineProperty(el, prop, {
+          set: () => { throw new Error(`${prop} assigned — labels must not be parsed as HTML`); },
+        });
+      }
+    };
+    const children: FakeEl[] = [];
+    const select = {
+      get textContent(): string { return ''; },
+      set textContent(_v: string) { children.length = 0; },
+      appendChild: (c: FakeEl) => { children.push(c); return c; },
+    };
+    noMarkup(select);
+    const classes = new Set<string>();
+    const bar = { classList: { add: (c: string) => classes.add(c), remove: (c: string) => classes.delete(c) } };
+    const saveBtn = { textContent: '' };
+    const doc = {
+      createElement: (tag: string): FakeEl => {
+        const el: FakeEl = { tag, value: '', textContent: '', children: [] };
+        noMarkup(el);
+        return el;
+      },
+    };
+
+    const run = new Function('document', 'prdVersionBarEl', 'prdVersionSelectEl', 'prdVersionSaveBtnEl',
+      `let prdVersions = [];\n${extract('fmtPrdVersion')}\n${extract('updatePrdVersionBar')}\nreturn updatePrdVersionBar;`,
+    )(doc, bar, select, saveBtn) as (v: unknown) => void;
+
+    const hostile = '1.0.0"><img src=x onerror=alert(1)>';
+    children.push({ tag: 'stale', value: '', textContent: '', children: [] });
+    run([
+      { version: hostile, createdAt: '2026-10-04T00:00:00.000Z' },
+      { version: 'v2.0.0', createdAt: '2026-10-04T00:00:00.000Z' },
+    ]);
+    assert.ok(classes.has('visible'));
+    assert.deepEqual(children.map((c) => c.tag), ['option', 'option'], 'stale options are cleared first');
+    assert.equal(children[0].value, hostile, 'the value carries the raw label');
+    assert.ok(children[0].textContent.startsWith('v' + hostile + ' ('), 'the label lands as text, verbatim');
+    assert.ok(children[1].textContent.startsWith('v2.0.0 ('), 'an already-prefixed label is not double-prefixed');
+
+    run([]);
+    assert.ok(!classes.has('visible'), 'no versions hides the bar');
   });
 
   it('inlines no script body, which is what the compiler could not see', () => {
@@ -1269,6 +1358,17 @@ describe('Regression: the dashboard webview script', () => {
     const dash = fsMod.readFileSync(COMPILED, 'utf-8');
     assert.ok(sidebar.includes('acquireVsCodeApi'), 'sidebar lost its runtime handle');
     assert.ok(dash.includes('acquireVsCodeApi'), 'dashboard lost its runtime handle');
+  });
+});
+
+describe('Regression: PRD version labels are never a counter (F2.2)', () => {
+  // 'v' + (versions.length + 1) + '.0' collided at "v21.0" forever once retention capped
+  // the history at MAX_PRD_VERSIONS. Labels are computed on the host from the last entry.
+  it('neither webview computes a label from versions.length + 1', () => {
+    for (const file of ['src/webview/prd-panel.ts', 'src/webview/sidebar.ts']) {
+      const source = fsMod.readFileSync(file, 'utf-8');
+      assert.ok(!/versions\.length \+ 1/.test(source), `${file} still derives a version label from the array length`);
+    }
   });
 });
 

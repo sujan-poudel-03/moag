@@ -11,9 +11,14 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
 import * as path from 'path';
-import { EngineId, Plan } from '../models/types';
-import { appendPrdVersion, dehydratePlan, hydratePlan, savePlan } from '../models/plan';
-import { isRoleId } from '../models/roles';
+import { EngineId, EngineResult, Plan, PlanFile, PrdVersion, SEMVER_BUMPS, SemverBump } from '../models/types';
+import { appendPrdVersion, dehydratePlan, savePlan } from '../models/plan';
+import { buildFullPlanPrompt, describeDeltaScope, generateDeltaPlan, parseGeneratedPlan } from '../runner/prd-plan';
+import {
+  RequirementDiff, collectReservedRequirementIds, computeLatestDiff, formatVersionLabel,
+  preparePrdVersion, recommendBump, relabelLastPrdVersion,
+} from '../models/requirements';
+import { designSystemCssTokens } from './design-system';
 import { getEngine } from '../adapters/index';
 import { analyzeProject, formatAnalysis } from '../context/project-analyzer';
 import { ghSync } from '../utils/gh';
@@ -33,6 +38,8 @@ export interface PrdAuthoringDeps {
   detectPrdFileInWorkspace(): string | null;
   getActivePlan(): Plan | null;
   injectTestTaskIfMissing(plan: Plan, cwd: string): void;
+  /** True while the runner is not Idle — delta generation must not append under a live play(). */
+  isRunnerBusy(): boolean;
   saveAndRefresh(): void;
   syncPromptProviderSidebar(provider: PromptInputViewProvider): void;
 }
@@ -194,7 +201,7 @@ export async function cmdOpenPrdFromPlan(args?: { prdOverride?: string }): Promi
   await cmdPlanFromPRD();
 }
 
-export async function openPrdPanel(prefill = '', versions?: { version: string; text: string; createdAt: string }[]): Promise<void> {
+export async function openPrdPanel(prefill = '', versions?: PrdVersion[]): Promise<void> {
   const plan = deps.getActivePlan();
   const resolvedVersions = versions ?? plan?.prdVersions ?? [];
   const panel = vscode.window.createWebviewPanel(
@@ -203,7 +210,17 @@ export async function openPrdPanel(prefill = '', versions?: { version: string; t
     vscode.ViewColumn.One,
     { enableScripts: true, retainContextWhenHidden: false },
   );
-  panel.webview.html = buildPrdPanelHtml(panel.webview, prefill, resolvedVersions);
+  // The panel can be closed mid-flight (generatePlanFromPrd disposes it); every new post
+  // goes through this guard so a late reply never throws into the message handler.
+  let disposed = false;
+  panel.onDidDispose(() => { disposed = true; });
+  const post = (msg: Record<string, unknown>): void => {
+    if (disposed) { return; }
+    try { void panel.webview.postMessage(msg); } catch { /* panel closed between check and post */ }
+  };
+  /** createdAt of the version saved in THIS panel session — the only one the override may relabel. */
+  let lastSavedCreatedAt: string | null = null;
+  panel.webview.html = buildPrdPanelHtml(panel.webview, prefill, resolvedVersions, { hasPlan: plan !== null });
   panel.webview.onDidReceiveMessage(async (message) => {
     if (message.type === 'openPrdFile') {
       const uris = await vscode.window.showOpenDialog({
@@ -290,8 +307,18 @@ export async function openPrdPanel(prefill = '', versions?: { version: string; t
     } else if (message.type === 'openPrdInBrowser') {
       await openPrdInBrowser(message.text as string);
     } else if (message.type === 'savePrdVersion') {
-      const saved = savePrdVersionToActivePlan(message.text as string, message.version as string);
-      panel.webview.postMessage({ type: 'prdVersionSaved', versions: saved.versions, version: saved.version });
+      const saved = savePrdVersionToActivePlan(String(message.text ?? ''));
+      if (saved.saved && saved.versions.length > 0) {
+        lastSavedCreatedAt = saved.versions[saved.versions.length - 1].createdAt;
+      }
+      post({ type: 'prdVersionSaved', ...saved });
+    } else if (message.type === 'overridePrdVersionBump') {
+      const bump = message.bump as unknown;
+      if (typeof bump !== 'string' || !(SEMVER_BUMPS as readonly string[]).includes(bump)) { return; }
+      const relabelled = relabelLatestPrdVersion(bump as SemverBump, lastSavedCreatedAt ?? '');
+      post({ type: 'prdVersionSaved', ...relabelled });
+    } else if (message.type === 'generateDeltaPlan') {
+      void vscode.commands.executeCommand('agentTaskPlayer.generateDeltaPlan', { prdText: String(message.text ?? '') });
     }
   });
   // Pre-fill after panel loads
@@ -437,23 +464,125 @@ export async function openPrdInBrowser(text: string): Promise<void> {
   await vscode.env.openExternal(vscode.Uri.file(outPath));
 }
 
-export function savePrdVersionToActivePlan(text: string, version: string): { versions: { version: string; text: string; createdAt: string }[]; version: string } {
+// ─── PRD version save ───
+
+/** What a PRD save (or relabel) did — posted verbatim to the PRD panel and the sidebar. */
+export interface PrdSaveResult {
+  saved: boolean;
+  versions: PrdVersion[];
+  version?: string;
+  /** The saved text with `[R-n]` tags written in — the editor should show this */
+  text?: string;
+  notice?: string;
+  diff?: RequirementDiff | null;
+  recommendedBump?: SemverBump;
+  chosenBump?: SemverBump;
+  rationale?: string;
+  canOverride: boolean;
+  canGenerateDelta: boolean;
+}
+
+/** True when a diff has something a delta plan could cover. */
+function hasDelta(diff: RequirementDiff | null | undefined): boolean {
+  return !!diff && diff.added.length + diff.changed.length > 0;
+}
+
+/**
+ * Save `text` as a new PRD version on the active plan. Requirement IDs are assigned and
+ * written into the text, the label is computed from the last saved version (semver, never
+ * a counter), and the recommended bump comes from the requirement diff. Refuses ambiguous
+ * IDs and unchanged text. With no active plan the version is returned but not persisted.
+ */
+export function savePrdVersionToActivePlan(text: string, override?: SemverBump): PrdSaveResult {
   const plan = deps.getActivePlan();
-  const newEntry = { version, text, createdAt: new Date().toISOString() };
-  if (plan) {
-    const { versions, dropped } = appendPrdVersion(plan.prdVersions, newEntry);
-    plan.prdVersions = versions;
-    plan.prdSource = text;
-    if (deps.currentPlanPath) { savePlan(plan, deps.currentPlanPath); }
-    if (deps.promptViewProvider) { deps.syncPromptProviderSidebar(deps.promptViewProvider); }
-    vscode.window.showInformationMessage(
-      dropped > 0
-        ? `PRD saved as ${version} — ${dropped} oldest snapshot${dropped !== 1 ? 's' : ''} removed (keeping the last ${MAX_PRD_VERSIONS}).`
-        : `PRD saved as ${version}`,
-    );
-    return { versions: plan.prdVersions, version };
+  const prep = preparePrdVersion({
+    text,
+    versions: plan?.prdVersions ?? [],
+    reservedIds: plan ? collectReservedRequirementIds(plan) : undefined,
+    override,
+  });
+
+  if (!prep.ok) {
+    if (prep.reason === 'duplicate-ids') {
+      vscode.window.showErrorMessage(prep.message);
+    } else {
+      vscode.window.showInformationMessage(prep.message);
+    }
+    return { saved: false, versions: plan?.prdVersions ?? [], notice: prep.message, canOverride: false, canGenerateDelta: false };
   }
-  return { versions: [newEntry], version };
+
+  const { entry, taggedText, diff, recommendation } = prep;
+  const label = formatVersionLabel(entry.version);
+  const result: PrdSaveResult = {
+    saved: true,
+    versions: [entry],
+    version: entry.version,
+    text: taggedText,
+    diff,
+    recommendedBump: entry.recommendedBump,
+    chosenBump: entry.chosenBump,
+    rationale: recommendation.rationale,
+    canOverride: entry.recommendedBump !== undefined,
+    canGenerateDelta: hasDelta(diff),
+  };
+
+  if (!plan) {
+    // Unpersisted, as before: there is no plan file to hold the version.
+    return { ...result, saved: false, canOverride: false, canGenerateDelta: false };
+  }
+
+  const { versions, dropped } = appendPrdVersion(plan.prdVersions, entry);
+  plan.prdVersions = versions;
+  // Q7: prdSource is always the full tagged text, never a delta.
+  plan.prdSource = taggedText;
+  if (deps.currentPlanPath) { savePlan(plan, deps.currentPlanPath); }
+  if (deps.promptViewProvider) { deps.syncPromptProviderSidebar(deps.promptViewProvider); }
+  const notice = dropped > 0
+    ? `PRD saved as ${label} — ${recommendation.rationale} ${dropped} oldest snapshot${dropped !== 1 ? 's' : ''} removed (keeping the last ${MAX_PRD_VERSIONS}).`
+    : `PRD saved as ${label} — ${recommendation.rationale}`;
+  vscode.window.showInformationMessage(notice);
+  return { ...result, versions: plan.prdVersions, notice };
+}
+
+/**
+ * Relabel the latest PRD version with the owner's chosen bump. Applies only when the
+ * plan's last version is the one this panel saved (matched on `createdAt`).
+ */
+export function relabelLatestPrdVersion(bump: SemverBump, expectedCreatedAt: string): PrdSaveResult {
+  const plan = deps.getActivePlan();
+  const versions = plan?.prdVersions ?? [];
+  const last = versions.length > 0 ? versions[versions.length - 1] : undefined;
+  const refuse = (notice: string): PrdSaveResult => {
+    vscode.window.showInformationMessage(notice);
+    return { saved: false, versions, notice, canOverride: false, canGenerateDelta: false };
+  };
+  if (!plan || !last || !expectedCreatedAt || last.createdAt !== expectedCreatedAt) {
+    return refuse('Only the version saved in this panel can be relabelled — save a new version first.');
+  }
+  const relabelled = relabelLastPrdVersion(versions, bump);
+  if (!relabelled) {
+    return refuse('The first PRD version has no bump to override.');
+  }
+  plan.prdVersions = relabelled;
+  if (deps.currentPlanPath) { savePlan(plan, deps.currentPlanPath); }
+  if (deps.promptViewProvider) { deps.syncPromptProviderSidebar(deps.promptViewProvider); }
+  const entry = relabelled[relabelled.length - 1];
+  const diff = computeLatestDiff(relabelled, collectReservedRequirementIds(plan));
+  const rationale = diff ? recommendBump(diff, true).rationale : undefined;
+  const notice = `PRD relabelled as ${formatVersionLabel(entry.version)} (${bump}, recommended ${entry.recommendedBump}).`;
+  vscode.window.showInformationMessage(notice);
+  return {
+    saved: true,
+    versions: relabelled,
+    version: entry.version,
+    notice,
+    diff,
+    recommendedBump: entry.recommendedBump,
+    chosenBump: entry.chosenBump,
+    rationale,
+    canOverride: true,
+    canGenerateDelta: hasDelta(diff),
+  };
 }
 
 export function buildPrdBrowserHtml(prdText: string, planName: string, versions: { version: string; createdAt: string }[]): string {
@@ -470,7 +599,7 @@ export function buildPrdBrowserHtml(prdText: string, planName: string, versions:
     .replace(/\n\n/g, '</p><p>')
     .replace(/\n/g, '<br>');
   const versionsHtml = versions.length > 0
-    ? `<div class="versions">${versions.map(v => `<span class="vpill">${safe(v.version)}</span>`).join('')}</div>`
+    ? `<div class="versions">${versions.map(v => `<span class="vpill">${safe(formatVersionLabel(v.version))}</span>`).join('')}</div>`
     : '';
   return `<!DOCTYPE html>
 <html lang="en">
@@ -507,10 +636,15 @@ export async function cmdPlanFromPRD(): Promise<void> {
 }
 
 // kept for direct invocation from old entry points
-export function buildPrdPanelHtml(webview: vscode.Webview, prefill = '', versions: { version: string; text: string; createdAt: string }[] = []): string {
+export function buildPrdPanelHtml(
+  webview: vscode.Webview,
+  prefill = '',
+  versions: PrdVersion[] = [],
+  opts: { hasPlan: boolean } = { hasPlan: false },
+): string {
   // Handed to the page as data. JSON.stringify escapes the content; the lone <
   // is neutralised so a value can never close the block carrying it.
-  const prdBootstrap = JSON.stringify({ versions, prefill })
+  const prdBootstrap = JSON.stringify({ versions, prefill, hasPlan: opts.hasPlan })
     .replace(/</g, '\u003c');
   const scriptUri = webviewScriptUri(webview, 'prd-panel');
   const nonce = webviewNonce();
@@ -523,6 +657,7 @@ export function buildPrdPanelHtml(webview: vscode.Webview, prefill = '', version
 ${csp}
 <title>Generate Plan from PRD</title>
 <style>
+  ${designSystemCssTokens()}
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -546,6 +681,33 @@ ${csp}
     color: #888; border-radius: 4px; cursor: pointer; font-size: 11px;
   }
   .version-save-btn:hover { border-color: #5a9e5a; color: #9dcc9d; }
+  .version-save-btn:disabled { opacity: 0.5; cursor: default; }
+  .prd-diff {
+    margin: var(--ds-space-2) 32px 0; padding: var(--ds-space-2) var(--ds-space-3);
+    border: 1px solid var(--ds-border); border-radius: var(--ds-radius-md);
+    background: var(--ds-surface); color: var(--ds-fg); font-size: 12px;
+    max-height: 30vh; overflow-y: auto; flex-shrink: 0;
+  }
+  .prd-diff[hidden] { display: none; }
+  .prd-diff-summary { color: var(--ds-fg); margin-bottom: var(--ds-space-1); line-height: 1.5; }
+  .prd-diff-list { list-style: none; margin: 0 0 var(--ds-space-2); }
+  .prd-diff-list li { padding: 2px 0; line-height: 1.4; }
+  .prd-diff-list li.added { color: var(--ds-success); }
+  .prd-diff-list li.changed { color: var(--ds-warning); }
+  .prd-diff-list li.removed { color: var(--ds-error); }
+  .prd-diff-actions { display: flex; align-items: center; gap: var(--ds-space-2); }
+  .prd-diff-actions [hidden] { display: none; }
+  .prd-diff-actions select {
+    background: var(--ds-input-bg); color: var(--ds-input-fg); border: 1px solid var(--ds-input-border);
+    border-radius: var(--ds-radius-sm); padding: 2px 6px; font-size: 12px; margin-left: var(--ds-space-1);
+  }
+  .prd-diff-actions button {
+    background: var(--ds-btn-secondary-bg); color: var(--ds-btn-secondary-fg); border: 1px solid var(--ds-border);
+    border-radius: var(--ds-radius-sm); padding: 3px 10px; font-size: 12px; cursor: pointer;
+  }
+  .prd-diff-actions button:hover:not(:disabled) { background: var(--ds-hover); }
+  .prd-diff-actions button:disabled { opacity: 0.5; cursor: default; }
+  .prd-diff-actions select:focus, .prd-diff-actions button:focus-visible { outline: 1px solid var(--ds-focus); }
   .body {
     flex: 1; display: flex; flex-direction: column;
     padding: 14px 32px 0; gap: 10px; min-height: 0;
@@ -599,7 +761,15 @@ ${csp}
 <div class="version-bar" id="versionBar">
   <span>Version:</span>
   <select id="versionSelect" class="version-select"></select>
-  <button id="versionSaveBtn" class="version-save-btn" type="button">Save as v1.0</button>
+  <button id="versionSaveBtn" class="version-save-btn" type="button">Save new version</button>
+</div>
+<div class="prd-diff" id="prdDiff" hidden aria-live="polite">
+  <p class="prd-diff-summary" id="prdDiffSummary"></p>
+  <ul class="prd-diff-list" id="prdDiffList"></ul>
+  <div class="prd-diff-actions">
+    <label id="bumpOverrideLabel" hidden>Bump <select id="bumpOverride"><option>patch</option><option>minor</option><option>major</option></select></label>
+    <button id="deltaBtn" type="button" hidden>Generate delta plan&hellip;</button>
+  </div>
 </div>
 <div class="body">
   <div class="tip">
@@ -633,6 +803,44 @@ AC3: Successful login redirects to dashboard"></textarea>
 </html>`;}
 
 
+// ─── Plan generation ───
+
+/** Runs one prompt through the plan-generation engine with the caller's abort signal. */
+type PlanGenerationRunner = (prompt: string, signal: AbortSignal) => Promise<EngineResult>;
+
+/**
+ * The single engine call site for plan generation (full and delta). Runs `body` inside a
+ * window progress indicator whose cancellation aborts the call; the cancellation
+ * subscription is disposed on every path.
+ */
+async function withPlanGenerationEngine<T>(
+  title: string,
+  cwd: string,
+  body: (runEngine: PlanGenerationRunner, signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  const defaultEngine = cfg.get<EngineId>('defaultEngine', 'claude' as EngineId);
+  const engine = getEngine(defaultEngine);
+  return vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Window, title },
+    async (_progress, token) => {
+      const abortController = new AbortController();
+      const sub = token.onCancellationRequested?.(() => abortController.abort());
+      try {
+        const runEngine: PlanGenerationRunner = (prompt, signal) => engine.runTask({
+          prompt,
+          cwd,
+          signal,
+          costLabel: 'plan-generation',
+        });
+        return await body(runEngine, abortController.signal);
+      } finally {
+        sub?.dispose();
+      }
+    },
+  );
+}
+
 export async function generatePlanFromPrdText(prdText: string): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) { UserMsg.showError(UserMsg.noWorkspace()); return; }
@@ -643,98 +851,38 @@ export async function generatePlanFromPrdText(prdText: string): Promise<void> {
     return;
   }
 
-  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
-  const defaultEngine = cfg.get<EngineId>('defaultEngine', 'claude' as EngineId);
-
-  const prdPrompt = `You are a senior engineering lead. Given the Product Requirements Document (PRD) below, generate a structured JSON execution plan for an AI coding agent.
-
-The plan MUST have up to three playlists in this order:
-1. "Design" — UI/UX specs, component sketches, API contract decisions. OMIT this playlist if the PRD mentions no user interface or front-end work.
-2. "Development" — implementation tasks (backend, frontend, infrastructure, migrations, etc.)
-3. "Testing" — test writing, QA, edge-case coverage, accessibility checks (set "testPhase": true)
-
-Rules:
-- Each task must have: "id" (unique string e.g. "task-1"), "name" (short title), "prompt" (detailed enough for Claude Code to execute autonomously — include file paths, acceptance criteria, patterns to follow), "status": "pending"
-- Task type rules — include optional "type" field (defaults to "agent"):
-  - "agent"       AI coding tasks (most tasks)
-  - "command"     Shell commands (test deps.runners, builds). Set "command" field to the exact shell command (e.g., "npm test", "pytest", "go test ./..."). The Testing playlist MUST include at least one "command" task running the test suite.
-  - "visual-test" Browser UI verification via screenshot + vision. For web/frontend projects only.
-- Each playlist must have: "id" (unique string), "name" (string), "testPhase" (boolean — true only for Testing), "tasks" (array)
-- Each playlist SHOULD have a "role" — the expert persona the agent adopts. Exactly one of:
-  "architect" | "designer" | "engineer" | "reviewer" | "tester" | "devops".
-  Typical mapping: Design → "designer", Development → "engineer", Testing → "tester".
-  Omit the field entirely if unsure. Never invent a value outside that list.
-- The root plan object must have: "version": "1.0", "name" (brief feature name derived from the PRD), "description" (one sentence), "playlists" (array)
-- Return ONLY valid JSON. No markdown code fences, no explanation, no preamble.
-- Keep tasks focused and atomic — one concern per task.
-
-PRD:
-${prdText}`;
-
-  const planHolder: { json: string } = { json: '' };
+  const prdPrompt = buildFullPlanPrompt(prdText);
+  let stdout = '';
 
   try {
-    const engine = getEngine(defaultEngine);
-    await vscode.window.withProgress(
-      { location: vscode.ProgressLocation.Window, title: 'Generating plan from PRD...' },
-      async (_progress, token) => {
-        const abortController = new AbortController();
-        token.onCancellationRequested(() => abortController.abort());
-        const result = await engine.runTask({
-          prompt: prdPrompt,
-          cwd,
-          signal: abortController.signal,
-          costLabel: 'plan-generation',
-        });
-        if (result.exitCode === 0 && result.stdout.trim()) {
-          planHolder.json = result.stdout.trim();
-        }
-      },
-    );
+    const result = await withPlanGenerationEngine('Generating plan from PRD...', cwd,
+      (runEngine, signal) => runEngine(prdPrompt, signal));
+    if (result.exitCode === 0 && result.stdout.trim()) {
+      stdout = result.stdout.trim();
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     vscode.window.showErrorMessage(`PRD plan generation failed: ${msg.substring(0, 200)}`);
     return;
   }
 
-  if (!planHolder.json) {
+  if (!stdout) {
     vscode.window.showErrorMessage('AI did not return a plan. Try again or check your API key / engine settings.');
     return;
   }
 
-  // Strip markdown fences if the AI ignored the instruction
-  const planJson = planHolder.json.replace(/^```(?:json)?\s*/m, '').replace(/\s*```\s*$/m, '').trim();
-
-  let parsed: { version?: string; name?: string; playlists?: unknown[] };
-  try {
-    parsed = JSON.parse(planJson);
-  } catch {
-    vscode.window.showErrorMessage('AI returned invalid JSON. Try again.');
+  const result = parseGeneratedPlan(stdout);
+  if (!result.ok) {
+    // F2.5: a plan that cannot be loaded is reported, never written.
+    vscode.window.showErrorMessage(result.error);
     return;
   }
+  const { invalidRoleCount } = result;
 
-  if (!parsed.version || !parsed.name || !Array.isArray(parsed.playlists) || parsed.playlists.length === 0) {
-    vscode.window.showErrorMessage('Generated plan is missing required fields (version, name, playlists).');
-    return;
-  }
-
-  (parsed as Record<string, unknown>).prdSource = prdText;
-
-  // Count roles the generator invented before hydration silently coerces them away, so the
-  // completion notification can say why a playlist came back without the role it asked for.
-  const invalidRoleCount = (parsed.playlists as Array<{ role?: unknown }>)
-    .filter(pl => pl?.role !== undefined && !isRoleId(pl.role)).length;
-
-  // Hydrate → inject missing test deps.runner → dehydrate back so the JSON file has the task
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const hydratedPrd = hydratePlan(parsed as any);
-    deps.injectTestTaskIfMissing(hydratedPrd, cwd);
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const dehydrated = dehydratePlan(hydratedPrd) as any;
-    dehydrated.prdSource = prdText;
-    parsed = dehydrated;
-  } catch { /* best-effort — proceed with unmodified parsed if hydration fails */ }
+  // Inject the missing test runner, then dehydrate so the JSON file carries the task.
+  deps.injectTestTaskIfMissing(result.plan, cwd);
+  const parsed: PlanFile = dehydratePlan(result.plan);
+  parsed.prdSource = prdText;
 
   const moagDir = ensureMoagDir();
   if (!moagDir) {
@@ -742,11 +890,11 @@ ${prdText}`;
     return;
   }
 
-  const taskCount = (parsed.playlists as Array<{ tasks?: unknown[] }>).reduce((s, pl) => s + (pl.tasks?.length ?? 0), 0);
-  const playlistCount = (parsed.playlists as unknown[]).length;
+  const taskCount = parsed.playlists.reduce((s, pl) => s + (pl.tasks?.length ?? 0), 0);
+  const playlistCount = parsed.playlists.length;
 
   // Guard against duplicates — use a deterministic path based on plan name
-  const safeName = (parsed.name as string).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '').slice(0, 40);
+  const safeName = parsed.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '').slice(0, 40);
   const canonicalPath = path.join(moagDir, `${safeName}.agent-plan.json`);
   let planPath = canonicalPath;
 
@@ -778,5 +926,109 @@ ${prdText}`;
   );
   if (action === 'Open Plan') {
     void vscode.commands.executeCommand('agentTaskPlayer.runPlanFile', planPath);
+  }
+}
+
+// ─── Delta plan ───
+
+/** One delta generation per extension host at a time. */
+let deltaInFlight = false;
+
+/**
+ * Generate a plan covering only the requirements the latest PRD version added or changed,
+ * and append it to the active plan as one playlist. One confirmed engine call; never runs
+ * while the runner is busy, and discards the result if a run started meanwhile.
+ * With no active plan, falls back to full plan generation from `args.prdText`.
+ */
+export async function cmdGenerateDeltaPlan(args?: { prdText?: string }): Promise<void> {
+  if (deps.isRunnerBusy()) { UserMsg.showWarning(UserMsg.runnerBusy()); return; }
+  if (deltaInFlight) {
+    vscode.window.showInformationMessage('A delta plan is already being generated.');
+    return;
+  }
+  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+  if (!workspaceFolder) { UserMsg.showError(UserMsg.noWorkspace()); return; }
+  const cwd = workspaceFolder.uri.fsPath;
+
+  const plan = deps.getActivePlan();
+  if (!plan) {
+    if (args?.prdText) {
+      await generatePlanFromPrdText(args.prdText);
+    } else {
+      UserMsg.showError(UserMsg.noPlanLoaded());
+    }
+    return;
+  }
+
+  const scope = describeDeltaScope(plan);
+  if (!scope) {
+    vscode.window.showInformationMessage('Nothing to generate — the latest version adds or changes no requirement.');
+    return;
+  }
+
+  const added = scope.added.length;
+  const changed = scope.changed.length;
+  const engineName = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
+  const confirm = await vscode.window.showInformationMessage(
+    `Generate a delta plan for ${added + changed} requirement(s) (${added} added, ${changed} changed) in ${formatVersionLabel(scope.versionLabel)}? This makes one ${engineName} call and uses tokens.`,
+    { modal: true },
+    'Generate',
+  );
+  if (confirm !== 'Generate') { return; }
+
+  // Re-check after the modal: a run may have started while it was open.
+  if (deps.isRunnerBusy()) { UserMsg.showWarning(UserMsg.runnerBusy()); return; }
+
+  deltaInFlight = true;
+  let outcome;
+  try {
+    outcome = await withPlanGenerationEngine('Generating delta plan…', cwd,
+      (runEngine, signal) => generateDeltaPlan(plan, { runEngine, signal }));
+  } finally {
+    deltaInFlight = false;
+  }
+
+  if (outcome.kind === 'appended' && deps.isRunnerBusy()) {
+    // generateDeltaPlan already pushed the playlist; take that exact object back out so
+    // nothing is appended under a live play().
+    const index = plan.playlists.indexOf(outcome.playlist);
+    if (index >= 0) { plan.playlists.splice(index, 1); }
+    vscode.window.showWarningMessage('A run started while generating — the delta plan was not added.');
+    return;
+  }
+
+  if (outcome.kind === 'appended' && deps.getActivePlan() !== plan) {
+    // The active plan was switched during the model call: the playlist went into the plan
+    // captured before the call, which is no longer the one shown or saved. Take it back out
+    // of that orphaned object and say so, rather than claiming it was added.
+    const index = plan.playlists.indexOf(outcome.playlist);
+    if (index >= 0) { plan.playlists.splice(index, 1); }
+    vscode.window.showWarningMessage('The active plan changed while generating — the delta plan was not added.');
+    return;
+  }
+
+  switch (outcome.kind) {
+    case 'appended': {
+      deps.saveAndRefresh();
+      const k = outcome.playlist.tasks.length;
+      const r = outcome.rejected.length;
+      vscode.window.showInformationMessage(
+        `Delta plan added — ${k} task(s) in "${outcome.playlist.name}"` +
+        (r > 0 ? `, ${r} rejected (cited no changed requirement)` : ''),
+      );
+      return;
+    }
+    case 'no-delta':
+      vscode.window.showErrorMessage('Nothing to generate — the latest version adds or changes no requirement.');
+      return;
+    case 'all-rejected':
+      vscode.window.showErrorMessage(
+        `Delta plan not added — all ${outcome.rejected.length} generated task(s) cited no changed requirement.`,
+      );
+      return;
+    case 'engine-failed':
+    case 'parse-failed':
+      vscode.window.showErrorMessage(outcome.error);
+      return;
   }
 }

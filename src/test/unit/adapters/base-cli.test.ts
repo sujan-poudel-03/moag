@@ -140,3 +140,32 @@ describe('runCli', () => {
     }
   });
 });
+
+// ─── Already-aborted signal: never spawn ───
+
+describe('runCli with an already-aborted signal', () => {
+  it('resolves an aborted result without spawning (a late abort listener would never fire)', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const proxyquire = require('proxyquire').noCallThru();
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const sinon = require('sinon');
+    const spawn = sinon.stub().throws(new Error('spawn must not be called'));
+    const execSync = sinon.stub();
+    const { runCli: isolatedRunCli } = proxyquire('../../../adapters/base-cli', {
+      'child_process': { spawn, execSync },
+      '../utils/process-kill': { killProcess: sinon.stub(), SPAWN_DETACHED: false },
+    }) as { runCli: typeof runCli };
+    const ac = new AbortController();
+    ac.abort();
+    const chunks: string[] = [];
+    const result = await isolatedRunCli(
+      { command: 'claude', buildArgs: () => ['-p'], useStdin: true },
+      { prompt: 'secret prompt', cwd: process.cwd(), signal: ac.signal },
+      (c) => chunks.push(c),
+    );
+    assert.equal(spawn.callCount, 0);
+    assert.equal(result.exitCode, 130);
+    assert.match(result.stderr, /aborted/i);
+    assert.equal(chunks.length, 0, 'no command header for a run that never started');
+  });
+});

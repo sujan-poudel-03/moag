@@ -38,6 +38,9 @@ export const PLAN_FILE_DISCLOSURE: Record<keyof PlanFile, Disclosure> = {
   aiRules: 'redact',
   prdVersions: 'redact',
   fixIterations: 'share',
+  // IDs, commit SHAs, exit codes, version labels, release tags and gate command strings —
+  // the same class as task.command. Requirement text never enters the trace.
+  requirementTrace: 'share',
   sandbox: 'share',
   validation: 'share',
   playlists: 'share',
@@ -97,6 +100,8 @@ export const TASK_DISCLOSURE: Record<keyof PlanFileTask, Disclosure> = {
   failureThreshold: 'share',
   incidentRepo: 'share',
   incidentLabel: 'share',
+  // Requirement IDs only ("R-4"), never requirement text.
+  requirementIds: 'share',
   status: 'share',
 };
 

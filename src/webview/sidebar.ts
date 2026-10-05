@@ -2018,16 +2018,23 @@ function updatePrdVersionBar(vers) {
   if (!prdVersionBarEl || !prdVersionSelectEl || !prdVersionSaveBtnEl) { return; }
   if (prdVersions.length > 0) {
     prdVersionBarEl.classList.add('visible');
-    prdVersionSelectEl.innerHTML = prdVersions.map(function(v) {
+    // Labels come from the plan file, so build options as nodes — never as HTML strings.
+    prdVersionSelectEl.textContent = '';
+    prdVersions.forEach(function(v) {
       let d = new Date(v.createdAt).toLocaleDateString();
-      return '<option value="' + v.version + '">' + v.version + ' (' + d + ')</option>';
-    }).join('');
-    prdVersionSaveBtnEl.textContent = 'Save as v' + (prdVersions.length + 1) + '.0';
+      let opt = document.createElement('option');
+      opt.value = String(v.version);
+      opt.textContent = fmtPrdVersion(String(v.version)) + ' (' + d + ')';
+      prdVersionSelectEl.appendChild(opt);
+    });
+    prdVersionSaveBtnEl.textContent = 'Save new version';
   } else {
     prdVersionBarEl.classList.remove('visible');
-    prdVersionSaveBtnEl.textContent = 'Save as v1.0';
+    prdVersionSaveBtnEl.textContent = 'Save new version';
   }
 }
+/** Display form of a PRD version label — the host computes labels, the sidebar only shows them. */
+function fmtPrdVersion(l: string): string { return l.startsWith('v') || l.startsWith('V') ? l : 'v' + l; }
 prdTextareaEl?.addEventListener('input', function() {
   let len = prdTextareaEl.value.length;
   if (prdCharCountEl) { prdCharCountEl.textContent = len + ' chars'; }
@@ -2049,8 +2056,7 @@ prdVersionSelectEl?.addEventListener('change', function() {
 prdVersionSaveBtnEl?.addEventListener('click', function() {
   let text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
   if (!text) { return; }
-  let nextVersion = 'v' + (prdVersions.length + 1) + '.0';
-  vscode.postMessage({ type: 'savePrdVersion', text: text, version: nextVersion });
+  vscode.postMessage({ type: 'savePrdVersion', text: text });
 });
 prdAiBtnEl?.addEventListener('click', function() {
   let text = prdTextareaEl ? prdTextareaEl.value.trim() : '';
@@ -2651,6 +2657,7 @@ window.addEventListener('message', (event) => {
     return;
   }
   if (msg.type === 'prdVersionSaved') {
+    if (prdTextareaEl && typeof msg.text === 'string' && msg.text) { prdTextareaEl.value = msg.text; }
     updatePrdVersionBar(msg.versions || []);
     if (prdVersionSelectEl && msg.version) { prdVersionSelectEl.value = msg.version; }
     return;

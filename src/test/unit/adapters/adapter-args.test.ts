@@ -74,6 +74,44 @@ describe('adapter argument building', () => {
     });
   });
 
+  describe('CodexAdapter in a plan-generation job', () => {
+    it('gets the plan-job args: runs outside a git repo, no shell tool, read-only sandbox, never --full-auto', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { buildPlanWorkerConfig } = require('../../../server/run-env') as typeof import('../../../server/run-env');
+      const cfg = buildPlanWorkerConfig({ defaultEngine: 'codex', versionBudgetUsd: 0 }, 0).agentTaskPlayer;
+      setMockConfig('agentTaskPlayer.engines.codex', { autoApprove: cfg['engines.codex.autoApprove'], args: cfg['engines.codex.args'] });
+      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[] } | undefined;
+      const { CodexAdapter: CA } = proxyquire('../../../adapters/codex-adapter', {
+        vscode: vscodeMock,
+        './base-cli': {
+          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[] }) => {
+            capturedConfig = config;
+            return Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 });
+          },
+        },
+      });
+      await new CA().runTask({ prompt: 'plan it', cwd: '/scratch' });
+      const args = capturedConfig!.buildArgs({ prompt: 'plan it' });
+      assert.equal(args[0], 'exec');
+      assert.ok(args.includes('--skip-git-repo-check'), 'the scratch dir is not a git repo');
+      const pairs = args.slice(0, -1).map((a, i) => `${a} ${args[i + 1]}`);
+      assert.ok(pairs.includes('--disable shell_tool'), 'no shell tool');
+      assert.ok(pairs.includes('--disable unified_exec'), 'no unified exec tool');
+      assert.ok(pairs.includes('--sandbox read-only'));
+      assert.ok(pairs.includes('-c shell_environment_policy.inherit=none'));
+      assert.ok(!args.includes('--full-auto'), 'auto-approve stays off');
+      assert.ok(!args.some((a) => /danger-full-access|dangerously|--yolo/.test(a)));
+      assert.ok(!args.includes('plan it'), 'the prompt still goes through stdin');
+    });
+
+    it('a run job (no plan args configured) does not get --skip-git-repo-check or the disables', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { buildWorkerConfig } = require('../../../server/run-env') as typeof import('../../../server/run-env');
+      const cfg = buildWorkerConfig({ defaultEngine: 'codex', versionBudgetUsd: 0 }, 0).agentTaskPlayer as Record<string, unknown>;
+      assert.equal('engines.codex.args' in cfg, false);
+    });
+  });
+
   describe('ClaudeAdapter', () => {
     it('should have id "claude"', () => {
       const adapter = new ClaudeAdapter();

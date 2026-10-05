@@ -758,6 +758,96 @@ describe('loadPlan / savePlan round-trip', () => {
     fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
     assert.throws(() => loadPlan(tmpFile), /port/);
   });
+
+  // ─── Requirement IDs, semver bumps and the requirement trace ───
+
+  /** Write a raw (deliberately malformed) plan object and return the loader's error message. */
+  function loadErrorFor(extra: Record<string, unknown>, tasks: unknown[] = []): string {
+    const raw = {
+      version: '1.0',
+      name: 'Bad Requirement Data',
+      defaultEngine: 'claude',
+      ...extra,
+      playlists: [{ id: 'pl-1', name: 'Tasks', autoplay: true, tasks }],
+    };
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    try {
+      loadPlan(tmpFile);
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    assert.fail('loadPlan should have thrown');
+  }
+
+  it('should throw a file-qualified error for an unknown chosenBump', () => {
+    const msg = loadErrorFor({
+      prdVersions: [{ version: '1.0.0', text: 't', createdAt: '2026-01-01T00:00:00.000Z', chosenBump: 'huge' }],
+    });
+    assert.match(msg, /test\.agent-plan\.json/);
+    assert.match(msg, /prdVersions\[0\]\.chosenBump/);
+    assert.match(msg, /patch, minor, major/);
+  });
+
+  it('should throw a file-qualified error when requirementIds is not an array', () => {
+    const msg = loadErrorFor({}, [{ id: 't-1', name: 'T', prompt: 'p', requirementIds: 'R-1' }]);
+    assert.match(msg, /test\.agent-plan\.json/);
+    assert.match(msg, /requirementIds/);
+    assert.match(msg, /t-1/);
+  });
+
+  it('should throw a file-qualified error for a trace record with a malformed id', () => {
+    const msg = loadErrorFor({ requirementTrace: [{ id: 'X' }] });
+    assert.match(msg, /test\.agent-plan\.json/);
+    assert.match(msg, /requirementTrace\[0\]\.id/);
+  });
+
+  it('should throw a file-qualified error for a gate exitCode that is a string', () => {
+    const msg = loadErrorFor({
+      requirementTrace: [{
+        id: 'R-1',
+        gates: [{ command: 'npm test', exitCode: '0', timedOut: false, at: '2026-01-01T00:00:00.000Z' }],
+      }],
+    });
+    assert.match(msg, /test\.agent-plan\.json/);
+    assert.match(msg, /requirementTrace\[0\]\.gates\[0\]/);
+  });
+
+  it('should default missing trace sub-arrays to [] and round-trip requirement fields through savePlan', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Trace Defaults',
+      defaultEngine: 'claude',
+      requirementTrace: [{ id: 'R-3' }],
+      playlists: [{
+        id: 'pl-1', name: 'Tasks', autoplay: true,
+        tasks: [{ id: 't-1', name: 'T', prompt: 'p', requirementIds: ['R-3'] }],
+      }],
+    };
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    const plan = loadPlan(tmpFile);
+    assert.deepEqual(plan.requirementTrace, [{ id: 'R-3', taskIds: [], commits: [], gates: [], releases: [] }]);
+
+    savePlan(plan, tmpFile);
+    const reloaded = loadPlan(tmpFile);
+    assert.deepEqual(reloaded.requirementTrace, plan.requirementTrace);
+    assert.deepEqual(reloaded.playlists[0].tasks[0].requirementIds, ['R-3']);
+  });
+
+  it('should hydrate an empty requirementIds array to undefined and not re-emit it', () => {
+    const raw = {
+      version: '1.0',
+      name: 'Empty Ids',
+      defaultEngine: 'claude',
+      playlists: [{
+        id: 'pl-1', name: 'Tasks', autoplay: true,
+        tasks: [{ id: 't-1', name: 'T', prompt: 'p', requirementIds: [] }],
+      }],
+    };
+    fs.writeFileSync(tmpFile, JSON.stringify(raw, null, 2), 'utf-8');
+    const plan = loadPlan(tmpFile);
+    assert.equal(plan.playlists[0].tasks[0].requirementIds, undefined);
+    assert.ok(!('requirementIds' in dehydratePlan(plan).playlists[0].tasks[0]));
+  });
 });
 
 describe('appendPrdVersion', () => {

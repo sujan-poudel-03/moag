@@ -11,6 +11,7 @@
 
 import { EngineResult, Plan, Playlist, Task, TaskStatus } from '../models/types';
 import * as nodeFs from 'fs';
+import { recordGateResults } from '../models/requirement-trace';
 import { commandFactId, recordFact } from './knowledge';
 import { decisionFor, park, ParkReason } from './park-queue';
 import {
@@ -52,6 +53,12 @@ export interface PrdLoopConfig {
     specPath?: string;
     timeoutMs: number;
   };
+  /**
+   * Spend ceiling in USD for this one loop run (agentTaskPlayer.prdLoop.versionBudgetUsd).
+   * Counts every engine call made while the loop is running; 0 disables it. Required so
+   * every host surface makes an explicit decision.
+   */
+  versionBudgetUsd: number;
 }
 
 /** Why the loop stopped short of a verdict. */
@@ -118,6 +125,13 @@ export interface PrdLoopDeps {
    * called after a repo gate has already failed.
    */
   prepareUat?: (signal: AbortSignal) => Promise<UatSession | null>;
+  /**
+   * Subscribe to per-call spend (USD) for the per-run budget; returns the unsubscribe.
+   * Only called when `versionBudgetUsd > 0`. Without it the cap cannot be metered.
+   */
+  subscribeSpend?: (onCost: (usd: number) => void) => () => void;
+  /** Stop the runner when the per-run budget is breached mid-run. Best effort. */
+  stopRun?: () => void;
   signal: AbortSignal;
 }
 
@@ -150,6 +164,10 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
   let manualGateHit = false;
   let manualGateTaskId: string | null = null;
   let budgetHit = false;
+  /** Spend metered since this run() subscribed — its own baseline, never shared. */
+  let versionSpendUsd = 0;
+  let versionBudgetHit = false;
+  let unsubscribeSpend: (() => void) | null = null;
 
   let iterations = 0;
   let modelCallsMade = 0;
@@ -183,6 +201,29 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
 
   /** All tasks across every playlist, in plan order. */
   const allTasks = (plan: Plan): Task[] => plan.playlists.flatMap((pl) => pl.tasks);
+
+  /**
+   * The budget-exceeded report when either ceiling was hit, else null. Checked at the top of
+   * each iteration, before every engine call, and right after a fix playlist ran.
+   */
+  const budgetHalt = (over: Partial<PrdLoopReport> = {}): PrdLoopReport | null => {
+    if (budgetHit) {
+      return makeReport({
+        ...over,
+        haltReason: 'budget-exceeded',
+        suggestion: 'The cost ceiling was reached. Raise agentTaskPlayer.costBudgetUsd to continue.',
+      });
+    }
+    if (versionBudgetHit) {
+      return makeReport({
+        ...over,
+        haltReason: 'budget-exceeded',
+        suggestion: `Per-run PRD budget reached: spent $${versionSpendUsd.toFixed(2)} of ` +
+          `agentTaskPlayer.prdLoop.versionBudgetUsd = $${cfg.versionBudgetUsd.toFixed(2)}.`,
+      });
+    }
+    return null;
+  };
 
   /**
    * Resolve a pending manual gate.
@@ -234,11 +275,9 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
       if (deps.signal.aborted) {
         return makeReport({ haltReason: 'aborted' });
       }
-      if (budgetHit) {
-        return makeReport({
-          haltReason: 'budget-exceeded',
-          suggestion: 'The cost ceiling was reached. Raise agentTaskPlayer.costBudgetUsd to continue.',
-        });
+      const budgetStop = budgetHalt();
+      if (budgetStop) {
+        return budgetStop;
       }
       if (settleManualGate()) {
         return makeReport({
@@ -397,6 +436,13 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
         }
       }
 
+      // ── Requirement trace evidence ──
+      // Recorded here — after every gate command ran and BEFORE any model call — so the
+      // trace only ever holds real exit codes. Nothing after the model call touches it.
+      if (gates.length > 0 && recordGateResults(deps.plan, gates, new Date().toISOString()).length > 0) {
+        deps.savePlan();
+      }
+
       // e. G3 — every artifact a completed task promised must exist
       if (!failedGate) {
         const expected = allTasks(deps.plan)
@@ -418,6 +464,10 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
       if (!failedGate) {
         deps.onProgress('verify', 'All deterministic gates passed — asking the model for a verdict.');
         const prompt = buildVerifyPrompt(prdText, summarizeEvidence(evidence, gates, cfg.maxDiffChars));
+        const verifyBudgetStop = budgetHalt();
+        if (verifyBudgetStop) {
+          return verifyBudgetStop;
+        }
         modelCallsMade++;
         const result = await deps.runEngine(prompt, deps.signal);
         const verdict = parseVerdict(result);
@@ -479,6 +529,10 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
       const fixPrompt = failedGate
         ? buildDeterministicFixPrompt(failedGate, failureDetail)
         : buildGapFixPrompt(gaps, suggestion);
+      const fixBudgetStop = budgetHalt({ failedGate, gaps, score });
+      if (fixBudgetStop) {
+        return fixBudgetStop;
+      }
       deps.onProgress('fix', `Generating fix tasks (iteration ${used + 1})`);
       modelCallsMade++;
       const fixResult = await deps.runEngine(fixPrompt, deps.signal);
@@ -528,6 +582,11 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
           score,
         });
       }
+      // A breach while the fix playlist ran stopped the runner — report that, not contention.
+      const runBudgetStop = budgetHalt({ failedGate, gaps, score });
+      if (runBudgetStop) {
+        return runBudgetStop;
+      }
       const untouched = fixPlaylist.tasks.every((t) => t.status === TaskStatus.Pending);
       if (untouched) {
         return makeReport({
@@ -551,9 +610,28 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
   const run = async (): Promise<PrdLoopReport> => {
     let report: PrdLoopReport | null = null;
     try {
+      if (cfg.versionBudgetUsd > 0) {
+        if (deps.subscribeSpend) {
+          unsubscribeSpend = deps.subscribeSpend((usd) => {
+            if (!Number.isFinite(usd) || usd < 0) { return; }
+            versionSpendUsd += usd;
+            if (!versionBudgetHit && versionSpendUsd > cfg.versionBudgetUsd) {
+              versionBudgetHit = true;
+              deps.onProgress('halt', `Per-run PRD budget reached ($${versionSpendUsd.toFixed(2)} of ` +
+                `$${cfg.versionBudgetUsd.toFixed(2)}) — stopping the run.`);
+              try { deps.stopRun?.(); } catch { /* best effort */ }
+            }
+          });
+        } else {
+          deps.onProgress('warning', 'per-version budget set but spend cannot be metered');
+        }
+      }
       report = await execute();
       return report;
     } finally {
+      // Unsubscribed on every path — including a throw — before the report goes out.
+      unsubscribeSpend?.();
+      unsubscribeSpend = null;
       // Exactly one report on every terminal path, including a thrown error.
       const final = report ?? makeReport({
         haltReason: 'engine-error',

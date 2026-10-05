@@ -147,6 +147,8 @@ export interface Task {
   incidentRepo?: string;
   /** monitor task: label applied to filed incident issues (default "moag:incident") */
   incidentLabel?: string;
+  /** PRD requirement IDs (e.g. "R-4") this task implements — IDs only, never requirement text */
+  requirementIds?: string[];
   /** Runtime status (not persisted in the plan file) */
   status: TaskStatus;
 }
@@ -204,11 +206,53 @@ export interface SandboxConfig {
   port?: number;
 }
 
+/** Semver bump kinds used when labelling a saved PRD version. */
+export const SEMVER_BUMPS = ['patch', 'minor', 'major'] as const;
+export type SemverBump = typeof SEMVER_BUMPS[number];
+
 /** A saved snapshot of a PRD at a specific version */
 export interface PrdVersion {
   version: string;
   text: string;
   createdAt: string;
+  /** Bump MOAG recommended from the requirement diff (absent on the first version) */
+  recommendedBump?: SemverBump;
+  /** Bump the owner applied — equals recommendedBump unless overridden */
+  chosenBump?: SemverBump;
+}
+
+/**
+ * One gate command's real exit code, recorded against a requirement.
+ * IDs only, never requirement text.
+ */
+export interface RequirementGateResult {
+  command: string;
+  exitCode: number;
+  timedOut: boolean;
+  at: string;
+}
+
+/**
+ * A release that shipped a requirement — the tag and the then-latest PRD version label.
+ * IDs only, never requirement text.
+ */
+export interface RequirementRelease {
+  releaseTag: string;
+  prdVersion: string;
+  at: string;
+  taskIds: string[];
+}
+
+/**
+ * Deterministic evidence linking one requirement ID to tasks, commits, gates and releases.
+ * IDs only, never requirement text.
+ */
+export interface RequirementTraceRecord {
+  id: string;
+  taskIds: string[];
+  commits: string[];
+  gates: RequirementGateResult[];
+  releases: RequirementRelease[];
 }
 
 /** Top-level plan file structure */
@@ -239,6 +283,8 @@ export interface Plan {
   prdVersions?: PrdVersion[];
   /** Number of fix-iteration playlists generated so far (iteration guard ceiling: 3) */
   fixIterations?: number;
+  /** Requirement trace evidence keyed by requirement ID — IDs only, never requirement text */
+  requirementTrace?: RequirementTraceRecord[];
   /** GitHub issues this plan was generated from — used to close them after successful completion */
   sourceIssues?: Array<{ repo: string; number: number; title: string }>;
   playlists: Playlist[];
@@ -421,6 +467,8 @@ export interface PlanFile {
   prdVersions?: PrdVersion[];
   /** Number of fix-iteration playlists generated so far */
   fixIterations?: number;
+  /** Requirement trace evidence keyed by requirement ID — IDs only, never requirement text */
+  requirementTrace?: RequirementTraceRecord[];
   /** Optional sandbox configuration — overrides project auto-detection */
   sandbox?: SandboxConfig;
   /** Optional plan-level validation defaults */
@@ -493,6 +541,8 @@ export interface PlanFileTask {
   failureThreshold?: number;
   incidentRepo?: string;
   incidentLabel?: string;
+  /** PRD requirement IDs this task implements — IDs only, never requirement text */
+  requirementIds?: string[];
   /** Persisted execution status (omitted or 'pending' means not yet run) */
   status?: string;
 }

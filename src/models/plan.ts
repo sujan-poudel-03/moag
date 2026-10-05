@@ -7,6 +7,7 @@ import {
   Playlist, Task, TaskStatus, EngineId,
   ContextBudget, PrdVersion, RoleDefinition, RoleId, SandboxConfig, SandboxTarget,
   ValidationProfile, ValidationSettings, ValidationTarget,
+  SEMVER_BUMPS, SemverBump, RequirementTraceRecord, RequirementGateResult, RequirementRelease,
 } from './types';
 import { redactPlanFile } from './plan-redaction';
 import { isRoleId, MAX_ROLE_CHARTER_CHARS } from './roles';
@@ -285,7 +286,128 @@ function normalizePrdVersions(raw: unknown, sourceName: string): PrdVersion[] {
     if (typeof createdAt !== 'string' || createdAt.length === 0) {
       throw new Error(`"${sourceName}" has invalid "prdVersions[${i}].createdAt" — expected a non-empty string.`);
     }
-    return { version, text, createdAt };
+    const result: PrdVersion = { version, text, createdAt };
+    const recommendedBump = parseSemverBump(entry.recommendedBump, `prdVersions[${i}].recommendedBump`, sourceName);
+    if (recommendedBump !== undefined) { result.recommendedBump = recommendedBump; }
+    const chosenBump = parseSemverBump(entry.chosenBump, `prdVersions[${i}].chosenBump`, sourceName);
+    if (chosenBump !== undefined) { result.chosenBump = chosenBump; }
+    return result;
+  });
+}
+
+/** Validate an optional semver bump field — undefined stays undefined, anything else must be a known bump. */
+function parseSemverBump(raw: unknown, field: string, sourceName: string): SemverBump | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (typeof raw !== 'string' || !(SEMVER_BUMPS as readonly string[]).includes(raw)) {
+    throw new Error(`"${sourceName}" has invalid "${field}" — expected one of ${SEMVER_BUMPS.join(', ')}.`);
+  }
+  return raw as SemverBump;
+}
+
+/**
+ * Validate a task's requirement-ID list structurally (an array of non-empty strings).
+ * The `R-n` format itself is enforced where IDs are generated, not here. An empty array
+ * hydrates to `undefined` so it is never re-emitted.
+ */
+function parseRequirementIds(raw: unknown, sourceName: string, taskId: string): string[] | undefined {
+  if (raw === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(raw) || raw.some(id => typeof id !== 'string' || id.length === 0)) {
+    throw new Error(
+      `"${sourceName}" has invalid "tasks[].requirementIds" for task "${taskId}" — expected an array of strings.`,
+    );
+  }
+  return raw.length > 0 ? [...(raw as string[])] : undefined;
+}
+
+const REQUIREMENT_ID_PATTERN = /^R-\d+$/;
+
+/** Throw a sourceName-qualified error for one field of a requirement-trace record. */
+function traceFieldError(sourceName: string, field: string, expected: string): Error {
+  return new Error(`"${sourceName}" has invalid "requirementTrace${field}" — expected ${expected}.`);
+}
+
+/** Read an optional string-array sub-field of a trace record; missing means []. */
+function parseTraceStringArray(raw: unknown, sourceName: string, field: string): string[] {
+  if (raw === undefined) {
+    return [];
+  }
+  if (!Array.isArray(raw) || raw.some(v => typeof v !== 'string')) {
+    throw traceFieldError(sourceName, field, 'an array of strings');
+  }
+  return [...(raw as string[])];
+}
+
+/**
+ * Validate the persisted requirement trace. Each record holds only IDs, SHAs, exit codes,
+ * version labels and tags — never requirement text. A missing sub-array defaults to `[]`;
+ * a wrongly typed one throws a sourceName-qualified error naming the field.
+ */
+function normalizeRequirementTrace(raw: unknown, sourceName: string): RequirementTraceRecord[] {
+  if (!Array.isArray(raw)) {
+    throw traceFieldError(sourceName, '', 'an array');
+  }
+  return raw.map((entry: unknown, i: number) => {
+    const at = `[${i}]`;
+    if (!isRecord(entry)) {
+      throw traceFieldError(sourceName, at, 'an object');
+    }
+    if (typeof entry.id !== 'string' || !REQUIREMENT_ID_PATTERN.test(entry.id)) {
+      throw traceFieldError(sourceName, `${at}.id`, 'a requirement ID like "R-1"');
+    }
+    const taskIds = parseTraceStringArray(entry.taskIds, sourceName, `${at}.taskIds`);
+    const commits = parseTraceStringArray(entry.commits, sourceName, `${at}.commits`);
+
+    let gates: RequirementGateResult[] = [];
+    if (entry.gates !== undefined) {
+      if (!Array.isArray(entry.gates)) {
+        throw traceFieldError(sourceName, `${at}.gates`, 'an array');
+      }
+      gates = entry.gates.map((g: unknown, j: number) => {
+        const field = `${at}.gates[${j}]`;
+        if (
+          !isRecord(g)
+          || typeof g.command !== 'string'
+          || typeof g.exitCode !== 'number' || !Number.isInteger(g.exitCode)
+          || typeof g.timedOut !== 'boolean'
+          || typeof g.at !== 'string'
+        ) {
+          throw traceFieldError(
+            sourceName, field, '{ command: string, exitCode: integer, timedOut: boolean, at: string }',
+          );
+        }
+        return { command: g.command, exitCode: g.exitCode, timedOut: g.timedOut, at: g.at };
+      });
+    }
+
+    let releases: RequirementRelease[] = [];
+    if (entry.releases !== undefined) {
+      if (!Array.isArray(entry.releases)) {
+        throw traceFieldError(sourceName, `${at}.releases`, 'an array');
+      }
+      releases = entry.releases.map((r: unknown, j: number) => {
+        const field = `${at}.releases[${j}]`;
+        if (
+          !isRecord(r)
+          || typeof r.releaseTag !== 'string' || r.releaseTag.length === 0
+          || typeof r.prdVersion !== 'string'
+          || typeof r.at !== 'string'
+        ) {
+          throw traceFieldError(
+            sourceName, field, '{ releaseTag: non-empty string, prdVersion: string, at: string, taskIds: string[] }',
+          );
+        }
+        if (!Array.isArray(r.taskIds) || r.taskIds.some(v => typeof v !== 'string')) {
+          throw traceFieldError(sourceName, `${field}.taskIds`, 'an array of strings');
+        }
+        return { releaseTag: r.releaseTag, prdVersion: r.prdVersion, at: r.at, taskIds: [...(r.taskIds as string[])] };
+      });
+    }
+
+    return { id: entry.id, taskIds, commits, gates, releases };
   });
 }
 
@@ -389,6 +511,9 @@ export function hydratePlan(file: PlanFile, sourceName = 'plan'): Plan {
   if (file.aiRules) { plan.aiRules = file.aiRules; }
   if (file.prdVersions !== undefined) { plan.prdVersions = normalizePrdVersions(file.prdVersions, sourceName); }
   if (file.fixIterations !== undefined) { plan.fixIterations = parseFixIterations(file.fixIterations, sourceName); }
+  if (file.requirementTrace !== undefined) {
+    plan.requirementTrace = normalizeRequirementTrace(file.requirementTrace, sourceName);
+  }
   if (file.sandbox !== undefined) { plan.sandbox = normalizeSandbox(file.sandbox, sourceName); }
   // Ensure all task/playlist IDs are unique; fix duplicates or missing IDs
   ensureUniqueIds(plan);
@@ -467,6 +592,7 @@ function hydrateTask(t: PlanFileTask, sourceName: string): Task {
     failureThreshold: t.failureThreshold,
     incidentRepo: t.incidentRepo,
     incidentLabel: t.incidentLabel,
+    requirementIds: parseRequirementIds(t.requirementIds, sourceName, t.id || t.name || '<unknown-task>'),
     status: (t.status as TaskStatus) || TaskStatus.Pending,
   };
 }
@@ -511,10 +637,30 @@ export function dehydratePlan(plan: Plan): PlanFile {
   if (plan.prdVersions?.length) {
     // Faithful at any count — the retention cap lives in appendPrdVersion, not here,
     // so a hand-authored 50-version file re-saves with all 50 intact.
-    result.prdVersions = plan.prdVersions.map(v => ({ version: v.version, text: v.text, createdAt: v.createdAt }));
+    result.prdVersions = plan.prdVersions.map(v => {
+      const entry: PrdVersion = { version: v.version, text: v.text, createdAt: v.createdAt };
+      if (v.recommendedBump !== undefined) { entry.recommendedBump = v.recommendedBump; }
+      if (v.chosenBump !== undefined) { entry.chosenBump = v.chosenBump; }
+      return entry;
+    });
   }
   // typeof, not truthiness: fixIterations === 0 is a real value and must persist as 0.
   if (typeof plan.fixIterations === 'number') { result.fixIterations = plan.fixIterations; }
+  if (plan.requirementTrace?.length) {
+    // Rebuilt field by field (no spreads) so runtime-only keys can never leak into the file.
+    result.requirementTrace = plan.requirementTrace.map(r => ({
+      id: r.id,
+      taskIds: [...r.taskIds],
+      commits: [...r.commits],
+      gates: r.gates.map(g => ({ command: g.command, exitCode: g.exitCode, timedOut: g.timedOut, at: g.at })),
+      releases: r.releases.map(rel => ({
+        releaseTag: rel.releaseTag,
+        prdVersion: rel.prdVersion,
+        at: rel.at,
+        taskIds: [...rel.taskIds],
+      })),
+    }));
+  }
   if (plan.sandbox && (plan.sandbox.targets?.length || plan.sandbox.command)) {
     // Rebuilt field-by-field in the same key order the loader produces — never emit
     // an empty "targets" array, and never carry unknown keys back out.
@@ -600,6 +746,7 @@ function dehydrateTask(t: Task): PlanFileTask {
   if (t.sourceIssueNumber !== undefined) { result.sourceIssueNumber = t.sourceIssueNumber; }
   if (t.sourceIssueRepo) { result.sourceIssueRepo = t.sourceIssueRepo; }
   if (t.role) { result.role = t.role; }
+  if (t.requirementIds?.length) { result.requirementIds = [...t.requirementIds]; }
   // Only persist non-pending statuses to keep plan files clean
   if (t.status && t.status !== TaskStatus.Pending) {
     result.status = t.status;

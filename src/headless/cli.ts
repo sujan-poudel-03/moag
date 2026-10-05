@@ -12,6 +12,7 @@
  *   moag loop   --repo <owner/repo> [--label <l>] [--interval <sec>] [--once]
  *                                   [--full-auto] [--engine <id>] [--cwd <dir>]
  *   moag config <get-engine | set-engine <id>>
+ *   moag trace  [<plan.json> | --plan <path>] [--req R-<n>]
  *
  * `run`    executes a single plan file, or a one-shot prompt (`--prompt`) which is
  *          turned into a single agent task and run through the selected engine.
@@ -22,6 +23,8 @@
  *          Playwright/Cypress setup then FAILS verification); `--no-uat` disables
  *          it. Without either flag, agentTaskPlayer.prdLoop.uat.mode decides.
  * `config` reads/sets the persistent default engine in `.moag/config.json`.
+ * `trace`  prints one JSONL line per PRD requirement (shipped / in-progress / not-shipped /
+ *          untracked / removed) with its PRD version, release tag, tasks and gate exit codes.
  * `loop`   polls a GitHub repo for open issues, turns each new issue into a task,
  *          runs them, then reports the outcome back to the issue (comment + close on
  *          success; comment + label on failure) — the closed autonomous loop.
@@ -37,6 +40,7 @@ import { installVscodeShim, FileMemento } from './install-shim';
 // Both of these are free of VS Code API imports, so they are safe to load before the shim.
 import { detectPrdFile } from '../runner/evidence';
 import { createPrdLoop, HaltReason, PrdLoopConfig, PrdLoopReport, UatSession } from '../runner/prd-loop';
+import type { Plan } from '../models/types';
 
 /** How long a freshly launched headless sandbox gets to report `running`. */
 const UAT_SANDBOX_READY_TIMEOUT_MS = 120_000;
@@ -79,6 +83,10 @@ export interface Args {
   merge?: boolean;
   /** `land` only: the branch to land into; defaults to the current one. */
   into?: string;
+  /** `trace` only: report a single requirement ID (`R-<n>`). */
+  req?: string;
+  /** `--plan` was given without a path (end of argv, or followed by another flag). */
+  planFlagMissing?: boolean;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -98,6 +106,7 @@ export function parseArgs(argv: string[]): Args {
     verify: false, fix: false, gates: [],
   };
   const rest = argv.slice(1);
+  let planFlag: string | undefined;
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i];
     if (arg === '--no-interactive') { a.noInteractive = true; }
@@ -126,12 +135,27 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--into') { const v = rest[++i]; if (v) { a.into = v; } }
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
+    // Resolved after the loop so a later --cwd still applies, whatever the flag order.
+    // A bare --plan (nothing after it, or another flag) is recorded, never silently ignored:
+    // `moag trace --plan` would otherwise fall back to .moag/plan.json and report the wrong plan.
+    else if (arg === '--plan') {
+      const v = rest[i + 1];
+      if (v === undefined || v === '' || v.startsWith('--')) { a.planFlagMissing = true; } else { planFlag = v; i++; }
+    }
+    // A bare trailing --req becomes '' so traceArgsError reports it as a usage error.
+    else if (arg === '--req') { a.req = rest[++i] ?? ''; }
     else if (!arg.startsWith('--')) {
       // `queue`/`config` read their verb from positionals; `run`/`verify` take a plan path.
       a.positionals.push(arg);
       if (!a.planPath) { a.planPath = path.resolve(a.cwd, arg); }
     }
   }
+  // `trace` resolves its positional plan path like --plan: against the FINAL --cwd,
+  // whatever the flag order (`moag trace plan.json --cwd repo` reads repo/plan.json).
+  if (a.command === 'trace' && planFlag === undefined && a.positionals.length > 0) {
+    a.planPath = path.resolve(a.cwd, a.positionals[0]);
+  }
+  if (planFlag !== undefined) { a.planPath = path.resolve(a.cwd, planFlag); }
   return a;
 }
 
@@ -143,7 +167,8 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
 
 /* eslint-disable @typescript-eslint/no-var-requires */
 /* eslint-disable @typescript-eslint/no-explicit-any */
-interface Ctx {
+/** What the post-shim commands need. Exported so tests can drive a command with fakes. */
+export interface Ctx {
   runner: any;
   vscode: any;
   TaskStatus: any;
@@ -202,7 +227,11 @@ function wireEvents(runner: any): RunnerEventState {
     manualGateHit = true;
     manualGateTaskId = t.id;
     emit({ event: 'manual-gate', id: t.id, name: t.name, note: 'Halting for human approval (ship gate).' });
-    runner.stop();
+    // Deferred on purpose (as in src/server/run-worker.ts): stop() inside this
+    // emit aborts the task signal BEFORE runManualTask attaches its abort
+    // listener, so the gate promise never settles and play() never resolves —
+    // exit 3 would hang until the watchdog. One tick later the listener is attached.
+    setImmediate(() => runner.stop());
   });
   return {
     manualGateHit: () => manualGateHit,
@@ -262,6 +291,12 @@ export function exitCodeForReport(report: { passed: boolean; haltReason: HaltRea
   }
 }
 
+/** A per-run budget setting as a usable number: anything non-finite or negative disables it (0). */
+function normalizeBudgetUsd(raw: unknown): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
 /** Build the loop config from settings, with CLI flags taking precedence. */
 export function buildVerifyConfig(args: Args, ctx: Ctx): PrdLoopConfig {
   const cfg = ctx.vscode.workspace.getConfiguration('agentTaskPlayer');
@@ -272,6 +307,7 @@ export function buildVerifyConfig(args: Args, ctx: Ctx): PrdLoopConfig {
     gateTimeoutMs: cfg.get('prdLoop.gateTimeoutMs', 600_000),
     maxDiffChars: cfg.get('prdLoop.maxDiffChars', 40_000),
     onManualGate: cfg.get('prdLoop.onManualGate', 'halt'),
+    versionBudgetUsd: normalizeBudgetUsd(cfg.get('prdLoop.versionBudgetUsd', 0)),
     fix: args.fix,
     // Unattended: an undetectable repo is a hard failure, not a warning.
     unattended: true,
@@ -289,8 +325,13 @@ export function buildVerifyConfig(args: Args, ctx: Ctx): PrdLoopConfig {
 /**
  * Run the PRD loop over an already-loaded plan and write the full report to
  * `.moag/verification-<ts>.json`. Shared by `moag verify` and `moag run --verify`.
+ * `persist` decides what the loop's saves write: `'plan'` (moag verify) saves the whole
+ * plan; `'trace'` (moag run --verify) writes only `requirementTrace` and `fixIterations`,
+ * because a headless run never persists its task statuses.
  */
-async function runVerifyCore(args: Args, ctx: Ctx, plan: any, events: RunnerEventState): Promise<number> {
+export async function runVerifyCore(
+  args: Args, ctx: Ctx, plan: any, events: RunnerEventState, persist: 'plan' | 'trace',
+): Promise<number> {
   const { savePlan } = require('../models/plan');
   const { getEngine } = require('../adapters/index');
   // Loaded here, inside the post-shim region, for consistency with setup().
@@ -390,6 +431,7 @@ async function runVerifyCore(args: Args, ctx: Ctx, plan: any, events: RunnerEven
 
   // Assigned below; the runPlan seam needs to reach the controller it belongs to.
   const holder: { controller: ReturnType<typeof createPrdLoop> | null } = { controller: null };
+  const persistTrace = persist === 'trace' && args.planPath ? tracePersister(plan, args.planPath) : null;
 
   try {
     const controller = createPrdLoop(cfgForUat, {
@@ -404,6 +446,7 @@ async function runVerifyCore(args: Args, ctx: Ctx, plan: any, events: RunnerEven
       runEngine: (prompt: string, signal: AbortSignal) =>
         getEngine(plan.defaultEngine).runTask({ prompt, cwd: args.cwd, signal, costLabel: 'prd-loop' }),
       savePlan: () => {
+        if (persistTrace) { persistTrace(); return; }
         if (args.planPath) {
           try { savePlan(plan, args.planPath); }
           catch (err) { emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); }
@@ -419,6 +462,10 @@ async function runVerifyCore(args: Args, ctx: Ctx, plan: any, events: RunnerEven
       }),
       skipManualGate: (taskId: string) => ctx.runner.skipManualGate(taskId),
       prepareUat,
+      // Per-run PRD budget: lazy, so the ledger singleton loads inside the post-shim region.
+      subscribeSpend: (cb: (usd: number) => void) =>
+        require('../utils/cost-ledger').costLedger.onRecord((e: { estimatedCostUsd: number }) => cb(e.estimatedCostUsd)),
+      stopRun: () => ctx.runner.stop(),
       signal: abort.signal,
     });
     holder.controller = controller;
@@ -460,7 +507,8 @@ async function runVerifyCore(args: Args, ctx: Ctx, plan: any, events: RunnerEven
 
 // ─── command: run ────────────────────────────────────────────────────────────
 
-async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
+/** `moag run`. Exported so tests can drive it with a fake runner. */
+export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   let plan;
   let planPath: string;
   if (args.prompt) {
@@ -482,8 +530,12 @@ async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   const { captureBaseRef } = require('../runner/evidence');
   const prBaseRef = args.pr ? await captureBaseRef(args.cwd) : null;
   emit({ event: 'run-started', plan: plan.name, planPath, fullAuto: args.fullAuto, engine: plan.defaultEngine });
+  // Headless runs do not save the plan, except for requirement trace evidence (commits,
+  // release stamps) the run recorded — that is persisted only when it actually changed.
+  const persistTrace = !args.prompt && args.planPath ? tracePersister(plan, args.planPath) : (): void => undefined;
   try { await ctx.runner.play(plan); }
-  catch (err) { emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
+  catch (err) { persistTrace(); emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
+  persistTrace();
 
   const t = tally(plan, ctx.TaskStatus);
   emit({ event: 'run-finished', ...t, manualGateHit: events.manualGateHit() });
@@ -493,8 +545,60 @@ async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
 
   if (!args.verify) { return runCode; }
   // A clean task tally is not evidence — fold the PRD verdict into the exit code.
-  const verifyCode = await runVerifyCore(args, ctx, plan, events);
+  const verifyCode = await runVerifyCore(args, ctx, plan, events, args.prompt ? 'plan' : 'trace');
   return runCode !== 0 ? runCode : verifyCode;
+}
+
+/**
+ * A function that writes `plan.requirementTrace` to `planPath` via `persistRequirementTrace`
+ * whenever it changed since the last write (or since this call, for the first). Never throws:
+ * a failed write is emitted as an error event and retried on the next call.
+ */
+function tracePersister(plan: Plan, planPath: string): () => void {
+  // The fix-iteration count rides along: without it on disk the next
+  // `moag run --verify --fix` would start the ceiling over from 0.
+  const snapshot = (): string => JSON.stringify([plan.requirementTrace ?? null, plan.fixIterations ?? null]);
+  let persisted = snapshot();
+  return (): void => {
+    const current = snapshot();
+    if (current === persisted) { return; }
+    try {
+      persistRequirementTrace(plan, planPath);
+      persisted = current;
+    } catch (err) {
+      emit({ event: 'error', message: `Failed to save requirement trace: ${err instanceof Error ? err.message : String(err)}` });
+    }
+  };
+}
+
+/**
+ * Write only `requirementTrace` and `fixIterations` back to the plan file. The file is
+ * re-read and just those keys are replaced (`fixIterations` so the PRD loop's fix ceiling
+ * carries across runs), so the run's task statuses never reach disk — a full `savePlan` would make
+ * the next `moag run` silently skip every task this run completed, release included. The
+ * write goes to a sibling temp file that is renamed over the original, so a crash mid-write
+ * cannot truncate the plan. Throws on an unreadable or unparsable plan file.
+ */
+export function persistRequirementTrace(plan: Plan, planPath: string): void {
+  const { dehydratePlan } = require('../models/plan');
+  const file = JSON.parse(fs.readFileSync(planPath, 'utf-8')) as Record<string, unknown>;
+  if (!file || typeof file !== 'object' || Array.isArray(file)) {
+    throw new Error(`"${path.basename(planPath)}" is not a valid plan — expected a JSON object.`);
+  }
+  // dehydratePlan rebuilds the trace field by field; it omits the key when the trace is empty.
+  const dehydrated = dehydratePlan(plan);
+  const trace = dehydrated.requirementTrace;
+  if (trace) { file.requirementTrace = trace; } else { delete file.requirementTrace; }
+  // Same key and form as savePlan writes (an integer >= 0; 0 is a real value).
+  if (typeof dehydrated.fixIterations === 'number') { file.fixIterations = dehydrated.fixIterations; } else { delete file.fixIterations; }
+  const tmp = `${planPath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(file, null, 2), 'utf-8');
+    fs.renameSync(tmp, planPath);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* best effort */ }
+    throw err;
+  }
 }
 
 /**
@@ -546,7 +650,7 @@ async function cmdVerify(args: Args, ctx: Ctx): Promise<number> {
   if (args.engine) { plan.defaultEngine = args.engine; }
 
   const events = wireEvents(ctx.runner);
-  return runVerifyCore(args, ctx, plan, events);
+  return runVerifyCore(args, ctx, plan, events, 'plan');
 }
 
 // ─── command: loop ───────────────────────────────────────────────────────────
@@ -812,6 +916,77 @@ function cmdQueue(args: Args): number {
   return open.length > 0 ? 1 : 0;
 }
 
+// ─── command: trace ──────────────────────────────────────────────────────────
+
+const TRACE_USAGE = 'Usage: moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n';
+
+/** A usage message when `moag trace` was given a malformed `--req`, else null. */
+export function traceArgsError(args: Args): string | null {
+  if (args.planFlagMissing) {
+    return `--plan needs a path.\n${TRACE_USAGE}`;
+  }
+  if (args.req !== undefined && !/^R-\d+$/.test(args.req)) {
+    return `Invalid --req "${args.req}" — expected a requirement ID like R-7.\n${TRACE_USAGE}`;
+  }
+  return null;
+}
+
+/** The plan `moag trace` reads: `--plan` or the positional, else `<cwd>/.moag/plan.json` when it exists. */
+export function resolveTracePlanPath(args: Args): string | null {
+  if (args.planPath) { return args.planPath; }
+  const fallback = path.join(args.cwd, '.moag', 'plan.json');
+  return fs.existsSync(fallback) ? fallback : null;
+}
+
+/**
+ * `moag trace` — read-only requirement status, one JSONL line per requirement.
+ * Like `queue`: no setup(), no runner, no spawn, no shim — it loads the plan and derives
+ * each status from recorded evidence only.
+ */
+export function cmdTrace(args: Args): number {
+  const usageError = traceArgsError(args);
+  if (usageError) {
+    process.stderr.write(usageError);
+    return 2;
+  }
+  const planPath = resolveTracePlanPath(args);
+  if (!planPath) {
+    process.stderr.write(`No plan found at ${path.join(args.cwd, '.moag', 'plan.json')}.\n${TRACE_USAGE}`);
+    return 2;
+  }
+  const { loadPlan } = require('../models/plan');
+  const { requirementStatuses } = require('../models/requirement-trace');
+  let plan;
+  try { plan = loadPlan(planPath); }
+  catch (err) {
+    process.stderr.write(`Failed to load plan: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 2;
+  }
+  const rows: Array<{
+    id: string; status: string; version: string | null; releaseTag: string | null; tasks: unknown; gates: unknown;
+    blockedBy?: string;
+  }> = requirementStatuses(plan);
+  const selected = args.req ? rows.filter((r) => r.id === args.req) : rows;
+  if (args.req && selected.length === 0) {
+    process.stderr.write(`No requirement ${args.req} in ${planPath}\n`);
+    return 2;
+  }
+  for (const row of selected) {
+    emit({
+      event: 'trace',
+      id: row.id,
+      status: row.status,
+      version: row.version,
+      releaseTag: row.releaseTag,
+      tasks: row.tasks,
+      gates: row.gates,
+      // Present only on not-shipped rows: the Failed/Blocked/Skipped task holding it back.
+      ...(row.blockedBy ? { blockedBy: row.blockedBy } : {}),
+    });
+  }
+  return 0;
+}
+
 // ─── one-shot prompt → plan ──────────────────────────────────────────────────
 
 /** Build a single-agent-task plan from a prompt string (the `--prompt` one-shot path). */
@@ -937,8 +1112,11 @@ async function main(): Promise<number> {
   if (args.command === 'config') {
     return cmdConfig(args);
   }
+  if (args.command === 'trace') {
+    return cmdTrace(args);
+  }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land> ...\n' +
+    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace> ...\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
     '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
     '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
@@ -947,7 +1125,8 @@ async function main(): Promise<number> {
     '  moag config <get-engine | set-engine <id>>\n' +
     '  moag queue <list | resolve <id>>\n' +
     '  moag digest [--since <when>]\n' +
-    '  moag land [--into <branch>] [--merge]\n',
+    '  moag land [--into <branch>] [--merge]\n' +
+    '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n',
   );
   return 2;
 }

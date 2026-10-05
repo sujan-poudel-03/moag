@@ -316,6 +316,7 @@ errors to users before it was fixed.
 | `failSafeMode` | `false` | Serial, conservative — for low memory |
 | `prdLoop.gateCommands` | *(auto)* | Commands that must exit 0 |
 | `prdLoop.uat.mode` | `auto` | `off` · `auto` (skip if absent) · `required` (fail if absent) |
+| `prdLoop.versionBudgetUsd` | `0` | Spend ceiling for one PRD verify/fix loop run; `0` disables |
 
 The headless CLI reads these from `.moag/config.json`, in any shape — flat
 (`"agentTaskPlayer.git.autoCommit": true`), sectioned, or nested.
@@ -334,7 +335,12 @@ moag config <get-engine | set-engine <id>>
 moag queue <list | resolve <id>>
 moag digest [--since <when>]
 moag land [--into <branch>] [--merge]
+moag trace [<plan.json> | --plan <path>] [--req R-<n>]
 ```
+
+`moag trace` prints one JSON line per PRD requirement — shipped, in-progress,
+not-shipped, untracked or removed — with the PRD version and release tag that
+shipped it, its tasks and its latest gate exit codes. It only reads the plan.
 
 `moag` reaches your PATH via `npm link` from the repository root.
 

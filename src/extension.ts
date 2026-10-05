@@ -65,6 +65,7 @@ import { captureScreenshot } from './sandbox/screenshot';
 import { resolveDeveloperEmail } from './utils/git-identity';
 import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
 import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
+import { costLedger } from './utils/cost-ledger';
 
 // ─── Shared state ───
 
@@ -1378,6 +1379,7 @@ export function activate(context: vscode.ExtensionContext): void {
     detectPrdFileInWorkspace,
     getActivePlan,
     injectTestTaskIfMissing,
+    isRunnerBusy: () => runner.state !== RunnerState.Idle,
     saveAndRefresh,
     syncPromptProviderSidebar,
   });
@@ -2198,6 +2200,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context)),
     vscode.commands.registerCommand('agentTaskPlayer.planFromPrd', cmdPlanFromPRD),
     vscode.commands.registerCommand('agentTaskPlayer.generatePlanFromPrdText', (prdText: string) => generatePlanFromPrdText(prdText)),
+    vscode.commands.registerCommand('agentTaskPlayer.generateDeltaPlan', (args?: { prdText?: string }) =>
+      cmdGenerateDeltaPlan(args).catch((err) => UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err))))),
     vscode.commands.registerCommand('agentTaskPlayer.prdChatAnswer', (payload: { answer: string; step: number; answers: string[] }) => void handlePrdChatAnswer(payload)),
     vscode.commands.registerCommand('agentTaskPlayer.openPrdFromPlan', cmdOpenPrdFromPlan),
     vscode.commands.registerCommand('agentTaskPlayer.savePrdToPlan', (prdText: string) => void cmdSavePrdToPlan(prdText)),
@@ -2205,9 +2209,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.prdAiImprove', (text: string) =>
       void handlePrdAiImprove(text, (improved) => promptViewProvider?.postMessage({ type: 'prdAiImproveResult', text: improved }))),
     vscode.commands.registerCommand('agentTaskPlayer.openPrdInBrowser', (text: string) => void openPrdInBrowser(text)),
-    vscode.commands.registerCommand('agentTaskPlayer.savePrdVersion', (payload: { text: string; version: string }) => {
-      const saved = savePrdVersionToActivePlan(payload.text, payload.version);
-      promptViewProvider?.postMessage({ type: 'prdVersionSaved', versions: saved.versions, version: saved.version });
+    vscode.commands.registerCommand('agentTaskPlayer.savePrdVersion', (payload: { text: string }) => {
+      const saved = savePrdVersionToActivePlan(payload.text);
+      promptViewProvider?.postMessage({ type: 'prdVersionSaved', ...saved });
     }),
     vscode.commands.registerCommand('agentTaskPlayer.suggestCommit', cmdSuggestCommit),
     vscode.commands.registerCommand('agentTaskPlayer.shareRunFeedback', cmdShareRunFeedback),
@@ -4739,6 +4743,7 @@ import {
   savePrdVersionToActivePlan,
   cmdPlanFromPRD,
   generatePlanFromPrdText,
+  cmdGenerateDeltaPlan,
 } from './ui/prd-authoring';
 
 // ─── PRD Verification ───
@@ -4756,6 +4761,7 @@ function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
     gateTimeoutMs: cfg.get<number>('prdLoop.gateTimeoutMs', 600_000),
     maxDiffChars: cfg.get<number>('prdLoop.maxDiffChars', 40_000),
     onManualGate: cfg.get<'halt' | 'skip'>('prdLoop.onManualGate', 'halt'),
+    versionBudgetUsd: cfg.get<number>('prdLoop.versionBudgetUsd', 0),
     fix,
     // Interactive surface: an undetectable repo warns instead of hard-failing.
     unattended: false,
@@ -5207,6 +5213,9 @@ async function runPrdLoopInteractive(options: { fix: boolean; title: string }): 
             emitReport: (r: PrdLoopReport) => { holder.report = r; },
             skipManualGate: (taskId: string) => runner.skipManualGate(taskId),
             prepareUat: (signal: AbortSignal) => prepareUatSession(cwd, signal),
+            // Per-run PRD budget: the loop keeps its own baseline from these per-call costs.
+            subscribeSpend: (cb: (usd: number) => void) => costLedger.onRecord((e) => cb(e.estimatedCostUsd)),
+            stopRun: () => runner.stop(),
             signal: abort.signal,
           });
           holder.controller = controller;

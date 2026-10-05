@@ -1092,6 +1092,71 @@ describe('TaskRunner', () => {
     assert.ok(gitArgs.some((a) => a[0] === 'tag' && a.includes('v1.2.3')), 'should create an annotated git tag');
   });
 
+  /** A release plan whose latest PRD version has R-1, implemented by a completed agent task with passing gates. */
+  function tracedReleasePlan(): Plan {
+    const plan = shipPlan((t) => { t.type = 'release'; t.releaseTag = 'v1.2.3'; });
+    const impl = createTask('Implement R-1', 'build it');
+    impl.status = TaskStatus.Completed;
+    impl.requirementIds = ['R-1'];
+    plan.playlists[0].tasks.unshift(impl);
+    plan.prdVersions = [
+      { version: '1.0.0', text: '## Requirements\n- [R-1] x', createdAt: '2026-10-01T00:00:00.000Z' },
+      { version: '2.0.0', text: '## Requirements\n- [R-1] x\n', createdAt: '2026-10-02T00:00:00.000Z' },
+    ];
+    plan.requirementTrace = [{
+      id: 'R-1',
+      taskIds: [impl.id],
+      commits: [],
+      gates: [{ command: 'npm test', exitCode: 0, timedOut: false, at: '2026-10-03T00:00:00.000Z' }],
+      releases: [],
+    }];
+    return plan;
+  }
+
+  it('a successful release stamps the requirement with the tag and the latest PRD version', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+    const output: string[] = [];
+    runner.on('task-output', (_t: unknown, chunk: string) => { output.push(chunk); });
+
+    const plan = tracedReleasePlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
+    const release = plan.requirementTrace![0].releases[0];
+    assert.ok(release, 'R-1 must be stamped');
+    assert.equal(release.releaseTag, 'v1.2.3');
+    assert.equal(release.prdVersion, '2.0.0');
+    assert.deepEqual(release.taskIds, [plan.playlists[0].tasks[0].id]);
+    assert.ok(output.some((c) => c.includes('[Release] Shipped R-1 in PRD 2.0.0.')));
+  });
+
+  it('a failed git tag fails the release and stamps nothing (F3.5)', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake((command: string, args: string[]) =>
+      command === 'git' && args[0] === 'tag'
+        ? createSpawnProc({ stderrChunks: ['fatal: tag exists'], closeCode: 1 })
+        : createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+
+    const plan = tracedReleasePlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Failed);
+    assert.deepEqual(plan.requirementTrace![0].releases, []);
+  });
+
+  it('a release with failing recorded gates stamps nothing', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+    const plan = tracedReleasePlan();
+    plan.requirementTrace![0].gates[0].exitCode = 1;
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
+    assert.deepEqual(plan.requirementTrace![0].releases, []);
+  });
+
   it('release task with neither command nor tag fails', async () => {
     const { runner } = buildRunner();
     const plan = shipPlan((t) => { t.type = 'release'; });
@@ -1812,3 +1877,51 @@ describe('TaskRunner — usage recorder', () => {
   });
 });
 
+
+// ─── Hosted-server worker: deferred stop on the manual gate ───
+//
+// The server's run worker (src/server/run-worker.ts) stops the runner one tick
+// AFTER the 'manual-gate' emit. This pins that the deferred path really unwinds:
+// play() resolves promptly and the gate task ends Failed (halted, not approved).
+
+describe('TaskRunner — deferred stop on manual-gate (server worker path)', () => {
+  afterEach(() => { sinon.restore(); });
+
+  function manualPlan(): Plan {
+    const plan = createEmptyPlan('Gate Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    const gate = createTask('Release v1.0.0', 'Ship it');
+    gate.type = 'manual';
+    pl.tasks.push(gate);
+    return plan;
+  }
+
+  it('play() resolves within 3 s and the gate task is Failed when stop() is deferred via setImmediate', async function () {
+    this.timeout(5000);
+    const prevCi = process.env.CI;
+    delete process.env.CI;
+    try {
+      const { runner } = buildRunner();
+      const plan = manualPlan();
+      let gateSeen = false;
+      runner.on('manual-gate', () => {
+        gateSeen = true;
+        setImmediate(() => runner.stop());
+      });
+      const started = Date.now();
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), 3000); });
+      const outcome = await Promise.race([runner.play(plan).then(() => 'resolved' as const), timeout]);
+      if (timer) { clearTimeout(timer); }
+      assert.equal(outcome, 'resolved', 'play() must resolve within 3 s');
+      assert.ok(Date.now() - started < 3000);
+      assert.equal(gateSeen, true);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+      assert.equal(runner.state, RunnerState.Idle);
+    } finally {
+      if (prevCi === undefined) { delete process.env.CI; } else { process.env.CI = prevCi; }
+    }
+  });
+});

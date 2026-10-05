@@ -68,3 +68,48 @@ export function killProcess(proc: ChildProcess): void {
     // ignore
   }
 }
+
+/**
+ * Kill every process this one started (children, grandchildren, and their
+ * process groups) — the last-resort cleanup for a worker that must exit while
+ * a task it supervises is still running.
+ *
+ * Windows: `taskkill /T` on our own pid walks the whole tree and takes THIS
+ * process with it; the caller should still call `process.exit` in case it
+ * survives. POSIX: descendants are found from `ps` by parent pid; each gets
+ * SIGKILL to its group (engine CLIs and commands lead their own, see
+ * {@link SPAWN_DETACHED}) and to itself. Never throws.
+ */
+export function killOwnProcessTree(
+  rootPid: number = process.pid,
+  run: (cmd: string) => string = (cmd) => execSync(cmd, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }),
+  platform: NodeJS.Platform = process.platform,
+  kill: (pid: number, signal: NodeJS.Signals) => void = (pid, signal) => { process.kill(pid, signal); },
+): void {
+  if (platform === 'win32') {
+    try { run(`taskkill /pid ${rootPid} /T /F`); } catch { /* already gone, or nothing to kill */ }
+    return;
+  }
+  let table: string;
+  try { table = run('ps -A -o pid= -o ppid='); } catch { return; }
+  const children = new Map<number, number[]>();
+  for (const line of table.split('\n')) {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    if (!Number.isInteger(pid) || !Number.isInteger(ppid)) { continue; }
+    const list = children.get(ppid) ?? [];
+    list.push(pid);
+    children.set(ppid, list);
+  }
+  const descendants: number[] = [];
+  const queue = [...(children.get(rootPid) ?? [])];
+  while (queue.length > 0) {
+    const pid = queue.shift()!;
+    if (pid === rootPid || descendants.includes(pid)) { continue; }
+    descendants.push(pid);
+    queue.push(...(children.get(pid) ?? []));
+  }
+  for (const pid of descendants) {
+    try { kill(-pid, 'SIGKILL'); } catch { /* not a group leader */ }
+    try { kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+  }
+}

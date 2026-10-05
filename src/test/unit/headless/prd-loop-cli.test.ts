@@ -206,4 +206,21 @@ describe('moag verify — buildVerifyConfig', () => {
     );
     assert.equal(cfg.uat.specPath, 'from/cli.spec.ts');
   });
+
+  it('reads the per-run PRD budget from prdLoop.versionBudgetUsd, defaulting to 0 (off)', () => {
+    assert.equal(buildVerifyConfig(parseArgs(['verify', 'p.json']), makeCtx() as never).versionBudgetUsd, 0);
+    const ctx = makeCtx({ 'prdLoop.versionBudgetUsd': 2.5 });
+    assert.equal(buildVerifyConfig(parseArgs(['verify', 'p.json']), ctx as never).versionBudgetUsd, 2.5);
+  });
+
+  it('coerces a negative or non-numeric budget to 0 instead of throwing', () => {
+    for (const bad of [-1, 'x', NaN, Infinity, null]) {
+      const ctx = makeCtx({ 'prdLoop.versionBudgetUsd': bad });
+      assert.equal(buildVerifyConfig(parseArgs(['verify', 'p.json']), ctx as never).versionBudgetUsd, 0, String(bad));
+    }
+  });
+
+  it('a budget halt maps to exit code 4', () => {
+    assert.equal(exitCodeForReport({ passed: false, haltReason: 'budget-exceeded' }), 4);
+  });
 });

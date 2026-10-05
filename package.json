@@ -586,6 +586,11 @@
         "icon": "$(checklist)"
       },
       {
+        "command": "agentTaskPlayer.generateDeltaPlan",
+        "title": "Generate Delta Plan from Latest PRD Version",
+        "category": "MOAG"
+      },
+      {
         "command": "agentTaskPlayer.suggestCommit",
         "title": "Commit & Push (PRD Workflow)",
         "category": "MOAG",
@@ -934,6 +939,10 @@
       ],
       "commandPalette": [
         {
+          "command": "agentTaskPlayer.generateDeltaPlan",
+          "when": "false"
+        },
+        {
           "command": "agentTaskPlayer.openSession",
           "when": "false"
         },
@@ -1253,6 +1262,12 @@
           "minimum": 1,
           "maximum": 10,
           "description": "Maximum number of fix playlists the PRD verification loop may generate before halting for a human."
+        },
+        "agentTaskPlayer.prdLoop.versionBudgetUsd": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Spend ceiling in USD for one PRD verification/fix loop run (Verify Against PRD, Generate Fix Tasks, moag verify, moag run --verify). Counts every engine call made while that loop is running. 0 disables it. When passed, the loop stops the runner and halts as budget-exceeded (headless exit code 4). Not carried across sessions; agentTaskPlayer.costBudgetUsd still applies independently."
         },
         "agentTaskPlayer.prdLoop.gateCommands": {
           "type": "array",
@@ -1699,6 +1714,7 @@
     "pretest:integration": "npm run compile",
     "package": "vsce package",
     "moag": "node ./out/headless/cli.js",
+    "server": "node ./out/server/main.js",
     "headless:smoke": "npm run compile && node ./out/headless/cli.js run .moag/sample.plan.json --no-interactive --full-auto",
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch",

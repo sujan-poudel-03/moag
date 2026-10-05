@@ -2,6 +2,7 @@
 
 import { strict as assert } from 'assert';
 import { EngineResult, Plan, TaskStatus } from '../../../models/types';
+import { requirementStatuses, stampRelease } from '../../../models/requirement-trace';
 import type {
   PrdLoopConfig,
   PrdLoopController,
@@ -124,6 +125,7 @@ function baseConfig(over: Partial<PrdLoopConfig> = {}): PrdLoopConfig {
     fix: false,
     unattended: false,
     uat: { mode: 'off', timeoutMs: 60_000 },
+    versionBudgetUsd: 0,
     ...over,
   };
 }
@@ -891,5 +893,247 @@ describe('createPrdLoop — fix playlist role', () => {
     assert.equal(report.haltReason, 'engine-error');
     assert.equal(plan.playlists.length, before);
     assert.equal(plan.fixIterations ?? 0, 0);
+  });
+});
+
+// ─── Requirement trace evidence (F3.3) ───
+
+describe('createPrdLoop — requirement trace evidence', () => {
+  function tracedPlan(): Plan {
+    const plan = makePlan({
+      prdVersions: [{ version: '1.0.0', text: '## Requirements\n- [R-1] login', createdAt: '2026-10-01T00:00:00.000Z' }],
+    });
+    plan.playlists[0].tasks[0].requirementIds = ['R-1'];
+    return plan;
+  }
+
+  const PASS_VERDICT = '{"passed":true,"score":100,"gaps":[],"suggestion":""}';
+
+  it('a failing gate is recorded with its real exit code and a "pass" model verdict cannot ship it', async () => {
+    const { createPrdLoop } = loadLoop({ gateResult: (c) => FAILING_GATE(c) });
+    const plan = tracedPlan();
+    const h = makeDeps(plan, { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await createPrdLoop(baseConfig(), h.deps).run();
+
+    assert.equal(report.modelCallsMade, 0);
+    assert.equal(report.passed, false);
+    const rec = plan.requirementTrace?.find((r) => r.id === 'R-1');
+    assert.ok(rec, 'R-1 must have a trace record');
+    assert.deepEqual(rec.gates.map((g) => [g.command, g.exitCode, g.timedOut]), [['npm test', 1, false]]);
+    assert.deepEqual(rec.taskIds, ['t-1']);
+    assert.ok(h.counters.saves > 0, 'the recorded evidence is persisted');
+
+    const status = () => requirementStatuses(plan).find((r) => r.id === 'R-1')?.status;
+    assert.notEqual(status(), 'shipped');
+    assert.deepEqual(stampRelease(plan, 'v1.0.0', '2026-10-04T00:00:00.000Z').shipped, []);
+    assert.notEqual(status(), 'shipped');
+  });
+
+  it('a passing gate is recorded as exit 0 even when the model verdict is "not passed"', async () => {
+    const { createPrdLoop } = loadLoop();
+    const plan = tracedPlan();
+    const h = makeDeps(plan);
+
+    const report = await createPrdLoop(baseConfig(), h.deps).run();
+
+    assert.equal(report.passed, false, 'the stub model says not passed');
+    assert.equal(report.modelCallsMade, 1);
+    const rec = plan.requirementTrace?.find((r) => r.id === 'R-1');
+    assert.ok(rec);
+    assert.deepEqual(rec.gates.map((g) => g.exitCode), [0]);
+  });
+
+  it('a status-gate failure (no gate ran) leaves the trace unchanged', async () => {
+    const { createPrdLoop } = loadLoop();
+    const plan = tracedPlan();
+    plan.playlists[0].tasks[0].status = TaskStatus.Failed;
+    const h = makeDeps(plan);
+
+    const report = await createPrdLoop(baseConfig(), h.deps).run();
+
+    assert.equal(report.failedGate, 'status');
+    assert.equal(plan.requirementTrace, undefined);
+  });
+
+  it('untagged tasks record nothing and do not trigger an extra save', async () => {
+    const { createPrdLoop } = loadLoop({ gateResult: (c) => FAILING_GATE(c) });
+    const plan = makePlan();
+    const h = makeDeps(plan);
+
+    await createPrdLoop(baseConfig(), h.deps).run();
+
+    assert.equal(plan.requirementTrace, undefined);
+  });
+});
+
+// ─── Per-loop cost cap (F3.6) ───
+
+describe('createPrdLoop — per-run PRD budget', () => {
+  /** A fake costLedger.onRecord: listeners plus emit(usd). */
+  function spendBus() {
+    const listeners: Array<(usd: number) => void> = [];
+    return {
+      listeners,
+      subscribe: (cb: (usd: number) => void): (() => void) => {
+        listeners.push(cb);
+        return () => {
+          const i = listeners.indexOf(cb);
+          if (i >= 0) { listeners.splice(i, 1); }
+        };
+      },
+      emit: (usd: number): void => { [...listeners].forEach((l) => l(usd)); },
+    };
+  }
+
+  const FIX_TASKS = '[{"name":"fix it","prompt":"make the gate pass"}]';
+
+  it('halts as budget-exceeded once a run spends past the cap, stops the runner once, and calls no further engine', async () => {
+    const { createPrdLoop } = loadLoop({ gateResult: (c) => FAILING_GATE(c) });
+    const bus = spendBus();
+    let stops = 0;
+    const engineCalls: string[] = [];
+    const h = makeDeps(makePlan(), {
+      runEngine: async (prompt: string) => { engineCalls.push(prompt); return engineResult(FIX_TASKS); },
+      runPlan: async (p: Plan) => { bus.emit(2); completeAll(p); },
+      subscribeSpend: bus.subscribe,
+      stopRun: () => { stops++; },
+    });
+
+    const report = await createPrdLoop(baseConfig({ fix: true, versionBudgetUsd: 1 }), h.deps).run();
+
+    assert.equal(report.haltReason, 'budget-exceeded');
+    assert.match(report.suggestion, /Per-run PRD budget reached: spent \$2\.00 of agentTaskPlayer\.prdLoop\.versionBudgetUsd = \$1\.00\./);
+    assert.equal(stops, 1);
+    assert.equal(engineCalls.length, 1, 'only the fix-generation call before the breach');
+    assert.equal(bus.listeners.length, 0, 'unsubscribed');
+  });
+
+  it('a breach before the verify call means the model is never asked', async () => {
+    const { createPrdLoop } = loadLoop();
+    const bus = spendBus();
+    const h = makeDeps(makePlan(), {
+      resolvePrdText: async () => { bus.emit(5); return 'PRD TEXT'; },
+      subscribeSpend: bus.subscribe,
+    });
+
+    const report = await createPrdLoop(baseConfig({ versionBudgetUsd: 1 }), h.deps).run();
+
+    assert.equal(report.haltReason, 'budget-exceeded');
+    assert.equal(report.modelCallsMade, 0);
+    assert.equal(h.engineCalls.length, 0);
+  });
+
+  it('ignores non-finite and negative costs', async () => {
+    const { createPrdLoop } = loadLoop();
+    const bus = spendBus();
+    const h = makeDeps(makePlan(), {
+      resolvePrdText: async () => { bus.emit(NaN); bus.emit(-50); bus.emit(Infinity); return 'PRD TEXT'; },
+      subscribeSpend: bus.subscribe,
+    });
+
+    const report = await createPrdLoop(baseConfig({ versionBudgetUsd: 1 }), h.deps).run();
+
+    assert.notEqual(report.haltReason, 'budget-exceeded');
+  });
+
+  it('budget 0 never subscribes', async () => {
+    const { createPrdLoop } = loadLoop();
+    let subscribed = 0;
+    const h = makeDeps(makePlan(), {
+      subscribeSpend: () => { subscribed++; return () => undefined; },
+    });
+
+    await createPrdLoop(baseConfig({ versionBudgetUsd: 0 }), h.deps).run();
+
+    assert.equal(subscribed, 0);
+  });
+
+  it('a cap without a spend source warns that it cannot be metered', async () => {
+    const { createPrdLoop } = loadLoop();
+    const h = makeDeps(makePlan());
+
+    await createPrdLoop(baseConfig({ versionBudgetUsd: 1 }), h.deps).run();
+
+    assert.ok(h.progress.some((p) => p.phase === 'warning' && /cannot be metered/.test(p.detail)));
+  });
+
+  it('two loops at once on one bus keep separate baselines', async () => {
+    const { createPrdLoop } = loadLoop({ gateResult: (c) => FAILING_GATE(c) });
+    const bus = spendBus();
+    const stops = { a: 0, b: 0 };
+    let releaseA!: () => void;
+    let releaseB!: () => void;
+    const holdA = new Promise<void>((r) => { releaseA = r; });
+    const holdB = new Promise<void>((r) => { releaseB = r; });
+
+    const mk = (hold: Promise<void>, key: 'a' | 'b') => makeDeps(makePlan(), {
+      runEngine: async () => engineResult(FIX_TASKS),
+      runPlan: async (p: Plan) => { await hold; completeAll(p); },
+      subscribeSpend: bus.subscribe,
+      stopRun: () => { stops[key]++; },
+    });
+    const a = mk(holdA, 'a');
+    const b = mk(holdB, 'b');
+
+    // A starts, 0.9 is spent, then B starts — B must not inherit A's 0.9.
+    const runA = createPrdLoop(baseConfig({ fix: true, versionBudgetUsd: 1 }), a.deps).run();
+    bus.emit(0.9);
+    // Budget 1 (not 100) so a shared baseline would be observable: 0.9 + 0.5 = 1.4 > 1.
+    const runB = createPrdLoop(baseConfig({ fix: true, versionBudgetUsd: 1 }), b.deps).run();
+    assert.equal(bus.listeners.length, 2);
+    bus.emit(0.5);
+
+    assert.equal(stops.a, 1, 'A spent 1.4 of 1 and halts');
+    assert.equal(stops.b, 0, 'B spent only 0.5 of 1 — no shared baseline');
+
+    releaseA();
+    releaseB();
+    const [reportA, reportB] = await Promise.all([runA, runB]);
+    assert.equal(reportA.haltReason, 'budget-exceeded');
+    assert.notEqual(reportB.haltReason, 'budget-exceeded');
+    assert.equal(bus.listeners.length, 0);
+  });
+
+  it('the spend listener is removed when runPlan throws', async () => {
+    const { createPrdLoop } = loadLoop({ gateResult: (c) => FAILING_GATE(c) });
+    const bus = spendBus();
+    const h = makeDeps(makePlan(), {
+      runEngine: async () => engineResult(FIX_TASKS),
+      runPlan: async () => { throw new Error('runner exploded'); },
+      subscribeSpend: bus.subscribe,
+    });
+
+    const report = await createPrdLoop(baseConfig({ fix: true, versionBudgetUsd: 1 }), h.deps).run();
+
+    assert.equal(report.haltReason, 'engine-error');
+    assert.equal(bus.listeners.length, 0);
+  });
+
+  it('the spend listener is removed when the loop itself throws', async () => {
+    const { createPrdLoop } = loadLoop();
+    const bus = spendBus();
+    const h = makeDeps(makePlan(), {
+      resolvePrdText: async () => { throw new Error('prd read failed'); },
+      subscribeSpend: bus.subscribe,
+    });
+
+    await assert.rejects(createPrdLoop(baseConfig({ versionBudgetUsd: 1 }), h.deps).run(), /prd read failed/);
+    assert.equal(bus.listeners.length, 0);
+    assert.equal(h.reports.length, 1, 'still exactly one report');
+  });
+
+  it('a stopRun that throws does not break the loop', async () => {
+    const { createPrdLoop } = loadLoop();
+    const bus = spendBus();
+    const h = makeDeps(makePlan(), {
+      resolvePrdText: async () => { bus.emit(5); return 'PRD TEXT'; },
+      subscribeSpend: bus.subscribe,
+      stopRun: () => { throw new Error('stop failed'); },
+    });
+
+    const report = await createPrdLoop(baseConfig({ versionBudgetUsd: 1 }), h.deps).run();
+
+    assert.equal(report.haltReason, 'budget-exceeded');
   });
 });

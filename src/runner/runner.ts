@@ -21,6 +21,7 @@ import {
   VerificationResult,
 } from '../models/types';
 import { generateId } from '../models/plan';
+import { recordCommit, stampRelease } from '../models/requirement-trace';
 import { commitTask, describePrepareFailure, prepareBranch, DeliveryConfig } from './git-delivery';
 import { park, decisionFor, ParkReason, ParkedItem } from './park-queue';
 import { knowledgeBlockFor } from './knowledge';
@@ -1324,13 +1325,20 @@ export class TaskRunner {
     const timeoutId = setTimeout(() => taskAbort.abort(), taskTimeoutMs);
     const onParentAbort = () => taskAbort.abort();
     this._abortController?.signal.addEventListener('abort', onParentAbort, { once: true });
+    // A stop that landed while this task was starting (e.g. during captureGitRef)
+    // aborted the parent BEFORE the listener above existed, so it never fires.
+    // Propagate it now, or the task would run to completion unsupervised.
+    if (this._abortController?.signal.aborted) {
+      taskAbort.abort();
+    }
 
     let verification: VerificationResult | undefined;
     let artifacts: TaskArtifact[] | undefined;
 
     // Gap 1: Pre-flight baseline check — run verifyCommand before the agent
     let baselineVerification: VerificationResult | undefined;
-    if (task.verifyCommand && taskType !== 'check') {
+    // Skipped when already stopped: an aborted baseline would read as "baseline broken".
+    if (task.verifyCommand && taskType !== 'check' && !taskAbort.signal.aborted) {
       this.emit('task-output', task, `\n-- Pre-flight baseline: ${task.verifyCommand} --\n`, 'stdout');
       baselineVerification = await this.runVerification(task.verifyCommand, cwd, resolvedEnv, taskAbort.signal, task);
       baselineVerification.baselinePassed = baselineVerification.passed;
@@ -1690,6 +1698,12 @@ export class TaskRunner {
     autoRoutingConfig?: AutoRoutingConfig,
     wasAutoRouted?: boolean,
   ): Promise<EngineResult> {
+    // Stopped before the task got going: start nothing. Every type below attaches
+    // its abort listener after the fact, and a listener on an already-aborted
+    // signal never fires (a manual gate would wait forever, a command would run).
+    if (signal.aborted) {
+      return { stdout: '', stderr: '[Task aborted before it started]', exitCode: 130, durationMs: 0 };
+    }
     switch (taskType) {
       case 'agent':
         return this.runAgentTask(task, engineId, cwd, fullPrompt, signal, fallbackEngine, autoRoutingConfig, wasAutoRouted);
@@ -1710,7 +1724,7 @@ export class TaskRunner {
       case 'deploy':
         return this.runDeployTask(task, cwd, signal, resolvedEnv);
       case 'release':
-        return this.runReleaseTask(task, cwd, signal, resolvedEnv);
+        return this.runReleaseTask(task, cwd, signal, resolvedEnv, plan);
       case 'monitor':
         return this.runMonitorTask(task, signal);
       default:
@@ -2294,7 +2308,13 @@ export class TaskRunner {
    * release task — optional pluggable command (version bump / changelog / publish),
    * then optional annotated git tag, then optional push + GitHub release via gh.
    */
-  private async runReleaseTask(task: Task, cwd: string, signal: AbortSignal, resolvedEnv?: Record<string, string>): Promise<EngineResult> {
+  private async runReleaseTask(
+    task: Task,
+    cwd: string,
+    signal: AbortSignal,
+    resolvedEnv: Record<string, string> | undefined,
+    plan: Plan,
+  ): Promise<EngineResult> {
     const command = task.command?.trim();
     if (!command && !task.releaseTag) {
       return { stdout: '', stderr: 'Release task needs a "command" and/or a "releaseTag".', exitCode: 1, durationMs: 0 };
@@ -2334,6 +2354,13 @@ export class TaskRunner {
         } catch (err) {
           return { stdout: outputs.join('\n'), stderr: `GitHub release failed: ${err instanceof Error ? err.message : String(err)}`, exitCode: 1, durationMs: 0, summary: 'GitHub release failed.' };
         }
+      }
+
+      // Only the final success path stamps: a failed tag, push or gh release has already
+      // returned above, so nothing is ever marked shipped by a release that did not happen.
+      const { shipped, prdVersion } = stampRelease(plan, task.releaseTag, new Date().toISOString());
+      if (shipped.length) {
+        this.emit('task-output', task, `[Release] Shipped ${shipped.join(', ')} in PRD ${prdVersion}.\n`, 'stdout');
       }
     }
 
@@ -2640,6 +2667,7 @@ export class TaskRunner {
     const timer = setTimeout(() => verifyAbort.abort(), VERIFY_TIMEOUT_MS);
     const onParentAbort = () => verifyAbort.abort();
     parentSignal.addEventListener('abort', onParentAbort, { once: true });
+    if (parentSignal.aborted) { verifyAbort.abort(); }
 
     try {
       const result = await this.runLocalCommand(effectiveCommand, {
@@ -2668,6 +2696,12 @@ export class TaskRunner {
       let stdout = '';
       let stderr = '';
       let settled = false;
+
+      // Already aborted: never spawn (a listener added now would never fire).
+      if (options.signal.aborted) {
+        resolve({ stdout: '', stderr: '[Command aborted]', exitCode: 130, durationMs: 0, command });
+        return;
+      }
 
       const proc = spawn(command, [], {
         cwd: options.cwd,
@@ -3062,6 +3096,7 @@ export class TaskRunner {
     if (outcome.committed) {
       this.emit('task-output', task,
         `[MOAG] Committed ${outcome.sha} on ${this._deliveryBranch}\n`, 'stdout');
+      if (this._plan) { recordCommit(this._plan, task, outcome.sha); }
     } else if (outcome.reason === 'commit-failed') {
       // Surface it, but never fail a task that already passed its gates.
       this.emit('task-output', task,

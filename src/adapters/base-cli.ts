@@ -59,6 +59,14 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
       : args.length > 1 ? args.slice(0, -1) : args;
     const commandStr = [config.command, ...displayArgs].join(' ');
 
+    // Already aborted (a stop that landed before this call): never spawn. An
+    // 'abort' listener added to an aborted signal never fires, so a process
+    // spawned now would run unsupervised until it ended on its own.
+    if (options.signal?.aborted) {
+      resolve({ stdout: '', stderr: '[Command aborted]', exitCode: 130, durationMs: 0, command: commandStr });
+      return;
+    }
+
     // Emit command and response headers before spawning
     if (onOutput) {
       onOutput(`\u2500\u2500 Command \u2500\u2500\n${commandStr}\n\n\u2500\u2500 Response \u2500\u2500\n`, 'stdout');

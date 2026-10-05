@@ -97,6 +97,7 @@ function buildMaximalFixture(): Plan {
     failureThreshold: 4109,
     incidentRepo: 'fixture-owner/fixture-incidents',
     incidentLabel: 'fixture:incident',
+    requirementIds: ['R-1', 'R-2'],
     status: TaskStatus.Completed,
   };
 
@@ -144,10 +145,30 @@ function buildMaximalFixture(): Plan {
     aiRules: 'fixture-plan-aiRules',
     prdSource: 'fixture-plan-prdSource',
     prdVersions: [
-      { version: 'v1', text: 'fixture-prd-v1', createdAt: '2026-01-01T00:00:00.000Z' },
-      { version: 'v2', text: 'fixture-prd-v2', createdAt: '2026-01-02T00:00:00.000Z' },
+      {
+        version: 'v1', text: 'fixture-prd-v1', createdAt: '2026-01-01T00:00:00.000Z',
+        recommendedBump: 'minor', chosenBump: 'major',
+      },
+      {
+        version: 'v2', text: 'fixture-prd-v2', createdAt: '2026-01-02T00:00:00.000Z',
+        recommendedBump: 'minor', chosenBump: 'major',
+      },
     ],
     fixIterations: 3,
+    requirementTrace: [
+      {
+        id: 'R-1',
+        taskIds: ['fixture-task-1'],
+        commits: ['fixture0sha1'],
+        gates: [{ command: 'npm run fixture:gate', exitCode: 0, timedOut: false, at: '2026-01-03T00:00:00.000Z' }],
+        releases: [{
+          releaseTag: 'v4.1.0-fixture',
+          prdVersion: 'v2',
+          at: '2026-01-04T00:00:00.000Z',
+          taskIds: ['fixture-task-1'],
+        }],
+      },
+    ],
     sourceIssues: [{ repo: 'fixture-owner/fixture-repo', number: 4116, title: 'fixture-issue-title' }],
     playlists: [playlist],
   };
@@ -197,6 +218,7 @@ const TASK_FIELDS: Record<keyof Task, true> = {
   failureThreshold: true,
   incidentRepo: true,
   incidentLabel: true,
+  requirementIds: true,
   status: true,
 };
 
@@ -229,6 +251,7 @@ const PLAN_FIELDS: Record<keyof Plan, true> = {
   prdSource: true,
   prdVersions: true,
   fixIterations: true,
+  requirementTrace: true,
   sourceIssues: true,
   playlists: true,
 };
@@ -261,7 +284,7 @@ describe('plan schema round trip (anti-recurrence harness)', () => {
     plan.playlists[0].tasks.push(createTask('Only Task', 'Only prompt'));
 
     const file = dehydratePlan(plan) as unknown as Record<string, unknown>;
-    for (const key of ['sandbox', 'aiRules', 'prdVersions', 'fixIterations', 'validation', 'defaultRole', 'customRoles']) {
+    for (const key of ['sandbox', 'aiRules', 'prdVersions', 'fixIterations', 'validation', 'defaultRole', 'customRoles', 'requirementTrace']) {
       assert.ok(!(key in file), `minimal plan should not emit "${key}"`);
     }
 
@@ -269,6 +292,7 @@ describe('plan schema round trip (anti-recurrence harness)', () => {
     assert.ok(!('timeoutMs' in rawTask), 'minimal task should not emit "timeoutMs"');
     assert.ok(!('status' in rawTask), 'minimal task should not emit a Pending "status"');
     assert.ok(!('role' in rawTask), 'minimal task should not emit "role"');
+    assert.ok(!('requirementIds' in rawTask), 'minimal task should not emit "requirementIds"');
 
     const rawPlaylist = dehydratePlan(plan).playlists[0] as unknown as Record<string, unknown>;
     assert.ok(!('role' in rawPlaylist), 'minimal playlist should not emit "role"');
