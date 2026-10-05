@@ -5,6 +5,7 @@
 // a result or a refusal carrying the HTTP status the route should send. No I/O.
 
 import { createHash } from 'crypto';
+import * as path from 'path';
 import {
   EngineId, Plan, PlanFilePlaylist, PlanFileTask, PrdVersion, SemverBump, TaskStatus,
 } from '../models/types';
@@ -175,7 +176,7 @@ export interface ReviewItem {
   taskId: string;
   taskName: string;
   taskType: string;
-  field: 'command' | 'verifyCommand' | 'cwd' | 'healthCheckUrl' | 'skipIf' | 'failurePolicy';
+  field: 'command' | 'verifyCommand' | 'cwd' | 'healthCheckUrl' | 'skipIf' | 'failurePolicy' | 'incidentRepo' | 'incidentLabel';
   /** Verbatim — the reviewer must see exactly what will run. */
   value: string;
 }
@@ -213,11 +214,30 @@ export function stripGeneratedSideEffects(pl: PlanFilePlaylist): NonNullable<Pen
 }
 
 /**
+ * Does a task `cwd` leave the project workspace? The runner joins a relative
+ * cwd onto the workspace root and uses an absolute one as-is, so an absolute
+ * path (POSIX, Windows drive, drive-relative `C:x` or UNC) escapes, and so does
+ * a relative path whose `..` segments climb above the root at any point.
+ * Either separator counts: the plan may run on Windows or POSIX.
+ */
+export function cwdEscapesWorkspace(cwd: string): boolean {
+  if (path.posix.isAbsolute(cwd) || path.win32.isAbsolute(cwd) || /^[A-Za-z]:/.test(cwd)) { return true; }
+  let depth = 0;
+  for (const seg of cwd.split(/[\\/]+/)) {
+    if (seg === '..') { depth--; if (depth < 0) { return true; } }
+    else if (seg !== '' && seg !== '.') { depth++; }
+  }
+  return false;
+}
+
+/**
  * Check a generated playlist before it can be approved: every engine it names
- * must be in `allowedEngines` and never `custom`/`copilot`; and list every shell
- * string it would run (any task type, deploy and release included) and every
- * side-effect field (`healthCheckUrl`, `skipIf`, `failurePolicy`) so the
- * reviewer sees them verbatim.
+ * must be in `allowedEngines` and never `custom`/`copilot`; every task `cwd`
+ * must stay inside the project workspace ({@link cwdEscapesWorkspace}); and list
+ * every shell string it would run (any task type, deploy and release included)
+ * and every side-effect field (`healthCheckUrl`, `skipIf`, `failurePolicy`, and
+ * a monitor task's `incidentRepo`/`incidentLabel`, which file GitHub issues) so
+ * the reviewer sees them verbatim.
  */
 export function validatePendingPlaylist(pl: PlanFilePlaylist, allowedEngines: readonly EngineId[]): PendingPlaylistReview {
   const allowed = new Set(allowedEngines.filter((e) => !SERVER_FORBIDDEN_ENGINES.includes(e)));
@@ -237,10 +257,17 @@ export function validatePendingPlaylist(pl: PlanFilePlaylist, allowedEngines: re
     const base = { taskId: t.id, taskName: t.name, taskType: t.type ?? 'agent' };
     if (typeof t.command === 'string' && t.command.length > 0) { commands.push({ ...base, field: 'command', value: t.command }); }
     if (typeof t.verifyCommand === 'string' && t.verifyCommand.length > 0) { commands.push({ ...base, field: 'verifyCommand', value: t.verifyCommand }); }
-    if (typeof t.cwd === 'string' && t.cwd.length > 0) { commands.push({ ...base, field: 'cwd', value: t.cwd }); }
+    if (typeof t.cwd === 'string' && t.cwd.length > 0) {
+      commands.push({ ...base, field: 'cwd', value: t.cwd });
+      if (cwdEscapesWorkspace(t.cwd)) { errors.push(`${where} sets cwd "${t.cwd}", which is outside the project workspace.`); }
+    } else if (t.cwd !== undefined && typeof t.cwd !== 'string') {
+      errors.push(`${where} sets a cwd that is not a path.`);
+    }
     if (t.healthCheckUrl !== undefined) { commands.push({ ...base, field: 'healthCheckUrl', value: String(t.healthCheckUrl) }); }
     if (t.skipIf !== undefined) { commands.push({ ...base, field: 'skipIf', value: JSON.stringify(t.skipIf) }); }
     if (t.failurePolicy !== undefined) { commands.push({ ...base, field: 'failurePolicy', value: String(t.failurePolicy) }); }
+    if (t.incidentRepo !== undefined) { commands.push({ ...base, field: 'incidentRepo', value: String(t.incidentRepo) }); }
+    if (t.incidentLabel !== undefined) { commands.push({ ...base, field: 'incidentLabel', value: String(t.incidentLabel) }); }
   }
   return { ok: errors.length === 0, errors, commands };
 }
@@ -295,20 +322,55 @@ export const SHIP_GATE_NAME = 'Ship approval';
 const SHIP_GATE_PROMPT = 'Ship gate: an approver reviews the completed work for this PRD version and approves shipping it. '
   + 'Added by the server to every generated plan; the run halts here until a human decides.';
 
+/** Task types that ship: they run only after the ship gate is approved. */
+const SHIPPING_TASK_TYPES: ReadonlySet<string> = new Set(['release', 'deploy']);
+
 /**
- * Append the server-owned terminal ship gate to a generated playlist: a
- * `manual` task named {@link SHIP_GATE_NAME} that depends on every leaf task
- * (no other task depends on it) and carries every requirement id the playlist
- * cites. Generated plans never contain one on their own, so without this the
- * "gated at ship" policy would be unreachable. Mutates `pl`; returns the gate.
+ * Ids of every `release`/`deploy` task in `tasks` plus everything that
+ * (transitively, via `dependsOn`) depends on one — the work that ships.
+ */
+export function shippingTaskIds(tasks: readonly PlanFileTask[]): Set<string> {
+  const shipping = new Set(tasks.filter((t) => SHIPPING_TASK_TYPES.has(t.type ?? 'agent')).map((t) => t.id));
+  let grew = shipping.size > 0;
+  while (grew) {
+    grew = false;
+    for (const t of tasks) {
+      if (!shipping.has(t.id) && (t.dependsOn ?? []).some((d) => shipping.has(d))) {
+        shipping.add(t.id);
+        grew = true;
+      }
+    }
+  }
+  return shipping;
+}
+
+/**
+ * Add the server-owned ship gate to a generated playlist: a `manual` task named
+ * {@link SHIP_GATE_NAME} that carries every requirement id the playlist cites.
+ * Generated plans never contain one on their own, so without this the "gated
+ * at ship" policy would be unreachable.
+ *
+ * The gate gates SHIPPING: it depends on every leaf of the non-shipping work
+ * (so, transitively, on every task that is not a release/deploy task or
+ * downstream of one), and every release/deploy task — and everything that
+ * depends on one — gains a `dependsOn` on the gate. The playlist is reordered
+ * to non-shipping tasks, then the gate, then shipping tasks (each group keeps
+ * its relative order), because the sequential runner executes in array order
+ * and would otherwise reach a release before its gate. With no release/deploy
+ * task the gate is terminal and last. Mutates `pl`; returns the gate.
  */
 export function appendShipGate(pl: PlanFilePlaylist, gateId: string): PlanFileTask {
   const tasks = pl.tasks ?? [];
   const taken = new Set(tasks.map((t) => t.id));
   let id = gateId;
   for (let n = 2; taken.has(id); n++) { id = `${gateId}-${n}`; }
-  const dependedOn = new Set(tasks.flatMap((t) => t.dependsOn ?? []));
-  const leaves = tasks.filter((t) => !dependedOn.has(t.id)).map((t) => t.id);
+  const shipping = shippingTaskIds(tasks);
+  const before = tasks.filter((t) => !shipping.has(t.id));
+  const after = tasks.filter((t) => shipping.has(t.id));
+  // Leaves of the non-shipping work. A non-shipping task never depends on a
+  // shipping one (shipping is closed over dependents), so no cycle can form.
+  const dependedOnBefore = new Set(before.flatMap((t) => t.dependsOn ?? []));
+  const leaves = before.filter((t) => !dependedOnBefore.has(t.id)).map((t) => t.id);
   const reqNum = (r: string): number => Number(r.replace(/^\D+/, '')) || 0;
   const requirementIds = [...new Set(tasks.flatMap((t) => t.requirementIds ?? []))].sort((a, b) => reqNum(a) - reqNum(b) || (a < b ? -1 : a > b ? 1 : 0));
   const gate: PlanFileTask = {
@@ -319,7 +381,11 @@ export function appendShipGate(pl: PlanFilePlaylist, gateId: string): PlanFileTa
     ...(leaves.length > 0 ? { dependsOn: leaves } : {}),
     ...(requirementIds.length > 0 ? { requirementIds } : {}),
   };
-  pl.tasks = [...tasks, gate];
+  for (const t of after) {
+    const deps = t.dependsOn ?? [];
+    if (!deps.includes(id)) { t.dependsOn = [...deps, id]; }
+  }
+  pl.tasks = [...before, gate, ...after];
   return gate;
 }
 

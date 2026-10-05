@@ -10,6 +10,7 @@ import {
   ValidationStageResult,
 } from './types';
 import { resolveValidationProfile } from '../../models/execution-profiles';
+import { trackChildProcess } from '../../utils/child-tracker';
 
 type MobileTool = 'detox' | 'appium' | 'expo';
 
@@ -42,14 +43,14 @@ export class MobileValidator implements ValidationAdapter {
   private isDeviceAvailable(): boolean {
     // Check for connected Android devices or running iOS simulators
     try {
-      const adbOutput = execSync('adb devices', { stdio: 'pipe', timeout: 5000 }).toString();
+      const adbOutput = execSync('adb devices', { stdio: 'pipe', timeout: 5000, windowsHide: true }).toString();
       const devices = adbOutput.split('\n').filter(l => l.includes('\tdevice'));
       if (devices.length > 0) { return true; }
     } catch {
       // adb not installed or failed
     }
     try {
-      const xcrunOutput = execSync('xcrun simctl list devices --json', { stdio: 'pipe', timeout: 5000 }).toString();
+      const xcrunOutput = execSync('xcrun simctl list devices --json', { stdio: 'pipe', timeout: 5000, windowsHide: true }).toString();
       const parsed = JSON.parse(xcrunOutput);
       const devices: unknown[] = Object.values(parsed.devices ?? {}).flat() as unknown[];
       if (devices.some((d: unknown) => (d as { state: string }).state === 'Booted')) { return true; }
@@ -186,7 +187,9 @@ function runCommand(
       shell: true,
       env: { ...process.env, ...(opts.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
+    trackChildProcess(proc);
 
     let settled = false;
     const finish = (code: number) => {

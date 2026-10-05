@@ -140,10 +140,53 @@ export const CODEX_PLAN_ARGS: readonly string[] = Object.freeze([
   '-c', 'shell_environment_policy.inherit=none',
 ]);
 
+/**
+ * Claude Code arguments for a plan-generation job (replacing the default `-p`).
+ * Without them, print mode still runs the read-only tools (Read, Glob, Grep)
+ * unprompted, so a PRD could steer the planner into reading any file the
+ * server user can read.
+ *
+ * - `--tools ""`: "Use "" to disable all tools" (`claude --help`) — no
+ *   built-in tool at all, file tools included.
+ * - `--strict-mcp-config`: "Only use MCP servers from --mcp-config, ignoring
+ *   all other MCP configurations" — none is given, so no MCP server (and no
+ *   MCP file tool) loads from the operator's user config either.
+ *
+ * Both verified against the installed CLI's `--help` (Claude Code 2.1.287). A
+ * Claude too old to know a flag exits non-zero, so the plan fails closed.
+ */
+export const CLAUDE_PLAN_ARGS: readonly string[] = Object.freeze([
+  '-p',
+  '--strict-mcp-config',
+  '--tools', '',
+]);
+
+/**
+ * Engines a plan-generation job can run with NO file or tool access, so the
+ * server's repository listing in the prompt is the planner's only repo context:
+ * Claude ({@link CLAUDE_PLAN_ARGS}), Codex ({@link CODEX_PLAN_ARGS}: no shell
+ * tool, read-only sandbox), Ollama (`ollama run` is a plain completion with no
+ * tools). Gemini CLI has no flag that removes its file tools, and the Anthropic
+ * API adapter always offers read_file/list_directory/run_bash — both are
+ * refused for plan generation unless an admin turns on `allowPlannerFileAccess`.
+ */
+export const PLANNER_LOCKED_ENGINES: readonly EngineId[] = Object.freeze(['claude', 'codex', 'ollama'] as EngineId[]);
+
+/**
+ * Why `engine` may not generate a plan, or null when it may. An engine outside
+ * {@link PLANNER_LOCKED_ENGINES} is refused unless `allowPlannerFileAccess`.
+ */
+export function plannerFileAccessRefusal(engine: EngineId, allowPlannerFileAccess: boolean): string | null {
+  if (PLANNER_LOCKED_ENGINES.includes(engine) || allowPlannerFileAccess) { return null; }
+  return `${engine} can't be stopped from reading files while it plans, so this server won't use it for plan generation. `
+    + 'Switch the project to Claude Code, Codex or Ollama, or ask an admin to turn on planner file access.';
+}
+
 /** {@link WorkerConfig} for a plan-generation job: the same, with every engine's auto-approve forced off. */
 export interface PlanWorkerConfig {
   agentTaskPlayer: WorkerConfig['agentTaskPlayer'] & {
     'engines.claude.autoApprove': false;
+    'engines.claude.args': string[];
     'engines.codex.autoApprove': false;
     'engines.codex.args': string[];
     'engines.gemini.args': [];
@@ -155,11 +198,12 @@ export interface PlanWorkerConfig {
  * and its prompt carries PO-written PRD text verbatim, so it must not run with
  * tools pre-approved: otherwise "request a plan" is "run any command on the
  * server" for a role that may not start runs (OQ3). Claude loses
- * `--dangerously-skip-permissions` and its settings.local.json allow-list,
- * Codex loses `--full-auto` and gets {@link CODEX_PLAN_ARGS} (no shell tool,
- * read-only sandbox, runs outside a git repo), and Gemini gets no extra args
- * (so no `--yolo`). The engines still answer in print/exec mode — generation
- * only needs text.
+ * `--dangerously-skip-permissions` and its settings.local.json allow-list and
+ * gets {@link CLAUDE_PLAN_ARGS} (no tools, no MCP servers), Codex loses
+ * `--full-auto` and gets {@link CODEX_PLAN_ARGS} (no shell tool, read-only
+ * sandbox, runs outside a git repo), and Gemini gets no extra args (so no
+ * `--yolo`). The engines still answer in print/exec mode — generation only
+ * needs text.
  */
 export function buildPlanWorkerConfig(project: Pick<ProjectRecord, 'defaultEngine' | 'versionBudgetUsd'>, remainingUsd: number): PlanWorkerConfig {
   const base = buildWorkerConfig(project, remainingUsd);
@@ -167,6 +211,7 @@ export function buildPlanWorkerConfig(project: Pick<ProjectRecord, 'defaultEngin
     agentTaskPlayer: {
       ...base.agentTaskPlayer,
       'engines.claude.autoApprove': false,
+      'engines.claude.args': [...CLAUDE_PLAN_ARGS],
       'engines.codex.autoApprove': false,
       'engines.codex.args': [...CODEX_PLAN_ARGS],
       'engines.gemini.args': [],

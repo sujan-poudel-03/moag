@@ -220,7 +220,11 @@ export async function waitFor(pred: () => boolean, ms = 2000): Promise<void> {
 
 export const PRD_V1 = '# Checkout\n\n## Requirements\n- Guest checkout with email\n- Card payments via Stripe\n';
 
-/** A dehydrated delta playlist with an agent task, a manual ship gate and a release that depends on it. */
+/**
+ * A dehydrated delta playlist with an agent task, a generated manual gate and a
+ * release that depends on it. Once the server adds its ship gate the order is
+ * t-impl, t-gate, Ship approval, t-rel — and t-rel also depends on the ship gate.
+ */
 export function gatedPlaylist(): Record<string, unknown> {
   return {
     id: 'pl-delta-test', name: 'PRD v1.0.0 delta', autoplay: true,
@@ -230,6 +234,16 @@ export function gatedPlaylist(): Record<string, unknown> {
       { id: 't-rel', name: 'Release v1.0.0', prompt: '', type: 'release', dependsOn: ['t-gate'], command: 'npm run release' },
     ],
   };
+}
+
+/**
+ * Turn on the admin override that lets an engine with unrestrictable file
+ * access (gemini, anthropic) generate plans. Tests that plan on such an engine
+ * need it; by default the server refuses them (planner lockdown).
+ */
+export async function enablePlannerFileAccess(h: Harness): Promise<void> {
+  const r = await h.request('PATCH', '/api/admin/settings', { as: 'admin', body: { allowPlannerFileAccess: true } });
+  if (r.status !== 200) { throw new Error(`settings: ${r.status} ${r.raw}`); }
 }
 
 /** Script a plan-generation worker: write the outcome file and exit 0. */

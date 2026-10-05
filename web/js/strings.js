@@ -58,7 +58,7 @@ export const STR = Object.freeze({
   /** @param {string} user */
   C28: (user) => m(`Disable ${user}? ${user} is signed out and can't sign in. Their audit history is kept.`, ['control:cancel', 'control:disable-user']),
   /** @param {string} entries e.g. ".claude/, .mcp.json" */
-  C29: (entries) => m(`This repo ships engine config: ${entries}. An approved run starts the agent inside the repo, so that config loads and can run commands (hooks, MCP servers) as the server's user. Approve only if you trust this repository.`),
+  C29: (entries) => m(`This repo ships engine config or agent instructions: ${entries}. An approved run starts the agent inside the repo, so they load: config can run commands (hooks, MCP servers) as the server's user, and instruction files steer what the agent does. Approve only if you trust this repository.`),
   /** @param {string} engine the project's current default engine */
   C30: (engine) => m(`The project's engine changed to ${engine} after this plan was approved, so it can't start. Switch the engine back in Settings or request a new plan.`),
 });

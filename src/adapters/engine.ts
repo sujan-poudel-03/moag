@@ -160,7 +160,7 @@ async function probeVersion(command: string): Promise<string | null> {
   const { execFile } = await import('child_process');
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), 5000);
-    execFile(command, ['--version'], { timeout: 5000 }, (err, stdout, stderr) => {
+    execFile(command, ['--version'], { timeout: 5000, windowsHide: true }, (err, stdout, stderr) => {
       clearTimeout(timer);
       if (err) {
         // Some CLIs only respond to --help

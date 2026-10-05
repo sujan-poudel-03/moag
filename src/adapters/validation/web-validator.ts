@@ -10,6 +10,7 @@ import {
   ValidationStageResult,
 } from './types';
 import { resolveValidationProfile } from '../../models/execution-profiles';
+import { trackChildProcess } from '../../utils/child-tracker';
 
 /** Commands probed to detect web test tooling */
 const PLAYWRIGHT_MARKERS = ['playwright.config.ts', 'playwright.config.js'];
@@ -207,7 +208,9 @@ function runCommand(
       shell: true,
       env: { ...process.env, ...(opts.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
+    trackChildProcess(proc);
 
     let settled = false;
 

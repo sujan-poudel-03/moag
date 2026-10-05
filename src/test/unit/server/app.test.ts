@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
 import {
-  startHarness, Harness, waitFor, approvedProject, planWorker, gatedPlaylist, PRD_V1, PASSWORD, FakeWorker,
+  startHarness, Harness, waitFor, approvedProject, planWorker, gatedPlaylist, PRD_V1, PASSWORD, FakeWorker, enablePlannerFileAccess,
 } from './app-harness';
 import { loadPlan, dehydratePlan } from '../../../models/plan';
 import { recordGateResults } from '../../../models/requirement-trace';
@@ -304,6 +304,27 @@ describe('server app', function () {
     } finally { await fresh.close(); }
   });
 
+  it('bootstrap: the attempt limit is per client IP, so one locked-out IP does not lock out another', async () => {
+    const token = 'b'.repeat(30);
+    const fresh = await startHarness({ accounts: {}, config: { bootstrapToken: token, trustProxy: true } });
+    try {
+      const s = await fresh.request('GET', '/api/session');
+      const cookie = String((s.headers['set-cookie'] ?? [])[0]).split(';')[0];
+      const pre = String(s.body.preAuthToken);
+      const from = (ip: string, body: unknown) =>
+        fresh.request('POST', '/api/bootstrap', { body, cookie, csrf: pre, headers: { 'X-Forwarded-For': ip } });
+      const attacker = '203.0.113.7';
+      for (let i = 0; i < 5; i++) {
+        assert.equal((await from(attacker, { token: 'w'.repeat(30), username: 'root', password: PASSWORD })).status, 403);
+      }
+      assert.equal((await from(attacker, { token, username: 'root', password: PASSWORD })).status, 429, 'the guessing IP is locked');
+      // A different client is untouched by that lock: its right token creates the admin.
+      const ok = await from('198.51.100.20', { token, username: 'root', password: PASSWORD });
+      assert.equal(ok.status, 201, ok.raw);
+      assert.equal(fresh.users.list().length, 1);
+    } finally { await fresh.close(); }
+  });
+
   it('POST /api/me/password: wrong current passwords are limited per user; the lock refuses before scrypt and spares other users', async () => {
     const wrong = { currentPassword: 'Not-The-Password-1', newPassword: 'My-Own-Password-456' };
     const results = await Promise.all(Array.from({ length: 7 }, () => h.request('POST', '/api/me/password', { as: 'po', body: wrong })));
@@ -538,7 +559,7 @@ describe('server app', function () {
     assert.equal(new Set(statuses).size, 5);
   });
 
-  it('every appended plan has exactly one terminal manual ship gate, hashed and approved with the playlist', async () => {
+  it('every appended plan has exactly one server ship gate that gates shipping, hashed and approved with the playlist', async () => {
     const ungated = { id: 'pl-delta-u', name: 'PRD v1.0.0 delta', autoplay: true, tasks: [
       { id: 'u1', name: 'Build', prompt: 'b', requirementIds: ['R-2'] },
       { id: 'u2', name: 'Test', prompt: 't', type: 'command', command: 'npm test', dependsOn: ['u1'], requirementIds: ['R-1', 'R-2'] },
@@ -557,14 +578,22 @@ describe('server app', function () {
         const review = local.state.load(id).plans[0];
         assert.equal(review.status, 'pending');
         const tasks = review.playlist!.tasks;
+        const shipGates = tasks.filter((t) => t.type === 'manual' && t.name === 'Ship approval');
+        assert.equal(shipGates.length, 1, JSON.stringify(tasks));
+        const gate = shipGates[0];
+        const releases = tasks.filter((t) => t.type === 'release' || t.type === 'deploy');
         const dependedOn = new Set(tasks.flatMap((t) => t.dependsOn ?? []));
-        const terminalGates = tasks.filter((t) => t.type === 'manual' && !dependedOn.has(t.id));
-        assert.equal(terminalGates.length, 1, JSON.stringify(tasks));
-        const gate = terminalGates[0];
-        assert.equal(gate.name, 'Ship approval');
-        assert.equal(tasks.at(-1), gate);
-        const leaves = tasks.filter((t) => t !== gate && !dependedOn.has(t.id)).map((t) => t.id);
-        assert.deepEqual(leaves, [], 'every other task is upstream of the gate');
+        if (releases.length === 0) {
+          // No shipping work: the gate is terminal and last, and every other task is upstream of it.
+          assert.equal(tasks.at(-1), gate);
+          assert.equal(dependedOn.has(gate.id), false);
+          assert.deepEqual(tasks.filter((t) => t !== gate && !dependedOn.has(t.id)).map((t) => t.id), []);
+        } else {
+          // The B2 fixture: the release runs only after approval, everything else before it.
+          for (const rel of releases) { assert.ok(rel.dependsOn?.includes(gate.id), `${rel.id} waits for the gate`); }
+          assert.deepEqual(gate.dependsOn, ['t-impl', 't-gate']);
+          assert.deepEqual(tasks.map((t) => t.id), ['t-impl', 't-gate', gate.id, 't-rel']);
+        }
         assert.deepEqual(gate.requirementIds, ['R-1', 'R-2']);
         // The hash covers the gate: the reviewer approves exactly the gated playlist.
         assert.equal(review.contentHash, contentHash(review.playlist));
@@ -657,6 +686,30 @@ describe('server app', function () {
     const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: h.state.load(id).plans[0].contentHash } });
     assert.equal(r.status, 409);
     assert.equal(r.body.error, 'engine-not-allowed');
+  });
+
+  it('a generated task whose cwd escapes the workspace cannot be approved; monitor incident fields are listed', async () => {
+    const id = await newProject();
+    await h.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    const pl = gatedPlaylist();
+    const tasks = pl.tasks as Array<Record<string, unknown>>;
+    Object.assign(tasks[0], { cwd: '../other-project' });
+    tasks.push({ id: 't-mon', name: 'Watch', prompt: '', type: 'monitor', command: 'curl -f http://127.0.0.1:9/', incidentRepo: 'someone/else', incidentLabel: 'moag:incident' });
+    h.onSpawn = planWorker({ kind: 'appended', playlist: pl, rejected: [] });
+    const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+    const planId = (g.body.plan as { id: string }).id;
+    await waitFor(() => h.state.load(id).plans[0]?.status === 'pending');
+    const review = h.state.load(id).plans[0];
+    assert.equal(review.review?.ok, false);
+    assert.match(review.review!.errors.join(' '), /"\.\.\/other-project", which is outside the project workspace/);
+    const listed = review.review!.commands.map((c) => `${c.taskId}.${c.field}=${c.value}`);
+    for (const want of ['t-impl.cwd=../other-project', 't-mon.incidentRepo=someone/else', 't-mon.incidentLabel=moag:incident']) {
+      assert.ok(listed.includes(want), want);
+    }
+    const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: review.contentHash } });
+    assert.equal(r.status, 409);
+    assert.equal(h.state.load(id).plans[0].status, 'pending', 'nothing was approved');
+    assert.equal(h.state.loadCanonicalPlan(id, 'Acme').playlists.some((p) => p.id === 'pl-delta-test'), false, 'nothing reached the canonical plan');
   });
 
   // ─── Runs ───
@@ -835,6 +888,34 @@ describe('server app', function () {
     assert.equal(ok.status, 202, ok.raw);
   });
 
+  it('approval binds the engine the pending card shows: a default changed while pending is 409 and nothing is approved', async () => {
+    const id = await newProject();
+    await h.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    h.onSpawn = planWorker({ kind: 'appended', playlist: gatedPlaylist(), rejected: [] });
+    const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+    const planId = (g.body.plan as { id: string; engine: string }).id;
+    assert.equal((g.body.plan as { engine: string }).engine, 'claude');
+    await waitFor(() => h.state.load(id).plans[0]?.status === 'pending');
+    const hash = h.state.load(id).plans[0].contentHash;
+    const patch = await h.request('PATCH', `/api/projects/${id}`, { as: 'po', body: { defaultEngine: 'codex' } });
+    assert.equal(patch.status, 200, patch.raw);
+    const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    assert.equal(r.status, 409, r.raw);
+    assert.equal(r.body.error, 'engine-changed');
+    assert.match(String(r.body.message), /generated for claude, but the project now uses codex/);
+    const after = h.state.load(id).plans[0];
+    assert.equal(after.status, 'pending');
+    assert.equal(after.approvedEngine, undefined);
+    assert.equal(h.auditEntries().filter((e) => e.action === 'plan.approve').length, 0);
+    // Switching back makes the shown engine current again: approval records it.
+    await h.request('PATCH', `/api/projects/${id}`, { as: 'po', body: { defaultEngine: 'claude' } });
+    const ok = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    assert.equal(ok.status, 200, ok.raw);
+    assert.equal(h.state.load(id).plans[0].approvedEngine, 'claude');
+    const audit = h.auditEntries().find((e) => e.action === 'plan.approve');
+    assert.equal((audit?.after as { engine?: string }).engine, 'claude', 'the audit names the bound engine');
+  });
+
   it('a gate resume refuses a run whose project engine changed after approval', async () => {
     const { projectId, runId } = await haltAtGate();
     await h.request('PATCH', `/api/projects/${projectId}`, { as: 'po', body: { defaultEngine: 'codex' } });
@@ -857,26 +938,27 @@ describe('server app', function () {
     assert.equal(recorded.tasks['t-rel'], 'pending', 'its halted dependent is pending again');
     assert.equal(recorded.gate, undefined);
     const w = h.workers.at(-1)!;
+    // The server ship gate now sits between the generated gate and the release: segment 2 reaches it first.
+    const shipGate = h.state.load(projectId).plans[0].playlist!.tasks.find((t) => t.name === 'Ship approval')!;
     w.line({ event: 'state', state: 'playing' });
-    w.line({ event: 'task-started', id: 't-rel', name: 'Release v1.0.0' });
+    w.line({ event: 'task-started', id: shipGate.id, name: shipGate.name });
     w.line({ event: 'cost', usd: 1.5 });
     // While segment 2 runs, the DTO still shows segment 1's work.
     const mid = await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' });
     const midRun = (mid.body.runs as Array<{ view: { tasks: Record<string, string>; costUsd: number } }>)[0];
-    assert.equal(midRun.view.tasks['t-rel'], 'running');
+    assert.equal(midRun.view.tasks[shipGate.id], 'running');
     assert.equal(midRun.view.tasks['t-impl'], 'completed');
     assert.equal(midRun.view.costUsd, 3.5);
     const detailTasks = (mid.body.currentRun as { tasks: Array<{ id: string; status: string }> }).tasks;
     assert.equal(detailTasks.find((t) => t.id === 't-impl')?.status, 'completed');
-    w.line({ event: 'task-completed', id: 't-rel', name: 'Release v1.0.0' });
-    const shipGate = h.state.load(projectId).plans[0].playlist!.tasks.at(-1)!;
     w.line({ event: 'manual-gate', id: shipGate.id, name: shipGate.name });
     w.exit(3);
     await waitFor(() => h.state.load(projectId).runs[0].status === 'awaiting-approval');
     const end = h.state.load(projectId).runs[0].view!;
     assert.deepEqual(
       { impl: end.tasks['t-impl'], gate: end.tasks['t-gate'], rel: end.tasks['t-rel'] },
-      { impl: 'completed', gate: 'completed', rel: 'completed' },
+      { impl: 'completed', gate: 'completed', rel: 'pending' },
+      'the release has not run: it waits for the ship gate',
     );
     assert.equal(end.costUsd, 3.5);
     assert.deepEqual(end.gate, { taskId: shipGate.id, name: shipGate.name }, 'the gate comes from the latest segment');
@@ -920,14 +1002,27 @@ describe('server app', function () {
     const w = h.workers.at(-1)!;
     const snapPath = (w.job as { planPath: string }).planPath;
     const snap = JSON.parse(fs.readFileSync(snapPath, 'utf-8'));
-    const tasks = snap.playlists.at(-1).tasks as Array<{ id: string; name: string; status?: string }>;
-    const shipGate = tasks.at(-1)!;
-    for (const t of tasks) { t.status = t.id === shipGate.id ? 'failed' : 'completed'; }
+    const tasks = snap.playlists.at(-1).tasks as Array<{ id: string; name: string; status?: string; dependsOn?: string[] }>;
+    const shipGate = tasks.find((t) => t.name === 'Ship approval')!;
+    // Upstream of the gate done, the gate aborted (Failed), the release behind it blocked.
+    for (const t of tasks) {
+      t.status = t.id === shipGate.id ? 'failed' : (t.dependsOn ?? []).includes(shipGate.id) ? 'blocked' : 'completed';
+    }
+    assert.equal(tasks.find((t) => t.id === 't-rel')?.status, 'blocked', 'the release waits behind the ship gate');
     fs.writeFileSync(snapPath, JSON.stringify(snap));
     w.line({ event: 'manual-gate', id: shipGate.id, name: shipGate.name });
     w.exit(3);
     await waitFor(() => h.state.load(projectId).runs[0].status === 'awaiting-approval');
     return { projectId, runId, shipGateId: shipGate.id };
+  }
+
+  /** What the resumed worker leaves for the release task that runs after approval. */
+  function releaseRan(w: FakeWorker, status: 'completed' | 'failed' | 'skipped'): void {
+    const snapPath = (w.job as { planPath: string }).planPath;
+    const snap = loadPlan(snapPath);
+    const rel = snap.playlists.at(-1)!.tasks.find((t) => t.id === 't-rel')!;
+    rel.status = status as TaskStatus;
+    fs.writeFileSync(snapPath, JSON.stringify(dehydratePlan(snap)));
   }
 
   /** What the resumed worker's verify pass leaves in its snapshot: the gate results it recorded. */
@@ -953,6 +1048,8 @@ describe('server app', function () {
     const w = h.workers.at(-1)!;
     const resumed = loadPlan((w.job as { planPath: string }).planPath);
     assert.equal(resumed.playlists.at(-1)!.tasks.find((t) => t.id === shipGateId)?.status, TaskStatus.Completed);
+    assert.equal(resumed.playlists.at(-1)!.tasks.find((t) => t.id === 't-rel')?.status, TaskStatus.Pending, 'the release runs only now, after approval');
+    releaseRan(w, 'completed');
     verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
     w.exit(0);
     await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
@@ -969,6 +1066,7 @@ describe('server app', function () {
     const ap = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
     assert.equal(ap.status, 202, ap.raw);
     const w = h.workers.at(-1)!;
+    releaseRan(w, 'completed');
     verifyPass(w, [{ command: 'npm test', exitCode: 0 }, { command: 'npm run lint', exitCode: 1 }]);
     w.exit(1);
     await waitFor(() => h.state.load(projectId).runs[0].status === 'gaps');
@@ -985,6 +1083,7 @@ describe('server app', function () {
     const a = await haltAtShipGate();
     assert.equal((await h.request('POST', `/api/projects/${a.projectId}/runs/${a.runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
     const wa = h.workers.at(-1)!;
+    releaseRan(wa, 'completed');
     verifyPass(wa, [{ command: 'npm test', exitCode: 2 }]);
     wa.exit(0);
     await waitFor(() => h.state.load(a.projectId).runs[0].status === 'completed');
@@ -993,10 +1092,40 @@ describe('server app', function () {
   });
 
   it('an admin skip of the ship gate never ships, even with green evidence', async () => {
-    const { projectId, runId } = await haltAtShipGate();
+    const { projectId, runId, shipGateId } = await haltAtShipGate();
     const skip = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/skip`, { as: 'admin', body: { reason: 'hotfix' } });
     assert.equal(skip.status, 202, skip.raw);
     const w = h.workers.at(-1)!;
+    // The resumed snapshot never lets the release run: gate Completed, release Skipped (not Pending).
+    const resumed = loadPlan((w.job as { planPath: string }).planPath);
+    assert.equal(resumed.playlists.at(-1)!.tasks.find((t) => t.id === shipGateId)?.status, TaskStatus.Completed);
+    assert.equal(resumed.playlists.at(-1)!.tasks.find((t) => t.id === 't-rel')?.status, TaskStatus.Skipped, 'a skip never runs the release');
+    const view = (skip.body.run as { view?: { tasks: Record<string, string> } }).view;
+    if (view) { assert.equal(view.tasks['t-rel'], TaskStatus.Skipped, 'the recorded view mirrors the snapshot'); }
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).length > 0);
+    assert.ok((await traceRows(projectId)).every((row) => row.status !== 'shipped' && row.releaseTag === null));
+  });
+
+  it('gate approve → the release fails: nothing ships', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    const w = h.workers.at(-1)!;
+    releaseRan(w, 'failed');
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    w.exit(1);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'gaps');
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).length > 0);
+    assert.ok((await traceRows(projectId)).every((row) => row.status !== 'shipped' && row.releaseTag === null));
+  });
+
+  it('gate approve → green gates and exit 0 but the release was skipped: nothing ships', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    const w = h.workers.at(-1)!;
+    releaseRan(w, 'skipped');
     verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
     w.exit(0);
     await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
@@ -1065,7 +1194,7 @@ describe('server app', function () {
     assert.deepEqual(await runActions(projectId, 'po'), []);
     const dto = await projectDto(projectId, 'approver');
     const detail = dto.currentRun as { tasks: Array<{ id: string; name: string; status: string }>; afterGate: string[] };
-    assert.deepEqual(detail.afterGate, ['Release v1.0.0', 'Ship approval'], 'the gate card lists what runs after approval (incl. the server-appended terminal gate)');
+    assert.deepEqual(detail.afterGate, ['Ship approval', 'Release v1.0.0'], 'the gate card lists what runs after approval (incl. the server ship gate, which precedes the release)');
     assert.equal(detail.tasks.find((t) => t.id === 't-impl')?.status, 'completed');
     assert.equal(detail.tasks.find((t) => t.id === 't-gate')?.name, 'Release gate');
   });
@@ -1164,6 +1293,7 @@ describe('server app', function () {
     for (const engine of ['codex', 'anthropic'] as const) {
       const hx = await startHarness({ engineAvailable: () => true, secrets: (d) => { const s = new SecretStore(d, MASTER); s.set('anthropic', KEY); return s; } });
       try {
+        if (engine === 'anthropic') { await enablePlannerFileAccess(hx); }
         const { projectId, planId } = await approvedProject(hx, engine);
         const r = await hx.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
         assert.equal(r.status, 202, r.raw);
@@ -1189,7 +1319,8 @@ describe('server app', function () {
     for (const outcome of cases) {
       const hx = await startHarness({ engineAvailable: () => true, secrets: (d) => { const s = new SecretStore(d, MASTER); s.set('anthropic', KEY); return s; } });
       try {
-        const c = await hx.request('POST', '/api/projects', { as: 'po', body: { name: 'A', source: { kind: 'path', path: 'acme' }, stack: 'go', defaultEngine: 'anthropic' } });
+        await enablePlannerFileAccess(hx);
+      const c = await hx.request('POST', '/api/projects', { as: 'po', body: { name: 'A', source: { kind: 'path', path: 'acme' }, stack: 'go', defaultEngine: 'anthropic' } });
         const id = (c.body.project as { id: string }).id;
         await hx.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
         hx.onSpawn = planWorker(outcome);
@@ -1212,6 +1343,7 @@ describe('server app', function () {
       const c = await hx.request('POST', '/api/projects', { as: 'po', body: { name: 'A', source: { kind: 'path', path: 'acme' }, stack: 'go', defaultEngine: 'anthropic' } });
       const id = (c.body.project as { id: string }).id;
       await hx.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+      await enablePlannerFileAccess(hx);
       const pl = gatedPlaylist();
       const tasks = pl.tasks as Array<Record<string, unknown>>;
       tasks[0].name = `Key is ${KEY}`;
@@ -1285,6 +1417,108 @@ describe('server app', function () {
     const rcfg = JSON.parse(fs.readFileSync(String(h.workers.at(-1)!.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
     assert.equal('engines.claude.autoApprove' in rcfg, false);
     assert.equal('engines.codex.args' in rcfg, false, 'run jobs keep the configured codex args');
+  });
+
+  // ─── Planner lockdown (no file/tool access during plan generation) ───
+
+  it('a claude plan job gets no tools and no MCP servers; a run job keeps the configured claude args', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    const planJob = h.workers.find((w) => w.job.kind === 'plan')!;
+    const pcfg = JSON.parse(fs.readFileSync(String(planJob.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
+    assert.deepEqual(pcfg['engines.claude.args'], ['-p', '--strict-mcp-config', '--tools', '']);
+    await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    const rcfg = JSON.parse(fs.readFileSync(String(h.workers.at(-1)!.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
+    assert.equal('engines.claude.args' in rcfg, false, 'agents in a run keep their tools');
+  });
+
+  let projectSeq = 0;
+  async function projectOn(engine: string, hx: Harness = h): Promise<string> {
+    const dir = `lockdown-${++projectSeq}`;
+    fs.mkdirSync(path.join(hx.root, dir), { recursive: true });
+    const c = await hx.request('POST', '/api/projects', { as: 'po', body: { name: `On ${engine} ${projectSeq}`, source: { kind: 'path', path: dir }, stack: 'go', defaultEngine: engine } });
+    assert.equal(c.status, 201, c.raw);
+    const id = (c.body.project as { id: string }).id;
+    await hx.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    return id;
+  }
+
+  for (const engine of ['gemini', 'anthropic']) {
+    it(`plan generation on ${engine} is refused (409 planner-file-access) while planner file access is off`, async () => {
+      const hx = await startHarness({ engineAvailable: () => true });
+      try {
+        const id = await projectOn(engine, hx);
+        const spawned = hx.workers.length;
+        const g = await hx.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+        assert.equal(g.status, 409, g.raw);
+        assert.equal(g.body.error, 'planner-file-access');
+        assert.match(String(g.body.message), /reading files/);
+        assert.equal(hx.workers.length, spawned, 'no worker spawned');
+        assert.deepEqual(hx.state.load(id).plans, [], 'no plan record');
+        assert.equal(hx.auditEntries().some((e) => e.action === 'plan.generate'), false);
+      } finally { await hx.close(); }
+    });
+  }
+
+  it('claude, codex and ollama plan without the override', async () => {
+    for (const engine of ['claude', 'codex', 'ollama']) {
+      const id = await projectOn(engine);
+      h.onSpawn = planWorker({ kind: 'no-delta' });
+      const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+      assert.equal(g.status, 202, `${engine}: ${g.raw}`);
+      await h.waitDone(id);
+      const audit = h.auditEntries().filter((e) => e.action === 'plan.generate').at(-1)!;
+      assert.equal((audit.after as Record<string, unknown>).plannerFileAccess, undefined, `${engine}: a locked-down planner is not flagged`);
+    }
+  });
+
+  it('the admin override is audited only when it changes, and then lets gemini plan (flagged in the audit)', async () => {
+    const get0 = await h.request('GET', '/api/admin/settings', { as: 'admin' });
+    assert.equal(get0.status, 200, get0.raw);
+    assert.deepEqual((get0.body.settings as Record<string, unknown>), { allowPlannerFileAccess: false }, 'default off');
+    assert.deepEqual([...(get0.body.plannerLockedEngines as string[])].sort(), ['claude', 'codex', 'ollama']);
+
+    const noop = await h.request('PATCH', '/api/admin/settings', { as: 'admin', body: { allowPlannerFileAccess: false } });
+    assert.equal(noop.status, 200, noop.raw);
+    assert.equal(h.auditEntries().filter((e) => e.action === 'settings.update').length, 0, 'no change, no audit');
+
+    const on = await h.request('PATCH', '/api/admin/settings', { as: 'admin', body: { allowPlannerFileAccess: true } });
+    assert.equal(on.status, 200, on.raw);
+    assert.deepEqual(on.body.settings, { allowPlannerFileAccess: true });
+    const changes = h.auditEntries().filter((e) => e.action === 'settings.update');
+    assert.equal(changes.length, 1);
+    assert.deepEqual(changes[0].before, { allowPlannerFileAccess: false });
+    assert.deepEqual(changes[0].after, { allowPlannerFileAccess: true });
+    assert.equal(changes[0].actorUsername, 'admin');
+    await h.request('PATCH', '/api/admin/settings', { as: 'admin', body: { allowPlannerFileAccess: true } });
+    assert.equal(h.auditEntries().filter((e) => e.action === 'settings.update').length, 1, 'setting it again is not a change');
+
+    const id = await projectOn('gemini');
+    h.onSpawn = planWorker({ kind: 'no-delta' });
+    const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+    assert.equal(g.status, 202, g.raw);
+    await h.waitDone(id);
+    const audit = h.auditEntries().filter((e) => e.action === 'plan.generate').at(-1)!;
+    assert.equal((audit.after as Record<string, unknown>).plannerFileAccess, true, 'an unrestricted planner is flagged in the audit');
+
+    // Turning it back off refuses gemini again (and is audited).
+    await h.request('PATCH', '/api/admin/settings', { as: 'admin', body: { allowPlannerFileAccess: false } });
+    assert.equal(h.auditEntries().filter((e) => e.action === 'settings.update').length, 2);
+    const id2 = await projectOn('gemini');
+    const g2 = await h.request('POST', `/api/projects/${id2}/plans`, { as: 'po', body: { mode: 'initial' } });
+    assert.equal(g2.status, 409, g2.raw);
+  });
+
+  it('only an admin may read or change server settings; a malformed value is a 400', async () => {
+    for (const as of ['po', 'reviewer', 'approver']) {
+      assert.equal((await h.request('GET', '/api/admin/settings', { as })).status, 403, as);
+      assert.equal((await h.request('PATCH', '/api/admin/settings', { as, body: { allowPlannerFileAccess: true } })).status, 403, as);
+    }
+    const bad = await h.request('PATCH', '/api/admin/settings', { as: 'admin', body: { allowPlannerFileAccess: 'yes' } });
+    assert.equal(bad.status, 400, bad.raw);
+    const extra = await h.request('PATCH', '/api/admin/settings', { as: 'admin', body: { somethingElse: true } });
+    assert.equal(extra.status, 400, extra.raw);
+    assert.deepEqual((await h.request('GET', '/api/admin/settings', { as: 'admin' })).body.settings, { allowPlannerFileAccess: false });
+    assert.equal(h.auditEntries().filter((e) => e.action === 'settings.update').length, 0);
   });
 
   it('a plan-generation job never starts in the repo: its cwd is an empty server-owned scratch dir with a file listing', async () => {

@@ -2,7 +2,11 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { buildWorkerEnv, buildWorkerConfig, buildPlanWorkerConfig, referencedEngines, isForbiddenWorkerEnvName, CODEX_PLAN_ARGS } from '../../../server/run-env';
+import {
+  buildWorkerEnv, buildWorkerConfig, buildPlanWorkerConfig, referencedEngines, isForbiddenWorkerEnvName, CODEX_PLAN_ARGS,
+  CLAUDE_PLAN_ARGS, PLANNER_LOCKED_ENGINES, plannerFileAccessRefusal,
+} from '../../../server/run-env';
+import { ENGINE_IDS } from '../../../models/types';
 import { workspace as shimWorkspace, __setWorkspaceRoot } from '../../../headless/vscode-shim';
 import { KEYED_ENGINE_ENV } from '../../../server/secrets';
 import { Plan } from '../../../models/types';
@@ -145,6 +149,9 @@ describe('run-env', () => {
       assert.deepEqual(c['engines.gemini.args'], []);
       assert.deepEqual(c['engines.codex.args'], [...CODEX_PLAN_ARGS]);
       assert.ok(c['engines.codex.args'].includes('--skip-git-repo-check'));
+      assert.deepEqual(c['engines.claude.args'], [...CLAUDE_PLAN_ARGS]);
+      assert.deepEqual(c['engines.claude.args'], ['-p', '--strict-mcp-config', '--tools', '']);
+      assert.equal('engines.claude.args' in buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0).agentTaskPlayer, false, 'run jobs keep the configured claude args (agents need tools)');
       assert.equal('engines.codex.args' in buildWorkerConfig({ defaultEngine: 'codex', versionBudgetUsd: 0 }, 0).agentTaskPlayer, false, 'run jobs keep the configured codex args');
       assert.equal(c['prdLoop.onManualGate'], 'halt');
       assert.equal(c.fullAuto, false);
@@ -167,10 +174,30 @@ describe('run-env', () => {
         assert.deepEqual(shimWorkspace.getConfiguration('agentTaskPlayer.engines.gemini').get<string[]>('args', ['--yolo']), []);
         // Codex: the exact lookup in codex-adapter.ts (default []) yields the plan-only args.
         assert.deepEqual(shimWorkspace.getConfiguration('agentTaskPlayer.engines.codex').get<string[]>('args', []), [...CODEX_PLAN_ARGS]);
+        // Claude: the exact lookup in claude-adapter.ts (default ['-p']) yields the no-tools args.
+        assert.deepEqual(shimWorkspace.getConfiguration('agentTaskPlayer.engines.claude').get<string[]>('args', ['-p']), [...CLAUDE_PLAN_ARGS]);
       } finally {
         if (prev === undefined) { delete process.env.MOAG_CONFIG_PATH; } else { process.env.MOAG_CONFIG_PATH = prev; }
         __setWorkspaceRoot(process.cwd());
         fs.rmSync(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('planner lockdown', () => {
+    it('only engines that can be denied every file/tool may plan by default', () => {
+      assert.deepEqual([...PLANNER_LOCKED_ENGINES].sort(), ['claude', 'codex', 'ollama']);
+      for (const e of ['claude', 'codex', 'ollama'] as const) { assert.equal(plannerFileAccessRefusal(e, false), null, e); }
+      for (const e of ['gemini', 'anthropic'] as const) {
+        assert.match(plannerFileAccessRefusal(e, false) ?? '', /reading files/, e);
+        assert.equal(plannerFileAccessRefusal(e, true), null, `${e} with the admin override`);
+      }
+    });
+
+    it('every server engine is classified: locked down, or refused unless overridden', () => {
+      for (const e of ENGINE_IDS) {
+        const refused = plannerFileAccessRefusal(e, false) !== null;
+        assert.equal(refused, !PLANNER_LOCKED_ENGINES.includes(e), e);
       }
     });
   });

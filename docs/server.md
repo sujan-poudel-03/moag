@@ -106,6 +106,8 @@ With `http://` public URLs (local trials only), cookies are not `Secure`.
 1. Start the server with `MOAG_BOOTSTRAP_TOKEN` set to a random string of 24+ characters. The server refuses to start when no admin exists and no token is set.
 2. Open the public URL. While no admin exists, the app shows **Create the first admin**. Enter the token, a username and a password (12–256 characters).
 3. Once an admin exists, `/api/bootstrap` returns 404 for good. Remove the token from the environment on the next restart.
+
+Wrong bootstrap tokens are rate-limited **per client IP** (the same limiter as sign-in: 5 wrong tokens lock that IP for 15 minutes, before the token is even compared). One guessing client cannot lock out the operator, who signs in from another address. Behind a proxy this needs `MOAG_TRUST_PROXY=1`; otherwise every client shares the proxy's IP.
 4. The admin creates everyone else under **Users**. New users get a temporary password and must change it at first sign-in.
 
 Roles are `product-owner`, `reviewer`, `approver` and `admin`. One user can hold several. The server always keeps at least one active admin.
@@ -139,6 +141,29 @@ The **anthropic** API key is set on the Engines screen:
 - Without a master key, setting a key returns 503. The rest of the server works.
 - A key is decrypted only for a job whose plan references that engine, and is injected as that job's `ANTHROPIC_API_KEY`. Jobs on other engines never see it.
 - If the master key changes, stored keys show **Key unreadable**. Set them again.
+
+### Planner lockdown and `allowPlannerFileAccess`
+
+Plan generation is triggered by a product owner, so the planning agent runs with **no file or tool access**. Its only view of the repository is the server's `git ls-files` listing, placed in the prompt as a context section before the output-format rules.
+
+| Engine | How plan generation is locked down |
+|---|---|
+| `claude` | `-p --strict-mcp-config --tools ""`: every built-in tool is removed and no MCP server loads. |
+| `codex` | `exec --skip-git-repo-check --sandbox read-only --disable shell_tool --disable unified_exec -c shell_environment_policy.inherit=none`: no shell or exec tool, read-only sandbox. |
+| `ollama` | `ollama run` is a plain completion with no tools. |
+| `gemini`, `anthropic` | Cannot be restricted: Gemini CLI has no flag that removes its file tools, and the anthropic API adapter always offers `read_file`, `list_directory` and `run_bash`. Refused with `409 planner-file-access` (no worker, no plan record) unless an admin turns on `allowPlannerFileAccess`. |
+
+`allowPlannerFileAccess` (default **off**) is an admin setting, stored in `<data>/server-settings.json`:
+
+```bash
+GET   /api/admin/settings                                   # admin only
+PATCH /api/admin/settings  {"allowPlannerFileAccess": true}  # admin only, CSRF-protected
+```
+
+- Each change of the value is audited as `settings.update` with the before and after values. A PATCH that changes nothing is not audited.
+- While it is on, the `plan.generate` audit entry of a plan generated on gemini or anthropic carries `plannerFileAccess: true`.
+- It only unlocks the engines in the last row. Claude and Codex plans stay locked down either way.
+- A malformed settings file reads as off.
 
 ### Master key
 
@@ -176,6 +201,31 @@ Every JSON file is written atomically (temp file then rename), so a file is neve
 Back up the master key separately. Restoring `/data` without it loses the stored API keys, but nothing else.
 
 On Windows hosts, `chmod` 0600/0700 has no effect. Protect the data directory with NTFS ACLs instead.
+
+## Restarts and the job lock
+
+Each project with a job running has `projects/<id>/job.lock`. It names everything that may still be working in the workspace:
+
+- the server pid and the worker pid;
+- on POSIX, the worker's process group (`workerPgid`);
+- `taskPids`: every agent CLI, shell command or gate command the worker currently has running. The worker reports each one as it starts and ends, and the server rewrites the lock to match (at most 64 pids).
+
+The lock is **held** while any of them is alive, even when the server and the worker are both gone. A new job for that project gets `409 project-locked`.
+
+On restart the server:
+
+1. Removes every lock whose holders are all dead.
+2. Recovers every project without a held lock: runs left `running` become `interrupted`, plan generations left `generating` become `interrupted`, and each interrupted run's snapshot is merged into the canonical plan, so tasks it completed (and paid for) are not rerun.
+3. Leaves a project whose lock is still held **alone**. Its previous worker is still running and still writing its snapshot, so marking it now would record a half-finished run as final. The server re-checks that lock every 5 seconds. Once every holder has exited, and no job of this server's own is running there, it removes the lock and runs step 2 for that project, merging the worker's final snapshot.
+
+A worker whose server dies stops its runner, which tree-kills the running task. If that has not settled within 30 seconds, the worker kills its own process tree and exits, so a hung task cannot hold a lock forever.
+
+### Windows notes
+
+- Workers are spawned **detached on every platform**. Without that, Windows puts the worker in the server's kill-on-close job object, and a server crash would hard-kill the worker while leaving the agent it started running.
+- Every child process the server and its workers start is spawned with `windowsHide`: agent CLIs, task and gate commands, git, `taskkill`, version probes. A detached worker has no console, so without it each child would open a console window on the server's desktop.
+- Process trees are killed with `taskkill /pid <pid> /T /F`. Windows has no process groups, so the lock relies on the worker pid and `taskPids`.
+- A task `cwd` such as `C:\x`, `C:x` or `\\server\share` is absolute, so a generated plan using one is refused at review.
 
 ## The CI lock
 
@@ -230,12 +280,14 @@ Names must match `^[A-Z_][A-Z0-9_]*$`. `MOAG_*` and `CI` are rejected at boot. A
 
 | Threat | Mitigation | Residual |
 |---|---|---|
-| Credential stuffing or brute force | scrypt, 429 per account+IP and per IP, uniform error and timing | In-memory limiter resets on restart |
-| Session theft | HttpOnly, `__Host-`, Secure on https, hashed ids at rest, epoch invalidation, no-store on `/api` | TLS is the reverse proxy's job (documented) |
+| Credential stuffing or brute force | scrypt, 429 per account+IP and per IP, uniform error and timing. Bootstrap tokens are limited per IP. Wrong *current* passwords on `POST /api/me/password` are limited per user, from any IP (5 wrong, then 15 minutes of 429 before scrypt runs), so a stolen session is not a password oracle | In-memory limiters reset on restart |
+| Session theft | HttpOnly, `__Host-`, Secure on https, hashed ids at rest, epoch invalidation, no-store on `/api`. A revoked session (logout, role change, disable, password set) ends its live event streams at once with an SSE `session-ended` event; an expired one at the next heartbeat | TLS is the reverse proxy's job (documented) |
 | CSRF | synchronizer token, JSON-only bodies, Origin check, SameSite=Lax | — |
 | XSS from agent-authored task names, error tails or PRD text | CSP `default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`, nosniff. A static test bans `innerHTML`, `insertAdjacentHTML`, `outerHTML`, `document.write`, `eval`, `new Function` and inline handlers/scripts in `web/**` | — |
 | Privilege escalation | `canPerform` on every route, last-admin guard, role change kills sessions, table-driven matrix test | — |
-| **Run = RCE** | Only `reviewer` and `admin` start runs, only on a reviewer-approved, content-hash-bound plan. A run job runs as a separate process with `cwd` = its project workspace, a server-generated config (the repo's `.moag/config.json` is ignored, `custom`/`copilot` are rejected at plan approval), and an env allowlist plus only that job's engine keys. **Plan generation** (`product-owner`-triggered) does NOT start in the repository: its agent CLI runs with `cwd` = an empty server-owned scratch dir (`projects/<id>/plans/<planId>/work`), auto-approve forced off (no `--dangerously-skip-permissions`, no Claude allow-list, no Codex `--full-auto`, no Gemini extra args), Codex additionally given `--disable shell_tool --disable unified_exec --sandbox read-only` (no command tool) and `--skip-git-repo-check` (the scratch dir is not a repo), and sees the repo only as a server-generated, size-capped `git ls-files` listing (first 2000 paths) in its prompt. No repo-shipped engine config (`.claude/settings*.json` hooks, `.mcp.json`, `.gemini/`) is loaded during plan generation. The generated playlist and rejections are scrubbed of the job's injected engine key before they are hashed, stored or shown; if the key appeared, the plan can never be approved. | **Agents run as the same OS user as the server.** An agent can read the data dir (`users.json` hashes, `secrets.json`, other workspaces) and `/proc/<server pid>/environ`, which holds the master key if it came from env. **The container is the real boundary.** An approved **run** executes inside the repository, so the engine CLI loads the repo's own engine config (`.claude/`, `.mcp.json`, `.gemini/`): hooks and MCP servers run as the server uid. That is why only `reviewer` and `admin` can start runs, and why a reviewer must trust a repository before approving its first run (the plan review card warns when the repo ships engine config). Documented with a recommendation: one instance per trust domain. Separating the agent UID is deferred. **Plan generation is not read-proof:** the planning engine still runs as the server uid with the engine key in its environment, and tools that need no approval (Claude's read tools; Codex's read-only sandbox) can read any file that uid can. A PRD can therefore steer file contents into the generated plan, which every signed-in user can read. Only the job's own engine key is redacted from that output. A Codex too old to know the `--disable` flags exits with an error, so its plans fail rather than run with commands. |
+| **Run = RCE** | Only `reviewer` and `admin` start runs, only on a reviewer-approved, content-hash-bound plan. A run job runs as a separate process with `cwd` = its project workspace, a server-generated config (the repo's `.moag/config.json` is ignored, `custom`/`copilot` are rejected at plan approval), and an env allowlist plus only that job's engine keys. **Plan generation** (`product-owner`-triggered) does NOT start in the repository: its agent CLI runs with `cwd` = an empty server-owned scratch dir (`projects/<id>/plans/<planId>/work`), auto-approve forced off (no `--dangerously-skip-permissions`, no Claude allow-list, no Codex `--full-auto`, no Gemini extra args), and **no file or tool access** (see [Planner lockdown](#planner-lockdown-and-allowplannerfileaccess)): Claude gets `--tools "" --strict-mcp-config`, Codex `--disable shell_tool --disable unified_exec --sandbox read-only` and `--skip-git-repo-check` (the scratch dir is not a repo), and engines that cannot be restricted (gemini, anthropic) are refused unless an admin turns on `allowPlannerFileAccess`. The planner sees the repo only as a server-generated, size-capped `git ls-files` listing (first 2000 paths) in its prompt. No repo-shipped engine config (`.claude/settings*.json` hooks, `.mcp.json`, `.gemini/`) is loaded during plan generation. The generated playlist and rejections are scrubbed of the job's injected engine key before they are hashed, stored or shown; if the key appeared, the plan can never be approved. | **Agents run as the same OS user as the server.** An agent can read the data dir (`users.json` hashes, `secrets.json`, other workspaces) and `/proc/<server pid>/environ`, which holds the master key if it came from env. **The container is the real boundary.** An approved **run** executes inside the repository, so the engine CLI loads the repo's own engine config (`.claude/`, `.mcp.json`, `.gemini/`): hooks and MCP servers run as the server uid. That is why only `reviewer` and `admin` can start runs, and why a reviewer must trust a repository before approving its first run (the plan review card warns when the repo ships engine config or agent instructions; see [Who can trigger agents](#who-can-trigger-agents-and-how-they-are-contained)). Documented with a recommendation: one instance per trust domain. Separating the agent UID is deferred. **Plan generation still runs as the server uid** with the engine key in its environment. Under the lockdown the planner has no tool to read files with, and the job's own engine key is still redacted from its output in case the model echoes it. If an admin turns on `allowPlannerFileAccess`, a gemini or anthropic planner **can** read any file that uid can, and a PRD can steer those contents into the generated plan, which every signed-in user can read. A CLI too old to know a lockdown flag exits with an error, so its plans fail rather than run unrestricted. Codex only warns about an unknown *feature name* (`--disable <name>`) rather than rejecting it; the read-only sandbox is the backstop there. |
+| Generated plan reaching outside its project | Every task `cwd` must stay inside the workspace: an absolute path (POSIX, `C:\`, drive-relative `C:x`, UNC) or a `..` that climbs above the root makes the plan unapprovable (409). Every command, cwd, `healthCheckUrl`, `skipIf`, `failurePolicy` and monitor `incidentRepo`/`incidentLabel` is listed verbatim on the review card. `env`, `inheritEnvFiles`, `githubRelease` and `releaseTag` are stripped before hashing | A command can still `cd` anywhere the uid can; the reviewer reads the commands |
+| Two projects sharing files | A project's workspace must be a git repository's top-level folder (`not-a-git-repo`, `not-repo-root`), and may not contain or sit inside another project's workspace (`409 workspace-nested`), compared as realpaths | — |
 | Command injection through clone URL or path | `execFile('git', ['-c','protocol.file.allow=never','-c','protocol.ext.allow=never','clone','--no-recurse-submodules','--',url,dest], {shell:false})`, `GIT_ALLOW_PROTOCOL`, URL allowlist, paths realpath-confined to the projects root | Re-validated at each job start (symlink TOCTOU) |
 | Ship-gate bypass | `CI` stripped and refused, `onManualGate:'halt'` forced, approve is approver-only, skip is admin-only with a reason, distinct audit actions | An agent could edit the run snapshot plan file (same uid). The server re-reads only statuses and trace from it. Documented. |
 | Key exfiltration through the API | GET returns last4 only; audit records "key set"/"key cleared" only; error tails are redacted of injected key values before persisting | Keys in the agent env are visible to that agent by design |
@@ -246,9 +298,24 @@ Names must match `^[A-Z_][A-Z0-9_]*$`. `MOAG_*` and `CI` are rejected at boot. A
 ### Who can trigger agents, and how they are contained
 
 - **Starting a run** is restricted to `reviewer` and `admin`. It needs a plan a reviewer approved, and the approval is bound to the plan's content hash.
-- **Plan generation** (product owner) runs an agent CLI in an **empty server-owned scratch directory**, never in the repository, with every engine's auto-approve forced off. Because the CLI does not start inside the repo, repo-shipped engine config (`.claude/settings*.json` hooks, `.mcp.json`, `.gemini/settings.json`) cannot load and run code on a product owner's click. Codex is also given no shell tool (`--disable shell_tool --disable unified_exec`) and a read-only sandbox. That stops the planner running commands, but **not reading files**: an engine's read tools need no approval. The server therefore redacts the job's engine key from the generated plan and refuses to approve a plan that contained it. The planner gets the repository only as text: a server-generated `git ls-files` listing capped at 2000 paths (git runs with array args, no shell, `core.fsmonitor=false`).
-- **Approving a plan / starting a run** (reviewer, admin) is where repository code and repository engine config become live: the run's agent starts inside the repo and its CLI loads `.claude/`, `.mcp.json` and `.gemini/` from there. **A reviewer must trust the repository before approving its first run.** The plan review card shows a "repo ships engine config" warning listing those entries when they exist; read them before approving.
-- **Approving a ship gate** (approver) resumes a halted run. When that resumed run finishes with its verify gates green (exit 0), the server stamps each ready requirement as shipped in the trace, under the server-generated tag `ship-<runId>` (a trace label, not a git tag; generated plans may not tag or push). A failing verify ships nothing. **Skipping** a gate is admin-only, needs a reason, is audited separately from approval, and never ships.
+- **Plan generation** (product owner) runs an agent CLI in an **empty server-owned scratch directory**, never in the repository, with every engine's auto-approve forced off. Because the CLI does not start inside the repo, repo-shipped engine config (`.claude/settings*.json` hooks, `.mcp.json`, `.gemini/settings.json`) cannot load and run code on a product owner's click. The planner also gets **no file or tool access** ([Planner lockdown](#planner-lockdown-and-allowplannerfileaccess)): Claude runs with `--tools ""` and `--strict-mcp-config`, Codex with no shell tool and a read-only sandbox, and gemini and anthropic are refused unless an admin sets `allowPlannerFileAccess`. The planner gets the repository only as text: a server-generated `git ls-files` listing capped at 2000 paths (git runs with array args, no shell, `core.fsmonitor=false`), placed before the output-format rules in the prompt. The server still redacts the job's engine key from the generated plan and refuses to approve a plan that contained it.
+- **Approving a plan** (reviewer, admin) binds two things: the plan's content hash, and **the engine the review card shows**, which is the engine the plan was generated with.
+  - If the project's default engine changed while the plan was pending, approval is refused with `409 engine-changed`. Switch the project back or request a new plan.
+  - After approval the engine stays locked. A run, or a resumed segment, on a project whose engine has since changed is also refused with `409 engine-changed`.
+  - A plan with a task `cwd` outside the workspace cannot be approved at all.
+- **Starting a run** (reviewer, admin) is where repository code and repository config become live: the run's agent starts inside the repo and loads what the repo ships. **A reviewer must trust the repository before approving its first run.** The plan review card warns, listing each of these entries the repo has:
+  - engine config: `.claude/`, `.mcp.json`, `.gemini/`, `.codex/`
+  - agent instruction files: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules`
+  - MOAG workspace rules: `.moag/rules.json`, which is injected into every task prompt
+
+  Read them before approving.
+- **Stopping a run** (reviewer, admin) asks the worker to stop over IPC, and kills it if it has not exited 30 seconds later. Stop is idempotent: a second stop while the first is still settling returns `200` with `alreadyStopping: true`, changes nothing and is not audited again.
+- **The ship gate gates shipping.** The server appends a `manual` task, **Ship approval**, to every generated plan.
+  - The gate depends on all the non-shipping work.
+  - Every `release` and `deploy` task, and anything that depends on one, depends on the gate, so nothing ships before an approver says so.
+  - The playlist is reordered to: work, then the gate, then shipping tasks.
+  - Without a release or deploy task, the gate is simply the last task.
+- **Approving a ship gate** (approver) resumes the halted run, and the release and deploy tasks run after it. The server stamps each ready requirement as shipped only when the resumed run finishes with its verify gates green (exit 0) **and** every `release` task in its playlist completed. The stamp goes under the server-generated tag `ship-<runId>`, a trace label rather than a git tag (generated plans may not tag or push). A failing verify ships nothing, and so does a release that failed, was skipped, was blocked or never ran. **Skipping** a gate is admin-only, needs a reason, is audited separately from approval, and never ships: the gate is marked done so the rest of the run (its verify pass included) continues, but every release and deploy task behind the gate, and everything that depends on one, is set to Skipped and never runs. Only an approval runs the release.
 
 Each job is its own process: a run with the project workspace as its working directory, a plan generation with its empty scratch directory. It gets the built environment above and only its own engine's key.
 
@@ -256,7 +323,7 @@ Each job is its own process: a run with the project workspace as its working dir
 
 Other known limits:
 
-- The login rate limiter is in memory and resets on restart.
+- The login, bootstrap and current-password rate limiters are in memory and reset on restart.
 - The audit log is append-only through the API but not tamper-evident against the server's own user.
 - One extra model call can overshoot the cost cap.
 - Two server instances on one data directory are unsupported.

@@ -23,6 +23,7 @@ export function resolveDeveloperEmail(cwd: string): string | null {
       cwd,
       timeout: 5000,
       encoding: 'utf-8',
+      windowsHide: true,
     });
     const trimmed = raw.trim();
     memoized = trimmed.length > 0 ? trimmed : null;

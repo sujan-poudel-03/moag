@@ -146,6 +146,36 @@ describe('adapter argument building', () => {
     });
   });
 
+  describe('ClaudeAdapter in a plan-generation job', () => {
+    it('gets no tools and no MCP servers, never skips permissions, and writes no settings.local.json', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { buildPlanWorkerConfig } = require('../../../server/run-env') as typeof import('../../../server/run-env');
+      const cfg = buildPlanWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0).agentTaskPlayer;
+      setMockConfig('agentTaskPlayer.engines.claude', { autoApprove: cfg['engines.claude.autoApprove'], args: cfg['engines.claude.args'] });
+      let capturedConfig: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean } | undefined;
+      const writes: string[] = [];
+      const { ClaudeAdapter: CA } = proxyquire('../../../adapters/claude-adapter', {
+        vscode: vscodeMock,
+        fs: { mkdirSync: (p: string) => { writes.push(p); }, writeFileSync: (p: string) => { writes.push(p); }, existsSync: () => false, readFileSync: () => '', unlinkSync: () => undefined },
+        './base-cli': {
+          runCli: (config: { buildArgs: (opts: { prompt: string }) => string[]; useStdin?: boolean }) => {
+            capturedConfig = config;
+            return Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 });
+          },
+        },
+      });
+      await new CA().runTask({ prompt: 'plan it', cwd: '/scratch' });
+      const args = capturedConfig!.buildArgs({ prompt: 'plan it' });
+      assert.deepEqual(args, ['-p', '--strict-mcp-config', '--tools', '']);
+      const toolsAt = args.indexOf('--tools');
+      assert.equal(args[toolsAt + 1], '', '--tools "" disables every built-in tool');
+      assert.ok(!args.some((a) => /dangerously|bypassPermissions|--allowedTools|--add-dir/.test(a)));
+      assert.ok(!args.includes('plan it'), 'the prompt still goes through stdin');
+      assert.equal(capturedConfig!.useStdin, true);
+      assert.deepEqual(writes, [], 'no permission allow-list is written for a plan job');
+    });
+  });
+
   describe('GeminiAdapter', () => {
     it('should have id "gemini"', () => {
       const adapter = new GeminiAdapter();

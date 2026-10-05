@@ -44,7 +44,7 @@ export function killProcess(proc: ChildProcess): void {
   if (process.platform === 'win32') {
     if (proc.pid) {
       try {
-        execSync(`taskkill /pid ${proc.pid} /T /F`, { stdio: 'ignore' });
+        execSync(`taskkill /pid ${proc.pid} /T /F`, { stdio: 'ignore', windowsHide: true });
       } catch {
         // ignore — the process may already be gone
       }
@@ -82,7 +82,7 @@ export function killProcess(proc: ChildProcess): void {
  */
 export function killOwnProcessTree(
   rootPid: number = process.pid,
-  run: (cmd: string) => string = (cmd) => execSync(cmd, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }),
+  run: (cmd: string) => string = (cmd) => execSync(cmd, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, windowsHide: true }),
   platform: NodeJS.Platform = process.platform,
   kill: (pid: number, signal: NodeJS.Signals) => void = (pid, signal) => { process.kill(pid, signal); },
 ): void {

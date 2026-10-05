@@ -303,6 +303,24 @@ describe('projects', () => {
       assert.deepEqual(detectRepoEngineConfig(ws), ['.claude', '.mcp.json', '.gemini']);
       assert.deepEqual(detectRepoEngineConfig(path.join(root, 'missing')), []);
     });
+
+    it('detectRepoEngineConfig also names Codex config, agent instruction files, MOAG rules and Cursor rules', () => {
+      const ws = path.join(root, 'instr');
+      fs.mkdirSync(path.join(ws, '.codex'), { recursive: true });
+      for (const f of ['CLAUDE.md', 'AGENTS.md', 'GEMINI.md']) { fs.writeFileSync(path.join(ws, f), '# rules'); }
+      fs.mkdirSync(path.join(ws, '.moag'));
+      fs.writeFileSync(path.join(ws, '.moag', 'rules.json'), '[]');
+      fs.mkdirSync(path.join(ws, '.cursor', 'rules'), { recursive: true });
+      assert.deepEqual(detectRepoEngineConfig(ws), ['.codex', 'CLAUDE.md', 'AGENTS.md', 'GEMINI.md', '.moag/rules.json', '.cursor/rules']);
+    });
+
+    it('detectRepoEngineConfig ignores a .moag or .cursor dir without the config inside', () => {
+      const ws = path.join(root, 'partial');
+      fs.mkdirSync(path.join(ws, '.moag'), { recursive: true });
+      fs.writeFileSync(path.join(ws, '.moag', 'plan.json'), '{}');
+      fs.mkdirSync(path.join(ws, '.cursor'));
+      assert.deepEqual(detectRepoEngineConfig(ws), []);
+    });
   });
 
   describe('ProjectStore + intakeProject', () => {

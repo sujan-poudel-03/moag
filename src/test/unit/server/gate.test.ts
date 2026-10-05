@@ -1,5 +1,6 @@
 import { strict as assert } from 'assert';
-import { prepareGateResume, GateResumeError } from '../../../server/gate';
+import { prepareGateResume, GateResumeError, stampApprovedShip } from '../../../server/gate';
+import { recordGateResults } from '../../../models/requirement-trace';
 import { createEmptyPlan, createPlaylist, createTask } from '../../../models/plan';
 import { Plan, Task, TaskStatus } from '../../../models/types';
 
@@ -31,7 +32,8 @@ const status = (plan: Plan, id: string) => plan.playlists.flatMap((p) => p.tasks
 describe('prepareGateResume', () => {
   it('completes the gate and resets transitive dependents across playlists', () => {
     const plan = fixture();
-    const reset = prepareGateResume(plan, 'gate');
+    const { reset, skipped } = prepareGateResume(plan, 'gate', 'approve');
+    assert.deepEqual(skipped, []);
     assert.equal(status(plan, 'gate'), TaskStatus.Completed);
     assert.deepEqual(reset.sort(), ['announce', 'monitor', 'release']);
     for (const id of reset) { assert.equal(status(plan, id), TaskStatus.Pending); }
@@ -39,7 +41,7 @@ describe('prepareGateResume', () => {
 
   it('leaves an unrelated failed task, completed dependents and non-dependents untouched', () => {
     const plan = fixture();
-    prepareGateResume(plan, 'gate');
+    prepareGateResume(plan, 'gate', 'approve');
     assert.equal(status(plan, 'unrelated-failed'), TaskStatus.Failed);
     assert.equal(status(plan, 'already-done'), TaskStatus.Completed);
     assert.equal(status(plan, 'build'), TaskStatus.Completed);
@@ -49,13 +51,13 @@ describe('prepareGateResume', () => {
   it('throws for a non-manual task without mutating anything', () => {
     const plan = fixture();
     const before = JSON.stringify(plan);
-    assert.throws(() => prepareGateResume(plan, 'release'), GateResumeError);
-    assert.throws(() => prepareGateResume(plan, 'build'), /not a manual ship gate/);
+    assert.throws(() => prepareGateResume(plan, 'release', 'approve'), GateResumeError);
+    assert.throws(() => prepareGateResume(plan, 'build', 'skip'), /not a manual ship gate/);
     assert.equal(JSON.stringify(plan), before);
   });
 
   it('throws for a missing task', () => {
-    assert.throws(() => prepareGateResume(fixture(), 'nope'), /not found/);
+    assert.throws(() => prepareGateResume(fixture(), 'nope', 'approve'), /not found/);
   });
 
   it('handles dependency cycles without looping forever', () => {
@@ -65,6 +67,74 @@ describe('prepareGateResume', () => {
       task('x', TaskStatus.Blocked, { dependsOn: ['gate', 'y'] }),
       task('y', TaskStatus.Blocked, { dependsOn: ['x'] }),
     );
-    assert.deepEqual(prepareGateResume(plan, 'gate').sort(), ['x', 'y']);
+    assert.deepEqual(prepareGateResume(plan, 'gate', 'approve').reset.sort(), ['x', 'y']);
+  });
+
+  it('a skip never ships: release/deploy work downstream of the gate becomes Skipped, not Pending', () => {
+    const plan = fixture();
+    plan.playlists[0].tasks.push(task('deploy', TaskStatus.Blocked, { type: 'deploy', dependsOn: ['gate'] }));
+    const { reset, skipped } = prepareGateResume(plan, 'gate', 'skip');
+    assert.equal(status(plan, 'gate'), TaskStatus.Completed);
+    // release, deploy and everything downstream of either (across playlists) never run.
+    assert.deepEqual(skipped.sort(), ['announce', 'deploy', 'monitor', 'release']);
+    for (const id of skipped) { assert.equal(status(plan, id), TaskStatus.Skipped); }
+    assert.deepEqual(reset, [], 'no shipping task is reset to Pending');
+    // Non-shipping dependents and completed work are untouched.
+    assert.equal(status(plan, 'after-gate-pending'), TaskStatus.Pending);
+    assert.equal(status(plan, 'already-done'), TaskStatus.Completed);
+    assert.equal(status(plan, 'unrelated-failed'), TaskStatus.Failed);
+  });
+
+  it('a skip still resets halted non-shipping dependents, and leaves a release outside the gate closure alone', () => {
+    const plan = createEmptyPlan('Skip');
+    plan.playlists[0].tasks.push(
+      task('gate', TaskStatus.Failed, { type: 'manual' }),
+      task('verify-notes', TaskStatus.Blocked, { dependsOn: ['gate'] }),
+      task('rel', TaskStatus.Blocked, { type: 'release', dependsOn: ['gate'] }),
+      task('other-rel', TaskStatus.Failed, { type: 'release' }),
+    );
+    const { reset, skipped } = prepareGateResume(plan, 'gate', 'skip');
+    assert.deepEqual(reset, ['verify-notes']);
+    assert.deepEqual(skipped, ['rel']);
+    assert.equal(status(plan, 'other-rel'), TaskStatus.Failed, 'not downstream of the gate: untouched');
+  });
+});
+
+describe('stampApprovedShip', () => {
+  const AT = '2026-10-04T00:00:00.000Z';
+  function shipPlan(releaseStatus: TaskStatus | null): Plan {
+    const plan = createEmptyPlan('Ship');
+    plan.prdVersions = [{ version: '1.0.0', text: '## Requirements\n- [R-1] login\n', createdAt: AT }];
+    plan.playlists[0].tasks.push(
+      task('impl', TaskStatus.Completed, { requirementIds: ['R-1'] }),
+      task('ship', TaskStatus.Completed, { type: 'manual', dependsOn: ['impl'], requirementIds: ['R-1'] }),
+    );
+    if (releaseStatus !== null) {
+      plan.playlists[0].tasks.push(task('rel', releaseStatus, { type: 'release', dependsOn: ['ship'], command: 'npm run release' }));
+    }
+    recordGateResults(plan, [{ command: 'npm test', exitCode: 0, timedOut: false }], AT);
+    return plan;
+  }
+
+  it('stamps an approved run whose release completed, and one with no release task', () => {
+    assert.deepEqual(stampApprovedShip(shipPlan(TaskStatus.Completed), 'r1', AT, 0), ['R-1']);
+    assert.deepEqual(stampApprovedShip(shipPlan(null), 'r1', AT, 0), ['R-1']);
+  });
+
+  for (const s of [TaskStatus.Failed, TaskStatus.Skipped, TaskStatus.Blocked, TaskStatus.Pending]) {
+    it(`never stamps while the run's release is ${s}, even with green gates and a completed gate`, () => {
+      const plan = shipPlan(s);
+      assert.deepEqual(stampApprovedShip(plan, 'r1', AT, 0), []);
+      assert.equal((plan.requirementTrace ?? []).every((r) => r.releases.length === 0), true);
+    });
+  }
+
+  it('checks only the run\'s playlist when an index is given, every playlist otherwise', () => {
+    const plan = shipPlan(TaskStatus.Completed);
+    const old = createPlaylist('Old');
+    old.tasks.push(task('old-rel', TaskStatus.Failed, { type: 'release', command: 'x' }));
+    plan.playlists.unshift(old);
+    assert.deepEqual(stampApprovedShip(plan, 'r1', AT), [], 'whole plan: the old failed release blocks');
+    assert.deepEqual(stampApprovedShip(plan, 'r1', AT, 1), ['R-1']);
   });
 });

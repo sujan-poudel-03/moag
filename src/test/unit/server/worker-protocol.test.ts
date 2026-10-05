@@ -68,6 +68,14 @@ describe('worker-protocol', () => {
       assert.deepEqual(v, { event: 'verify', name: 'verify-report', data: { passed: false, score: 3 } });
     });
 
+    it('parses task-pid and rejects a non-positive, fractional or missing pid / alive flag', () => {
+      assert.deepEqual(parseWorkerLine(line({ event: 'task-pid', pid: 4321, alive: true })), { event: 'task-pid', pid: 4321, alive: true });
+      assert.deepEqual(parseWorkerLine(line({ event: 'task-pid', pid: 4321, alive: false })), { event: 'task-pid', pid: 4321, alive: false });
+      for (const bad of [{ pid: 0, alive: true }, { pid: -5, alive: true }, { pid: 1.5, alive: true }, { pid: '12', alive: true }, { pid: 12 }, { pid: 12, alive: 'yes' }]) {
+        assert.equal(parseWorkerLine(line({ event: 'task-pid', ...bad })), null, JSON.stringify(bad));
+      }
+    });
+
     it('rejects a probe row with an unknown engine', () => {
       assert.equal(parseWorkerLine(line({ event: 'probe-result', engines: [{ id: 'evil', available: true }] })), null);
     });

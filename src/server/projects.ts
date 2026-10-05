@@ -332,16 +332,24 @@ export const REPO_LISTING_MAX_PATHS = 2000;
 export const REPO_LISTING_MAX_CHARS = 100_000;
 
 /**
- * Repository entries an engine CLI loads as its own configuration when it runs
- * with cwd = the workspace (hooks, MCP servers, tool grants). Plan generation
- * never runs there; an approved run does.
+ * Repository entries an engine (or MOAG itself) loads as configuration or
+ * standing instructions when it runs with cwd = the workspace: hooks, MCP
+ * servers and tool grants (`.claude`, `.mcp.json`, `.gemini`, `.codex`), agent
+ * instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules`) and
+ * MOAG's workspace AI rules injected into every task prompt (`.moag/rules.json`).
+ * Plan generation never runs there; an approved run does. Paths are relative to
+ * the workspace root, `/`-separated.
  */
-export const REPO_ENGINE_CONFIG_ENTRIES = ['.claude', '.mcp.json', '.gemini'] as const;
+export const REPO_ENGINE_CONFIG_ENTRIES = [
+  '.claude', '.mcp.json', '.gemini', '.codex',
+  'CLAUDE.md', 'AGENTS.md', 'GEMINI.md',
+  '.moag/rules.json', '.cursor/rules',
+] as const;
 
-/** The engine-config entries present at the top of `dir` (empty when none or unreadable). */
+/** The engine-config entries present in `dir` (empty when none or unreadable). */
 export function detectRepoEngineConfig(dir: string): string[] {
   return REPO_ENGINE_CONFIG_ENTRIES.filter((name) => {
-    try { fs.lstatSync(path.join(dir, name)); return true; } catch { return false; }
+    try { fs.lstatSync(path.join(dir, ...name.split('/'))); return true; } catch { return false; }
   });
 }
 

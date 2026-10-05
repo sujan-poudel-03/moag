@@ -45,7 +45,8 @@ import {
 } from './projects';
 import { ProjectStateStore, PlanReview, RunRecord, RunStatus, ProjectState } from './project-state';
 import { JobManager, JobEnd, SpawnSpec, WorkerProcess, JobNotice, redactSecrets } from './jobs';
-import { buildWorkerConfig, buildPlanWorkerConfig, buildWorkerEnv, referencedEngines } from './run-env';
+import { buildWorkerConfig, buildPlanWorkerConfig, buildWorkerEnv, referencedEngines, plannerFileAccessRefusal, PLANNER_LOCKED_ENGINES } from './run-env';
+import { ServerSettingsStore } from './server-settings';
 import { SecretStore, NoMasterKeyError, isKeyedEngine, API_KEY_RE } from './secrets';
 import { EngineStatusCache, buildEngineRows, PROBE_TIMEOUT_MS } from './engines';
 import { OutcomeStore } from './outcomes';
@@ -56,7 +57,7 @@ import {
   savePrdVersion, overrideBump, mergeRunSnapshot, validatePendingPlaylist, contentHash, SERVER_FORBIDDEN_ENGINES, appendShipGate,
   stripGeneratedSideEffects, redactStringsDeep, CREDENTIAL_IN_PLAYLIST_ERROR,
 } from './prd-ops';
-import { prepareGateResume, GateResumeError, stampApprovedShip } from './gate';
+import { prepareGateResume, GateResumeError, GateResumeResult, stampApprovedShip } from './gate';
 import { createStaticServer } from './static';
 import { ServerAction, canPerform, allowedActions, Actor } from './permissions';
 
@@ -90,6 +91,8 @@ export const ROUTES: readonly RouteSpec[] = Object.freeze([
   { method: 'POST', path: '/api/admin/engines/recheck', action: 'engines.manage', mutating: true, auth: 'session' },
   { method: 'PUT', path: '/api/admin/engines/:engine/key', action: 'engines.manage', mutating: true, auth: 'session' },
   { method: 'DELETE', path: '/api/admin/engines/:engine/key', action: 'engines.manage', mutating: true, auth: 'session' },
+  { method: 'GET', path: '/api/admin/settings', action: 'engines.manage', mutating: false, auth: 'session' },
+  { method: 'PATCH', path: '/api/admin/settings', action: 'engines.manage', mutating: true, auth: 'session' },
   { method: 'GET', path: '/api/engines/availability', action: null, mutating: false, auth: 'session' },
   { method: 'GET', path: '/api/users/approvers', action: null, mutating: false, auth: 'session' },
   { method: 'GET', path: '/api/projects', action: null, mutating: false, auth: 'session' },
@@ -167,6 +170,8 @@ export interface AppDeps {
   webRoot?: string;
   /** Engine API key store; default: `secrets.json` in the data dir under `config.masterKey`. */
   secrets?: SecretStore;
+  /** Admin settings store; default: `server-settings.json` in the data dir. */
+  settings?: ServerSettingsStore;
   /** Stack evidence store; default: `outcomes.jsonl` in the data dir. */
   outcomes?: OutcomeStore;
   /** SSE heartbeat (and session re-check) interval; default {@link SSE_HEARTBEAT_MS}. Tests shorten it. */
@@ -237,6 +242,7 @@ const S = {
   gateReject: obj({ note: LONG_TEXT }),
   gateSkip: obj({ reason: LONG_TEXT }),
   setKey: obj({ value: str(8, 512, API_KEY_RE) }),
+  patchSettings: obj({ allowPlannerFileAccess: opt(bool()) }),
 };
 
 /** `POST /api/projects` body: a source union the generic `obj` cannot express. */
@@ -282,6 +288,7 @@ export function createApp(deps: AppDeps): App {
   const keyStatus = (e: EngineId) => secrets.status(e);
   const engineAvailable = deps.engineAvailable ?? ((e: EngineId) => engineCache.isAvailable(e, keyStatus));
   const outcomes = deps.outcomes ?? new OutcomeStore(config.dataDir, log);
+  const settings = deps.settings ?? new ServerSettingsStore(config.dataDir);
 
   /** Per run-segment job: what an outcome needs that the worker event does not carry. */
   interface RunJobContext {
@@ -642,14 +649,16 @@ export function createApp(deps: AppDeps): App {
         try {
           const canonical = state.loadCanonicalPlan(projectId, project.name, project.defaultEngine);
           const snapshot = loadPlan(snapshotPath);
-          // Server-owned ship: generated plans carry no release task (tags are
-          // stripped), so an approver's approval is what ships. Only a segment that
+          // Server-owned ship: generated release tasks carry no tag (stripped),
+          // so an approver's approval is what ships. Only a segment that
           // resumed after `approve` and exited 0 (its verify pass ran green)
           // stamps; stampRelease re-checks tasks and gates. A skip never ships.
           const rec = state.load(projectId).runs.find((x) => x.id === runId);
           const lastDecision = rec?.gateDecisions?.[rec.gateDecisions.length - 1];
           if (end.status === 'completed' && end.exitCode === 0 && lastDecision?.action === 'approve') {
-            const shipped = stampApprovedShip(snapshot, runId, now().toISOString());
+            // Release tasks run after the gate: their playlist's release must also have succeeded.
+            const playlistIndex = state.load(projectId).plans.find((x) => x.id === rec?.planId)?.playlistIndex;
+            const shipped = stampApprovedShip(snapshot, runId, now().toISOString(), playlistIndex);
             if (shipped.length > 0) {
               writeFileAtomicSync(snapshotPath, JSON.stringify(dehydratePlan(snapshot), null, 2), 0o600);
             }
@@ -990,6 +999,26 @@ export function createApp(deps: AppDeps): App {
     sendJson(ctx.res, 200, { engine, cleared, status: secrets.status(engine) });
   };
 
+  // ─── Admin settings ───
+
+  const settingsDto = () => ({ settings: settings.get(), plannerLockedEngines: [...PLANNER_LOCKED_ENGINES] });
+
+  H['GET /api/admin/settings'] = async (ctx) => sendJson(ctx.res, 200, settingsDto());
+
+  H['PATCH /api/admin/settings'] = async (ctx) => {
+    const b = await body(ctx, S.patchSettings);
+    const { before, after } = settings.update(b);
+    // Audited only when something actually changed.
+    if (before.allowPlannerFileAccess !== after.allowPlannerFileAccess) {
+      writeAudit(ctx, {
+        action: 'settings.update', target: 'allowPlannerFileAccess',
+        before: { allowPlannerFileAccess: before.allowPlannerFileAccess }, after: { allowPlannerFileAccess: after.allowPlannerFileAccess },
+      });
+      log(`settings: allowPlannerFileAccess ${before.allowPlannerFileAccess} -> ${after.allowPlannerFileAccess} by ${ctx.user?.username ?? '?'}`);
+    }
+    sendJson(ctx.res, 200, settingsDto());
+  };
+
   H['GET /api/engines/availability'] = async (ctx) => {
     const snap = engineCache.snapshot();
     sendJson(ctx.res, 200, {
@@ -1218,6 +1247,12 @@ export function createApp(deps: AppDeps): App {
     }
     requireRunsEnabled();
     requireEngine(p.defaultEngine);
+    // Planner lockdown: an engine that cannot be denied file access never plans,
+    // unless an admin has turned on planner file access (audited when changed).
+    const plannerFileAccess = settings.get().allowPlannerFileAccess;
+    const refusal = plannerFileAccessRefusal(p.defaultEngine, plannerFileAccess);
+    if (refusal) { throw new HttpError(409, 'planner-file-access', refusal, { engine: p.defaultEngine }); }
+    const plannerUnlocked = !PLANNER_LOCKED_ENGINES.includes(p.defaultEngine);
     await state.withProjectLock(p.id, async () => {
       const plan = state.loadCanonicalPlan(p.id, p.name, p.defaultEngine);
       const latest = latestVersion(plan);
@@ -1262,7 +1297,7 @@ export function createApp(deps: AppDeps): App {
         requestedBy: ctx.user!.id, requestedAt: now().toISOString(),
       };
       state.update(p.id, (s) => { s.plans.push(review); s.overrideLocked[latest.createdAt] = true; });
-      writeAudit(ctx, { action: 'plan.generate', projectId: p.id, target: `PRD ${formatVersionLabel(latest.version)} ${b.mode}`, after: { planId, engine: p.defaultEngine } });
+      writeAudit(ctx, { action: 'plan.generate', projectId: p.id, target: `PRD ${formatVersionLabel(latest.version)} ${b.mode}`, after: { planId, engine: p.defaultEngine, ...(plannerUnlocked ? { plannerFileAccess: true } : {}) } });
       sendJson(ctx.res, 202, { plan: planDto(review, ctx.user!) });
     });
   };
@@ -1299,6 +1334,15 @@ export function createApp(deps: AppDeps): App {
       if (review.review && !review.review.ok) {
         throw new HttpError(409, 'engine-not-allowed', review.review.errors.join(' '));
       }
+      // The pending card shows the engine the plan was generated with
+      // (review.engine); that is what the reviewer approves. If the project's
+      // default changed while the plan was pending, approving would bind an
+      // engine nobody reviewed — refuse instead.
+      if (review.engine !== p.defaultEngine) {
+        throw new HttpError(409, 'engine-changed',
+          `This plan was generated for ${review.engine}, but the project now uses ${p.defaultEngine}. Switch the project back or request a new plan.`,
+          { planEngine: review.engine, projectEngine: p.defaultEngine });
+      }
       let next: Plan;
       try {
         const file = dehydratePlan(plan);
@@ -1312,9 +1356,9 @@ export function createApp(deps: AppDeps): App {
       review.decidedBy = ctx.user!.id;
       review.decidedAt = now().toISOString();
       review.playlistIndex = next.playlists.length - 1;
-      review.approvedEngine = p.defaultEngine;
+      review.approvedEngine = review.engine;
       state.save(p.id, st);
-      writeAudit(ctx, { action: 'plan.approve', projectId: p.id, target: review.playlist.name, after: { planId: review.id, contentHash: review.contentHash }, flags });
+      writeAudit(ctx, { action: 'plan.approve', projectId: p.id, target: review.playlist.name, after: { planId: review.id, contentHash: review.contentHash, engine: review.engine }, flags });
       sendJson(ctx.res, 200, { plan: planDto(review, ctx.user!) });
     });
   };
@@ -1441,10 +1485,11 @@ export function createApp(deps: AppDeps): App {
       const workspace = requireWorkspace(p);
       const snapshotPath = path.join(state.runDir(p.id, run.id), 'plan.json');
       let snapshot: Plan;
-      let resetIds: string[] = [];
+      let resume: GateResumeResult = { reset: [], skipped: [] };
       try {
         snapshot = loadPlan(snapshotPath);
-        resetIds = prepareGateResume(snapshot, gate.taskId);
+        // A skip completes the gate but sets its shipping dependents Skipped: it never ships.
+        resume = prepareGateResume(snapshot, gate.taskId, kind);
       } catch (err) {
         const code = err instanceof GateResumeError ? 'gate-invalid' : 'snapshot-unreadable';
         throw new HttpError(409, code, (err as Error).message);
@@ -1456,9 +1501,11 @@ export function createApp(deps: AppDeps): App {
       run.status = 'running';
       run.segments += 1;
       if (run.view) {
-        // The recorded view mirrors the rewritten snapshot: gate done, its halted dependents pending again.
+        // The recorded view mirrors the rewritten snapshot: gate done, its halted dependents
+        // pending again — except the shipping work a skip set Skipped.
         const tasks = { ...run.view.tasks, [gate.taskId]: TaskStatus.Completed };
-        for (const id of resetIds) { tasks[id] = TaskStatus.Pending; }
+        for (const id of resume.reset) { tasks[id] = TaskStatus.Pending; }
+        for (const id of resume.skipped) { tasks[id] = TaskStatus.Skipped; }
         run.view = { ...run.view, tasks, haltReason: null };
         delete run.view.gate;
       }

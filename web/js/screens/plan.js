@@ -168,7 +168,7 @@ function planCard(app, project, p, refresh) {
         taskRows(tasks),
         review.commands && review.commands.length > 0 ? h('div', null,
           h('h3', { class: 'section-header' }, `Commands and side effects (${review.commands.length})`),
-          h('p', { class: 'muted' }, 'Shown exactly as written. Review them: commands run in the project workspace; health-check URLs are fetched; skip conditions and failure policies change what runs.'),
+          h('p', { class: 'muted' }, 'Shown exactly as written. Review them: commands run in the project workspace; health-check URLs are fetched; skip conditions and failure policies change what runs; an incident repo receives the GitHub issues a monitor task files.'),
           h('ul', { class: 'diff-list' }, review.commands.map((c) => h('li', null,
             h('span', null, `${c.taskName} (${c.taskType}) · ${c.field}`),
             h('pre', { class: 'tail' }, c.value))))) : null,

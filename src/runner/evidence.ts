@@ -13,6 +13,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { analyzeProject } from '../context/project-analyzer';
 import { killProcess } from '../utils/process-kill';
+import { trackChildProcess } from '../utils/child-tracker';
 
 /** Hard ceiling on any single git invocation, mirroring the runner's GIT_TIMEOUT_MS. */
 const GIT_TIMEOUT_MS = 30_000;
@@ -87,7 +88,7 @@ function runGit(args: string[], cwd: string): Promise<string | null> {
   return new Promise((resolve) => {
     let proc: ChildProcess;
     try {
-      proc = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      proc = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     } catch {
       resolve(null);
       return;
@@ -230,7 +231,9 @@ export function runGate(command: string, options: GateOptions): Promise<GateResu
         shell: true,
         env: { ...process.env, ...(options.env ?? {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
+      trackChildProcess(proc);
     } catch (err) {
       resolve({
         command,

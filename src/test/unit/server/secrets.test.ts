@@ -7,7 +7,7 @@ import * as path from 'path';
 import {
   SecretStore, SECRETS_FILE, KEYED_ENGINE_ENV, KEYED_ENGINES, isKeyedEngine, NoMasterKeyError,
 } from '../../../server/secrets';
-import { startHarness, Harness, approvedProject, planWorker, gatedPlaylist, PRD_V1, waitFor } from './app-harness';
+import { startHarness, Harness, approvedProject, planWorker, gatedPlaylist, PRD_V1, waitFor, enablePlannerFileAccess } from './app-harness';
 
 const MASTER = Buffer.from('master-secret-for-tests-0123456789', 'utf-8');
 const KEY = 'sk-ant-api03-THIS-IS-A-FAKE-KEY-a91F';
@@ -141,6 +141,7 @@ describe('server secrets: injection into worker envs', function () {
   });
 
   it('a job for an anthropic project gets the key, and the key is redacted from what the worker reports', async () => {
+    await enablePlannerFileAccess(h);
     const c = await h.request('POST', '/api/projects', {
       as: 'po', body: { name: 'Api', source: { kind: 'path', path: 'other' }, stack: 'python', defaultEngine: 'anthropic' },
     });

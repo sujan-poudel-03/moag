@@ -4,9 +4,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as sinon from 'sinon';
-import { JobManager, JobManagerOptions, WorkerProcess, JobEnd, redactSecrets, MAX_LINE_BYTES, STOP_KILL_AFTER_MS } from '../../../server/jobs';
+import { JobManager, JobManagerOptions, WorkerProcess, JobEnd, redactSecrets, MAX_LINE_BYTES, STOP_KILL_AFTER_MS, HELD_LOCK_POLL_MS } from '../../../server/jobs';
 import { ProjectStateStore, emptyProjectState, PLAN_REVIEW_STATUSES, RUN_STATUSES } from '../../../server/project-state';
-import { WorkerJob } from '../../../server/worker-protocol';
+import { WorkerJob, emptyRunView } from '../../../server/worker-protocol';
 import { createEmptyPlan, createTask, dehydratePlan } from '../../../models/plan';
 
 class FakeProc extends EventEmitter implements WorkerProcess {
@@ -283,6 +283,126 @@ describe('JobManager', () => {
     alive.delete(8888);
     assert.deepEqual(m.reclaimStaleLocks(['p1']), ['p1']);
     assert.equal(start(m, 'p1').ok, true);
+  });
+
+  it('records task pids the worker reports in job.lock, drops them on exit, and never fans them out', () => {
+    const m = mk({ workerLeadsProcessGroup: true });
+    const events: string[] = [];
+    const notices: string[] = [];
+    m.start({ projectId: 'p1', job: RUN_JOB, jobPath: jobPath('p1'), workspace: '/w', env: {}, onEvent: (e) => events.push(e.event) });
+    m.subscribe('p1', (n) => notices.push(n.type === 'event' ? n.event.event : 'end'));
+    const lock = () => JSON.parse(fs.readFileSync(m.lockPath('p1'), 'utf-8'));
+    procs[0].line({ event: 'task-pid', pid: 5001, alive: true });
+    procs[0].line({ event: 'task-pid', pid: 5002, alive: true });
+    assert.deepEqual(lock(), { serverPid: process.pid, workerPid: 99999, workerPgid: 99999, taskPids: [5001, 5002] });
+    procs[0].line({ event: 'task-pid', pid: 5001, alive: false });
+    assert.deepEqual(lock().taskPids, [5002]);
+    procs[0].line({ event: 'task-pid', pid: 5002, alive: false });
+    assert.deepEqual(lock(), { serverPid: process.pid, workerPid: 99999, workerPgid: 99999 }, 'no empty taskPids array');
+    procs[0].line({ event: 'task-pid', pid: 7, alive: false });
+    assert.deepEqual(events, [], 'task-pid never reaches onEvent');
+    assert.deepEqual(notices, [], 'task-pid never reaches SSE subscribers');
+    assert.deepEqual(m.view('p1'), emptyRunView(), 'and is not folded into the run view');
+    procs[0].emit('close', 0);
+    assert.equal(fs.existsSync(m.lockPath('p1')), false, 'a finished job releases its lock');
+  });
+
+  it('a recorded task pid keeps the workspace locked after the worker dies mid-task (successor server)', () => {
+    const m = mk();
+    start(m, 'p1');
+    procs[0].line({ event: 'task-pid', pid: 6006, alive: true });
+    // The server and the worker crash: no close event, the lock file stays as written.
+    const lockText = fs.readFileSync(m.lockPath('p1'), 'utf-8');
+    const successor = mk({ isPidAlive: (pid) => pid === 6006 });
+    assert.deepEqual(successor.reclaimStaleLocks(['p1']), [], 'the orphaned agent still owns the workspace');
+    assert.equal(fs.readFileSync(successor.lockPath('p1'), 'utf-8'), lockText);
+    assert.equal((start(successor, 'p1') as { reason: string }).reason, 'project-locked');
+    const afterAgentExit = mk({ isPidAlive: () => false });
+    assert.deepEqual(afterAgentExit.reclaimStaleLocks(['p1']), ['p1']);
+  });
+
+  it('task-pid events after the job ended do not resurrect the lock', () => {
+    const m = mk();
+    start(m, 'p1');
+    const p = procs[0];
+    const stdoutListener = p.stdout.listeners('data')[0] as (c: Buffer) => void;
+    p.emit('close', 0);
+    stdoutListener(Buffer.from(JSON.stringify({ event: 'task-pid', pid: 42, alive: true }) + '\n'));
+    assert.equal(fs.existsSync(m.lockPath('p1')), false);
+  });
+
+  it('isLockHeld: false without a lock or with only dead holders, true while a holder lives', () => {
+    const alive = new Set<number>([7777]);
+    const m = mk({ isPidAlive: (pid) => alive.has(pid) });
+    assert.equal(m.isLockHeld('p1'), false, 'no lock file');
+    fs.mkdirSync(path.dirname(m.lockPath('p1')), { recursive: true });
+    fs.writeFileSync(m.lockPath('p1'), JSON.stringify({ serverPid: 5555, workerPid: 7777 }));
+    assert.equal(m.isLockHeld('p1'), true);
+    alive.clear();
+    assert.equal(m.isLockHeld('p1'), false);
+    fs.writeFileSync(m.lockPath('p1'), 'garbage');
+    assert.equal(m.isLockHeld('p1'), false, 'garbage is not a holder');
+  });
+
+  it('watchHeldLocks reclaims and reports a project only once its holder exits, then stops polling', () => {
+    const alive = new Set<number>([7777]);
+    const m = mk({ isPidAlive: (pid) => alive.has(pid) });
+    fs.mkdirSync(path.dirname(m.lockPath('p1')), { recursive: true });
+    fs.writeFileSync(m.lockPath('p1'), JSON.stringify({ serverPid: 5555, workerPid: 7777, taskPids: [8888] }));
+    let tick: (() => void) | null = null;
+    let interval = -1;
+    let cleared = 0;
+    const released: string[] = [];
+    m.watchHeldLocks(['p1'], (id) => released.push(id), {
+      setInterval: (fn, ms) => { tick = fn; interval = ms; return 'timer'; },
+      clearInterval: (t) => { assert.equal(t, 'timer'); cleared++; },
+    });
+    assert.equal(interval, HELD_LOCK_POLL_MS);
+    tick!();
+    assert.deepEqual(released, [], 'worker alive: nothing recovered');
+    alive.delete(7777);
+    alive.add(8888);
+    tick!();
+    assert.deepEqual(released, [], 'its agent alive: still held');
+    alive.clear();
+    tick!();
+    assert.deepEqual(released, ['p1']);
+    assert.equal(fs.existsSync(m.lockPath('p1')), false, 'the stale lock is reclaimed');
+    assert.equal(cleared, 1, 'polling stops once every project is released');
+  });
+
+  it('watchHeldLocks waits while this server has its own job in the project', () => {
+    const alive = new Set<number>([7777]);
+    const m = mk({ isPidAlive: (pid) => alive.has(pid) });
+    fs.mkdirSync(path.dirname(m.lockPath('p1')), { recursive: true });
+    fs.writeFileSync(m.lockPath('p1'), JSON.stringify({ serverPid: 5555, workerPid: 7777 }));
+    let tick: (() => void) | null = null;
+    const released: string[] = [];
+    m.watchHeldLocks(['p1'], (id) => released.push(id), { setInterval: (fn) => { tick = fn; return 1; }, clearInterval: () => undefined });
+    alive.clear();
+    assert.equal(start(m, 'p1').ok, true, 'the dead holder lets a new job in');
+    tick!();
+    assert.deepEqual(released, [], 'never recover under a live job of ours');
+    procs[0].emit('close', 0);
+    tick!();
+    assert.deepEqual(released, ['p1']);
+  });
+
+  it('watchHeldLocks: the disposer stops polling; a throwing callback is logged and does not stop other projects', () => {
+    const logs: string[] = [];
+    const m = mk({ isPidAlive: () => false, log: (x) => logs.push(x) });
+    let tick: (() => void) | null = null;
+    let cleared = 0;
+    const seen: string[] = [];
+    const stop = m.watchHeldLocks(['a', 'b'], (id) => { seen.push(id); if (id === 'a') { throw new Error('boom'); } },
+      { setInterval: (fn) => { tick = fn; return 1; }, clearInterval: () => { cleared++; } });
+    tick!();
+    assert.deepEqual(seen, ['a', 'b']);
+    assert.ok(logs.some((l) => l.includes('boom')));
+    const stop2 = m.watchHeldLocks(['c'], () => assert.fail('disposed'), { setInterval: (fn) => { tick = fn; return 2; }, clearInterval: () => { cleared++; } });
+    stop2();
+    stop();
+    assert.equal(cleared, 2);
   });
 
   it('task pids that are not positive integers are ignored; a lock of only dead task pids is reclaimed', () => {

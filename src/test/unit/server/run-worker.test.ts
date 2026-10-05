@@ -9,6 +9,8 @@ import {
   runJob, WorkerDeps, RunnerLike, DeltaOutcomeLike, guardParentPipes, withRepoListing, MAX_REPO_LISTING_CHARS, NON_EVIDENCE_FAILURE_CATEGORIES,
 } from '../../../server/run-worker';
 import { RunJob, PlanJob, parseWorkerLine } from '../../../server/worker-protocol';
+import { buildDeltaPlanPrompt, buildFullPlanPrompt } from '../../../runner/prd-plan';
+import { resolveRequirements } from '../../../models/requirements';
 
 interface FakeTask { id: string; name: string; status?: string; engine?: string; }
 
@@ -357,6 +359,32 @@ describe('run-worker', () => {
       }
     });
 
+    it('reports task child pids as task-pid events while the job runs, and unsubscribes after', async () => {
+      let child: ((c: { pid: number; alive: boolean }) => void) | null = null;
+      let disposed = 0;
+      const runner = new FakeRunner(async () => {
+        child!({ pid: 9001, alive: true });
+        child!({ pid: 9001, alive: false });
+      });
+      const h = harness(runner, {
+        onChildProcess: (l) => { child = l; return () => { disposed++; child = null; }; },
+      });
+      await runJob(RUN_JOB, h.deps);
+      const pids = h.events.filter((e) => e.event === 'task-pid');
+      assert.deepEqual(pids, [{ event: 'task-pid', pid: 9001, alive: true }, { event: 'task-pid', pid: 9001, alive: false }]);
+      for (const e of pids) { assert.ok(parseWorkerLine(JSON.stringify(e)), 'every task-pid line parses under the protocol'); }
+      assert.equal(disposed, 1);
+      assert.equal(child, null);
+    });
+
+    it('unsubscribes the child tracker when play() throws', async () => {
+      let disposed = 0;
+      const runner = new FakeRunner(async () => { throw new Error('boom'); });
+      const h = harness(runner, { onChildProcess: () => () => { disposed++; } });
+      assert.equal(await runJob(RUN_JOB, h.deps), 2);
+      assert.equal(disposed, 1);
+    });
+
     it('warns for each routing.json value the validator drops', async () => {
       const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-worker-'));
       try {
@@ -438,7 +466,7 @@ describe('run-worker', () => {
       assert.equal(opts!.costLabel, 'plan-generation');
     });
 
-    it('appends the server repository listing to the planning prompt; cwd stays the scratch dir', async () => {
+    it('puts the server repository listing in a context section before the output-format rules; cwd stays the scratch dir', async () => {
       const scratch = path.join(dir, 'work');
       fs.mkdirSync(scratch);
       const listingPath = path.join(dir, 'repo-files.txt');
@@ -446,13 +474,33 @@ describe('run-worker', () => {
       let seen: { prompt: string; cwd: string } | null = null;
       const h = harness(new FakeRunner(async () => {}), {
         getEngine: () => ({ runTask: async (o) => { seen = o; return { stdout: '', stderr: '', exitCode: 0, durationMs: 0 }; } }),
-        generateDeltaPlan: async (_p, d) => { await d.runEngine('PLAN PROMPT', d.signal); return { kind: 'no-delta' }; },
+        generateDeltaPlan: async (_p, d) => { await d.runEngine('PLAN PROMPT\n\nRules:\n- Return ONLY valid JSON.\n\nFull PRD:\nx', d.signal); return { kind: 'no-delta' }; },
       });
       await runJob({ kind: 'plan', mode: 'delta', workspace: scratch, planPath: '/p', outPath: path.join(dir, 'o.json'), engine: 'claude', repoListingPath: listingPath }, h.deps);
       assert.equal(seen!.cwd, scratch);
-      assert.ok(seen!.prompt.startsWith('PLAN PROMPT\n\n'), seen!.prompt);
-      assert.match(seen!.prompt, /src\/index\.ts\npackage\.json$/);
+      assert.equal(seen!.prompt,
+        'PLAN PROMPT\n\nRepository files (tracked paths only):\nsrc/index.ts\npackage.json\n\nRules:\n- Return ONLY valid JSON.\n\nFull PRD:\nx');
       assert.equal(fs.readdirSync(scratch).length, 0, 'nothing from the repo is placed in the scratch cwd');
+    });
+
+    it('withRepoListing places the listing before the Rules section of the real planning prompts', () => {
+      const LISTING = 'Repository files (tracked paths only):\nsrc/a.ts';
+      const delta = buildDeltaPlanPrompt({ fullPrdText: '- [R-1] login', scope: { versionLabel: '1.1.0', added: resolveRequirements('## Requirements\n- [R-1] login\n'), changed: [] } });
+      assert.ok(delta.includes('- [R-1] (added) login'), 'the fixture has a real changed-requirements section');
+      for (const prompt of [delta, buildFullPlanPrompt('# PRD\nRules:\n(a PRD line that only looks like the marker)')]) {
+        const out = withRepoListing(prompt, LISTING);
+        const listingAt = out.indexOf(LISTING);
+        const rulesAt = out.indexOf('\nRules:\n');
+        const jsonRuleAt = out.indexOf('Return ONLY valid JSON');
+        assert.ok(listingAt > 0 && listingAt < rulesAt, 'listing precedes the rules');
+        assert.ok(listingAt < jsonRuleAt, 'listing precedes the output-format instruction');
+        assert.equal(out.split(LISTING).length, 2, 'inserted exactly once');
+        assert.equal(out.replace(`${LISTING}\n\n`, ''), prompt, 'nothing else changes');
+      }
+    });
+
+    it('withRepoListing leads the prompt with the listing when there is no Rules section', () => {
+      assert.equal(withRepoListing('P', 'L'), 'L\n\nP');
     });
 
     it('a missing repository listing is a warning, and the prompt goes out unchanged', async () => {
@@ -471,7 +519,7 @@ describe('run-worker', () => {
       assert.equal(withRepoListing('P', null), 'P');
       assert.equal(withRepoListing('P', '   \n'), 'P');
       const huge = 'x'.repeat(MAX_REPO_LISTING_CHARS + 5000);
-      assert.equal(withRepoListing('P', huge).length, 'P\n\n'.length + MAX_REPO_LISTING_CHARS);
+      assert.equal(withRepoListing('P', huge).length, '\n\nP'.length + MAX_REPO_LISTING_CHARS);
     });
 
     it('a thrown generator becomes exit 2 with an error event and a disposed subscription', async () => {
@@ -488,6 +536,13 @@ describe('run-worker', () => {
       const h = harness(new FakeRunner(async () => {}), { checkAvailability: async () => rows });
       assert.equal(await runJob({ kind: 'probe' }, h.deps), 0);
       assert.deepEqual(h.events, [{ event: 'probe-result', engines: rows }]);
+    });
+
+    it('a probe job does not subscribe to child processes', async () => {
+      let subscribed = 0;
+      const h = harness(new FakeRunner(async () => undefined), { onChildProcess: () => { subscribed++; return () => undefined; } });
+      await runJob({ kind: 'probe' }, h.deps);
+      assert.equal(subscribed, 0);
     });
 
     it('a failing probe is exit 2', async () => {
@@ -514,6 +569,63 @@ describe('armDisconnectWatchdog', () => {
     assert.deepEqual(calls, [], 'nothing happens before the grace period');
     fire!();
     assert.deepEqual(calls, ['kill', 'exit 2']);
+  });
+
+  describe('main() arms it', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { main } = require('../../../server/run-worker') as typeof import('../../../server/run-worker');
+
+    /** A fake process: records what main() registers, writes and asks for. */
+    function host(argv: string[]) {
+      const disconnect: Array<() => void> = [];
+      const h = {
+        calls: [] as string[],
+        out: [] as string[],
+        timers: [] as Array<{ fn: () => void; ms: number }>,
+        pipeErrorHandlers: 0,
+        disconnect,
+        host: {
+          argv,
+          stdout: { write: (s: string) => { h.out.push(s); return true; }, on: () => { h.pipeErrorHandlers++; } },
+          stderr: { on: () => { h.pipeErrorHandlers++; } },
+          once: (event: 'disconnect', fn: () => void) => { assert.equal(event, 'disconnect'); disconnect.push(fn); },
+          exit: (code: number) => { h.calls.push('exit ' + code); },
+          killTree: () => { h.calls.push('kill'); },
+          setTimer: (fn: () => void, ms: number) => { h.timers.push({ fn, ms }); },
+        },
+      };
+      return h;
+    }
+
+    it('hooks disconnect before reading argv; a disconnect arms the 30 s kill-then-exit', async () => {
+      const h = host(['node', 'run-worker.js']); // no job path: main returns early
+      assert.equal(await main(h.host), 2);
+      assert.match(h.out.join(''), /usage: run-worker/);
+      assert.equal(h.pipeErrorHandlers, 2, 'both parent pipes are guarded');
+      assert.equal(h.disconnect.length, 1, 'the watchdog hook is registered even on the earliest return');
+      assert.equal(h.timers.length, 0, 'nothing is armed until the parent disconnects');
+      h.disconnect[0]();
+      assert.equal(h.timers.length, 1);
+      assert.equal(h.timers[0].ms, DISCONNECT_WATCHDOG_MS);
+      assert.deepEqual(h.calls, [], 'no kill before the grace period');
+      h.timers[0].fn();
+      assert.deepEqual(h.calls, ['kill', 'exit 2']);
+    });
+
+    it('a malformed job file still leaves the watchdog armed', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-main-'));
+      try {
+        const jobPath = path.join(dir, 'job.json');
+        fs.writeFileSync(jobPath, '{not json');
+        const h = host(['node', 'run-worker.js', jobPath]);
+        assert.equal(await main(h.host), 2);
+        assert.match(h.out.join(''), /Malformed job file/);
+        assert.equal(h.disconnect.length, 1);
+        h.disconnect[0]();
+        h.timers[0].fn();
+        assert.deepEqual(h.calls, ['kill', 'exit 2']);
+      } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+    });
   });
 
   it('exits even when killing the tree throws', () => {

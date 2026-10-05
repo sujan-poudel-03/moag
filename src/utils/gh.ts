@@ -11,7 +11,7 @@ import { execFileSync, execFile, ExecFileSyncOptions, ExecFileOptions } from 'ch
 
 /** Run `gh` synchronously with array args and no shell. Returns stdout as a string. */
 export function ghSync(args: string[], opts: ExecFileSyncOptions = {}): string {
-  const out = execFileSync('gh', args, { encoding: 'utf-8', shell: false, ...opts });
+  const out = execFileSync('gh', args, { encoding: 'utf-8', shell: false, windowsHide: true, ...opts });
   // execFileSync returns null when stdout isn't piped (e.g. stdio:'ignore').
   if (out == null) { return ''; }
   return typeof out === 'string' ? out : out.toString();
@@ -23,5 +23,5 @@ export function ghAsync(
   opts: ExecFileOptions = {},
   cb: (err: Error | null) => void = () => {},
 ): void {
-  execFile('gh', args, { shell: false, ...opts }, (err) => cb(err));
+  execFile('gh', args, { shell: false, windowsHide: true, ...opts }, (err) => cb(err));
 }

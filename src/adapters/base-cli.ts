@@ -4,6 +4,7 @@ import { spawn } from 'child_process';
 import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 import { EngineResult } from '../models/types';
 import { EngineRunOptions } from './engine';
+import { trackChildProcess } from '../utils/child-tracker';
 
 export interface CliConfig {
   /** Command to execute (e.g. "claude", "codex") */
@@ -87,7 +88,11 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
       // open, so `close` never fires and an aborted run hangs until its timeout.
       // Windows needs no group: taskkill /T already walks the tree.
       detached: SPAWN_DETACHED,
+      // A detached server worker has no console; without this every engine
+      // spawn on Windows flashes a console window.
+      windowsHide: true,
     });
+    trackChildProcess(proc);
 
     // Pipe prompt via stdin if configured (avoids Windows command-line length limit)
     if (config.useStdin) {

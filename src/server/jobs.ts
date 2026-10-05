@@ -32,6 +32,8 @@ export const MAX_LINE_BYTES = 1024 * 1024;
 export const STDERR_TAIL_BYTES = 64 * 1024;
 export const STOP_KILL_AFTER_MS = 30_000;
 export const LOCK_FILE = 'job.lock';
+/** How often a boot-time watch re-checks a job.lock still held by a predecessor's worker. */
+export const HELD_LOCK_POLL_MS = 5_000;
 
 /** The slice of ChildProcess the manager uses (fakeable in tests). */
 export interface WorkerProcess extends EventEmitter {
@@ -125,6 +127,8 @@ interface ActiveJob {
   stopRequested: boolean;
   killTimer: NodeJS.Timeout | null;
   lockPath: string;
+  /** Live task child pids the worker reported (`task-pid`), mirrored into job.lock. */
+  taskPids: Set<number>;
 }
 
 function defaultIsPidAlive(pid: number): boolean {
@@ -187,18 +191,10 @@ export class JobManager {
       return { ok: false, status: 409, reason: 'spawn-failed', message: 'The worker process could not be started.' };
     }
 
-    if (proc.pid) {
-      // Name the worker in the lock so a successor server respects it while it lives.
-      try {
-        writeFileAtomicSync(lockPath, JSON.stringify({
-          serverPid: process.pid, workerPid: proc.pid,
-          ...(this.opts.workerLeadsProcessGroup ? { workerPgid: proc.pid } : {}),
-        }), 0o600);
-      } catch (err) { this.opts.log?.(`job.lock update for project ${projectId}: ${(err as Error).message}`); }
-    }
-
     const jobId = randomUUID();
-    const a: ActiveJob = { jobId, projectId, kind: job.kind, proc, view: emptyRunView(), stopRequested: false, killTimer: null, lockPath };
+    const a: ActiveJob = { jobId, projectId, kind: job.kind, proc, view: emptyRunView(), stopRequested: false, killTimer: null, lockPath, taskPids: new Set() };
+    // Name the worker in the lock so a successor server respects it while it lives.
+    if (proc.pid) { this.writeLock(a); }
     this.active.set(projectId, a);
     this.wire(a, input);
     return { ok: true, jobId, ...(proc.pid ? { workerPid: proc.pid } : {}) };
@@ -276,6 +272,55 @@ export class JobManager {
     return reclaimed;
   }
 
+  /**
+   * Is the project's job.lock held by a live process other than this server
+   * (a predecessor's worker, its process group, a recorded task pid, or another
+   * live server)? False when there is no lock or every holder is gone.
+   */
+  isLockHeld(projectId: string): boolean {
+    const info = readLock(this.lockPath(projectId));
+    return info !== undefined && info !== null && this.lockHeld(info);
+  }
+
+  /**
+   * Boot-time: watch locks that {@link reclaimStaleLocks} had to keep because a
+   * predecessor's worker (or its agent) is still alive. Every `intervalMs` each
+   * project is re-checked; once nothing holds its lock — and this server has no
+   * job of its own running there — the stale lock is reclaimed and
+   * `onReleased(projectId)` runs (the caller re-runs boot recovery then). The
+   * timer is unref'd and stops by itself once every project was released.
+   * Returns a disposer that stops watching. Never throws.
+   */
+  watchHeldLocks(
+    projectIds: readonly string[],
+    onReleased: (projectId: string) => void,
+    opts: { intervalMs?: number; setInterval?: (fn: () => void, ms: number) => unknown; clearInterval?: (t: unknown) => void } = {},
+  ): () => void {
+    const pending = new Set(projectIds);
+    const setTimer = opts.setInterval ?? ((fn: () => void, ms: number) => { const t = setInterval(fn, ms); t.unref?.(); return t; });
+    const clearTimer = opts.clearInterval ?? ((t: unknown) => clearInterval(t as NodeJS.Timeout));
+    let timer: unknown = null;
+    const stop = (): void => {
+      if (timer !== null) { clearTimer(timer); timer = null; }
+      pending.clear();
+    };
+    const tick = (): void => {
+      for (const id of [...pending]) {
+        try {
+          // Our own job there means the predecessor is gone, but its records must
+          // not be recovered under a live run of ours: wait for that to end too.
+          if (this.active.has(id) || this.isLockHeld(id)) { continue; }
+          this.reclaimStaleLocks([id]);
+          pending.delete(id);
+          onReleased(id);
+        } catch (err) { this.opts.log?.(`held-lock watch ${id}: ${(err as Error).message}`); }
+      }
+      if (pending.size === 0) { stop(); }
+    };
+    if (pending.size > 0) { timer = setTimer(tick, opts.intervalMs ?? HELD_LOCK_POLL_MS); }
+    return stop;
+  }
+
   // ─── Internals ───
 
   private notify(projectId: string, n: JobNotice): void {
@@ -316,6 +361,24 @@ export class JobManager {
     return info.serverPid !== null && info.serverPid !== process.pid && this.isPidAlive(info.serverPid);
   }
 
+  /**
+   * Rewrite a live job's lock: the worker (and its group) plus every task pid it
+   * has reported alive. Best effort — a failed write leaves the previous lock,
+   * which still names the worker.
+   */
+  private writeLock(a: ActiveJob): void {
+    const workerPid = a.proc.pid;
+    if (!workerPid) { return; }
+    const taskPids = [...a.taskPids].slice(0, MAX_LOCK_TASK_PIDS);
+    try {
+      writeFileAtomicSync(a.lockPath, JSON.stringify({
+        serverPid: process.pid, workerPid,
+        ...(this.opts.workerLeadsProcessGroup ? { workerPgid: workerPid } : {}),
+        ...(taskPids.length > 0 ? { taskPids } : {}),
+      }), 0o600);
+    } catch (err) { this.opts.log?.(`job.lock update for project ${a.projectId}: ${(err as Error).message}`); }
+  }
+
   private releaseLock(lockPath: string): void {
     try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
   }
@@ -330,6 +393,16 @@ export class JobManager {
     let ended = false;
 
     const handleEvent = (ev: WorkerEvent): void => {
+      if (ev.event === 'task-pid') {
+        // Lock bookkeeping only: pids are never folded into the view or fanned out to SSE.
+        if (ended || this.active.get(a.projectId) !== a) { return; }
+        const before = a.taskPids.size;
+        if (ev.alive) {
+          if (a.taskPids.size < MAX_LOCK_TASK_PIDS) { a.taskPids.add(ev.pid); }
+        } else { a.taskPids.delete(ev.pid); }
+        if (a.taskPids.size !== before) { this.writeLock(a); }
+        return;
+      }
       a.view = foldRunEvent(a.view, ev);
       if (ev.event === 'cost' && input.spendKey && this.opts.recordSpend) {
         try { this.opts.recordSpend(a.projectId, input.spendKey, ev.usd); } catch (err) { this.opts.log?.(`recordSpend: ${(err as Error).message}`); }

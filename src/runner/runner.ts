@@ -52,6 +52,7 @@ import { ghSync } from '../utils/gh';
 import { fileIncidentIssue } from '../github/issue-sync';
 // Type-only — zero runtime dependency, keeps the runner headless-safe.
 import type { EngineCallUsage } from '../utils/usage-log';
+import { trackChildProcess } from '../utils/child-tracker';
 
 const GIT_TIMEOUT_MS = 30_000;
 const VERIFY_TIMEOUT_MS = 30_000;
@@ -2428,7 +2429,9 @@ export class TaskRunner {
         // Lead a process group on POSIX so killProcess can signal the whole
         // tree; a bare SIGTERM reaches the shell and orphans what it started.
         detached: SPAWN_DETACHED,
+        windowsHide: true,
       });
+      trackChildProcess(proc);
 
       let stdout = '';
       let stderr = '';
@@ -2711,7 +2714,9 @@ export class TaskRunner {
         // Lead a process group on POSIX so killProcess can signal the whole
         // tree; a bare SIGTERM reaches the shell and orphans what it started.
         detached: SPAWN_DETACHED,
+        windowsHide: true,
       });
+      trackChildProcess(proc);
 
       const finish = (result: EngineResult) => {
         if (settled) {
@@ -3212,7 +3217,7 @@ export class TaskRunner {
 
   private runGitCommand(args: string[], cwd: string): Promise<string | null> {
     return new Promise((resolve) => {
-      const proc = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn('git', args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       let stdout = '';
       let settled = false;
 

@@ -73,6 +73,11 @@ export interface WorkerDeps {
   defer?(fn: () => void): void;
   /** `classifyFailure(stderr, stdout).category` from the runner; absent = every failure is a verdict. */
   failureCategory?(stderr: string, stdout: string): string;
+  /**
+   * `onChildProcess` from utils/child-tracker: told when a task's child process
+   * (engine CLI, shell or gate command) starts and ends. Returns a disposer.
+   */
+  onChildProcess?(listener: (change: { pid: number; alive: boolean }) => void): () => void;
 }
 
 const ERROR_TAIL_CHARS = 2000;
@@ -91,17 +96,32 @@ const errMessage = (err: unknown): string => (err instanceof Error ? err.message
 
 // ─── Job dispatch ───
 
-/** Run one job. Never throws: every failure becomes an `error` event and exit code 2. */
+/**
+ * Run one job. Never throws: every failure becomes an `error` event and exit code 2.
+ *
+ * While a run or plan job is live, every task child process the engine core
+ * starts or reaps is reported as a `task-pid` event; the server records the
+ * live ones in the project's job.lock so an agent that outlives this worker
+ * keeps the workspace locked.
+ */
 export async function runJob(job: WorkerJob, deps: WorkerDeps): Promise<number> {
+  let disposeChildren: (() => void) | null = null;
   try {
+    if (job.kind !== 'probe' && deps.onChildProcess) {
+      disposeChildren = deps.onChildProcess((c) => deps.emit({ event: 'task-pid', pid: c.pid, alive: c.alive }));
+    }
     switch (job.kind) {
       case 'run': return await runRunJob(job, deps);
       case 'plan': return await runPlanJob(job, deps);
       case 'probe': return await runProbeJob(deps);
     }
+    // Unreachable (the switch is exhaustive); keeps the finally-wrapped return total.
+    return 2;
   } catch (err) {
     deps.emit({ event: 'error', message: errMessage(err) });
     return 2;
+  } finally {
+    disposeChildren?.();
   }
 }
 
@@ -261,10 +281,25 @@ function warnOnRoutingConfig(workspace: string, deps: WorkerDeps): void {
 /** Most characters of the server's repository listing a planning prompt carries. */
 export const MAX_REPO_LISTING_CHARS = 120_000;
 
-/** Append the server-generated repository listing (plain text, capped) to a planning prompt. */
+/**
+ * Where the planning prompt's output-format instructions begin. Both PRD
+ * planning prompts (`buildDeltaPlanPrompt`, `buildFullPlanPrompt` in
+ * runner/prd-plan.ts) open that section with a line reading exactly `Rules:`.
+ */
+export const OUTPUT_FORMAT_MARKER = '\nRules:\n';
+
+/**
+ * Insert the server-generated repository listing (plain text, capped) into a
+ * planning prompt as a context section BEFORE the output-format instructions,
+ * so the rules ("Return ONLY valid JSON…") stay the last instructions the
+ * model reads before the PRD. Without the marker the listing leads the prompt.
+ */
 export function withRepoListing(prompt: string, listing: string | null): string {
   const text = (listing ?? '').trim().slice(0, MAX_REPO_LISTING_CHARS);
-  return text ? `${prompt}\n\n${text}` : prompt;
+  if (!text) { return prompt; }
+  const at = prompt.indexOf(OUTPUT_FORMAT_MARKER);
+  if (at < 0) { return `${text}\n\n${prompt}`; }
+  return `${prompt.slice(0, at).trimEnd()}\n\n${text}\n\n${prompt.slice(at + 1)}`;
 }
 
 /**
@@ -318,9 +353,9 @@ async function runProbeJob(deps: WorkerDeps): Promise<number> {
 
 // ─── Entry ───
 
-function emitLine(obj: Record<string, unknown>): void {
+function emitLine(obj: Record<string, unknown>, out: { write(s: string): unknown } = process.stdout): void {
   try {
-    process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n');
+    out.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n');
   } catch { /* parent gone: nothing is listening; keep supervising the task tree */ }
 }
 
@@ -364,22 +399,56 @@ export function armDisconnectWatchdog(opts: DisconnectWatchdogOptions): void {
   }, opts.graceMs ?? DISCONNECT_WATCHDOG_MS);
 }
 
+/**
+ * The process-level surface `main()` touches before any job runs: argv, the
+ * parent pipes, the IPC `disconnect` event and the watchdog's kill/exit/timer.
+ * Injectable so a test can prove the watchdog is armed without killing itself.
+ */
+export interface WorkerHost {
+  argv: readonly string[];
+  stdout: { write(s: string): unknown; on(event: 'error', fn: (err: Error) => void): unknown };
+  stderr: { on(event: 'error', fn: (err: Error) => void): unknown };
+  once(event: 'disconnect', fn: () => void): unknown;
+  exit(code: number): void;
+  /** Kill every descendant of this process (`killOwnProcessTree`). */
+  killTree(): void;
+  /** Watchdog timer (setTimeout in production). */
+  setTimer?: (fn: () => void, ms: number) => unknown;
+}
+
 /* eslint-disable @typescript-eslint/no-var-requires */
 /* eslint-disable @typescript-eslint/no-explicit-any */
-/** Wire the real dependencies (post-shim) and run the job named on argv. */
-async function main(): Promise<number> {
-  guardParentPipes(process.stdout, process.stderr);
+/** The real process as a {@link WorkerHost}. */
+function processHost(): WorkerHost {
+  return {
+    argv: process.argv,
+    stdout: process.stdout,
+    stderr: process.stderr,
+    once: (event, fn) => process.once(event, fn),
+    exit: (code) => process.exit(code),
+    killTree: () => require('../utils/process-kill').killOwnProcessTree(),
+  };
+}
+
+/**
+ * Wire the real dependencies (post-shim) and run the job named on argv. The
+ * disconnect watchdog is hooked FIRST, before argv or the job file is read, so
+ * no early return can leave a worker without it.
+ */
+export async function main(host: WorkerHost = processHost()): Promise<number> {
+  guardParentPipes(host.stdout, host.stderr);
   // Server gone: the job's onStop handler stops the runner; this guarantees the
   // worker (and the job lock it holds) does not outlive it if play() never settles.
-  process.once('disconnect', () => armDisconnectWatchdog({
-    killTree: () => require('../utils/process-kill').killOwnProcessTree(),
-    exit: (code) => process.exit(code),
+  host.once('disconnect', () => armDisconnectWatchdog({
+    killTree: () => host.killTree(),
+    exit: (code) => host.exit(code),
+    ...(host.setTimer ? { setTimer: host.setTimer } : {}),
   }));
-  const jobPath = process.argv[2];
-  if (!jobPath) { emitLine({ event: 'error', message: 'usage: run-worker <job.json>' }); return 2; }
+  const jobPath = host.argv[2];
+  if (!jobPath) { emitLine({ event: 'error', message: 'usage: run-worker <job.json>' }, host.stdout); return 2; }
   let job: WorkerJob | null = null;
   try { job = parseJob(JSON.parse(fs.readFileSync(jobPath, 'utf-8'))); } catch { job = null; }
-  if (!job) { emitLine({ event: 'error', message: 'Malformed job file.' }); return 2; }
+  if (!job) { emitLine({ event: 'error', message: 'Malformed job file.' }, host.stdout); return 2; }
   if (process.env.CI) {
     emitLine({ event: 'error', message: 'Refusing to run: CI is set in the worker environment.' });
     return 2;
@@ -443,6 +512,7 @@ async function main(): Promise<number> {
     withSyntheticBaseline: (plan) => require('./prd-ops').withSyntheticBaseline(plan),
     dehydratePlaylist: (plan, playlist) => dehydratePlan({ ...(plan as any), playlists: [playlist] }).playlists[0],
     failureCategory: (stderr, stdout) => require('../runner/runner').classifyFailure(stderr, stdout).category,
+    onChildProcess: (listener) => require('../utils/child-tracker').onChildProcess(listener),
   };
   return runJob(job, deps);
 }

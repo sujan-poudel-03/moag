@@ -31,6 +31,7 @@ export const AUDIT_ACTIONS = [
   'gate.skip',
   'engine.key-set',
   'engine.key-clear',
+  'settings.update',
 ] as const;
 export type AuditAction = typeof AUDIT_ACTIONS[number];
 

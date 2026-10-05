@@ -775,7 +775,7 @@ async function cmdLand(args: Args): Promise<number> {
   // exiting non-zero, and discarding them would throw away the useful half.
   const git = (gitArgs: string[], cwd: string): Promise<{ ok: boolean; stdout: string }> =>
     new Promise((resolve) => {
-      const proc = spawn('git', gitArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+      const proc = spawn('git', gitArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
       let out = '';
       proc.stdout.on('data', (d: Buffer) => { out += d.toString(); });
       proc.on('error', () => resolve({ ok: false, stdout: '' }));
@@ -838,7 +838,7 @@ async function cmdDigest(args: Args): Promise<number> {
   const nodeFs = require('fs');
 
   const git = (gitArgs: string[], cwd: string): Promise<string | null> => new Promise((resolve) => {
-    const proc = spawn('git', gitArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    const proc = spawn('git', gitArgs, { cwd, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
     let out = '';
     proc.stdout.on('data', (d: Buffer) => { out += d.toString(); });
     proc.on('error', () => resolve(null));

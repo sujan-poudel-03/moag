@@ -3,7 +3,7 @@ import * as http from 'http';
 import { AddressInfo } from 'net';
 import { PassThrough } from 'stream';
 import {
-  readJsonBody, sendJson, sendError, HttpError, parseCookies, clientIp, securityHeaders, Router, CONTENT_SECURITY_POLICY,
+  readJsonBody, sendJson, sendError, HttpError, parseCookies, clientIp, securityHeaders, Router, CONTENT_SECURITY_POLICY, MAX_BODY_BYTES,
 } from '../../../server/http-kit';
 import {
   obj, str, oneOf, bool, num, opt, nullable, engineId, bump, stack, roles, parseBody, ValidationError,
@@ -69,13 +69,38 @@ describe('http-kit', () => {
       } finally { await srv.close(); }
     });
 
-    it('413 past 1 MB (declared length and streamed)', async () => {
-      const srv = await withServer(echo);
+    // Deterministic by construction: the 1 MB default is exercised on in-memory
+    // requests (no socket), and the over-the-wire check uses a small injected
+    // limit. Posting a real 1 MB body raced the server's early 413 against the
+    // client's upload, so the client could see ECONNRESET/EPIPE instead.
+    it('413 past the 1 MB default for a declared Content-Length, without reading the body', async () => {
+      assert.equal(MAX_BODY_BYTES, 1024 * 1024);
+      const req = fakeReq({ 'content-type': 'application/json', 'content-length': String(MAX_BODY_BYTES + 10) });
+      await assert.rejects(readJsonBody(req), (e: unknown) => e instanceof HttpError && e.status === 413 && e.code === 'payload-too-large');
+      const atLimit = fakeReq({ 'content-type': 'application/json', 'content-length': String(MAX_BODY_BYTES) });
+      const pending = readJsonBody(atLimit);
+      (atLimit as unknown as PassThrough).end(Buffer.alloc(MAX_BODY_BYTES, 0x20));
+      assert.deepEqual(await pending, {}, 'exactly 1 MB is accepted (whitespace parses as an empty body)');
+    });
+
+    it('413 past the 1 MB default for a streamed body (no Content-Length)', async () => {
+      const req = fakeReq({ 'content-type': 'application/json' });
+      const p = readJsonBody(req);
+      (req as unknown as PassThrough).write(Buffer.alloc(MAX_BODY_BYTES, 0x20));
+      (req as unknown as PassThrough).write(Buffer.alloc(10, 0x20));
+      await assert.rejects(p, (e: unknown) => e instanceof HttpError && e.status === 413);
+    });
+
+    it('413 over the wire maps to a payload-too-large JSON error (small injected limit)', async () => {
+      const srv = await withServer((req, res) => {
+        readJsonBody(req, 64).then((b) => sendJson(res, 200, { got: b }), (e) => sendError(res, e));
+      });
       try {
-        const big = Buffer.alloc(1024 * 1024 + 10, 0x20);
-        const r = await post(srv.url, big, { 'Content-Type': 'application/json' });
+        const r = await post(srv.url, Buffer.alloc(100, 0x20), { 'Content-Type': 'application/json' });
         assert.equal(r.status, 413);
         assert.equal(JSON.parse(r.body).error, 'payload-too-large');
+        const ok = await post(srv.url, '{"a":1}', { 'Content-Type': 'application/json' });
+        assert.equal(ok.status, 200, 'under the limit still parses');
       } finally { await srv.close(); }
     });
 

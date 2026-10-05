@@ -20,7 +20,7 @@ import { ProjectStore } from './projects';
 import { ProjectStateStore } from './project-state';
 import { LoginRateLimiter } from './rate-limit';
 import { createApp, App } from './app';
-import { SpawnSpec, WorkerProcess } from './jobs';
+import { JobManager, SpawnSpec, WorkerProcess } from './jobs';
 import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 
 const log = (m: string): void => { process.stderr.write(`${new Date().toISOString()} [moag-server] ${m}\n`); };
@@ -69,6 +69,43 @@ export function spawnRunWorker(spec: SpawnSpec): WorkerProcess {
   return spawn(process.execPath, [workerScript, spec.jobPath], workerSpawnOptions(spec)) as WorkerProcess;
 }
 
+export interface BootRecoveryResult {
+  /** Interrupted run/plan records marked now. */
+  recovered: number;
+  /** Projects whose stale job.lock was removed. */
+  reclaimed: string[];
+  /** Projects left alone because a predecessor's worker still holds their lock. */
+  held: string[];
+}
+
+/**
+ * Crash recovery at boot. Stale locks are reclaimed first; a project whose lock
+ * is still HELD (a predecessor's worker — or the agent it started — is alive)
+ * is not recovered now: marking its run `interrupted` and merging its snapshot
+ * while the worker is still writing that snapshot would record a half-finished
+ * run as final. Instead its lock is watched, and recovery runs for that project
+ * (under its project lock) once the worker has exited. Every other project is
+ * recovered immediately. Returns a disposer for the watch alongside the counts.
+ */
+export function recoverAfterRestart(
+  ids: readonly string[],
+  jobs: Pick<JobManager, 'reclaimStaleLocks' | 'isLockHeld' | 'watchHeldLocks'>,
+  state: Pick<ProjectStateStore, 'recoverOnBoot' | 'withProjectLock'>,
+  log: (m: string) => void,
+): BootRecoveryResult & { stopWatching: () => void } {
+  const reclaimed = jobs.reclaimStaleLocks(ids);
+  const held = ids.filter((id) => jobs.isLockHeld(id));
+  const recovered = state.recoverOnBoot(ids.filter((id) => !held.includes(id)), new Date(), log);
+  const stopWatching = held.length === 0 ? () => undefined : jobs.watchHeldLocks(held, (id) => {
+    state.withProjectLock(id, () => {
+      const n = state.recoverOnBoot([id], new Date(), log);
+      log(`project ${id}: previous worker exited; recovered ${n} interrupted record(s)`);
+    }).catch((err) => log(`deferred recovery ${id}: ${(err as Error).message}`));
+  });
+  if (held.length > 0) { log(`${held.length} project(s) still locked by a previous worker; recovery deferred until it exits`); }
+  return { recovered, reclaimed, held, stopWatching };
+}
+
 /** Build and start the server. Resolves once it is listening. */
 export async function startServer(env: NodeJS.ProcessEnv = process.env): Promise<{ app: App; config: ServerConfig }> {
   const loaded = loadServerConfig(env);
@@ -103,8 +140,7 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env): Promise
   });
 
   const ids = projects.list().map((p) => p.id);
-  const recovered = state.recoverOnBoot(ids, new Date(), log);
-  const reclaimed = app.jobs.reclaimStaleLocks(ids);
+  const { recovered, reclaimed } = recoverAfterRestart(ids, app.jobs, state, log);
   if (recovered > 0) { log(`marked ${recovered} interrupted run/plan record(s) after restart`); }
   if (reclaimed.length > 0) { log(`reclaimed ${reclaimed.length} stale job lock(s)`); }
   if (config.runsDisabledReason === 'ci') { log('CI=true is set: runs and plan generation are DISABLED (CI would auto-approve ship gates).'); }

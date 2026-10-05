@@ -73,7 +73,7 @@ export const HEADLESS_EVENTS = [
 ] as const;
 
 export const WORKER_ONLY_EVENTS = [
-  'cost', 'task-engine', 'task-error-tail', 'plan-outcome', 'probe-result', 'run-finished', 'warning',
+  'cost', 'task-engine', 'task-error-tail', 'plan-outcome', 'probe-result', 'run-finished', 'warning', 'task-pid',
 ] as const;
 
 export const DELTA_OUTCOME_KINDS = ['no-delta', 'engine-failed', 'parse-failed', 'all-rejected', 'appended'] as const;
@@ -103,6 +103,8 @@ export type WorkerEvent =
   | { event: 'probe-result'; engines: ProbeRow[] }
   | { event: 'run-finished'; code: number }
   | { event: 'warning'; message: string }
+  /** A task child process (engine CLI, shell/gate command) started or ended. Server-internal: recorded in job.lock, never fanned out. */
+  | { event: 'task-pid'; pid: number; alive: boolean }
   | { event: 'verify'; name: string; data: Record<string, unknown> };
 
 const RUNNER_STATES = new Set<string>(Object.values(RunnerState));
@@ -177,6 +179,10 @@ export function parseWorkerLine(line: string): WorkerEvent | null {
       return finite(o.code) ? { event: ev, code: o.code } : null;
     case 'warning':
       return { event: 'warning', message: str(o.message) };
+    case 'task-pid':
+      return typeof o.pid === 'number' && Number.isInteger(o.pid) && o.pid > 0 && typeof o.alive === 'boolean'
+        ? { event: ev, pid: o.pid, alive: o.alive }
+        : null;
     default:
       if (/^verify-[a-z-]{1,32}$/.test(ev)) {
         // eslint-disable-next-line @typescript-eslint/no-unused-vars
