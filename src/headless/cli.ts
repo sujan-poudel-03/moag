@@ -13,7 +13,7 @@
  *                                   [--full-auto] [--engine <id>] [--cwd <dir>]
  *   moag config <get-engine | set-engine <id>>
  *   moag trace  [<plan.json> | --plan <path>] [--req R-<n>]
- *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]
+ *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
  *
  * `run`   executes a single plan file, or a one-shot prompt (`--prompt`) which is
  *          turned into a single agent task and run through the selected engine.
@@ -28,7 +28,8 @@
  *          untracked / removed) with its PRD version, release tag, tasks and gate exit codes.
  * `bench`  drives the hosted server end to end through one benchmark scenario
  *          (docs/benchmark.md). `--dry-run` uses a fake engine and spends nothing;
- *          a paid run requires `--max-usd`.
+ *          a paid run requires `--max-usd`, and stops before any engine call when a
+ *          scenario environment probe fails unless `--allow-failed-probes` is given.
  * `loop`   polls a GitHub repo for open issues, turns each new issue into a task,
  *          runs them, then reports the outcome back to the issue (comment + close on
  *          success; comment + label on failure) — the closed autonomous loop.
@@ -97,6 +98,8 @@ export interface Args {
   out?: string;
   /** `bench` only: hard spend cap in USD; NaN when the value was not a positive number. */
   maxUsd?: number;
+  /** `bench` only: let a paid run go ahead although a scenario environment probe failed. */
+  allowFailedProbes?: boolean;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -144,6 +147,7 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--since') { const v = rest[++i]; if (v) { a.since = v; } }
     else if (arg === '--merge') { a.merge = true; }
     else if (arg === '--dry-run') { a.dryRun = true; }
+    else if (arg === '--allow-failed-probes') { a.allowFailedProbes = true; }
     else if (arg === '--out') {
       const v = rest[i + 1];
       if (v === undefined || v === '' || v.startsWith('--')) { outFlag = ''; } else { outFlag = v; i++; }
@@ -1104,7 +1108,7 @@ async function main(): Promise<number> {
   if (args.command === 'bench') {
     // No setup() and no shim: the bench drives the hosted server over HTTP and never loads vscode.
     if (args.out === '' || (args.maxUsd !== undefined && Number.isNaN(args.maxUsd))) {
-      process.stderr.write('Usage: moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]  (--max-usd must be a positive number)\n');
+      process.stderr.write('Usage: moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]  (--max-usd must be a positive number)\n');
       return 2;
     }
     return require('../bench/harness').cmdBench(args);
@@ -1156,7 +1160,7 @@ async function main(): Promise<number> {
     '  moag digest [--since <when>]\n' +
     '  moag land [--into <branch>] [--merge]\n' +
     '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n' +
-    '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]\n',
+    '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n',
   );
   return 2;
 }

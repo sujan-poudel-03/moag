@@ -54,7 +54,7 @@ import { StackId } from './stacks';
 import { recommendStack, detectStackFromRepo } from './stack-recommendation';
 import { RunJob, PlanJob, ProbeJob, WorkerEvent, mergeRunViews } from './worker-protocol';
 import {
-  savePrdVersion, overrideBump, mergeRunSnapshot, validatePendingPlaylist, contentHash, SERVER_FORBIDDEN_ENGINES, appendShipGate,
+  savePrdVersion, overrideBump, mergeRunSnapshot, validatePendingPlaylist, pendingPlaylistEngineErrors, contentHash, SERVER_FORBIDDEN_ENGINES, appendShipGate,
   stripGeneratedSideEffects, redactStringsDeep, CREDENTIAL_IN_PLAYLIST_ERROR,
 } from './prd-ops';
 import { prepareGateResume, GateResumeError, GateResumeResult, stampApprovedShip } from './gate';
@@ -404,6 +404,33 @@ export function createApp(deps: AppDeps): App {
   /** {@link requireEngine} for every engine a plan can run on (default, fallback, playlist, task, consensus). */
   const requirePlanEngines = (plan: Plan): void => {
     for (const e of referencedEngines(plan)) { requireEngine(e); }
+  };
+
+  /**
+   * Refuse a plan whose playlist does not pass {@link validatePendingPlaylist}
+   * NOW. The review stored with the plan is only what the rules said when it was
+   * generated; a plan that was pending or approved before a rule existed (the
+   * `parallel` refusal, the `cwd` check) must still be refused by it. `also` is
+   * any other copy of the playlist that would run (the canonical one at run start).
+   * Stored errors are kept too: a redacted credential cannot be re-derived.
+   * 409 `engine-not-allowed` when every error is about a disallowed engine,
+   * 409 `review-errors` otherwise; `lead` prefixes the message.
+   */
+  const requireReviewPasses = (review: PlanReview, also: readonly PlanFilePlaylist[] = [], lead = ''): void => {
+    const errors = new Set<string>(review.review && !review.review.ok ? review.review.errors : []);
+    const engineErrors = new Set<string>();
+    for (const pl of [review.playlist, ...also]) {
+      if (!pl) { continue; }
+      for (const e of validatePendingPlaylist(pl, SERVER_ENGINES).errors) { errors.add(e); }
+      for (const e of pendingPlaylistEngineErrors(pl, SERVER_ENGINES)) { engineErrors.add(e); }
+    }
+    const list = [...errors];
+    if (list.length === 0) {
+      if (!review.review || review.review.ok) { return; }
+      list.push('This plan did not pass review.');
+    }
+    const code = list.every((e) => engineErrors.has(e)) ? 'engine-not-allowed' : 'review-errors';
+    throw new HttpError(409, code, `${lead}${list.join(' ')}`, { errors: list });
   };
 
   /** True when any engine the plan references is known to be missing (the DTO mirror of {@link requirePlanEngines}). */
@@ -1364,9 +1391,9 @@ export function createApp(deps: AppDeps): App {
       if (latestVersion(plan)?.createdAt !== review.forVersionCreatedAt) {
         throw new HttpError(409, 'stale', 'A newer PRD version was saved after this plan was generated. Request a new plan.');
       }
-      if (review.review && !review.review.ok) {
-        throw new HttpError(409, 'engine-not-allowed', review.review.errors.join(' '));
-      }
+      // Re-validated now, not read from the stored review: a plan generated
+      // before a review rule existed is refused by that rule too.
+      requireReviewPasses(review);
       // The pending card shows the engine the plan was generated with
       // (review.engine); that is what the reviewer approves. If the project's
       // default changed while the plan was pending, approving would bind an
@@ -1441,6 +1468,11 @@ export function createApp(deps: AppDeps): App {
       // Stamped with the project's engine: the snapshot's defaultEngine is what the runner uses.
       const canonical = state.loadCanonicalPlan(p.id, p.name, p.defaultEngine);
       requirePlanEngines(canonical);
+      // An approval is not a waiver: a plan approved before a review rule existed
+      // (a `parallel` playlist, a `cwd` outside the workspace) never starts. Both
+      // the approved playlist and the canonical copy the runner would load are checked.
+      const runs = review.playlistIndex === undefined ? undefined : dehydratePlan(canonical).playlists[review.playlistIndex];
+      requireReviewPasses(review, runs ? [runs] : [], 'This plan no longer passes review, so it cannot start. ');
       const remaining = requireBudget(p, st, review.forVersionCreatedAt);
       const workspace = requireWorkspace(p);
       const run: RunRecord = {

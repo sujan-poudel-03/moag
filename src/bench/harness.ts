@@ -52,6 +52,12 @@ export interface BenchOptions {
   outDir: string;
   /** Required for a paid run; the effective cap is min(maxUsd, scenario.budgetUsd). */
   maxUsd?: number;
+  /**
+   * Paid runs only: carry on when an `environmentProbes` command fails in the
+   * untouched workspace (`--allow-failed-probes`). Without it a paid run stops
+   * there, before any engine call. A dry-run never stops for a probe.
+   */
+  allowFailedProbes?: boolean;
   /** Human progress lines (default: stderr). */
   progress?: (line: string) => void;
 }
@@ -377,7 +383,9 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
 
     // ── Environment probes: the untouched workspace, before any plan ──
     // A probe that fails here fails whatever MOAG does next, so a later failure
-    // of the same command is the machine's, not the product's. Never fatal.
+    // of the same command is the machine's, not the product's. A dry-run carries
+    // on (it spends nothing). A paid run stops here, before any engine call,
+    // unless the caller opted in with `allowFailedProbes`.
     if (scenario.environmentProbes.length > 0) {
       progress('probing the environment in the untouched workspace…');
       const [nodeProbe, ...probed] = await deps.runGates(['node --version', ...scenario.environmentProbes], workspace.dir, server.serverEnv, scenario.gateTimeoutMs);
@@ -392,6 +400,16 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
         progress(`environment: "${p.command}" fails in the untouched workspace (${p.timedOut ? 'timed out' : `exit ${p.exitCode}`})${environment.node ? ` on Node ${environment.node}` : ''}`);
       }
       check();
+      const failedProbes = environment.probes.filter((x) => !x.pass);
+      if (failedProbes.length > 0 && !opts.dryRun) {
+        const named = failedProbes.map((p) => `"${p.command}" (${p.timedOut ? 'timed out' : `exit ${p.exitCode}`})`).join(', ');
+        if (!opts.allowFailedProbes) {
+          log.write({ kind: 'environment-probes-stop', failed: failedProbes.map((p) => ({ command: p.command, exitCode: p.exitCode, timedOut: p.timedOut })) });
+          throw new BenchAbort(`paid run refused: environment probe ${named} fails in the untouched workspace${environment.node ? ` on Node ${environment.node}` : ''}. `
+            + 'No plan was requested and no engine call was made. Fix the environment, or pass --allow-failed-probes to run anyway.');
+        }
+        notes.push(`--allow-failed-probes: the paid run went ahead although environment probe ${named} fails in the untouched workspace`);
+      }
     }
 
     // ── People (setup, not interventions) ──
@@ -760,13 +778,14 @@ export interface BenchCliArgs {
   dryRun?: boolean;
   out?: string;
   maxUsd?: number;
+  allowFailedProbes?: boolean;
 }
 
-/** `moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]`. Returns the exit code. */
+/** `moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]`. Returns the exit code. */
 export async function cmdBench(args: BenchCliArgs): Promise<number> {
   const file = args.planPath ?? args.positionals[0];
   if (!file) {
-    process.stderr.write('Usage: moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]\n');
+    process.stderr.write('Usage: moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n');
     return 2;
   }
   if (args.maxUsd !== undefined && !(Number.isFinite(args.maxUsd) && args.maxUsd > 0)) {
@@ -780,7 +799,11 @@ export async function cmdBench(args: BenchCliArgs): Promise<number> {
   }
   const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, '').replace('T', '-');
   const outDir = args.out ?? path.join(os.tmpdir(), 'moag-bench', `${scenario.name.replace(/[^A-Za-z0-9._-]/g, '-')}-${stamp}`);
-  const r = await runBench(scenario, { dryRun: args.dryRun === true, outDir, ...(args.maxUsd !== undefined ? { maxUsd: args.maxUsd } : {}) });
+  const r = await runBench(scenario, {
+    dryRun: args.dryRun === true, outDir,
+    ...(args.maxUsd !== undefined ? { maxUsd: args.maxUsd } : {}),
+    ...(args.allowFailedProbes === true ? { allowFailedProbes: true } : {}),
+  });
   if (r.summary) {
     const s = r.summary;
     process.stdout.write(JSON.stringify({

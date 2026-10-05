@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 import {
-  savePrdVersion, overrideBump, withSyntheticBaseline, mergeRunSnapshot, validatePendingPlaylist, cwdEscapesWorkspace, contentHash,
+  savePrdVersion, overrideBump, withSyntheticBaseline, mergeRunSnapshot, validatePendingPlaylist, pendingPlaylistEngineErrors, cwdEscapesWorkspace, contentHash,
   stableStringify, MAX_PRD_TEXT_CHARS, PrdSaveSuccess, Refusal, BumpOverrideSuccess, appendShipGate, SHIP_GATE_NAME, stripGeneratedSideEffects,
   redactStringsDeep, PARALLEL_PLAYLIST_ERROR,
 } from '../../../server/prd-ops';
@@ -227,6 +227,25 @@ describe('prd-ops', () => {
       const r = validatePendingPlaylist(cop, ['claude', 'copilot']);
       assert.equal(r.ok, false);
       assert.match(r.errors[0], /copilot/);
+    });
+
+    it('pendingPlaylistEngineErrors is exactly the engine subset of the review errors, never parallel or cwd', () => {
+      const clean = pl();
+      clean.tasks[2].cwd = 'apps/web';
+      assert.deepEqual(pendingPlaylistEngineErrors(clean, ['claude']), []);
+      assert.deepEqual(pendingPlaylistEngineErrors(pl({ parallel: true }), ['claude']), [], 'parallel and an escaping cwd are not engine errors');
+      const mixed = pl({ engine: 'codex', parallel: true });
+      mixed.tasks[0].engine = 'custom';
+      mixed.tasks[1].consensus = { engines: ['claude', 'copilot'], strategy: 'first-pass' };
+      const all = validatePendingPlaylist(mixed, ['claude']).errors;
+      const engine = pendingPlaylistEngineErrors(mixed, ['claude']);
+      assert.deepEqual(engine, [
+        'Playlist "PRD v1.1.0 delta" uses engine "codex", which is not allowed for server runs.',
+        'Task "Implement" uses engine "custom", which is not allowed for server runs.',
+        'Task "Run tests" uses engine "copilot", which is not allowed for server runs.',
+      ]);
+      assert.deepEqual(all.filter((e) => engine.includes(e)), engine, 'same strings, same order');
+      assert.equal(all.length, engine.length + 2, 'the parallel and cwd errors are the rest');
     });
 
     it('a parallel playlist cannot be approved (truthiness, as the runner decides it); a sequential one can', () => {

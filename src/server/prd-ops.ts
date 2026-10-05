@@ -248,13 +248,30 @@ export const PARALLEL_PLAYLIST_ERROR = 'The generated plan runs its tasks in par
  * the reviewer sees them verbatim.
  */
 export function validatePendingPlaylist(pl: PlanFilePlaylist, allowedEngines: readonly EngineId[]): PendingPlaylistReview {
+  return reviewPendingPlaylist(pl, allowedEngines).review;
+}
+
+/**
+ * The subset of {@link validatePendingPlaylist}'s errors that are about an
+ * engine the server does not allow (same strings, same order). Everything else
+ * it reports (`parallel`, a `cwd` outside the workspace) is a review error of
+ * another kind, so a caller can tell the two apart without parsing text.
+ */
+export function pendingPlaylistEngineErrors(pl: PlanFilePlaylist, allowedEngines: readonly EngineId[]): string[] {
+  return reviewPendingPlaylist(pl, allowedEngines).engineErrors;
+}
+
+function reviewPendingPlaylist(pl: PlanFilePlaylist, allowedEngines: readonly EngineId[]): { review: PendingPlaylistReview; engineErrors: string[] } {
   const allowed = new Set(allowedEngines.filter((e) => !SERVER_FORBIDDEN_ENGINES.includes(e)));
   const errors: string[] = [];
+  const engineErrors: string[] = [];
   const commands: ReviewItem[] = [];
   const checkEngine = (engine: unknown, where: string): void => {
     if (engine === undefined) { return; }
     if (typeof engine !== 'string' || !allowed.has(engine as EngineId)) {
-      errors.push(`${where} uses engine "${String(engine)}", which is not allowed for server runs.`);
+      const error = `${where} uses engine "${String(engine)}", which is not allowed for server runs.`;
+      errors.push(error);
+      engineErrors.push(error);
     }
   };
   checkEngine(pl.engine, `Playlist "${pl.name}"`);
@@ -279,7 +296,7 @@ export function validatePendingPlaylist(pl: PlanFilePlaylist, allowedEngines: re
     if (t.incidentRepo !== undefined) { commands.push({ ...base, field: 'incidentRepo', value: String(t.incidentRepo) }); }
     if (t.incidentLabel !== undefined) { commands.push({ ...base, field: 'incidentLabel', value: String(t.incidentLabel) }); }
   }
-  return { ok: errors.length === 0, errors, commands };
+  return { review: { ok: errors.length === 0, errors, commands }, engineErrors };
 }
 
 // ─── Credential redaction of model output ───

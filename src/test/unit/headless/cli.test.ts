@@ -75,6 +75,14 @@ describe('headless CLI: moag bench flags', () => {
     assert.equal(plain.dryRun, undefined);
     assert.equal(plain.out, undefined);
     assert.equal(plain.maxUsd, undefined);
+    assert.equal(plain.allowFailedProbes, undefined, 'a failed probe stops a paid run unless the flag is given');
+  });
+
+  it('--allow-failed-probes is an explicit opt-in flag that takes no value', () => {
+    const a = parseArgs(['bench', 's.json', '--allow-failed-probes', '--max-usd', '5']);
+    assert.equal(a.allowFailedProbes, true);
+    assert.equal(a.maxUsd, 5, 'the next flag is still read');
+    assert.deepEqual(a.positionals, ['s.json']);
   });
 });
 

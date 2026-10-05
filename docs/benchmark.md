@@ -131,11 +131,23 @@ The two can disagree, and both are reported. A brownfield version that MOAG refu
 A command that the machine cannot run fails whatever MOAG does. The bench must not report that as a product failure.
 
 - A scenario lists such commands in `environmentProbes`. The bench runs `node --version` and then each probe, once, in the untouched workspace: after the setup commands, before any plan.
-- A failing probe never stops the bench. The results are in `summary.json` → `environment` (`node`, and per probe `command`, `exitCode`, `timedOut`, `durationMs`, `pass`, `detail`).
+- The results are in `summary.json` → `environment` (`node`, and per probe `command`, `exitCode`, `timedOut`, `durationMs`, `pass`, `detail`).
+- A failing probe never stops a **dry-run**: it spends nothing.
+- A failing probe **stops a paid run** before any plan is requested, so before any engine call. See [`--allow-failed-probes`](#--allow-failed-probes).
 - A version gets an `environment` entry only on evidence. The probe must have failed in the untouched workspace, **and** it must be exactly the command MOAG's verify stopped at (`moagVerify.failedCommand`) or the command of a task that failed.
 - The entry reads, for example: `environment: Node v24.16.0 cannot run "npm test": it exits 1 in the untouched workspace, before any plan (…). MOAG's own verify stopped at this command.`
 - The version's `outcome` and `endState` do not change: nothing shipped, and the summary says so. The `environment` entry says why that is not MOAG's doing.
 - Where the probe passes, a later failure of the same command stays a product failure.
+
+### `--allow-failed-probes`
+
+A paid run on a machine that cannot run a probed command would spend money to measure something the machine cannot measure. So a paid run stops as soon as a probe fails.
+
+- The stop comes right after the probes: no user, project or plan has been created and no engine call has been made.
+- The exit code is `2`. `summary.json` → `harnessError` names each failed probe and its exit code (or `timed out`), for example: `paid run refused: environment probe "npm test" (exit 1) fails in the untouched workspace on Node v24.16.0. …`
+- Every version has `outcome: "error"` and `endState: "harness-error"`. `events.jsonl` has an `environment-probes-stop` entry.
+- To run anyway, pass `--allow-failed-probes`. The run then goes ahead as described above, and `summary.json` → `notes` records that the flag was used and which probes failed.
+- The flag has no effect on a dry-run, or when every probe passes.
 
 ### Brownfield and the Node version
 
@@ -143,7 +155,8 @@ The brownfield scenario probes `npm test`, because that is the full suite MOAG's
 
 - **Node 20** (the version `.nvmrc` and CI pin) **gives the full signal.** `npm test` runs, so the probe passes and MOAG's verify result is a real verdict on the work. The probe runs the whole suite once, which takes several minutes.
 - **Node 22.6 or later cannot start `npm test`.** Node loads the suite's `.ts` files as ES modules, and the run exits 1 in about 2 s with `require is not defined in ES module scope`. Neither `--no-experimental-strip-types` nor `--no-experimental-detect-module` fixes this when passed through `NODE_OPTIONS`. Only flags given directly to `node` do, and `npm test` cannot take them.
-- On such a machine the brownfield version ends `run-gaps` with `moagVerify.failedGate: "command"`, `moagVerify.failedCommand: "npm test"`, and an `environment` entry. Read it as "not measured here", not as a MOAG failure.
+- So on Node 22.6 or later a **paid** brownfield run stops at the probe (exit 2) before it spends anything. Switch to Node 20, or pass [`--allow-failed-probes`](#--allow-failed-probes) to run it anyway. A dry-run is not stopped.
+- With the flag (or in a dry-run) on such a machine, the brownfield version ends `run-gaps` with `moagVerify.failedGate: "command"`, `moagVerify.failedCommand: "npm test"`, and an `environment` entry. Read it as "not measured here", not as a MOAG failure.
 - A plan task that runs `npm test` (the planner must emit one) fails on such a machine for the same reason, and is reported the same way.
 - The bench's own acceptance gate is one mocha file run through `npx mocha`, with no Node flag. With the dry-run fixture it passes on Node 20 and on Node 24.16. A flag given directly to `node` is not an option: Node 20 rejects `--no-experimental-strip-types` as a bad option.
 - On Node 22.6 or later that gate has the same limit as the full suite for one kind of file: a test that mixes ES `import` with `require(...)`, as many tests in this repository do, fails to load. In a paid run the agent writes the test file, so on such a machine a red acceptance gate (`gate-rejected`) can also be the machine's doing. No probe covers that case. Use Node 20 for a paid brownfield run.
@@ -230,7 +243,7 @@ Exit codes:
 
 - `0`: the harness completed, whatever the product outcome.
 - `4`: stopped for budget.
-- `2`: a harness or usage error, including Ctrl+C.
+- `2`: a harness or usage error, including Ctrl+C, and a paid run stopped by a failed environment probe.
 
 `--out` must be empty or missing. Keep it short on Windows: `MAX_PATH` applies to the workspace and its `node_modules`.
 
@@ -263,7 +276,7 @@ Caveat: `--max-budget-usd` can overshoot by one turn, which is why the reserve i
    cd <path-to-moag-repo>
    git status
    npm ci; npm run compile
-   node --version   # use Node 20 (nvm use) for brownfield: on Node 22.6+ MOAG's own verify cannot be measured
+   node --version   # use Node 20 (nvm use) for brownfield: on Node 22.6+ the npm test probe fails and the paid run stops (exit 2) unless --allow-failed-probes is given
    ```
 
 2. Check `claude --version`. It must be 2.1.287 or later. Find out whether `claude` is billed through the API (Console) or a subscription.

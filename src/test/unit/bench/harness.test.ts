@@ -316,7 +316,7 @@ describe('bench harness (scripted workers behind the real app)', function () {
   });
 
   /** One version whose MOAG verify stops at `npm test`, with `npm test` probed first in the untouched workspace. */
-  async function verifyStopsAtNpmTest(probeExit: number, node = 'v24.16.0') {
+  async function verifyStopsAtNpmTest(probeExit: number, node = 'v24.16.0', opts: { dryRun?: boolean; allowFailedProbes?: boolean } = { allowFailedProbes: true }) {
     const seen = { plans: 0, runs: 0 };
     scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]], verifyFailsAt: 'npm test' }, seen);
     const calls: string[][] = [];
@@ -330,17 +330,64 @@ describe('bench harness (scripted workers behind the real app)', function () {
         return { command, exitCode: 0, timedOut: false, durationMs: 5, tail: 'ok' };
       });
     };
+    const fakeCheck: Partial<BenchDeps> = opts.dryRun
+      ? { checkEngine: async () => ({ available: true, probeVersion: null, shellVersion: '0.0.0-moag-bench-fake (Claude Code)' }) } : {};
     const r = await runBench(scenario({ gateCommands: ['npm run compile'], environmentProbes: ['npm test'] }, 1),
-      { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({ runGates }));
+      { dryRun: opts.dryRun === true, ...(opts.dryRun ? {} : { maxUsd: 10 }), ...(opts.allowFailedProbes ? { allowFailedProbes: true } : {}), outDir: out(), ...quiet },
+      deps({ runGates, ...fakeCheck }));
     return { r, v: r.summary!.versions[0], calls, seen };
   }
+
+  it('a paid run stops at a failing environment probe before any plan request: exit 2, the probe and its exit code named', async () => {
+    const { r, v, calls, seen } = await verifyStopsAtNpmTest(1, 'v24.16.0', {});
+    assert.equal(r.exitCode, 2);
+    assert.match(r.summary!.harnessError ?? '', /paid run refused: environment probe "npm test" \(exit 1\) fails in the untouched workspace on Node v24\.16\.0\./);
+    assert.match(r.summary!.harnessError ?? '', /--allow-failed-probes/);
+    assert.deepEqual(calls, [['node --version', 'npm test']], 'only the probes ran');
+    assert.equal(seen.plans, 0, 'no plan job was started');
+    assert.equal(h.workers.length, 0, 'no worker was spawned');
+    assert.equal(h.auditEntries().some((e) => e.action === 'plan.generate'), false, 'no plan was requested');
+    assert.equal(h.projects.list().length, 0, 'the bench stopped before it created anything on the server');
+    assert.equal(r.summary!.environment.probes[0].exitCode, 1, 'the probe result is still in the summary');
+    assert.deepEqual([v.outcome, v.endState], ['error', 'harness-error'], 'the version is not a product outcome');
+    assert.equal(r.summary!.budget.upperBoundUsd, 0, 'nothing was spent');
+    const written = JSON.parse(fs.readFileSync(path.join(out(), 'summary.json'), 'utf-8'));
+    assert.match(written.harnessError, /environment probe "npm test" \(exit 1\)/, 'summary.json records the stop');
+    assert.ok(fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8').includes('"kind":"environment-probes-stop"'));
+  });
+
+  it('a probe that timed out stops a paid run too, and is named as timed out', async () => {
+    const runGates: BenchDeps['runGates'] = async (commands) => commands.map((command): CommandResult => (
+      command === 'npm test' ? { command, exitCode: null, timedOut: true, durationMs: 10_000, tail: '' }
+        : { command, exitCode: 0, timedOut: false, durationMs: 1, tail: 'v20.20.2\n' }));
+    const r = await runBench(scenario({ environmentProbes: ['npm test'] }, 1), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({ runGates }));
+    assert.equal(r.exitCode, 2);
+    assert.match(r.summary!.harnessError ?? '', /environment probe "npm test" \(timed out\)/);
+    assert.equal(h.workers.length, 0);
+  });
+
+  it('a dry-run never stops for a failing environment probe, and needs no flag', async () => {
+    const { r, seen } = await verifyStopsAtNpmTest(1, 'v24.16.0', { dryRun: true });
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    assert.equal(r.summary!.mode, 'dry-run');
+    assert.equal(seen.plans, 1, 'the plan was requested');
+    assert.equal(r.summary!.environment.probes[0].pass, false);
+    assert.equal(r.summary!.notes.some((n) => /allow-failed-probes/.test(n)), false);
+  });
+
+  it('a paid run whose probes all pass needs no flag', async () => {
+    const { r, seen } = await verifyStopsAtNpmTest(0, 'v20.20.2', {});
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    assert.equal(seen.plans, 1);
+  });
 
   it('a verify failure at a command the untouched workspace already could not run is recorded as environment, not product', async () => {
     const { r, v, calls, seen } = await verifyStopsAtNpmTest(1);
     assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
     assert.deepEqual(calls[0], ['node --version', 'npm test'], 'the probes run first, before any plan');
     assert.deepEqual(calls[1], ['npm run compile'], 'the acceptance gates are still only the scenario gate commands');
-    assert.equal(seen.plans, 1, 'a failing probe does not stop the bench');
+    assert.equal(seen.plans, 1, 'with --allow-failed-probes a failing probe does not stop a paid run');
+    assert.ok(r.summary!.notes.some((n) => /--allow-failed-probes: the paid run went ahead although environment probe "npm test" \(exit 1\)/.test(n)), JSON.stringify(r.summary!.notes));
     assert.equal(r.summary!.environment.node, 'v24.16.0');
     assert.deepEqual(r.summary!.environment.probes, [{
       command: 'npm test', exitCode: 1, timedOut: false, durationMs: 2000, pass: false,

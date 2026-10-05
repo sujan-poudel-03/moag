@@ -708,6 +708,8 @@ describe('server app', function () {
     }
     const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: review.contentHash } });
     assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'review-errors', 'a cwd refusal is not an engine problem');
+    assert.match(String(r.body.message), /outside the project workspace/, 'the reviewer is told why');
     assert.equal(h.state.load(id).plans[0].status, 'pending', 'nothing was approved');
     assert.equal(h.state.loadCanonicalPlan(id, 'Acme').playlists.some((p) => p.id === 'pl-delta-test'), false, 'nothing reached the canonical plan');
   });
@@ -734,6 +736,119 @@ describe('server app', function () {
     assert.equal(run.status, 409);
     assert.equal(run.body.error, 'plan-not-approved');
     assert.equal(h.workers.length, spawned, 'no run worker was spawned');
+    assert.equal(r.body.error, 'review-errors', 'a parallel refusal is not an engine problem');
+    assert.deepEqual(r.body.errors, review.review!.errors, 'the review errors are returned as a list too');
+  });
+
+  it('a refusal that mixes a forbidden engine with another review error is review-errors and names both', async () => {
+    const id = await newProject();
+    await h.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    const pl = gatedPlaylist();
+    (pl as Record<string, unknown>).parallel = true;
+    (pl.tasks as Array<Record<string, unknown>>)[0].engine = 'custom';
+    h.onSpawn = planWorker({ kind: 'appended', playlist: pl, rejected: [] });
+    const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+    const planId = (g.body.plan as { id: string }).id;
+    await waitFor(() => h.state.load(id).plans[0]?.status === 'pending');
+    const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: h.state.load(id).plans[0].contentHash } });
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'review-errors');
+    assert.match(String(r.body.message), /uses engine "custom"/);
+    assert.match(String(r.body.message), /runs its tasks in parallel/);
+    assert.equal((r.body.errors as string[]).length, 2);
+  });
+
+  /** A plan generated normally and still pending, then edited in state as if stored before a review rule existed (its stored review still says ok). */
+  async function legacyPendingPlan(edit: (pl: Record<string, unknown>) => void): Promise<{ id: string; planId: string; hash: string }> {
+    const id = await newProject();
+    await h.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    h.onSpawn = planWorker({ kind: 'appended', playlist: gatedPlaylist(), rejected: [] });
+    const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+    const planId = (g.body.plan as { id: string }).id;
+    await waitFor(() => h.state.load(id).plans[0]?.status === 'pending');
+    h.state.update(id, (s) => {
+      const p = s.plans[0];
+      edit(p.playlist as unknown as Record<string, unknown>);
+      p.contentHash = contentHash(p.playlist);
+    });
+    const stored = h.state.load(id).plans[0];
+    assert.equal(stored.review?.ok, true, 'the stored review predates the rule');
+    return { id, planId, hash: stored.contentHash! };
+  }
+
+  it('a stored pending parallel plan (reviewed ok before the rule existed) cannot be approved: 409 review-errors', async () => {
+    const { id, planId, hash } = await legacyPendingPlan((pl) => { pl.parallel = true; });
+    const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    assert.equal(r.status, 409, r.raw);
+    assert.equal(r.body.error, 'review-errors');
+    assert.match(String(r.body.message), /runs its tasks in parallel.*one engine call at a time/);
+    const after = h.state.load(id).plans[0];
+    assert.equal(after.status, 'pending', 'nothing was approved');
+    assert.equal(after.approvedEngine, undefined);
+    assert.equal(h.auditEntries().some((e) => e.action === 'plan.approve'), false);
+    assert.equal(h.state.loadCanonicalPlan(id, 'Acme').playlists.some((p) => p.parallel), false, 'no parallel playlist reached the canonical plan');
+    // It can still be rejected, and the same plan without the flag is approvable: the flag is what was refused.
+    h.state.update(id, (s) => { const p = s.plans[0]; delete (p.playlist as unknown as Record<string, unknown>).parallel; p.contentHash = contentHash(p.playlist); });
+    const ok = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: h.state.load(id).plans[0].contentHash } });
+    assert.equal(ok.status, 200, ok.raw);
+  });
+
+  it('a stored pending plan with a cwd outside the workspace is refused at approve with review-errors; a stored forbidden engine stays engine-not-allowed', async () => {
+    const cwd = await legacyPendingPlan((pl) => { (pl.tasks as Array<Record<string, unknown>>)[0].cwd = '../other-project'; });
+    const r = await h.request('POST', `/api/projects/${cwd.id}/plans/${cwd.planId}/approve`, { as: 'reviewer', body: { contentHash: cwd.hash } });
+    assert.equal(r.status, 409, r.raw);
+    assert.equal(r.body.error, 'review-errors');
+    assert.match(String(r.body.message), /outside the project workspace/);
+    await h.close();
+    h = await startHarness();
+    const eng = await legacyPendingPlan((pl) => { (pl.tasks as Array<Record<string, unknown>>)[0].engine = 'copilot'; });
+    const r2 = await h.request('POST', `/api/projects/${eng.id}/plans/${eng.planId}/approve`, { as: 'reviewer', body: { contentHash: eng.hash } });
+    assert.equal(r2.status, 409, r2.raw);
+    assert.equal(r2.body.error, 'engine-not-allowed');
+    assert.equal(h.state.load(eng.id).plans[0].status, 'pending');
+  });
+
+  it('a stored already-approved parallel plan cannot be started: 409 review-errors, no worker, no run record', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    const setParallel = (where: 'review' | 'canonical', on: boolean): void => {
+      if (where === 'review') {
+        h.state.update(projectId, (s) => {
+          const pl = s.plans[0].playlist as unknown as Record<string, unknown>;
+          if (on) { pl.parallel = true; } else { delete pl.parallel; }
+        });
+        return;
+      }
+      const canonical = h.state.loadCanonicalPlan(projectId, 'Acme', 'claude');
+      canonical.playlists[h.state.load(projectId).plans[0].playlistIndex!].parallel = on ? true : undefined;
+      h.state.saveCanonicalPlan(projectId, canonical, 'claude');
+    };
+    const spawned = h.workers.length;
+    const refused = async (what: string): Promise<void> => {
+      const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+      assert.equal(r.status, 409, `${what}: ${r.raw}`);
+      assert.equal(r.body.error, 'review-errors', what);
+      assert.match(String(r.body.message), /^This plan no longer passes review, so it cannot start\. .*runs its tasks in parallel/, what);
+      assert.equal(h.workers.length, spawned, `${what}: no run worker was spawned`);
+      assert.equal(h.state.load(projectId).runs.length, 0, `${what}: no run record`);
+      assert.equal(h.state.load(projectId).plans[0].status, 'approved', `${what}: the plan is not marked ran`);
+      assert.equal(h.auditEntries().some((e) => e.action === 'run.start'), false, what);
+    };
+    // As a legacy approval looks: both the approved playlist and the canonical copy are parallel.
+    setParallel('review', true);
+    setParallel('canonical', true);
+    assert.equal(h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').playlists.at(-1)?.parallel, true, 'the canonical plan really is parallel');
+    await refused('both copies parallel');
+    // Either copy alone is enough: the runner loads the canonical one.
+    setParallel('review', false);
+    await refused('only the canonical playlist is parallel');
+    setParallel('review', true);
+    setParallel('canonical', false);
+    await refused('only the approved playlist is parallel');
+    // Without the flag the same approved plan starts: the flag is what was refused.
+    setParallel('review', false);
+    const ok = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(ok.status, 202, ok.raw);
+    assert.equal(h.workers.length, spawned + 1);
   });
 
   // ─── Runs ───
