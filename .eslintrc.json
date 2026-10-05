@@ -36,7 +36,8 @@
       "files": [
         "src/runner/**/*.ts",
         "src/context/**/*.ts",
-        "src/adapters/**/*.ts"
+        "src/adapters/**/*.ts",
+        "src/server/**/*.ts"
       ],
       "excludedFiles": [
         "src/adapters/copilot-adapter.ts"

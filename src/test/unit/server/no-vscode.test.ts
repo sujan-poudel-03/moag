@@ -1,0 +1,144 @@
+// ─── G4: no hosted-server module reaches `vscode` at load time ───
+//
+// Parses each src/server/*.ts with the TypeScript compiler, follows its
+// TOP-LEVEL relative imports/requires recursively, and asserts no file reached
+// that way imports `vscode` (anywhere in that file). Lazy `require()`s inside functions are not
+// followed: that is exactly the post-shim region of the run worker, which must
+// only ever execute in a child process after `installVscodeShim()`.
+
+import { strict as assert } from 'assert';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as ts from 'typescript';
+
+const SRC = path.resolve(__dirname, '..', '..', '..');
+const SERVER = path.join(SRC, 'server');
+
+/**
+ * True when `text` really imports vscode — an import/export declaration or a
+ * `require('vscode')` / `import('vscode')` call ANYWHERE in the file (inside
+ * functions too). Parsed, not grepped: install-shim.ts mentions
+ * `require('vscode')` in a comment while only comparing the request string,
+ * which a regex would misreport.
+ */
+function importsVscode(text: string): boolean {
+  const sf = ts.createSourceFile('x.ts', text, ts.ScriptTarget.ES2022, true);
+  let found = false;
+  const visit = (n: ts.Node): void => {
+    if (found) { return; }
+    if ((ts.isImportDeclaration(n) || ts.isExportDeclaration(n)) && n.moduleSpecifier
+      && ts.isStringLiteral(n.moduleSpecifier) && n.moduleSpecifier.text === 'vscode') { found = true; return; }
+    if (ts.isImportEqualsDeclaration(n) && ts.isExternalModuleReference(n.moduleReference)
+      && ts.isStringLiteral(n.moduleReference.expression) && n.moduleReference.expression.text === 'vscode') { found = true; return; }
+    if (ts.isCallExpression(n) && n.arguments.length === 1 && ts.isStringLiteral(n.arguments[0]) && n.arguments[0].text === 'vscode'
+      && ((ts.isIdentifier(n.expression) && n.expression.text === 'require') || n.expression.kind === ts.SyntaxKind.ImportKeyword)) {
+      found = true;
+      return;
+    }
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return found;
+}
+
+/** Module specifiers loaded when `file` is first required (type-only imports excluded). */
+function topLevelSpecifiers(file: string): string[] {
+  const text = fs.readFileSync(file, 'utf-8');
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.ES2022, true);
+  const out: string[] = [];
+  const requireArg = (e: ts.Expression | undefined): string | null => {
+    if (e && ts.isCallExpression(e) && ts.isIdentifier(e.expression) && e.expression.text === 'require'
+      && e.arguments.length === 1 && ts.isStringLiteral(e.arguments[0])) {
+      return e.arguments[0].text;
+    }
+    return null;
+  };
+  for (const st of sf.statements) {
+    if (ts.isImportDeclaration(st) && ts.isStringLiteral(st.moduleSpecifier)) {
+      if (st.importClause?.isTypeOnly) { continue; }
+      out.push(st.moduleSpecifier.text);
+    } else if (ts.isExportDeclaration(st) && st.moduleSpecifier && ts.isStringLiteral(st.moduleSpecifier) && !st.isTypeOnly) {
+      out.push(st.moduleSpecifier.text);
+    } else if (ts.isImportEqualsDeclaration(st) && ts.isExternalModuleReference(st.moduleReference)
+      && ts.isStringLiteral(st.moduleReference.expression)) {
+      out.push(st.moduleReference.expression.text);
+    } else if (ts.isVariableStatement(st)) {
+      for (const d of st.declarationList.declarations) {
+        let init = d.initializer;
+        while (init && ts.isPropertyAccessExpression(init)) { init = init.expression; }
+        while (init && ts.isCallExpression(init) && !requireArg(init) && ts.isPropertyAccessExpression(init.expression)) {
+          init = init.expression.expression;
+        }
+        const spec = requireArg(init);
+        if (spec) { out.push(spec); }
+      }
+    } else if (ts.isExpressionStatement(st)) {
+      const spec = requireArg(st.expression);
+      if (spec) { out.push(spec); }
+    }
+  }
+  return out;
+}
+
+function resolveRelative(from: string, spec: string): string | null {
+  if (!spec.startsWith('.')) { return null; }
+  const base = path.resolve(path.dirname(from), spec);
+  for (const c of [`${base}.ts`, path.join(base, 'index.ts')]) {
+    if (fs.existsSync(c)) { return c; }
+  }
+  return null;
+}
+
+/** Every file reachable from `entry` through top-level relative imports. */
+function reachable(entry: string): Set<string> {
+  const seen = new Set<string>();
+  const stack = [entry];
+  while (stack.length > 0) {
+    const f = stack.pop()!;
+    if (seen.has(f)) { continue; }
+    seen.add(f);
+    for (const spec of topLevelSpecifiers(f)) {
+      if (spec === 'vscode') { continue; } // reported by the content check below
+      const r = resolveRelative(f, spec);
+      if (r) { stack.push(r); }
+    }
+  }
+  return seen;
+}
+
+const serverFiles = fs.readdirSync(SERVER).filter((n) => n.endsWith('.ts')).map((n) => path.join(SERVER, n));
+
+describe('G4: server modules never load vscode', () => {
+  it('finds the server modules (non-vacuous)', () => {
+    assert.ok(serverFiles.length >= 15, `found ${serverFiles.length}`);
+    assert.ok(serverFiles.some((f) => f.endsWith('app.ts')));
+    assert.ok(serverFiles.some((f) => f.endsWith('run-worker.ts')));
+  });
+
+  it('the walker detects a vscode import in a synthetic file', () => {
+    assert.ok(importsVscode("import * as vscode from 'vscode';"));
+    assert.ok(importsVscode("function f() { const vscode = require('vscode'); }"));
+    assert.ok(importsVscode("const v = import('vscode');"));
+    assert.equal(importsVscode("// require('vscode') in a comment\nif (request === 'vscode') {}"), false);
+    // And it really follows imports: app.ts reaches the models layer.
+    const r = [...reachable(path.join(SERVER, 'app.ts'))].map((f) => path.relative(SRC, f).replace(/\\/g, '/'));
+    assert.ok(r.includes('models/plan.ts'), 'walker follows relative imports');
+  });
+
+  for (const file of serverFiles) {
+    it(`${path.basename(file)} reaches no vscode import at load time`, () => {
+      const offenders = [...reachable(file)].filter((f) => importsVscode(fs.readFileSync(f, 'utf-8')));
+      assert.deepEqual(offenders.map((f) => path.relative(SRC, f)), []);
+    });
+  }
+
+  it('run-worker.ts has exactly the four allowed top-level imports', () => {
+    const specs = topLevelSpecifiers(path.join(SERVER, 'run-worker.ts')).sort();
+    assert.deepEqual(specs, ['../headless/install-shim', './worker-protocol', 'fs', 'path']);
+  });
+
+  it("the string 'vscode' never appears as a module specifier in run-worker.ts", () => {
+    assert.equal(importsVscode(fs.readFileSync(path.join(SERVER, 'run-worker.ts'), 'utf-8')), false);
+    assert.equal(/['"]vscode['"]/.test(fs.readFileSync(path.join(SERVER, 'run-worker.ts'), 'utf-8')), false);
+  });
+});

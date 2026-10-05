@@ -1,0 +1,7 @@
+node_modules
+out
+.git
+.moag
+*.vsix
+.vscode-test
+.claude

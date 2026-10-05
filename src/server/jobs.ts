@@ -1,0 +1,455 @@
+// ─── Job manager ───
+//
+// Owns every worker child process. One job per project (in memory + a `job.lock`
+// file opened with `wx`), a server-wide concurrency cap, line-framed JSONL
+// parsing with a per-line cap, an stderr tail, secret redaction in error tails,
+// cooperative stop (IPC) with a hard-kill fallback, and SSE fan-out. Every
+// listener and timer is released on both `close` and `error`.
+//
+// The lock file names the WORKER, not just the server: `{serverPid, workerPid,
+// workerPgid?}`. A server crash leaves the worker (and the agent it supervises)
+// running; while that worker — or, on POSIX, its process group — is alive the
+// lock is held, so a restarted server cannot admit a second job into the same
+// workspace. The worker notices the lost IPC channel, stops its runner (which
+// tree-kills the running task) and exits; the lock is reclaimed after that.
+// Workers are spawned detached on every platform (main.ts), so on Windows a
+// server crash no longer hard-kills the worker out from under its agent. A lock
+// may also list `taskPids` (agent processes); while any of them is alive the
+// lock is held even if the worker itself is gone.
+
+import * as fs from 'fs';
+import * as path from 'path';
+import { EventEmitter } from 'events';
+import { randomUUID } from 'crypto';
+import { writeFileAtomicSync } from '../utils/file-io';
+import {
+  WorkerEvent, WorkerJob, RunView, emptyRunView, foldRunEvent, parseWorkerLine, exitToRunStatus, ExitRunStatus,
+} from './worker-protocol';
+import { RunsDisabledReason } from './config';
+import { TaskStatus } from '../models/types';
+
+export const MAX_LINE_BYTES = 1024 * 1024;
+export const STDERR_TAIL_BYTES = 64 * 1024;
+export const STOP_KILL_AFTER_MS = 30_000;
+export const LOCK_FILE = 'job.lock';
+
+/** The slice of ChildProcess the manager uses (fakeable in tests). */
+export interface WorkerProcess extends EventEmitter {
+  pid?: number;
+  stdout: EventEmitter | null;
+  stderr: EventEmitter | null;
+  send?(message: unknown): boolean;
+  connected?: boolean;
+}
+
+export interface SpawnSpec {
+  jobPath: string;
+  workspace: string;
+  env: NodeJS.ProcessEnv;
+}
+
+export type JobKind = WorkerJob['kind'];
+export type JobEndStatus = ExitRunStatus | 'stopped';
+
+export interface JobEnd {
+  jobId: string;
+  projectId: string;
+  kind: JobKind;
+  exitCode: number | null;
+  status: JobEndStatus;
+  view: RunView;
+  /** stderr tail with injected secrets redacted. */
+  stderrTail: string;
+  spawnError?: string;
+}
+
+export interface TaskOutcome {
+  projectId: string;
+  jobId: string;
+  taskId: string;
+  status: 'completed' | 'failed';
+  engine: string | null;
+}
+
+export type JobNotice =
+  | { type: 'event'; jobId: string; event: WorkerEvent }
+  | { type: 'end'; end: JobEnd };
+
+export interface StartJobInput {
+  projectId: string;
+  job: WorkerJob;
+  /** Where the job document is written (inside the data dir). */
+  jobPath: string;
+  workspace: string;
+  env: NodeJS.ProcessEnv;
+  /** Secret values that must never appear in error tails / stderr. */
+  redact?: string[];
+  /** Spend bucket key (PRD version `createdAt`) for `cost` events. */
+  spendKey?: string;
+  onEvent?: (ev: WorkerEvent) => void;
+  onEnd?: (end: JobEnd) => void;
+}
+
+export type StartResult =
+  | { ok: true; jobId: string; workerPid?: number }
+  | { ok: false; status: 409 | 429; reason: 'runs-disabled' | 'job-active' | 'project-locked' | 'too-many-jobs' | 'spawn-failed'; message: string };
+
+export interface JobManagerOptions {
+  dataDir: string;
+  spawnWorker: (spec: SpawnSpec) => WorkerProcess;
+  maxConcurrent: number;
+  runsDisabledReason: RunsDisabledReason;
+  killProcess: (proc: WorkerProcess) => void;
+  now?: () => number;
+  /** Add `usd` to the project's spend for `spendKey`. */
+  recordSpend?: (projectId: string, spendKey: string, usd: number) => void;
+  /** Consumed by the outcome store (stack evidence). */
+  onTaskOutcome?: (o: TaskOutcome) => void;
+  /**
+   * Liveness probe for a pid found in a lock file. A NEGATIVE argument asks
+   * about the process group `-pid` (the default uses `process.kill(pid, 0)`,
+   * which means exactly that).
+   */
+  isPidAlive?: (pid: number) => boolean;
+  /** Workers lead their own process group (POSIX `detached: true`); recorded in the lock as `workerPgid`. */
+  workerLeadsProcessGroup?: boolean;
+  log?: (message: string) => void;
+}
+
+interface ActiveJob {
+  jobId: string;
+  projectId: string;
+  kind: JobKind;
+  proc: WorkerProcess;
+  view: RunView;
+  stopRequested: boolean;
+  killTimer: NodeJS.Timeout | null;
+  lockPath: string;
+}
+
+function defaultIsPidAlive(pid: number): boolean {
+  try { process.kill(pid, 0); return true; } catch (e) { return (e as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
+/** Replace every occurrence of each secret in `text`. */
+export function redactSecrets(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const s of secrets) {
+    if (s && s.length >= 4) { out = out.split(s).join('[REDACTED]'); }
+  }
+  return out;
+}
+
+export class JobManager {
+  private readonly active = new Map<string, ActiveJob>();
+  private readonly subscribers = new Map<string, Set<(n: JobNotice) => void>>();
+  private readonly isPidAlive: (pid: number) => boolean;
+
+  constructor(private readonly opts: JobManagerOptions) {
+    this.isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
+  }
+
+  isActive(projectId: string): boolean { return this.active.has(projectId); }
+  activeCount(): number { return this.active.size; }
+  activeKind(projectId: string): JobKind | null { return this.active.get(projectId)?.kind ?? null; }
+  view(projectId: string): RunView | null { return this.active.get(projectId)?.view ?? null; }
+  /** True once {@link stop} was called for the project's current job (until that job ends). */
+  isStopRequested(projectId: string): boolean { return this.active.get(projectId)?.stopRequested === true; }
+
+  lockPath(projectId: string): string {
+    return path.join(this.opts.dataDir, 'projects', projectId, LOCK_FILE);
+  }
+
+  /** Start a worker. Synchronous admission: a second call for the same project gets 409 at once. */
+  start(input: StartJobInput): StartResult {
+    const { projectId, job } = input;
+    if (job.kind !== 'probe' && this.opts.runsDisabledReason !== null) {
+      return { ok: false, status: 409, reason: 'runs-disabled', message: 'Runs are disabled: the server sets CI=true, which would auto-approve ship gates.' };
+    }
+    if (this.active.has(projectId)) {
+      return { ok: false, status: 409, reason: 'job-active', message: 'This project already has a job running.' };
+    }
+    if (this.active.size >= this.opts.maxConcurrent) {
+      return { ok: false, status: 429, reason: 'too-many-jobs', message: 'The server is at its concurrent job limit. Try again shortly.' };
+    }
+    const lockPath = this.lockPath(projectId);
+    if (!this.acquireLock(lockPath)) {
+      return { ok: false, status: 409, reason: 'project-locked', message: 'This project is locked by another process.' };
+    }
+
+    let proc: WorkerProcess;
+    try {
+      writeFileAtomicSync(input.jobPath, JSON.stringify(job, null, 2), 0o600);
+      proc = this.opts.spawnWorker({ jobPath: input.jobPath, workspace: input.workspace, env: input.env });
+    } catch (err) {
+      this.releaseLock(lockPath);
+      this.opts.log?.(`spawn failed for project ${projectId}: ${(err as Error).message}`);
+      return { ok: false, status: 409, reason: 'spawn-failed', message: 'The worker process could not be started.' };
+    }
+
+    if (proc.pid) {
+      // Name the worker in the lock so a successor server respects it while it lives.
+      try {
+        writeFileAtomicSync(lockPath, JSON.stringify({
+          serverPid: process.pid, workerPid: proc.pid,
+          ...(this.opts.workerLeadsProcessGroup ? { workerPgid: proc.pid } : {}),
+        }), 0o600);
+      } catch (err) { this.opts.log?.(`job.lock update for project ${projectId}: ${(err as Error).message}`); }
+    }
+
+    const jobId = randomUUID();
+    const a: ActiveJob = { jobId, projectId, kind: job.kind, proc, view: emptyRunView(), stopRequested: false, killTimer: null, lockPath };
+    this.active.set(projectId, a);
+    this.wire(a, input);
+    return { ok: true, jobId, ...(proc.pid ? { workerPid: proc.pid } : {}) };
+  }
+
+  /** Ask the project's worker to stop; hard-kill it after 30 s. Returns false when nothing is running. */
+  stop(projectId: string): boolean {
+    const a = this.active.get(projectId);
+    if (!a) { return false; }
+    if (a.stopRequested) { return true; }
+    a.stopRequested = true;
+    try { a.proc.send?.({ type: 'stop' }); } catch { /* channel closed; the kill timer covers it */ }
+    a.killTimer = setTimeout(() => {
+      a.killTimer = null;
+      if (this.active.get(projectId) === a) {
+        this.opts.log?.(`worker for project ${projectId} ignored stop; killing`);
+        this.opts.killProcess(a.proc);
+      }
+    }, STOP_KILL_AFTER_MS);
+    return true;
+  }
+
+  /** Stop every job (SIGTERM path). Resolves when all have ended or `timeoutMs` passes. */
+  async stopAll(timeoutMs = STOP_KILL_AFTER_MS + 5000): Promise<void> {
+    const ids = [...this.active.keys()];
+    if (ids.length === 0) { return; }
+    const done = new Promise<void>((resolve) => {
+      const check = (): void => { if (this.active.size === 0) { resolve(); } };
+      for (const id of ids) {
+        const dispose = this.subscribe(id, (n) => { if (n.type === 'end') { dispose(); check(); } });
+        this.stop(id);
+      }
+      check();
+    });
+    let t: NodeJS.Timeout | undefined;
+    await Promise.race([done, new Promise<void>((r) => { t = setTimeout(r, timeoutMs); })]);
+    if (t) { clearTimeout(t); }
+  }
+
+  /** Subscribe to a project's job notices (SSE). Returns a disposer. */
+  subscribe(projectId: string, cb: (n: JobNotice) => void): () => void {
+    let set = this.subscribers.get(projectId);
+    if (!set) { set = new Set(); this.subscribers.set(projectId, set); }
+    set.add(cb);
+    return () => {
+      const s = this.subscribers.get(projectId);
+      if (!s) { return; }
+      s.delete(cb);
+      if (s.size === 0) { this.subscribers.delete(projectId); }
+    };
+  }
+
+  subscriberCount(projectId: string): number { return this.subscribers.get(projectId)?.size ?? 0; }
+
+  /**
+   * Boot-time: remove lock files left by a crashed predecessor. A lock whose
+   * worker (or worker process group, or — when the lock records them — any of
+   * its task pids) is still alive is NOT reclaimed — an agent may still be
+   * running in the workspace; it stays locked (409) until every recorded holder
+   * has exited. Returns the project ids whose lock was reclaimed.
+   */
+  reclaimStaleLocks(projectIds: readonly string[]): string[] {
+    const reclaimed: string[] = [];
+    for (const id of projectIds) {
+      const p = this.lockPath(id);
+      const info = readLock(p);
+      if (info === undefined) { continue; }
+      if (info !== null && this.lockHeld(info)) {
+        this.opts.log?.(`project ${id}: job lock still held (worker pid ${info.workerPid ?? '-'}, server pid ${info.serverPid ?? '-'}); keeping it until the holder exits`);
+        continue;
+      }
+      this.releaseLock(p);
+      reclaimed.push(id);
+    }
+    return reclaimed;
+  }
+
+  // ─── Internals ───
+
+  private notify(projectId: string, n: JobNotice): void {
+    for (const cb of [...(this.subscribers.get(projectId) ?? [])]) {
+      try { cb(n); } catch (err) { this.opts.log?.(`subscriber threw: ${(err as Error).message}`); }
+    }
+  }
+
+  private acquireLock(lockPath: string): boolean {
+    fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = fs.openSync(lockPath, 'wx', 0o600);
+        try { fs.writeSync(fd, JSON.stringify({ serverPid: process.pid })); } finally { fs.closeSync(fd); }
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EEXIST') { throw err; }
+        const info = readLock(lockPath);
+        // Respected: a live worker (whoever started it), a live OTHER server, or
+        // us without an in-memory job (cannot happen). A dead holder is reclaimed once.
+        if (info && (this.lockHeld(info) || (info.serverPid === process.pid && info.workerPid === null))) { return false; }
+        this.releaseLock(lockPath);
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Is a lock held by someone alive? Its worker (or the worker's process group)
+   * still running — whichever server started it — or a live OTHER server.
+   * Our own pid never counts as a live holder.
+   */
+  private lockHeld(info: LockInfo): boolean {
+    if (info.workerPid !== null && info.workerPid !== process.pid && this.isPidAlive(info.workerPid)) { return true; }
+    // An agent process outliving its worker still owns the workspace.
+    if (info.taskPids.some((pid) => pid !== process.pid && this.isPidAlive(pid))) { return true; }
+    if (info.workerPgid !== null && info.workerPgid !== process.pid && this.isPidAlive(-info.workerPgid)) { return true; }
+    return info.serverPid !== null && info.serverPid !== process.pid && this.isPidAlive(info.serverPid);
+  }
+
+  private releaseLock(lockPath: string): void {
+    try { fs.rmSync(lockPath, { force: true }); } catch { /* best effort */ }
+  }
+
+  private wire(a: ActiveJob, input: StartJobInput): void {
+    const { proc } = a;
+    const redact = input.redact ?? [];
+    const taskEngines = new Map<string, string>();
+    let stdoutBuf = '';
+    let discarding = false;
+    let stderrTail = '';
+    let ended = false;
+
+    const handleEvent = (ev: WorkerEvent): void => {
+      a.view = foldRunEvent(a.view, ev);
+      if (ev.event === 'cost' && input.spendKey && this.opts.recordSpend) {
+        try { this.opts.recordSpend(a.projectId, input.spendKey, ev.usd); } catch (err) { this.opts.log?.(`recordSpend: ${(err as Error).message}`); }
+      }
+      if (ev.event === 'task-engine') { taskEngines.set(ev.id, ev.engine); }
+      const outcome = (ev.event === 'task-completed' || ev.event === 'task-failed') ? countableOutcome(ev, a) : null;
+      if (outcome && (ev.event === 'task-completed' || ev.event === 'task-failed') && this.opts.onTaskOutcome) {
+        try {
+          this.opts.onTaskOutcome({
+            projectId: a.projectId, jobId: a.jobId, taskId: ev.id, status: outcome,
+            engine: taskEngines.get(ev.id) ?? null,
+          });
+        } catch (err) { this.opts.log?.(`onTaskOutcome: ${(err as Error).message}`); }
+      }
+      const safe: WorkerEvent = ev.event === 'task-error-tail' ? { ...ev, tail: redactSecrets(ev.tail, redact) }
+        : ev.event === 'error' || ev.event === 'warning' ? { ...ev, message: redactSecrets(ev.message, redact) }
+          : ev;
+      try { input.onEvent?.(safe); } catch (err) { this.opts.log?.(`onEvent: ${(err as Error).message}`); }
+      this.notify(a.projectId, { type: 'event', jobId: a.jobId, event: safe });
+    };
+
+    const onStdout = (chunk: Buffer | string): void => {
+      stdoutBuf += chunk.toString();
+      let nl: number;
+      while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
+        const line = stdoutBuf.slice(0, nl);
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        if (discarding) { discarding = false; continue; }
+        if (Buffer.byteLength(line) > MAX_LINE_BYTES) { continue; }
+        const ev = parseWorkerLine(line);
+        if (ev) { handleEvent(ev); }
+      }
+      if (Buffer.byteLength(stdoutBuf) > MAX_LINE_BYTES) {
+        // An overlong line: drop what we have and skip to the next newline.
+        stdoutBuf = '';
+        discarding = true;
+      }
+    };
+    const onStderr = (chunk: Buffer | string): void => {
+      stderrTail = (stderrTail + chunk.toString()).slice(-STDERR_TAIL_BYTES);
+    };
+
+    const finish = (exitCode: number | null, spawnError?: string): void => {
+      if (ended) { return; }
+      ended = true;
+      if (a.killTimer) { clearTimeout(a.killTimer); a.killTimer = null; }
+      proc.stdout?.removeListener('data', onStdout);
+      proc.stderr?.removeListener('data', onStderr);
+      proc.removeListener('close', onClose);
+      proc.removeListener('error', onError);
+      if (this.active.get(a.projectId) === a) { this.active.delete(a.projectId); }
+      this.releaseLock(a.lockPath);
+      const end: JobEnd = {
+        jobId: a.jobId,
+        projectId: a.projectId,
+        kind: a.kind,
+        exitCode,
+        status: a.stopRequested && exitCode !== 3 ? 'stopped' : exitToRunStatus(spawnError ? null : exitCode),
+        view: a.view,
+        stderrTail: redactSecrets(stderrTail, redact),
+        ...(spawnError ? { spawnError: redactSecrets(spawnError, redact) } : {}),
+      };
+      try { input.onEnd?.(end); } catch (err) { this.opts.log?.(`onEnd: ${(err as Error).message}`); }
+      this.notify(a.projectId, { type: 'end', end });
+    };
+    const onClose = (code: number | null): void => finish(code);
+    const onError = (err: Error): void => finish(null, err.message);
+
+    proc.stdout?.on('data', onStdout);
+    proc.stderr?.on('data', onStderr);
+    proc.on('close', onClose);
+    proc.on('error', onError);
+  }
+}
+
+/**
+ * The stack-evidence verdict of a terminal task event, or null when it is not
+ * evidence. Only a task the engine ran to its own verdict counts: the runner
+ * also emits task-completed for SKIPPED tasks and task-failed for BLOCKED ones
+ * and for pre-flight halts, and a task that ends after a stop (user, ship gate,
+ * cost ceiling) was aborted, not judged.
+ */
+function countableOutcome(
+  ev: Extract<WorkerEvent, { event: 'task-completed' | 'task-failed' }>,
+  a: Pick<ActiveJob, 'stopRequested' | 'view'>,
+): 'completed' | 'failed' | null {
+  if (ev.engineRan !== true || a.stopRequested || a.view.haltReason !== null) { return null; }
+  if (ev.event === 'task-completed') { return ev.status === undefined || ev.status === TaskStatus.Completed ? 'completed' : null; }
+  return ev.status === undefined || ev.status === TaskStatus.Failed ? 'failed' : null;
+}
+
+/** Who holds a project's job lock. `taskPids`: agent processes, when the lock records them. */
+interface LockInfo { serverPid: number | null; workerPid: number | null; workerPgid: number | null; taskPids: number[]; }
+
+/** Most task pids read from one lock file (a garbage lock cannot make boot probe forever). */
+const MAX_LOCK_TASK_PIDS = 64;
+
+const posInt = (v: unknown): number | null => (typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : null);
+
+/**
+ * A lock file's holders: null when unreadable/garbage, undefined when there is
+ * no file. Accepts the JSON form and the older bare server pid.
+ */
+function readLock(lockPath: string): LockInfo | null | undefined {
+  let raw: string;
+  try { raw = fs.readFileSync(lockPath, 'utf-8'); } catch (e) {
+    return (e as NodeJS.ErrnoException).code === 'ENOENT' ? undefined : null;
+  }
+  const text = raw.trim();
+  if (/^\d+$/.test(text)) {
+    const n = posInt(Number(text));
+    return n === null ? null : { serverPid: n, workerPid: null, workerPgid: null, taskPids: [] };
+  }
+  let o: unknown;
+  try { o = JSON.parse(text); } catch { return null; }
+  if (!o || typeof o !== 'object' || Array.isArray(o)) { return null; }
+  const rec = o as Record<string, unknown>;
+  const taskPids = Array.isArray(rec.taskPids)
+    ? rec.taskPids.slice(0, MAX_LOCK_TASK_PIDS).map(posInt).filter((n): n is number => n !== null)
+    : [];
+  const info: LockInfo = { serverPid: posInt(rec.serverPid), workerPid: posInt(rec.workerPid), workerPgid: posInt(rec.workerPgid), taskPids };
+  return info.serverPid === null && info.workerPid === null && info.workerPgid === null && taskPids.length === 0 ? null : info;
+}
