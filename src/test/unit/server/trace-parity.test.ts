@@ -30,7 +30,10 @@ function fixture(): Plan {
   );
   plan.playlists = [pl];
   plan.requirementTrace = [
-    { id: 'R-1', taskIds: ['t-1'], commits: ['abc123'], gates: [{ command: 'npm test', exitCode: 0, timedOut: false, at: createdAt }], releases: [{ releaseTag: 'v2.0.0', prdVersion: '2.0.0', at: createdAt, taskIds: ['t-1'], standardsVersion: 3 }] },
+    { id: 'R-1', taskIds: ['t-1'], commits: ['abc123'], gates: [
+      { command: 'moag:standards v3', exitCode: 0, timedOut: false, at: createdAt, standardsCounts: { advisoryFindings: 2, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true } },
+      { command: 'npm test', exitCode: 0, timedOut: false, at: createdAt },
+    ], releases: [{ releaseTag: 'v2.0.0', prdVersion: '2.0.0', at: createdAt, taskIds: ['t-1'], standardsVersion: 3 }] },
     { id: 'R-2', taskIds: ['t-2'], commits: [], gates: [{ command: 'npm test', exitCode: 1, timedOut: false, at: createdAt }], releases: [] },
     { id: 'R-3', taskIds: ['t-3'], commits: [], gates: [], releases: [{ releaseTag: 'v1.0.0', prdVersion: '1.0.0', at: createdAt, taskIds: ['t-3'] }] },
   ];
@@ -71,6 +74,12 @@ describe('trace parity: web API vs moag trace', function () {
     });
 
     assert.deepEqual(rows, cli);
+    // The standards row means the same thing on both sides: its word and its counts, not just an exit code.
+    assert.deepEqual(rows[0].gates, [
+      { command: 'moag:standards v3', exitCode: 0, standards: 'no blocking rules configured', standardsCounts: { advisoryFindings: 2, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true } },
+      { command: 'npm test', exitCode: 0 },
+    ]);
+    assert.deepEqual((cli[0] as { gates: unknown }).gates, rows[0].gates);
     // The standards version is on both sides: a number where a release recorded one, null elsewhere.
     assert.deepEqual(rows.map((r) => [r.id, r.standardsVersion]), [['R-1', 3], ['R-2', null], ['R-3', null], ['R-4', null], ['R-5', null]]);
     assert.ok(cli.every((line: Record<string, unknown>) => 'standardsVersion' in line), 'moag trace prints the key on every line');

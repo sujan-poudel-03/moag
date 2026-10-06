@@ -330,6 +330,12 @@ command was not checked the row is written with exit 1 and nothing ships.
 Beside the version the trace records how many advisory findings, rules not
 checked and files not checked that check left open (`standardsCounts`).
 
+The row is not a command, so it is never shown as a pass or a fail. Wherever a
+gate is worded — the gate table of the verification report, the evidence the
+verifying model reads, `moag trace` — it says one of three things: `stopped`,
+`no blocking rules configured` or `nothing blocking`. Your own commands keep
+`pass`, `fail` and `timeout`.
+
 **Staged work is checked too.** Content you `git add` and then delete from the
 working tree is judged from the index, like content that was committed and then
 removed. Moved files are recognised as moves whatever `diff.renameLimit` the
@@ -435,7 +441,7 @@ and this one is injected at high priority, so it would rot every future run.
 | `queue.jsonl` | Parked work — append-only |
 | `knowledge/facts.json` | Proven facts about this repo |
 | `errors.jsonl` | Internal error log |
-| `verification-*.json` | PRD verification reports |
+| `verification-*.json` | PRD verification reports. A command gate is stored as it ran (`exitCode`, `passed`). The `moag:standards` row has no `passed` key: it has `standards` (`stopped`, `no blocking rules configured` or `nothing blocking`) and `standardsOpen` (what the check left open, in words) |
 | `screenshots/` | Browser UAT captures |
 
 ## Layering
@@ -501,7 +507,10 @@ moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]
 not-shipped, untracked or removed — with the PRD version and release tag that
 shipped it, the standards version that release was checked against and what
 that check left open (`standardsCounts`), its tasks and its latest gate exit
-codes. It only reads the plan.
+codes. The `moag:standards` row among those gates also says what it means, in
+`standards` (`stopped`, `no blocking rules configured` or `nothing blocking`)
+and, when recorded, `standardsCounts`: an exit code of 0 there is not a pass.
+It only reads the plan.
 
 `moag standards` works on the workspace's own `.moag/standards.json`, with no
 engine and no model call. `show` prints the document and the text every task

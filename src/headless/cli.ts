@@ -69,7 +69,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { installVscodeShim, FileMemento } from './install-shim';
 // Both of these are free of VS Code API imports, so they are safe to load before the shim.
-import { captureHeadRef, collectStandardsInput, detectPrdFile, EMPTY_TREE_REF, runGate } from '../runner/evidence';
+import { captureHeadRef, collectStandardsInput, detectPrdFile, EMPTY_TREE_REF, gatesForStoredReport, runGate } from '../runner/evidence';
 import { createPrdLoop, HaltReason, PrdLoopConfig, PrdLoopReport, UatSession } from '../runner/prd-loop';
 import {
   capStandardsReport, checkStandards, commandRow, groupStandardsRules, isBlockingNotChecked, MAX_REPORT_TAIL_CHARS, NO_BLOCKING_RULES,
@@ -724,7 +724,8 @@ export async function runVerifyCore(
     const reportPath = path.join(args.cwd, '.moag', `verification-${Date.now()}.json`);
     try {
       fs.mkdirSync(path.dirname(reportPath), { recursive: true });
-      fs.writeFileSync(reportPath, JSON.stringify(report, null, 2), 'utf-8');
+      // The standards row is stored in words, never as a bare "passed: true".
+      fs.writeFileSync(reportPath, JSON.stringify({ ...report, gates: gatesForStoredReport(report.gates) }, null, 2), 'utf-8');
     } catch (err) {
       emit({ event: 'error', message: `Could not write verification report: ${err instanceof Error ? err.message : String(err)}` });
     }

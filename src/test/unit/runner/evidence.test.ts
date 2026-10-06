@@ -11,10 +11,12 @@ import {
   checkArtifacts,
   collectDiffEvidence,
   collectStandardsInput,
+  describeGateLine,
   detectPrdFile,
   DiffEvidence,
   EMPTY_TREE_REF,
   GateResult,
+  gatesForStoredReport,
   HIDDEN_FROM_GIT,
   readWorkspacePackages,
   resolveGateCommands,
@@ -1689,6 +1691,74 @@ describe('evidence — summarizeEvidence', () => {
     assert.ok(out.length <= budget, `expected <= ${budget}, got ${out.length}`);
     assert.ok(out.includes('[diff truncated]') || out.includes('[output truncated]'), 'truncation marker must be present');
     assert.ok(out.includes('npm test'), 'gate command must survive truncation');
+  });
+});
+
+describe('evidence — the standards row is worded, never labelled PASS, off-screen', () => {
+  const ev: DiffEvidence = { baseRef: 'abc123', changedFiles: ['src/a.ts'], diffStat: ' src/a.ts | 2 +-', unifiedDiff: '+x', truncated: false };
+  const NONE = { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true as const };
+  const OPEN = { advisoryFindings: 2, notCheckedRules: 1, notCheckedFiles: 3 };
+  const gate = (over: Partial<GateResult>): GateResult =>
+    ({ command: 'npm test', exitCode: 0, passed: true, output: 'ok', durationMs: 12, timedOut: false, ...over });
+  const standardsLine = (text: string): string => text.split('\n').find((l) => l.startsWith('- `moag:standards')) ?? '';
+
+  it('the model evidence says what the row means: nothing blocking, with what the check left open', () => {
+    const out = summarizeEvidence(ev, [
+      gate({ command: 'moag:standards v3', output: 'Project standards: nothing blocking (2 advisory findings, 1 rule not checked, 3 files not checked).', standardsCounts: OPEN }),
+      gate({}),
+    ], 10_000);
+    assert.equal(standardsLine(out), '- `moag:standards v3` — nothing blocking (2 advisory findings · 1 rule not checked · 3 files not checked, 12ms)');
+    assert.doesNotMatch(standardsLine(out), /PASS|exit 0/);
+    // The real command beside it keeps its exit code and its PASS.
+    assert.ok(out.includes('- `npm test` — exit 0 (PASS, 12ms)'));
+    assert.equal((out.match(/\(PASS/g) ?? []).length, 1, 'one PASS in the block: the command');
+  });
+
+  it('a profile with no blocking set says "no blocking rules configured"; a row without counts says "nothing blocking"', () => {
+    assert.equal(describeGateLine(gate({ command: 'moag:standards v1', standardsCounts: NONE })), '- `moag:standards v1` — no blocking rules configured (12ms)');
+    assert.equal(describeGateLine(gate({ command: 'moag:standards v1', standardsCounts: { ...NONE, advisoryFindings: 1 } })),
+      '- `moag:standards v1` — no blocking rules configured (1 advisory finding, 12ms)');
+    assert.equal(describeGateLine(gate({ command: 'moag:standards' })), '- `moag:standards` — nothing blocking (12ms)');
+  });
+
+  it('a standards row that stopped the release says "stopped", never FAIL or an exit code', () => {
+    const line = describeGateLine(gate({ command: 'moag:standards v3', exitCode: 1, passed: false, durationMs: 40 }));
+    assert.equal(line, '- `moag:standards v3` — stopped (40ms)');
+    assert.doesNotMatch(line, /FAIL|exit 1/);
+    // Its output — the findings, the rows not checked — still follows it in the block.
+    const out = summarizeEvidence(ev, [gate({ command: 'moag:standards v3', exitCode: 1, passed: false, output: 'Project standards stop this release: naming/files (findings)' })], 10_000);
+    assert.ok(out.includes('Project standards stop this release: naming/files (findings)'));
+  });
+
+  it('commands are worded as before: exit code, PASS / FAIL, TIMED OUT — also one that merely mentions the name', () => {
+    assert.equal(describeGateLine(gate({})), '- `npm test` — exit 0 (PASS, 12ms)');
+    assert.equal(describeGateLine(gate({ exitCode: 2, passed: false })), '- `npm test` — exit 2 (FAIL, 12ms)');
+    assert.equal(describeGateLine(gate({ exitCode: 124, passed: false, timedOut: true })), '- `npm test` — exit 124 (FAIL, TIMED OUT, 12ms)');
+    assert.equal(describeGateLine(gate({ command: 'echo moag:standards v3' })), '- `echo moag:standards v3` — exit 0 (PASS, 12ms)');
+  });
+
+  it('a stored report keeps a command whole and stores the standards row in words, with no "passed" key', () => {
+    const command = gate({});
+    const failing = gate({ command: 'npm run lint', exitCode: 2, passed: false });
+    const stored = gatesForStoredReport([
+      gate({ command: 'moag:standards v3', output: 'Project standards: nothing blocking', standardsCounts: OPEN }), command, failing,
+    ]);
+    assert.deepEqual(stored[0], {
+      command: 'moag:standards v3', exitCode: 0, output: 'Project standards: nothing blocking', durationMs: 12, timedOut: false,
+      standardsCounts: OPEN, standards: 'nothing blocking', standardsOpen: '2 advisory findings · 1 rule not checked · 3 files not checked',
+    });
+    assert.equal('passed' in stored[0], false, 'no bare "passed: true" for a scan');
+    assert.equal(stored[1], command, 'a command is stored exactly as it ran');
+    assert.equal(stored[2], failing);
+    const none = gatesForStoredReport([gate({ command: 'moag:standards v1', standardsCounts: NONE })])[0] as Record<string, unknown>;
+    assert.deepEqual([none.standards, none.standardsOpen, 'passed' in none], ['no blocking rules configured', '', false]);
+    const stopped = gatesForStoredReport([gate({ command: 'moag:standards v1', exitCode: 1, passed: false })])[0] as Record<string, unknown>;
+    assert.deepEqual([stopped.standards, stopped.exitCode, 'passed' in stopped], ['stopped', 1, false]);
+    assert.deepEqual(gatesForStoredReport([]), []);
+    // The input is not changed: the loop still reads `passed` on its own rows.
+    const row = gate({ command: 'moag:standards v3' });
+    gatesForStoredReport([row]);
+    assert.equal(row.passed, true);
   });
 });
 

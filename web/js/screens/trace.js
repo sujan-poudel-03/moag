@@ -52,22 +52,40 @@ export function standardsOpen(counts) {
 }
 
 /**
+ * The name of the synthetic standards gate row. The same pattern, under the same name, as
+ * `STANDARDS_GATE_COMMAND` in src/models/requirement-trace.ts — this file is plain browser
+ * JavaScript and cannot import it, so a unit test compares the two.
+ */
+export const STANDARDS_GATE_COMMAND = /^moag:standards(?: v\d+)?$/;
+
+/**
+ * The word for the standards row: "stopped" when it stopped the release, "no blocking rules
+ * configured" when the profile had nothing that could, otherwise "nothing blocking". Never
+ * "pass". Mirrors the server's `standardsGateWord`, whose word (`gate.standards`) the trace
+ * API sends on the row; it is derived here too, so a row without it reads the same.
+ */
+export function standardsGateWord(gate) {
+  if (gate.exitCode !== 0 || gate.timedOut === true) { return 'stopped'; }
+  const counts = gate.standardsCounts;
+  return counts && typeof counts === 'object' && counts.noBlockingRules === true ? 'no blocking rules configured' : 'nothing blocking';
+}
+
+/**
  * The Gates cell. Only real commands are tallied as "N/M pass". The synthetic
  * `moag:standards` row is not a command and is never counted as a pass: it is worded beside
- * the tally — "stopped" when it stopped the release, "no blocking rules configured" when the
- * profile had nothing that could, otherwise "nothing blocking".
+ * the tally (see `standardsGateWord`). An entry that is not a gate row at all — null, a
+ * string — is left out rather than failing the whole table.
  */
 export function gateSummary(gates) {
-  if (!Array.isArray(gates) || !gates.length) { return '—'; }
-  const isStandards = (g) => typeof g.command === 'string' && /^moag:standards(?: v\d+)?$/.test(g.command);
-  const commands = gates.filter((g) => !isStandards(g));
-  const standards = gates.filter(isStandards).pop();
+  if (!Array.isArray(gates)) { return '—'; }
+  const rows = gates.filter((g) => g !== null && typeof g === 'object');
+  if (!rows.length) { return '—'; }
+  const isStandards = (g) => typeof g.command === 'string' && STANDARDS_GATE_COMMAND.test(g.command);
+  const commands = rows.filter((g) => !isStandards(g));
+  const standards = rows.filter(isStandards).pop();
   const parts = [];
   if (commands.length) { parts.push(`${commands.filter((g) => g.exitCode === 0).length}/${commands.length} pass`); }
-  if (standards) {
-    const noBlocking = standards.standardsCounts && standards.standardsCounts.noBlockingRules === true;
-    parts.push(`standards: ${standards.exitCode !== 0 ? 'stopped' : noBlocking ? 'no blocking rules configured' : 'nothing blocking'}`);
-  }
+  if (standards) { parts.push(`standards: ${standardsGateWord(standards)}`); }
   return parts.join(' · ');
 }
 

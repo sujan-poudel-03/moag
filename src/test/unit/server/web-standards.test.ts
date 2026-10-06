@@ -14,6 +14,8 @@ import {
 } from '../../../standards/checker';
 import { DEFAULT_RULE_SEVERITY, STANDARDS_RULE_IDS, StandardsProfile, isScannerRule, validateProfile } from '../../../standards/profile';
 import { promote, sampleProfile } from '../standards/fixtures';
+import { STANDARDS_GATE_COMMAND, isStandardsGateCommand, standardsGateCommand, standardsGateWord } from '../../../models/requirement-trace';
+import { gateStatus } from '../../../ui/standards-report-html';
 
 const WEB = path.resolve(__dirname, '..', '..', '..', '..', 'web', 'js');
 
@@ -291,8 +293,8 @@ describe('web trace screen — what a checked release left open', () => {
     const NONE = { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true };
     const SOME = { advisoryFindings: 1, notCheckedRules: 0, notCheckedFiles: 0 };
 
-    // The greenfield dry-run trace exactly as the trace API sends it (command and exit code
-    // only — `requirementStatuses` does not forward a gate's counts): it used to read "2/2 pass".
+    // A standards row with a command and an exit code and nothing else — what the trace API
+    // sent before it forwarded the row's counts: it used to read "2/2 pass".
     assert.equal(gateSummary([{ command: 'moag:standards v2', exitCode: 0 }, { command: 'npm test', exitCode: 0 }]), '1/1 pass · standards: nothing blocking');
     // When a gate row does carry its counts, the row with no blocking set says so.
     assert.equal(gateSummary([std(0, NONE), cmd(0)]), '1/1 pass · standards: no blocking rules configured');
@@ -312,6 +314,63 @@ describe('web trace screen — what a checked release left open', () => {
       const tally = /(\d+)\/(\d+) pass/.exec(gateSummary(gates));
       assert.equal(tally ? Number(tally[2]) : 0, gates.length - 1, 'the standards row is in neither number');
     }
+  });
+
+  it('a gates list with a null or non-object element does not break the cell: the entry is left out', () => {
+    const { gateSummary } = loadWebModule('screens/trace.js', { ...DOM_STUBS, uid: never, Map }, ['gateSummary']) as { gateSummary: (gates: unknown) => string };
+    const cmd = { command: 'npm test', exitCode: 0, timedOut: false };
+    const std = { command: 'moag:standards v2', exitCode: 0, timedOut: false, standardsCounts: { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true } };
+    assert.doesNotThrow(() => gateSummary([null]));
+    assert.equal(gateSummary([null, cmd]), '1/1 pass');
+    assert.equal(gateSummary([cmd, null, std, undefined, 'npm test', 7]), '1/1 pass · standards: no blocking rules configured');
+    assert.equal(gateSummary([null, undefined]), '—', 'nothing left to show');
+    assert.equal(gateSummary(['x', 3, true]), '—');
+    // A row that is an object but malformed is still a row: it is counted, and not as a pass.
+    assert.equal(gateSummary([{}, cmd]), '1/2 pass');
+    assert.equal(gateSummary([{ command: 'moag:standards v2', exitCode: 0, standardsCounts: null }]), 'standards: nothing blocking');
+    assert.equal(gateSummary([{ command: 'moag:standards v2', exitCode: 0, standardsCounts: 'x' }]), 'standards: nothing blocking');
+  });
+
+  it('the name of the standards row is one pattern: the web copy is the server one, source and behaviour', () => {
+    const web = loadWebModule('screens/trace.js', { ...DOM_STUBS, uid: never, Map }, ['STANDARDS_GATE_COMMAND']) as { STANDARDS_GATE_COMMAND: RegExp };
+    assert.equal(web.STANDARDS_GATE_COMMAND.source, STANDARDS_GATE_COMMAND.source);
+    assert.equal(web.STANDARDS_GATE_COMMAND.flags, STANDARDS_GATE_COMMAND.flags);
+    const names = [
+      standardsGateCommand(null), standardsGateCommand(1), standardsGateCommand(42), 'moag:standards v', 'moag:standards v1.2', 'moag:standardsx',
+      'moag:standards v3 && npm test', 'echo moag:standards', ' moag:standards', 'moag:standards v1 ', 'MOAG:STANDARDS', 'npm test', '',
+    ];
+    for (const name of names) {
+      assert.equal(web.STANDARDS_GATE_COMMAND.test(name), isStandardsGateCommand(name), JSON.stringify(name));
+    }
+    // And there is one copy on the web side: no second pattern literal anywhere under web/js.
+    const walk = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true })
+      .flatMap((e) => (e.isDirectory() ? walk(path.join(dir, e.name)) : e.name.endsWith('.js') ? [path.join(dir, e.name)] : []));
+    const literal = 'moag:standards(?:';
+    const holders = walk(WEB).filter((file) => fs.readFileSync(file, 'utf-8').includes(literal));
+    assert.deepEqual(holders.map((f) => path.relative(WEB, f).split(path.sep).join('/')), ['screens/trace.js']);
+    assert.equal(fs.readFileSync(path.join(WEB, 'screens', 'trace.js'), 'utf-8').split(literal).length - 1, 1, 'written once in that file');
+  });
+
+  it('one word for the standards row on every surface: the hosted trace, the trace API and the VS Code gate table agree', () => {
+    const web = loadWebModule('screens/trace.js', { ...DOM_STUBS, uid: never, Map }, ['standardsGateWord', 'gateSummary']) as {
+      standardsGateWord: (gate: unknown) => string; gateSummary: (gates: unknown) => string;
+    };
+    const NONE = { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true as const };
+    const SOME = { advisoryFindings: 2, notCheckedRules: 0, notCheckedFiles: 0 };
+    for (const exitCode of [0, 1]) {
+      for (const standardsCounts of [undefined, NONE, SOME]) {
+        const passed = exitCode === 0;
+        const server = standardsGateWord(passed, standardsCounts);
+        const name = `exit ${exitCode}, ${JSON.stringify(standardsCounts)}`;
+        assert.equal(web.standardsGateWord({ command: 'moag:standards v3', exitCode, timedOut: false, standardsCounts }), server, name);
+        assert.equal(web.gateSummary([{ command: 'moag:standards v3', exitCode, timedOut: false, standardsCounts }]), `standards: ${server}`, name);
+        assert.equal(gateStatus({ command: 'moag:standards v3', passed, timedOut: false, standardsCounts }).word, server, `VS Code gate table, ${name}`);
+      }
+    }
+    // The failing row in particular: "stopped" everywhere, never "fail" in one place and "stopped" in another.
+    assert.equal(web.standardsGateWord({ command: 'moag:standards v3', exitCode: 1 }), 'stopped');
+    assert.equal(gateStatus({ command: 'moag:standards v3', passed: false, timedOut: false }).word, 'stopped');
+    assert.equal(web.standardsGateWord({ command: 'moag:standards v3', exitCode: 0, timedOut: true }), 'stopped', 'a row that timed out did not pass');
   });
 
   it('the table shows them only beside a standards version', () => {
@@ -387,6 +446,91 @@ describe('web run screen — the standards report keeps Blocking, Advisory and N
     assert.match(source, /const standardsStop = !!preGate && \(preGate\.failed > 0 \|\| preGate\.blockingNotChecked > 0\);/);
     assert.match(source, /class: 'btn btn-primary', disabled: standardsStop, on: \{ click: approve \} \}, 'Approve and ship'\)/);
     assert.match(source, /r\.body\.error === 'standards-blocking'\) \{\n\s+toast\(STR\.C59\(/);
+  });
+
+  describe('the card badge: green only for a command that passed', () => {
+    interface Look { text: string; kind: string; card: string }
+    const { standardsBadge } = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map }, ['standardsBadge']) as { standardsBadge: (t: unknown) => Look };
+    const clean = [{ path: 'src/usd-format.ts', status: 'added' as const, addedLines: [1], content: 'export {};' }];
+    const lookOf = (report: StandardsReport): Look => plain(standardsBadge(run.asStandardsReport(JSON.parse(JSON.stringify(report)))!.totals));
+    const withCommand = (result: 'passed' | 'failed' | 'not-checked'): StandardsReport => {
+      const report = checkStandards(sampleProfile(), input(clean));
+      report.rules.push(commandRow({ result, command: 'npm run lint', ...(result === 'not-checked' ? { reason: 'Commands were not run' } : { exitCode: result === 'passed' ? 0 : 1 }) }));
+      report.totals = recountTotals(report);
+      return report;
+    };
+    const TOTALS = { passed: 0, noFindings: 0, failed: 0, advisory: 0, notChecked: 0, blockingNotChecked: 0, noBlockingRules: false, findings: 0, advisoryFindings: 0, notCheckedFiles: 0 };
+
+    it('a real report whose only blocking rows are promoted scans with no findings is never badged green', () => {
+      const report = checkStandards(promote(sampleProfile(), 'frontend/raw-pattern'), input(clean));
+      assert.equal(standardsBlockingState(report), 'evaluated', 'the fixture really has a blocking set, and it was evaluated');
+      assert.equal(report.rules.some((r) => r.rule === 'command'), false, 'and no command in it');
+      assert.equal(report.totals.failed, 0);
+      const look = lookOf(report);
+      assert.match(look.text, /^NOTHING BLOCKING · /, look.text);
+      assert.doesNotMatch(look.text, /✓|PASS/, 'no tick: a scan that found nothing proved nothing');
+      assert.notEqual(look.kind, 'success');
+      assert.notEqual(look.card, 'card-success');
+    });
+
+    it('promoted scans, no findings, nothing left open: "NOTHING BLOCKING · NO FINDINGS", neutral, no green frame', () => {
+      const scansOnly = { ...TOTALS, noFindings: 2 };
+      assert.deepEqual(plain(standardsBadge(scansOnly)), { text: 'NOTHING BLOCKING · NO FINDINGS', kind: 'muted', card: '' });
+      // What was left open is still named, in the warning colour, and still with no tick.
+      assert.deepEqual(plain(standardsBadge({ ...scansOnly, advisory: 1, advisoryFindings: 3, notCheckedFiles: 2 })),
+        { text: 'NOTHING BLOCKING · 3 ADVISORY · 2 FILES NOT CHECKED', kind: 'warning', card: 'card-warning' });
+      assert.equal(plain(standardsBadge({ ...scansOnly, notChecked: 1, notCheckedFiles: 1 })).text, 'NOTHING BLOCKING · 1 RULE NOT CHECKED · 1 FILE NOT CHECKED');
+      assert.equal(plain(standardsBadge({ ...scansOnly, notChecked: 2 })).text, 'NOTHING BLOCKING · 2 RULES NOT CHECKED', 'upper case to the last letter');
+      for (const t of [scansOnly, { ...scansOnly, noFindings: 9 }, { ...scansOnly, advisory: 2, advisoryFindings: 2 }, { ...scansOnly, notChecked: 1 }, { ...scansOnly, notCheckedFiles: 1 }]) {
+        const look = plain(standardsBadge(t));
+        assert.doesNotMatch(look.text, /✓|PASS/, JSON.stringify(t));
+        assert.notEqual(look.kind, 'success', JSON.stringify(t));
+        assert.notEqual(look.card, 'card-success', JSON.stringify(t));
+      }
+    });
+
+    it('a command that passed, with nothing left open, is the one case that earns the green tick', () => {
+      const green = { text: '✓ NOTHING BLOCKING', kind: 'success', card: 'card-success' };
+      assert.deepEqual(plain(standardsBadge({ ...TOTALS, passed: 1, noFindings: 4 })), green);
+      assert.deepEqual(plain(standardsBadge({ ...TOTALS, passed: 2 })), green);
+      // From a real report: the command passed, so there is a real result behind the badge.
+      const real = lookOf(withCommand('passed'));
+      assert.match(real.text, /NOTHING BLOCKING/);
+      assert.equal(real.text.includes('✓'), real.kind === 'success', 'a tick only ever on the success badge');
+    });
+
+    it('the other states keep their words: stopped, not checked, no blocking rules configured', () => {
+      const failed = lookOf(withCommand('failed'));
+      assert.deepEqual([failed.text, failed.kind, failed.card], ['✗ 1 BLOCKING', 'error', 'card-error']);
+      const unread = lookOf(withCommand('not-checked'));
+      assert.deepEqual([unread.text, unread.kind, unread.card], ['✗ 1 BLOCKING NOT CHECKED', 'error', 'card-error']);
+      const none = lookOf(checkStandards(sampleProfile(), input(clean)));
+      assert.match(none.text, /^NO BLOCKING RULES CONFIGURED/);
+      assert.deepEqual([none.kind, none.card], ['warning', 'card-warning']);
+      assert.deepEqual(plain(standardsBadge(TOTALS)), { text: '○ NOT CHECKED', kind: 'muted', card: '' });
+      // A failure outranks everything else on the card.
+      assert.equal(plain(standardsBadge({ ...TOTALS, failed: 2, passed: 3, noBlockingRules: true })).text, '✗ 2 BLOCKING');
+    });
+
+    it('the card is drawn from it: no second badge decision in the render', () => {
+      const source = fs.readFileSync(path.join(WEB, 'screens', 'run.js'), 'utf-8');
+      assert.ok(source.includes('const look = standardsBadge(t);'));
+      assert.ok(source.includes('const state = badge(look.text, look.kind);'));
+      assert.equal(source.split("'✓ NOTHING BLOCKING'").length - 1, 1, 'the green badge is written in one place');
+      assert.equal(source.split("card: 'card-success'").length - 1, 1, 'and so is the green frame of this card');
+    });
+  });
+
+  it('the plan card never offers a start the server would refuse over review errors: it says why and lists them', () => {
+    // Line endings are normalised: a Windows checkout with autocrlf holds this file with CRLF.
+    const source = fs.readFileSync(path.join(WEB, 'screens', 'plan.js'), 'utf-8').replace(/\r\n/g, '\n');
+    assert.ok(source.includes("if (reason === 'review-errors') { return STR.C60.text; }"));
+    assert.ok(source.includes("p.startBlockedReason === 'review-errors' && Array.isArray(p.startBlockedErrors)"));
+    // Both buttons are drawn from the server's allowedActions and, for Approve, the review the server sent.
+    assert.ok(source.includes("allowed.has('plan.approve') && review.ok ?"));
+    assert.ok(source.includes("allowed.has('run.start')\n          ? h('div', { class: 'form-actions' }, h('button', { type: 'button', class: 'btn btn-primary', on: { click: start } }, 'Start run'))"));
+    const strings = fs.readFileSync(path.join(WEB, 'strings.js'), 'utf-8');
+    assert.ok(strings.split('\n').some((l) => l.trimStart().startsWith('C60:')), 'C60 is defined');
   });
 
   it('words every row as the server does: a scan has findings or no findings, and is never "Passed" or "Failed"', () => {

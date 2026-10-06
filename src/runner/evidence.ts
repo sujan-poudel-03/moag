@@ -19,6 +19,7 @@ import { trackChildProcess } from '../utils/child-tracker';
 import { VENDOR_MANIFESTS } from '../standards/checker';
 import type { StandardsCheckFile, StandardsCheckInput, WorkspacePackage } from '../standards/checker';
 import type { StandardsCheckCounts } from '../models/types';
+import { StandardsGateWord, isStandardsGateCommand, standardsGateWord, standardsOpenText } from '../models/requirement-trace';
 
 /** Hard ceiling on any single git invocation, mirroring the runner's GIT_TIMEOUT_MS. */
 const GIT_TIMEOUT_MS = 30_000;
@@ -503,6 +504,49 @@ export function checkArtifacts(cwd: string, artifacts: string[]): Array<{ target
   });
 }
 
+// ─── Wording a gate off-screen ───
+
+/**
+ * One line for a gate in the evidence handed to a model. A command is a process with an exit
+ * code: "exit 0 (PASS, 12ms)". The synthetic `moag:standards` row is not a command — most of
+ * what it covers is a scan, and a scan that found nothing has not proved that nothing is
+ * there — so it is never labelled PASS or FAIL. It says what `standardsGateWord` says on
+ * every other surface, with what the check left open beside it:
+ * "nothing blocking (2 advisory findings · 1 file not checked, 12ms)".
+ */
+export function describeGateLine(g: GateResult): string {
+  if (isStandardsGateCommand(g.command)) {
+    const open = standardsOpenText(g.standardsCounts);
+    return '- `' + g.command + '` — ' + standardsGateWord(g.passed, g.standardsCounts) +
+      ` (${open ? `${open}, ` : ''}${g.durationMs}ms)`;
+  }
+  return '- `' + g.command + '` — exit ' + g.exitCode +
+    ` (${g.passed ? 'PASS' : 'FAIL'}${g.timedOut ? ', TIMED OUT' : ''}, ${g.durationMs}ms)`;
+}
+
+/** A gate as a stored report holds it: a command as it ran, the standards row in words. */
+export type StoredGateResult = GateResult | (Omit<GateResult, 'passed'> & {
+  /** What the standards row says; it has no `passed` — see {@link gatesForStoredReport}. */
+  standards: StandardsGateWord;
+  /** What the check left open, in words; '' when nothing was, or nothing was recorded. */
+  standardsOpen: string;
+});
+
+/**
+ * The gates of a verification as a report file stores them (`.moag/verification-<ts>.json`).
+ * A command keeps every field. The synthetic `moag:standards` row loses `passed` — a reader
+ * of the file must not take "passed: true" for a scan that found nothing — and says instead,
+ * in `standards`, one of: stopped / no blocking rules configured / nothing blocking, with
+ * what the check left open in `standardsOpen` (and as numbers in `standardsCounts`).
+ */
+export function gatesForStoredReport(gates: readonly GateResult[]): StoredGateResult[] {
+  return gates.map((g) => {
+    if (!isStandardsGateCommand(g.command)) { return g; }
+    const { passed, ...rest } = g;
+    return { ...rest, standards: standardsGateWord(passed, g.standardsCounts), standardsOpen: standardsOpenText(g.standardsCounts) };
+  });
+}
+
 /**
  * Render the evidence as deterministic markdown that fits inside `budgetChars`.
  *
@@ -542,10 +586,7 @@ export function summarizeEvidence(ev: DiffEvidence, gates: GateResult[], budgetC
     // 40% of the budget is reserved for gate output, split evenly per gate.
     const perGate = Math.floor((budget * 0.4) / gates.length);
     for (const g of gates) {
-      sections.push(
-        '- `' + g.command + '` — exit ' + g.exitCode +
-        ` (${g.passed ? 'PASS' : 'FAIL'}${g.timedOut ? ', TIMED OUT' : ''}, ${g.durationMs}ms)`,
-      );
+      sections.push(describeGateLine(g));
       const tail = clampTail(g.output.trim(), perGate);
       if (tail.length > 0) {
         sections.push('```');

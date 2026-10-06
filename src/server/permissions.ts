@@ -95,6 +95,8 @@ export interface ActionState {
   engineUnavailable?: boolean;
   /** run.start: the project's default engine changed after the plan was approved. */
   engineChanged?: boolean;
+  /** plan.approve / run.start: false when the review rules, applied now, refuse the plan. */
+  reviewPasses?: boolean;
   /** run.stop: the runner state of the active run. */
   runnerState?: string;
   /** gate.*: status of the run. */
@@ -124,6 +126,9 @@ export function canPerform(actor: Actor, action: ServerAction, state: ActionStat
       if (state.planStatus !== undefined && state.planStatus !== 'generating' && state.planStatus !== 'pending') { return false; }
       return true;
     case 'plan.approve':
+      // Never offered for a plan the approve route would refuse; rejecting it stays possible.
+      if (state.reviewPasses === false) { return false; }
+      return state.planStatus === undefined || state.planStatus === 'pending';
     case 'plan.reject':
       return state.planStatus === undefined || state.planStatus === 'pending';
     case 'plan.generate':
@@ -139,7 +144,7 @@ export function canPerform(actor: Actor, action: ServerAction, state: ActionStat
       return state.canOverride === undefined || state.canOverride;
     case 'run.start':
       if (state.runsDisabled === true || state.jobActive === true || state.budgetExhausted === true || state.engineUnavailable === true
-        || state.engineChanged === true || state.standardsApproved === false) { return false; }
+        || state.engineChanged === true || state.standardsApproved === false || state.reviewPasses === false) { return false; }
       return state.planStatus === undefined || state.planStatus === 'approved' || state.planStatus === 'ran';
     case 'run.stop':
       return state.runnerState === undefined || state.runnerState === 'playing' || state.runnerState === 'paused';

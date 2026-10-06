@@ -130,6 +130,29 @@ describe('web assets (static scan)', () => {
     assert.deepEqual(missing, []);
   });
 
+  it('every web/js module parses: a syntax error in one file would blank the whole app', () => {
+    // The other checks here read the source as text, and a module with a syntax error still
+    // matches every pattern (an unescaped apostrophe in strings.js once did). The files are
+    // browser ES modules that this suite cannot import, so they are parsed, not run.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const ts = require('typescript') as typeof import('typescript');
+    const broken: string[] = [];
+    for (const f of ofExt('.js')) {
+      const out = ts.transpileModule(read(f), {
+        fileName: rel(f), reportDiagnostics: true,
+        compilerOptions: { allowJs: true, module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022 },
+      });
+      for (const d of out.diagnostics ?? []) {
+        const at = d.file && d.start !== undefined ? d.file.getLineAndCharacterOfPosition(d.start).line + 1 : 0;
+        broken.push(`${rel(f)}:${at}: ${ts.flattenDiagnosticMessageText(d.messageText, ' ')}`);
+      }
+    }
+    assert.deepEqual(broken, []);
+    // The check itself catches what it is for.
+    const bad = ts.transpileModule("export const x = m('it can't start');", { fileName: 'x.js', reportDiagnostics: true, compilerOptions: { allowJs: true } });
+    assert.ok((bad.diagnostics ?? []).length > 0, 'an unescaped apostrophe is a diagnostic');
+  });
+
   it('the extension package excludes the web app and the server build', () => {
     const ignore = read(path.join(REPO, '.vscodeignore')).split(/\r?\n/).map((l) => l.trim());
     assert.ok(ignore.includes('web/**'));

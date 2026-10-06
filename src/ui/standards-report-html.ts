@@ -17,13 +17,32 @@ import {
   SCANNER_PROMOTION_WARNING, StandardsFinding, StandardsReport, StandardsRuleOutcome, groupStandardsRules, isBlockingNotChecked,
   NO_BLOCKING_RULES, promotedScannerRules, ruleOutcomeLabel, severityOf, standardsBlockingState,
 } from '../standards/checker';
-import { isStandardsGateCommand } from '../models/requirement-trace';
+import { isStandardsGateCommand, standardsGateWord } from '../models/requirement-trace';
 import { StandardsCheckCounts } from '../models/types';
 
 /** Most findings spelled out per group; the heading always carries the true count. */
 const MAX_FINDINGS_SHOWN = 100;
 /** Most not-checked files spelled out; the heading always carries the true count. */
 const MAX_FILES_SHOWN = 100;
+
+// ─── Colours ───
+
+/**
+ * The colours this module writes inline. Each is a design-system token with a fallback:
+ *
+ *   - inside MOAG — a webview whose stylesheet includes `designSystemCssTokens()` — the
+ *     `--ds-*` token is defined and the markup follows the user's VS Code theme;
+ *   - in the standalone report (`.moag/verification-<ts>.html`, opened in the system
+ *     browser) no `--ds-*` token exists, because there is no VS Code theme to map onto. The
+ *     value after the comma is used, and it is the colour that report has always had.
+ *
+ * The fallbacks are the only raw colours in this file; nothing else may add one.
+ */
+export const REPORT_COLOR = {
+  pass: 'var(--ds-success, #28a745)',
+  fail: 'var(--ds-error, #dc3545)',
+  muted: 'var(--ds-muted, #999)',
+} as const;
 
 function escapeHtml(text: string): string {
   return text
@@ -98,13 +117,14 @@ export interface GateStatus {
 
 /**
  * The words for one gate row. A command says pass / fail / timeout. The synthetic
- * `moag:standards` row is not a command and is never said to have passed: when nothing in it
- * stopped the release it says "no blocking rules configured" (the profile has no command and
- * no promoted rule) or "nothing blocking", in a neutral tone.
+ * `moag:standards` row is not a command and is never said to have passed or failed: it says
+ * what `standardsGateWord` says on every surface — "stopped" when it stopped the release,
+ * else "no blocking rules configured" (the profile has no command and no promoted rule) or
+ * "nothing blocking", in a neutral tone.
  */
 export function gateStatus(gate: Pick<GateRowInput, 'command' | 'passed' | 'timedOut' | 'standardsCounts'>): GateStatus {
-  if (isStandardsGateCommand(gate.command) && gate.passed) {
-    return { word: gate.standardsCounts?.noBlockingRules === true ? NO_BLOCKING_RULES : 'nothing blocking', tone: 'neutral' };
+  if (isStandardsGateCommand(gate.command)) {
+    return { word: standardsGateWord(gate.passed, gate.standardsCounts), tone: gate.passed ? 'neutral' : 'fail' };
   }
   if (gate.passed) { return { word: 'pass', tone: 'pass' }; }
   return { word: gate.timedOut ? 'timeout' : 'fail', tone: 'fail' };
@@ -115,7 +135,7 @@ export function verificationGateRows(gates: readonly GateRowInput[]): string {
   return gates.map((gate) => {
     const status = gateStatus(gate);
     // A neutral row takes the text colour: no green for a row that proved nothing.
-    const style = status.tone === 'neutral' ? '' : ` style="color:${status.tone === 'pass' ? '#28a745' : '#dc3545'}"`;
+    const style = status.tone === 'neutral' ? '' : ` style="color:${status.tone === 'pass' ? REPORT_COLOR.pass : REPORT_COLOR.fail}"`;
     const snippet = gate.output
       .split('\n').map((l) => l.trim()).reverse().find((l) => l.length > 0)?.substring(0, 160) ?? '—';
     // The standards row is not a process: it has no exit code to show.
@@ -125,7 +145,7 @@ export function verificationGateRows(gates: readonly GateRowInput[]): string {
       <td${style}>${escapeHtml(status.word)}</td>
       <td>${exit}</td>
       <td>${gate.durationMs}ms</td>
-      <td style="font-size:0.8em;color:#999">${escapeHtml(snippet)}</td>
+      <td style="font-size:0.8em;color:${REPORT_COLOR.muted}">${escapeHtml(snippet)}</td>
     </tr>`;
   }).join('');
 }

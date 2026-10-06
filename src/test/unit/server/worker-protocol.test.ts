@@ -19,6 +19,19 @@ function fold(events: Array<Record<string, unknown>>): RunView {
   return v;
 }
 
+/**
+ * The web run view's `foldEvent`, cut out of the text of web/js/screens/run.js
+ * and evaluated on its own. Works on an LF and on a CRLF copy of that file.
+ */
+function extractWebFoldEvent(source: string): (view: RunView, ev: WorkerEvent) => RunView {
+  const m = /export function foldEvent\(view, ev\) \{[\s\S]*?\r?\n\}\r?\n/.exec(source);
+  assert.ok(m, 'foldEvent found in web/js/screens/run.js');
+  const ctx: { foldEvent?: (v: RunView, e: WorkerEvent) => RunView } = {};
+  vm.runInNewContext(`${m[0].replace('export function', 'function')}\nthis.foldEvent = foldEvent;`, ctx);
+  assert.equal(typeof ctx.foldEvent, 'function');
+  return ctx.foldEvent as (v: RunView, e: WorkerEvent) => RunView;
+}
+
 describe('worker-protocol', () => {
   describe('parseWorkerLine', () => {
     it('ignores non-JSON stray output and non-objects', () => {
@@ -122,33 +135,42 @@ describe('worker-protocol', () => {
       assert.deepEqual(v.tasks, { s: 'skipped', b: 'blocked', c: 'completed', f: 'failed', x: 'completed', y: 'failed', z: 'completed' });
     });
 
-    it('the web run view folds every event exactly like the server', () => {
-      const src = fs.readFileSync(path.resolve(__dirname, '..', '..', '..', '..', 'web', 'js', 'screens', 'run.js'), 'utf-8');
-      const m = /export function foldEvent\(view, ev\) \{[\s\S]*?\n\}\n/.exec(src);
-      assert.ok(m, 'foldEvent found in web/js/screens/run.js');
-      const ctx: { foldEvent?: (v: unknown, e: unknown) => RunView } = {};
-      vm.runInNewContext(`${m[0].replace('export function', 'function')}\nthis.foldEvent = foldEvent;`, ctx);
-      const events: Array<Record<string, unknown>> = [
-        { event: 'state', state: 'playing' },
-        { event: 'task-started', id: 'a', name: 'A' },
-        { event: 'task-completed', id: 'a', name: 'A', status: 'completed' },
-        { event: 'task-completed', id: 's', name: 'S', status: 'skipped' },
-        { event: 'task-failed', id: 'b', name: 'B', status: 'blocked' },
-        { event: 'task-failed', id: 'f', name: 'F' },
-        { event: 'cost', usd: 0.5 },
-        { event: 'manual-gate', id: 'g', name: 'G' },
-        { event: 'budget-exceeded', totalCost: 2, budget: 1 },
-      ];
-      let server = emptyRunView();
-      let web = emptyRunView();
-      for (const e of events) {
-        const parsed = parseWorkerLine(JSON.stringify(e)) as WorkerEvent;
-        server = foldRunEvent(server, parsed);
-        web = ctx.foldEvent!(web, parsed);
-      }
-      assert.deepEqual(JSON.parse(JSON.stringify(web)), JSON.parse(JSON.stringify(server)));
-      assert.equal(web.tasks.s, 'skipped');
-      assert.equal(web.tasks.b, 'blocked');
+    // The web copy of the fold is read out of web/js/screens/run.js as text. A
+    // checkout may hold that file with CRLF (Git for Windows defaults to
+    // core.autocrlf=true), so the extraction is run against both renditions.
+    for (const [label, eolOf] of [['LF', '\n'], ['CRLF', '\r\n']] as const) {
+      it(`the web run view folds every event exactly like the server (${label} checkout)`, () => {
+        const onDisk = fs.readFileSync(path.resolve(__dirname, '..', '..', '..', '..', 'web', 'js', 'screens', 'run.js'), 'utf-8');
+        const src = onDisk.replace(/\r\n/g, '\n').replace(/\n/g, eolOf);
+        assert.equal(src.includes('\r\n'), eolOf === '\r\n', `the source under test is ${label}`);
+        const webFold = extractWebFoldEvent(src);
+        const events: Array<Record<string, unknown>> = [
+          { event: 'state', state: 'playing' },
+          { event: 'task-started', id: 'a', name: 'A' },
+          { event: 'task-completed', id: 'a', name: 'A', status: 'completed' },
+          { event: 'task-completed', id: 's', name: 'S', status: 'skipped' },
+          { event: 'task-failed', id: 'b', name: 'B', status: 'blocked' },
+          { event: 'task-failed', id: 'f', name: 'F' },
+          { event: 'cost', usd: 0.5 },
+          { event: 'manual-gate', id: 'g', name: 'G' },
+          { event: 'budget-exceeded', totalCost: 2, budget: 1 },
+        ];
+        let server = emptyRunView();
+        let web = emptyRunView();
+        for (const e of events) {
+          const parsed = parseWorkerLine(JSON.stringify(e)) as WorkerEvent;
+          server = foldRunEvent(server, parsed);
+          web = webFold(web, parsed);
+        }
+        assert.deepEqual(JSON.parse(JSON.stringify(web)), JSON.parse(JSON.stringify(server)));
+        assert.equal(web.tasks.s, 'skipped');
+        assert.equal(web.tasks.b, 'blocked');
+      });
+    }
+
+    it('reports a web source without foldEvent instead of comparing nothing', () => {
+      assert.throws(() => extractWebFoldEvent('export function somethingElse(view, ev) {\n  return view;\n}\n'), /foldEvent found in web\/js\/screens\/run\.js/);
+      assert.throws(() => extractWebFoldEvent(''), /foldEvent found in web\/js\/screens\/run\.js/);
     });
 
     it('sums cost events', () => {

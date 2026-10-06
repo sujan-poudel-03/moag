@@ -1,0 +1,10 @@
+# Line endings.
+#
+# Git for Windows ships core.autocrlf=true, which checks every text file out
+# with CRLF. Parts of the unit suite read source files as text (to compare the
+# web front-end with the server, to check a shipped script), so a CRLF checkout
+# changed what those tests saw. Source is LF in the repository and stays LF in
+# every working tree, whatever core.autocrlf says. `text=auto` keeps git's
+# binary detection, so a binary file added under these folders is left alone.
+src/** text=auto eol=lf
+web/** text=auto eol=lf

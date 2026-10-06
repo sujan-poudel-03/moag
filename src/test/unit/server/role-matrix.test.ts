@@ -158,6 +158,14 @@ describe('role matrix (ROUTES × WEB_ROLES)', function () {
     assert.equal(canPerform({ id: 'a', roles: ['admin'] }, 'plan.cancel', { requestedBy: 'u2', planStatus: 'pending' }), true);
     assert.equal(canPerform(po, 'plan.cancel', { requestedBy: 'u1', planStatus: 'approved' }), false);
     const rev = { id: 'r', roles: ['reviewer' as const] };
+    // A plan the review rules refuse today: approving and starting are off, rejecting and cancelling stay.
+    assert.equal(canPerform(rev, 'plan.approve', { planStatus: 'pending', reviewPasses: false }), false);
+    assert.equal(canPerform(rev, 'plan.approve', { planStatus: 'pending', reviewPasses: true }), true);
+    assert.equal(canPerform(rev, 'plan.approve', { planStatus: 'pending' }), true, 'unknown is not a refusal');
+    assert.equal(canPerform(rev, 'plan.reject', { planStatus: 'pending', reviewPasses: false }), true, 'the way out stays open');
+    assert.equal(canPerform(po, 'plan.cancel', { requestedBy: 'u1', planStatus: 'pending', reviewPasses: false }), true);
+    assert.equal(canPerform(rev, 'run.start', { planStatus: 'approved', reviewPasses: false }), false);
+    assert.equal(canPerform(rev, 'run.start', { planStatus: 'approved', reviewPasses: true }), true);
     assert.equal(canPerform(rev, 'run.stop', { runnerState: 'playing' }), true);
     assert.equal(canPerform(rev, 'run.stop', { runnerState: 'paused' }), true);
     assert.equal(canPerform(rev, 'run.stop', { runnerState: 'idle' }), false);

@@ -373,7 +373,11 @@ describe('standards proposal — stack mapping and safety', () => {
     }
   });
 
-  it('starts no process at all: detection reads files, and a proposal reads nothing', () => {
+  it('starts no process at all: detection reads files, and a proposal reads nothing', function () {
+    // '@global' makes proxyquire load both module graphs afresh, and ts-node
+    // compiles them again. Late in the full suite on Node 20 that alone runs
+    // past mocha's 2 s default (288 ms when this file runs on its own).
+    this.timeout(30_000);
     const spawn = sinon.spy();
     const execSync = sinon.spy();
     const execFile = sinon.spy();

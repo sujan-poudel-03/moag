@@ -271,6 +271,44 @@ describe('headless CLI: moag trace', () => {
     }
   });
 
+  it('says what the standards row means on each line: a word and its counts, never just "exit 0"', () => {
+    const dir = tmpDir();
+    dirs.push(dir);
+    const planFile = path.join(dir, 'plan.json');
+    const at = '2026-10-04T00:00:00.000Z';
+    const counts = { advisoryFindings: 3, notCheckedRules: 0, notCheckedFiles: 1, noBlockingRules: true };
+    fs.writeFileSync(planFile, JSON.stringify({
+      version: '1.0', name: 'p',
+      prdVersions: [{ version: '1.0.0', text: '## Requirements\n- [R-1] login\n- [R-2] logout\n', createdAt: at }],
+      playlists: [{ id: 'pl', name: 'Build', tasks: [
+        { id: 't-1', name: 't', prompt: 'p', status: 'completed', requirementIds: ['R-1'] },
+        { id: 't-2', name: 't', prompt: 'p', status: 'completed', requirementIds: ['R-2'] },
+      ] }],
+      requirementTrace: [
+        { id: 'R-1', taskIds: ['t-1'], commits: [], releases: [], gates: [
+          { command: 'moag:standards v2', exitCode: 0, timedOut: false, at, standardsCounts: counts },
+          { command: 'npm test', exitCode: 0, timedOut: false, at },
+        ] },
+        { id: 'R-2', taskIds: ['t-2'], commits: [], releases: [], gates: [{ command: 'moag:standards v2', exitCode: 1, timedOut: false, at }] },
+      ],
+    }));
+    const lines: string[] = [];
+    const stdout = sinon.stub(process.stdout, 'write').callsFake((chunk: unknown) => { lines.push(String(chunk)); return true; });
+    let code: number;
+    try {
+      code = cmdTrace(parseArgs(['trace', '--plan', planFile]));
+    } finally {
+      stdout.restore();
+    }
+    assert.equal(code, 0);
+    const rows = lines.map((l) => JSON.parse(l));
+    assert.deepEqual(rows[0].gates, [
+      { command: 'moag:standards v2', exitCode: 0, standards: 'no blocking rules configured', standardsCounts: counts },
+      { command: 'npm test', exitCode: 0 },
+    ]);
+    assert.deepEqual(rows[1].gates, [{ command: 'moag:standards v2', exitCode: 1, standards: 'stopped' }]);
+  });
+
   it('emits blockedBy on a not-shipped row', () => {
     const dir = tmpDir();
     dirs.push(dir);
@@ -598,7 +636,7 @@ describe('headless CLI: verify and the standards gate', () => {
           return {
             run: async () => ({
               passed: true, score: 100, haltReason: null, failedGate: null, iterations: 1, modelCallsMade: 1,
-              gateCommandsEmpty: false, uatRan: false, uatSkipReason: null, changedFiles: [], standards: null,
+              gateCommandsEmpty: false, uatRan: false, uatSkipReason: null, changedFiles: [], standards: null, gates: [],
               ...spy.report,
             }),
             noteManualGate: () => undefined,
@@ -608,6 +646,9 @@ describe('headless CLI: verify and the standards gate', () => {
       },
       '../runner/evidence': {
         detectPrdFile: () => null,
+        // The real wording of a stored gate: this stub replaces the whole module.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        gatesForStoredReport: require('../../../runner/evidence').gatesForStoredReport,
         captureBaseRef: async () => null,
         // Each call returns the next ref, the way HEAD moves when a run commits.
         captureHeadRef: async () => {
@@ -757,6 +798,30 @@ describe('headless CLI: verify and the standards gate', () => {
     assert.equal(ev.contentHash, profileHash(held.profile), 'the attestation is of the profile really used');
     assert.equal(ev.recordedBaseRef, 'f00dfeed');
     assert.equal(fs.existsSync(baseFile), true, 'the workspace base belongs to local runs');
+  });
+
+  it('the stored verification report words the standards row and never stores it as a bare pass; commands are kept whole', async () => {
+    const { dir, planFile } = workspace();
+    const counts = { advisoryFindings: 2, notCheckedRules: 0, notCheckedFiles: 1, noBlockingRules: true };
+    const gates = [
+      { command: 'moag:standards v7', exitCode: 0, passed: true, output: 'Project standards: no blocking rules configured', durationMs: 4, timedOut: false, standardsCounts: counts },
+      { command: 'npm test', exitCode: 0, passed: true, output: 'ok', durationMs: 9, timedOut: false },
+    ];
+    const spy = spyOf({ report: { gates } });
+    const code = await loadCli(spy).runVerifyCore(parseArgs(['verify', planFile, '--cwd', dir, '--no-standards']), ctxFor(spy), loadPlan(planFile),
+      { manualGateHit: () => false, manualGateTaskId: () => null, budgetHit: () => false }, 'plan');
+    assert.equal(code, 0);
+    assert.deepEqual(events('error'), [], 'the report was written');
+    const files = fs.readdirSync(path.join(dir, '.moag')).filter((f) => /^verification-\d+\.json$/.test(f));
+    assert.equal(files.length, 1);
+    const stored = JSON.parse(fs.readFileSync(path.join(dir, '.moag', files[0]), 'utf-8')) as { passed: boolean; gates: Array<Record<string, unknown>> };
+    assert.equal(stored.passed, true, 'the verdict of the whole verification is untouched');
+    assert.deepEqual(stored.gates[0], {
+      command: 'moag:standards v7', exitCode: 0, output: 'Project standards: no blocking rules configured', durationMs: 4, timedOut: false,
+      standardsCounts: counts, standards: 'no blocking rules configured', standardsOpen: '2 advisory findings · 1 file not checked',
+    });
+    assert.equal('passed' in stored.gates[0], false);
+    assert.deepEqual(stored.gates[1], gates[1], 'a command keeps passed: true');
   });
 
   it('--no-standards turns the gate off even when the workspace has a standards file', async () => {

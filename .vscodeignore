@@ -15,6 +15,7 @@ node_modules/@types/**
 node_modules/**/*.ts
 node_modules/**/*.map
 .gitignore
+.gitattributes
 tsconfig.json
 tsconfig.test.json
 .vscode-test.mjs

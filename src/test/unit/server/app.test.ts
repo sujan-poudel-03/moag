@@ -861,6 +861,106 @@ describe('server app', function () {
     assert.equal(h.workers.length, spawned + 1);
   });
 
+  // ─── The plan card is drawn from today's review, not from the one stored with the plan ───
+
+  type PlanCard = {
+    id: string; status: string; allowedActions: string[]; startBlockedReason?: string | null; startBlockedErrors?: string[];
+    review?: { ok: boolean; errors: string[]; commands: unknown[] };
+  };
+  const planCard = async (projectId: string, as: string): Promise<PlanCard> => {
+    const r = await h.request('GET', `/api/projects/${projectId}`, { as });
+    assert.equal(r.status, 200, r.raw);
+    return (r.body.plans as PlanCard[])[0];
+  };
+
+  it('plan DTO: a stored pending plan a review rule now refuses is sent as failing review, with no plan.approve; reject and cancel stay', async () => {
+    const { id, planId, hash } = await legacyPendingPlan((pl) => { pl.parallel = true; });
+    const seen = await planCard(id, 'reviewer');
+    assert.equal(seen.status, 'pending');
+    assert.equal(seen.review?.ok, false, 'the card shows the review of today');
+    assert.match(seen.review!.errors.join(' '), /runs its tasks in parallel.*one engine call at a time/);
+    assert.deepEqual(seen.allowedActions, ['plan.reject'], 'no Approve button for a plan the approve route refuses');
+    assert.deepEqual((await planCard(id, 'po')).allowedActions, ['plan.cancel'], 'the requester can still cancel it');
+    assert.ok(Array.isArray(seen.review!.commands), 'the rest of the stored review is kept');
+    assert.equal(h.state.load(id).plans[0].review?.ok, true, 'nothing is written back: the DTO is derived on read');
+    // The DTO and the guard agree: the click the card no longer offers would have been refused, for the same reasons.
+    const r = await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    assert.equal(r.status, 409, r.raw);
+    assert.deepEqual(r.body.errors, seen.review!.errors);
+    // Without the flag the same plan is offered for approval again.
+    h.state.update(id, (s) => { const p = s.plans[0]; delete (p.playlist as unknown as Record<string, unknown>).parallel; p.contentHash = contentHash(p.playlist); });
+    const clean = await planCard(id, 'reviewer');
+    assert.equal(clean.review?.ok, true);
+    assert.deepEqual(clean.allowedActions, ['plan.approve', 'plan.reject']);
+  });
+
+  it('plan DTO: a pending plan with a cwd outside the workspace or a forbidden engine is not offered for approval either', async () => {
+    const cwd = await legacyPendingPlan((pl) => { (pl.tasks as Array<Record<string, unknown>>)[0].cwd = '../other-project'; });
+    const seen = await planCard(cwd.id, 'reviewer');
+    assert.equal(seen.review?.ok, false);
+    assert.match(seen.review!.errors.join(' '), /outside the project workspace/);
+    assert.deepEqual(seen.allowedActions, ['plan.reject']);
+    await h.close();
+    h = await startHarness();
+    const eng = await legacyPendingPlan((pl) => { (pl.tasks as Array<Record<string, unknown>>)[0].engine = 'copilot'; });
+    const forbidden = await planCard(eng.id, 'reviewer');
+    assert.equal(forbidden.review?.ok, false);
+    assert.deepEqual(forbidden.allowedActions, ['plan.reject']);
+  });
+
+  it('plan DTO: an approved plan a review rule now refuses offers no run.start and says why (review-errors, with the errors)', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    assert.deepEqual((await planCard(projectId, 'reviewer')).allowedActions, ['run.start'], 'offered while the plan passes');
+    assert.equal((await planCard(projectId, 'reviewer')).startBlockedReason, null);
+    assert.equal('startBlockedErrors' in (await planCard(projectId, 'reviewer')), false);
+    const setParallel = (where: 'review' | 'canonical', on: boolean): void => {
+      if (where === 'review') {
+        h.state.update(projectId, (s) => {
+          const pl = s.plans[0].playlist as unknown as Record<string, unknown>;
+          if (on) { pl.parallel = true; } else { delete pl.parallel; }
+        });
+        return;
+      }
+      const canonical = h.state.loadCanonicalPlan(projectId, 'Acme', 'claude');
+      canonical.playlists[h.state.load(projectId).plans[0].playlistIndex!].parallel = on ? true : undefined;
+      h.state.saveCanonicalPlan(projectId, canonical, 'claude');
+    };
+    const blocked = async (what: string): Promise<void> => {
+      for (const as of ['reviewer', 'admin']) {
+        const card = await planCard(projectId, as);
+        assert.deepEqual(card.allowedActions, [], `${what}, ${as}: no Start run`);
+        assert.equal(card.startBlockedReason, 'review-errors', what);
+        assert.match((card.startBlockedErrors ?? []).join(' '), /runs its tasks in parallel/, what);
+      }
+      // The DTO mirrors the guard: the same errors the start route answers with.
+      const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+      assert.equal(r.status, 409, `${what}: ${r.raw}`);
+      assert.equal(r.body.error, 'review-errors', what);
+      assert.deepEqual(r.body.errors, (await planCard(projectId, 'reviewer')).startBlockedErrors, what);
+    };
+    // Either copy of the playlist is enough, as it is for the start route.
+    setParallel('review', true);
+    await blocked('only the approved playlist is parallel');
+    setParallel('canonical', true);
+    await blocked('both copies parallel');
+    setParallel('review', false);
+    await blocked('only the canonical playlist is parallel');
+    setParallel('canonical', false);
+    const ok = await planCard(projectId, 'reviewer');
+    assert.deepEqual([ok.allowedActions, ok.startBlockedReason], [['run.start'], null], 'offered again once the plan passes');
+    assert.equal('startBlockedErrors' in ok, false);
+  });
+
+  it('plan DTO: a reason checked before the review keeps its place — a job in flight is still job-active', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    h.state.update(projectId, (s) => { (s.plans[0].playlist as unknown as Record<string, unknown>).parallel = true; });
+    const card = await planCard(projectId, 'reviewer');
+    assert.equal(card.startBlockedReason, 'job-active');
+    assert.equal('startBlockedErrors' in card, false, 'the errors ride only with their own reason');
+    assert.deepEqual(card.allowedActions, []);
+  });
+
   // ─── Runs ───
 
   it('starting a run on an unapproved plan is 409 and spawns nothing', async () => {
@@ -1013,6 +1113,72 @@ describe('server app', function () {
     assert.equal(h.auditEntries().filter((e) => e.action === 'gate.skip').length, 0);
     const twice = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
     assert.equal(twice.status, 409);
+  });
+
+  it('a gate decision that resumes the run re-runs plan review: a legacy parallel run halted at its gate cannot be approved or skipped, only rejected', async () => {
+    const { projectId, runId } = await haltAtGate();
+    const snapPath = path.join(h.state.runDir(projectId, runId), 'plan.json');
+    const setParallel = (where: 'review' | 'snapshot', on: boolean): void => {
+      if (where === 'review') {
+        h.state.update(projectId, (s) => {
+          const pl = s.plans[0].playlist as unknown as Record<string, unknown>;
+          if (on) { pl.parallel = true; } else { delete pl.parallel; }
+        });
+        return;
+      }
+      const snap = JSON.parse(fs.readFileSync(snapPath, 'utf-8'));
+      const pl = snap.playlists[h.state.load(projectId).plans[0].playlistIndex!];
+      if (on) { pl.parallel = true; } else { delete pl.parallel; }
+      fs.writeFileSync(snapPath, JSON.stringify(snap));
+    };
+    const spawned = h.workers.length;
+    const refused = async (kind: 'approve' | 'skip', what: string): Promise<void> => {
+      const before = fs.readFileSync(snapPath, 'utf-8');
+      const r = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/${kind}`, { as: kind === 'skip' ? 'admin' : 'approver', body: kind === 'skip' ? { reason: 'hotfix' } : {} });
+      assert.equal(r.status, 409, `${what}, ${kind}: ${r.raw}`);
+      assert.equal(r.body.error, 'review-errors', `${what}, ${kind}`);
+      assert.match(String(r.body.message), /^This plan no longer passes review, so the run cannot resume\. Reject the ship and request a new plan\. .*runs its tasks in parallel/, what);
+      assert.ok(Array.isArray(r.body.errors) && (r.body.errors as string[]).length > 0, what);
+      assert.equal(h.workers.length, spawned, `${what}, ${kind}: no segment was spawned`);
+      const run = h.state.load(projectId).runs[0];
+      assert.equal(run.status, 'awaiting-approval', `${what}, ${kind}: still waiting`);
+      assert.equal(run.segments, 1, what);
+      assert.ok(run.gate, 'the gate is still open');
+      assert.deepEqual(run.gateDecisions ?? [], [], 'no decision was recorded');
+      assert.equal(fs.readFileSync(snapPath, 'utf-8'), before, `${what}, ${kind}: the snapshot was not rewritten`);
+      assert.equal(h.auditEntries().some((e) => e.action === 'gate.approve' || e.action === 'gate.skip'), false, what);
+    };
+    // As a run started before the rule existed looks: the approved playlist and the snapshot the segment loads are parallel.
+    setParallel('review', true);
+    setParallel('snapshot', true);
+    await refused('approve', 'both copies parallel');
+    await refused('skip', 'both copies parallel');
+    // Either copy alone is enough: the next segment loads the snapshot.
+    setParallel('review', false);
+    await refused('approve', 'only the snapshot is parallel');
+    await refused('skip', 'only the snapshot is parallel');
+    setParallel('review', true);
+    setParallel('snapshot', false);
+    await refused('approve', 'only the approved playlist is parallel');
+    // The way out: rejecting the ship is not a resume, and stays possible.
+    const rejected = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/reject`, { as: 'approver', body: { note: 'plan no longer passes review' } });
+    assert.equal(rejected.status, 200, rejected.raw);
+    assert.equal(h.state.load(projectId).runs[0].status, 'ship-rejected');
+    assert.equal(h.workers.length, spawned);
+  });
+
+  it('a gate resume of a plan that still passes review goes through once the flag is gone: the flag is what was refused', async () => {
+    const { projectId, runId } = await haltAtGate();
+    h.state.update(projectId, (s) => { (s.plans[0].playlist as unknown as Record<string, unknown>).parallel = true; });
+    const spawned = h.workers.length;
+    const no = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(no.status, 409, no.raw);
+    assert.equal(no.body.error, 'review-errors');
+    h.state.update(projectId, (s) => { delete (s.plans[0].playlist as unknown as Record<string, unknown>).parallel; });
+    const ok = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(ok.status, 202, ok.raw);
+    assert.equal(h.workers.length, spawned + 1);
+    assert.equal(h.state.load(projectId).runs[0].status, 'running');
   });
 
   it('the default engine is locked at approval: a changed engine hides run.start and the start is 409', async () => {

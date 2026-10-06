@@ -3,10 +3,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   latestRequirements, taggedTasks, recordGateResults, recordCommit, stampRelease, requirementStatuses, standardsGateCommand,
+  isStandardsGateCommand, standardsGateWord, standardsOpenText, STANDARDS_GATE_COMMAND,
   MAX_TRACE_COMMITS, MAX_TRACE_RELEASES, MAX_TRACE_GATES,
 } from '../../../models/requirement-trace';
 import { Plan, Task, TaskStatus, TaskType } from '../../../models/types';
 import { createEmptyPlan } from '../../../models/plan';
+import { NO_BLOCKING_RULES } from '../../../standards/checker';
 
 // ─── Fixtures ───
 
@@ -481,6 +483,86 @@ describe('requirement-trace — standards version on the release', () => {
       assert.equal(plan.requirementTrace![0].releases[0].standardsVersion, 3);
       assert.equal('standardsCounts' in plan.requirementTrace![0].releases[0], false);
       assert.equal(row(plan, 'R-1').standardsCounts, null);
+    });
+  });
+
+  // The status row is what the hosted trace and `moag trace` send: a standards row that only
+  // said "exit 0" there read as a pass, and could not say "no blocking rules configured".
+  describe('the status row carries what the standards row means, not just its exit code', () => {
+    const NONE = { advisoryFindings: 1, notCheckedRules: 0, notCheckedFiles: 2, noBlockingRules: true as const };
+    const SOME = { advisoryFindings: 4, notCheckedRules: 2, notCheckedFiles: 7 };
+    const gatesOf = (gates: Parameters<typeof recordGateResults>[1]) => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, gates, AT);
+      return { plan, gates: row(plan, 'R-1').gates };
+    };
+
+    it('a profile with no blocking set: the row says "no blocking rules configured" and carries its counts', () => {
+      const { plan, gates } = gatesOf([{ command: standardsGateCommand(3), exitCode: 0, timedOut: false, standardsCounts: NONE }, ...pass]);
+      assert.deepEqual(gates, [
+        { command: 'moag:standards v3', exitCode: 0, standards: 'no blocking rules configured', standardsCounts: NONE },
+        { command: 'npm test', exitCode: 0 },
+      ]);
+      assert.notEqual(gates[0].standardsCounts, plan.requirementTrace![0].gates[0].standardsCounts, 'a copy: the plan is not handed out');
+    });
+
+    it('a blocking set that was evaluated says "nothing blocking"; a row recorded without counts says so too, and has no counts key', () => {
+      assert.deepEqual(gatesOf([{ command: standardsGateCommand(3), exitCode: 0, timedOut: false, standardsCounts: SOME }]).gates,
+        [{ command: 'moag:standards v3', exitCode: 0, standards: 'nothing blocking', standardsCounts: SOME }]);
+      assert.deepEqual(gatesOf([{ command: standardsGateCommand(null), exitCode: 0, timedOut: false }]).gates,
+        [{ command: 'moag:standards', exitCode: 0, standards: 'nothing blocking' }]);
+    });
+
+    it('a standards row that stopped the release says "stopped" — whatever counts it carries, and when it timed out', () => {
+      assert.deepEqual(gatesOf([{ command: standardsGateCommand(3), exitCode: 1, timedOut: false }, ...pass]).gates[0],
+        { command: 'moag:standards v3', exitCode: 1, standards: 'stopped' });
+      assert.equal(gatesOf([{ command: standardsGateCommand(3), exitCode: 1, timedOut: false, standardsCounts: NONE }]).gates[0].standards, 'stopped');
+      assert.equal(gatesOf([{ command: standardsGateCommand(3), exitCode: 0, timedOut: true, standardsCounts: NONE }]).gates[0].standards, 'stopped');
+    });
+
+    it('a real command never gets either key — not even one that mentions the name or was recorded with counts', () => {
+      const { gates } = gatesOf([
+        { command: 'npm test', exitCode: 0, timedOut: false, standardsCounts: NONE },
+        { command: 'echo moag:standards v3', exitCode: 0, timedOut: false, standardsCounts: NONE },
+      ]);
+      assert.deepEqual(gates, [{ command: 'npm test', exitCode: 0 }, { command: 'echo moag:standards v3', exitCode: 0 }]);
+    });
+
+    it('nothing but numbers leaves through the row: a file name smuggled into the stored counts is dropped', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, [{ command: standardsGateCommand(3), exitCode: 0, timedOut: false, standardsCounts: SOME }], AT);
+      (plan.requirementTrace![0].gates[0].standardsCounts as unknown as Record<string, unknown>).file = 'src/secret.ts';
+      assert.deepEqual(row(plan, 'R-1').gates[0].standardsCounts, SOME);
+    });
+
+    it('standardsGateWord: the three words, and the one for no blocking set is the one the checker exports', () => {
+      assert.equal(standardsGateWord(false), 'stopped');
+      assert.equal(standardsGateWord(false, NONE), 'stopped');
+      assert.equal(standardsGateWord(true, NONE), NO_BLOCKING_RULES);
+      assert.equal(standardsGateWord(true, SOME), 'nothing blocking');
+      assert.equal(standardsGateWord(true), 'nothing blocking');
+      assert.equal(standardsGateWord(true, null), 'nothing blocking');
+      assert.equal(standardsGateWord(true, { ...SOME, noBlockingRules: 'yes' } as unknown as typeof NONE), 'nothing blocking', 'only the literal true');
+    });
+
+    it('standardsOpenText: counts in words, zeros left out, nothing for nothing', () => {
+      assert.equal(standardsOpenText(SOME), '4 advisory findings · 2 rules not checked · 7 files not checked');
+      assert.equal(standardsOpenText({ advisoryFindings: 1, notCheckedRules: 1, notCheckedFiles: 1 }), '1 advisory finding · 1 rule not checked · 1 file not checked');
+      assert.equal(standardsOpenText({ advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0 }), '');
+      assert.equal(standardsOpenText(undefined), '');
+      assert.equal(standardsOpenText(null), '');
+      assert.equal(standardsOpenText({ advisoryFindings: -1, notCheckedRules: 1.5, notCheckedFiles: Number.NaN }), '', 'a malformed count says nothing rather than something wrong');
+    });
+
+    it('isStandardsGateCommand is the exported pattern, and matches the exact synthetic name only', () => {
+      for (const name of ['moag:standards', 'moag:standards v1', 'moag:standards v12']) {
+        assert.equal(isStandardsGateCommand(name), true, name);
+        assert.equal(STANDARDS_GATE_COMMAND.test(name), true, name);
+      }
+      for (const name of ['moag:standardsx', 'moag:standards v', 'moag:standards v1 ', ' moag:standards', 'moag:standards v1.2', 'echo moag:standards', 'moag:standards v3 && npm test', '']) {
+        assert.equal(isStandardsGateCommand(name), false, JSON.stringify(name));
+      }
+      assert.equal(STANDARDS_GATE_COMMAND.global || STANDARDS_GATE_COMMAND.sticky, false, 'no lastIndex state between calls');
     });
   });
 

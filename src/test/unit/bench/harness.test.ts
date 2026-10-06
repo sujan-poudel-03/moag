@@ -304,12 +304,31 @@ describe('bench harness (scripted workers behind the real app)', function () {
       const lockPath = h.app.jobs.lockPath(h.projects.list()[0].id);
       fs.mkdirSync(path.dirname(lockPath), { recursive: true });
       fs.writeFileSync(lockPath, JSON.stringify({ serverPid: process.pid, workerPid: 999991, taskPids: [31337] }));
-      setTimeout(() => { liveLockPid = null; }, 150);
     };
-    const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({ onGates }));
+    // No timer decides when the lock is released: the task process "exits" inside the bench's
+    // own second lock-retry wait. The sequence is therefore fixed whatever the machine's speed:
+    // approve → 409 → wait → approve → 409 (lock-wait recorded) → wait, lock released → approve → 202.
+    // The retry wait is told apart from the poll wait by its own duration; the retry window is
+    // far longer than the test, so the clock never ends it.
+    const LOCK_RETRY_MS = 7;
+    const lockWaits: number[] = [];
+    const sleep = async (ms: number): Promise<void> => {
+      if (ms === LOCK_RETRY_MS) {
+        lockWaits.push(ms);
+        if (lockWaits.length === 2) { liveLockPid = null; }
+        return;
+      }
+      await new Promise<void>((res) => setTimeout(res, ms));
+    };
+    const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet },
+      deps({ onGates, sleep, lockRetryMs: LOCK_RETRY_MS, lockRetryMaxMs: 60 * 60_000 }));
     const v = r.summary!.versions[0];
     assert.equal(v.outcome, 'shipped', JSON.stringify(v));
-    assert.ok(v.interventions.unplanned.some((i) => i.kind === 'lock-wait'), JSON.stringify(v.interventions));
+    assert.equal(lockWaits.length, 2, 'exactly two refusals were waited out before the approval went through');
+    assert.deepEqual(v.interventions.unplanned.filter((i) => i.kind === 'lock-wait').map((i) => i.detail),
+      ['gate approve got 409 project-locked; waiting for the previous task processes to exit'], JSON.stringify(v.interventions));
+    assert.deepEqual(v.interventions.required.map((i) => i.kind), ['plan-approval', 'ship-approval']);
+    assert.equal(h.auditEntries().filter((e) => e.action === 'gate.approve').length, 1, 'approved once, after the lock was free');
     assert.equal(h.auditEntries().some((e) => e.action === 'job.lock-force-release'), false, 'the bench never force-releases');
   });
 

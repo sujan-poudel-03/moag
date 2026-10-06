@@ -19,6 +19,8 @@ const mockEngineResult: EngineResult = {
 
 let engineRunStub: sinon.SinonStub;
 let spawnStub: sinon.SinonStub;
+/** Every process the runner asked to have killed, through the stubbed `utils/process-kill`. */
+let killProcessStub: sinon.SinonStub;
 
 function createSpawnProc(options?: {
   stdoutChunks?: string[];
@@ -80,6 +82,9 @@ function createSpawnProc(options?: {
   // Expose handler maps for tests that need to emit service output after spawn.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (proc as any).__stdoutHandlers = stdoutHandlers;
+  // Emit a process event (`close`, `error`) to whatever is listening right now.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (proc as any).__emit = (event: string, ...args: unknown[]) => { [...(handlers[event] || [])].forEach(h => h(...args)); };
 
   if (!options?.keepOpen) {
     setTimeout(() => {
@@ -123,6 +128,11 @@ function buildRunner(routingOverrides?: {
   const historyStore = createMockHistoryStore();
   const mockEngine = createMockEngine();
   spawnStub = sinon.stub().callsFake(() => createSpawnProc());
+  // The real helper shells out (`taskkill /pid <pid> /T /F` on Windows, a group signal on
+  // POSIX) with its OWN child_process import, which the stub below does not reach: left in
+  // place it spends real process-spawn time inside a test and aims a real kill at the fake
+  // pid 1234. Here it only marks the fake process killed, as a real kill would.
+  killProcessStub = sinon.stub().callsFake((proc: { kill?: () => void }) => { proc.kill?.(); });
 
   let lastEngineId: string | undefined;
 
@@ -136,6 +146,7 @@ function buildRunner(routingOverrides?: {
       getContextSettings: () => ({ enabled: false }),
     },
     'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+    '../utils/process-kill': { killProcess: killProcessStub, SPAWN_DETACHED: false },
     ...(routingOverrides ?? {}),
   });
 
@@ -464,17 +475,25 @@ describe('TaskRunner', () => {
   it('should keep a service task running after it becomes ready', async () => {
     const { runner } = buildRunner();
     const serviceProc = createSpawnProc({ keepOpen: true });
+    // No real time decides this test. The runner polls readiness on an interval; only that
+    // interval is faked (the git stub above still closes on a real timer), and the test fires
+    // it itself. Before, a 10 ms timer raced a 400 ms poll against mocha's 2 s limit.
+    const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    let polls = 0;
     spawnStub.callsFake((command: string) => {
       if (command === 'git') {
         return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
       }
-      setTimeout(() => {
+      // runServiceTask attaches its output listeners and starts its readiness poll in the
+      // same synchronous stretch that called spawn(), so by the time this microtask runs
+      // both exist: the service prints its ready line, then the poll fires once.
+      queueMicrotask(() => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const handlers = (serviceProc as any).__stdoutHandlers;
-        if (handlers?.data) {
-          handlers.data.forEach((handler: (...args: unknown[]) => void) => handler(Buffer.from('server ready')));
-        }
-      }, 10);
+        (handlers?.data ?? []).forEach((handler: (...args: unknown[]) => void) => handler(Buffer.from('server ready')));
+        polls = clock.countTimers();
+        clock.next();
+      });
       return serviceProc;
     });
 
@@ -484,11 +503,54 @@ describe('TaskRunner', () => {
     plan.playlists[0].tasks[0].command = 'npm run dev';
     plan.playlists[0].tasks[0].readyPattern = 'server ready';
 
-    await runner.play(plan);
+    try {
+      await runner.play(plan);
 
-    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
-    assert.equal(runner.getRunningServices().length, 1);
-    runner.stopAllServices();
+      assert.equal(polls, 1, 'the readiness poll was the one pending interval when the service printed its line');
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+      assert.equal(runner.getRunningServices().length, 1);
+      assert.equal(clock.countTimers(), 0, 'the poll was cleared once the service was ready');
+      assert.equal(killProcessStub.called, false, 'a ready service is kept, not killed');
+      runner.stopAllServices();
+      assert.equal(killProcessStub.calledOnceWithExactly(serviceProc), true, 'stopping the services kills it, once');
+      assert.equal(runner.getRunningServices().length, 0);
+    } finally {
+      runner.stopAllServices();
+      clock.restore();
+    }
+  });
+
+  it('should fail a service task whose process exits before it is ready, and keep nothing running', async () => {
+    const { runner } = buildRunner();
+    const serviceProc = createSpawnProc({ keepOpen: true });
+    const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    spawnStub.callsFake((command: string) => {
+      if (command === 'git') {
+        return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
+      }
+      // The process dies before any readiness poll fires: same sequencing, no timer.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      queueMicrotask(() => { (serviceProc as any).__emit('close', 3); });
+      return serviceProc;
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'service';
+    plan.playlists[0].tasks[0].command = 'npm run dev';
+    plan.playlists[0].tasks[0].readyPattern = 'server ready';
+
+    try {
+      await runner.play(plan);
+
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+      assert.equal(runner.getRunningServices().length, 0);
+      assert.equal(clock.countTimers(), 0, 'the readiness poll does not outlive the failed start');
+      assert.equal(killProcessStub.calledWith(serviceProc), true, 'what is left of the failed start is killed');
+    } finally {
+      runner.stopAllServices();
+      clock.restore();
+    }
   });
 
   it('should play a single task', async () => {

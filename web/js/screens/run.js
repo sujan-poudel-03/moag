@@ -134,6 +134,38 @@ function totalsLine(t) {
 }
 
 /**
+ * The badge and the frame of the standards card, from the report's totals: `{ text, kind,
+ * card }`, where `kind` is the badge colour and `card` the card's class ('' for a plain one).
+ *
+ * "PASSED" is never the badge: most rows are scans, and a scan does not pass. The green
+ * "✓ NOTHING BLOCKING" is earned only by a command that ran and exited 0 (`t.passed`). When
+ * the blocking set is made only of scanner rules a project promoted, and they found nothing,
+ * nothing was proved: the badge says "NOTHING BLOCKING · NO FINDINGS" in the neutral colour,
+ * with no tick and no green frame. A profile with no command and no promoted rule says so
+ * in so many words.
+ */
+export function standardsBadge(t) {
+  const extras = [
+    t.advisory > 0 ? `${t.advisoryFindings} ADVISORY` : null,
+    // Upper case throughout: `plural` would append a lower-case "s" ("2 FILEs").
+    t.notChecked > 0 ? `${t.notChecked} ${t.notChecked === 1 ? 'RULE' : 'RULES'} NOT CHECKED` : null,
+    t.notCheckedFiles > 0 ? `${t.notCheckedFiles} ${t.notCheckedFiles === 1 ? 'FILE' : 'FILES'} NOT CHECKED` : null,
+  ].filter(Boolean);
+  // Stopped: something blocking failed, or something blocking was never evaluated.
+  if (t.failed > 0) { return { text: `✗ ${t.failed} BLOCKING`, kind: 'error', card: 'card-error' }; }
+  if (t.blockingNotChecked > 0) { return { text: `✗ ${t.blockingNotChecked} BLOCKING NOT CHECKED`, kind: 'error', card: 'card-error' }; }
+  const open = extras.length > 0;
+  if (t.passed === 0 && t.noFindings === 0 && t.advisory === 0 && !t.noBlockingRules) {
+    return { text: '○ NOT CHECKED', kind: 'muted', card: open ? 'card-warning' : '' };
+  }
+  if (t.noBlockingRules) { return { text: ['NO BLOCKING RULES CONFIGURED', ...extras].join(' · '), kind: 'warning', card: 'card-warning' }; }
+  if (open) { return { text: `NOTHING BLOCKING · ${extras.join(' · ')}`, kind: 'warning', card: 'card-warning' }; }
+  // No command passed, so every blocking row is a promoted scan that found nothing.
+  if (t.passed === 0) { return { text: 'NOTHING BLOCKING · NO FINDINGS', kind: 'muted', card: '' }; }
+  return { text: '✓ NOTHING BLOCKING', kind: 'success', card: 'card-success' };
+}
+
+/**
  * The standards report card. `stored` is `{ phase, report }` or null. A run
  * with no report says why: "no report" is never shown as a pass.
  */
@@ -149,23 +181,10 @@ function standardsCard(run, stored) {
   }
   const report = stored.report;
   const t = report.totals;
-  const open = t.notChecked > 0 || t.advisory > 0 || t.notCheckedFiles > 0;
-  // Stopped: something blocking failed, or something blocking was never evaluated.
-  const stopped = t.failed > 0 || t.blockingNotChecked > 0;
-  const kind = stopped ? 'card-error' : open || t.noBlockingRules ? 'card-warning' : 'card-success';
-  const extras = [
-    t.advisory > 0 ? `${t.advisoryFindings} ADVISORY` : null,
-    t.notChecked > 0 ? `${plural(t.notChecked, 'RULE')} NOT CHECKED` : null,
-    t.notCheckedFiles > 0 ? `${plural(t.notCheckedFiles, 'FILE')} NOT CHECKED` : null,
-  ].filter(Boolean);
-  // "PASSED" is never the badge: most rows are scans, and a scan does not pass. A profile
-  // with no command and no promoted rule says so in so many words.
-  const state = t.failed > 0 ? badge(`✗ ${t.failed} BLOCKING`, 'error')
-    : t.blockingNotChecked > 0 ? badge(`✗ ${t.blockingNotChecked} BLOCKING NOT CHECKED`, 'error')
-      : t.passed === 0 && t.noFindings === 0 && t.advisory === 0 && !t.noBlockingRules ? badge('○ NOT CHECKED', 'muted')
-        : t.noBlockingRules ? badge(['NO BLOCKING RULES CONFIGURED', ...extras].join(' · '), 'warning')
-          : extras.length > 0 ? badge(`NOTHING BLOCKING · ${extras.join(' · ')}`, 'warning')
-            : badge('✓ NOTHING BLOCKING', 'success');
+  // The badge and the frame: see standardsBadge — green only for a command that passed.
+  const look = standardsBadge(t);
+  const kind = look.card || null;
+  const state = badge(look.text, look.kind);
   const truncated = t.findings > report.findings.length;
   const perRule = {};
   for (const f of report.findings) { perRule[f.rule] = (perRule[f.rule] || 0) + 1; }
@@ -215,7 +234,7 @@ function standardsCard(run, stored) {
   const stopping = (rows) => rows.filter((r) => r.result === 'failed').length;
   const filesShown = report.notCheckedFiles.length;
 
-  return h('section', { class: ['card', kind] },
+  return h('section', { class: ['card', kind].filter(Boolean) },
     h('div', { class: 'card-head' }, heading, h('span', { class: 'header-spacer' }), state),
     h('p', null, totalsLine(t)),
     // The one line nobody may miss: a rule that can stop a release read nothing.

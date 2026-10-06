@@ -4,7 +4,8 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import { StandardsCheckInput, StandardsReport, checkStandards, commandRow, recountTotals } from '../../../standards/checker';
-import { GateRowInput, gateStatus, standardsReportSection, verificationGateRows } from '../../../ui/standards-report-html';
+import { GateRowInput, REPORT_COLOR, gateStatus, standardsReportSection, verificationGateRows } from '../../../ui/standards-report-html';
+import { designSystemCssTokens } from '../../../ui/design-system';
 import { isStandardsGateCommand, standardsGateCommand } from '../../../models/requirement-trace';
 import { STANDARDS_RULE_IDS } from '../../../standards/profile';
 import { promote, sampleProfile, totalsOf } from '../standards/fixtures';
@@ -222,23 +223,27 @@ describe('verification report — the gates table never calls the standards row 
     const standards = rowOf(html, 'moag:standards v1');
     assert.match(standards, /<td>no blocking rules configured<\/td>\s*<td>—<\/td>/);
     assert.doesNotMatch(standards, />pass</);
-    assert.doesNotMatch(standards, /✓|#28a745/, 'no green, no tick');
+    assert.doesNotMatch(standards, /✓|#28a745|--ds-success/, 'no green, no tick');
     // The real command beside it is still a pass, in green, with its exit code.
-    assert.match(rowOf(html, 'npm test'), /<td style="color:#28a745">pass<\/td>\s*<td>0<\/td>/);
+    assert.ok(rowOf(html, 'npm test').includes(`<td style="color:${REPORT_COLOR.pass}">pass</td>`));
+    assert.match(rowOf(html, 'npm test'), />pass<\/td>\s*<td>0<\/td>/);
 
     for (const command of [standardsGateCommand(7), standardsGateCommand(null)]) {
       const evaluated = rowOf(verificationGateRows([gate({ command, standardsCounts: SOME })]), command);
       assert.match(evaluated, /<td>nothing blocking<\/td>/);
-      assert.doesNotMatch(evaluated, />pass<|#28a745/);
+      assert.doesNotMatch(evaluated, />pass<|#28a745|--ds-success/);
       // A row recorded without counts is worded the same way, never upgraded to a pass.
       assert.match(rowOf(verificationGateRows([gate({ command })]), command), /<td>nothing blocking<\/td>/);
     }
   });
 
-  it('gateStatus: a standards row that stopped the release fails; commands keep pass / fail / timeout', () => {
+  it('gateStatus: a standards row that stopped the release says "stopped", in the failing tone; commands keep pass / fail / timeout', () => {
     assert.deepEqual(gateStatus(gate({ command: 'moag:standards v3', standardsCounts: NONE })), { word: 'no blocking rules configured', tone: 'neutral' });
     assert.deepEqual(gateStatus(gate({ command: 'moag:standards v3', standardsCounts: SOME })), { word: 'nothing blocking', tone: 'neutral' });
-    assert.deepEqual(gateStatus(gate({ command: 'moag:standards v3', exitCode: 1, passed: false })), { word: 'fail', tone: 'fail' });
+    assert.deepEqual(gateStatus(gate({ command: 'moag:standards v3', exitCode: 1, passed: false })), { word: 'stopped', tone: 'fail' });
+    // Its counts do not soften it, and it is never "timeout": the row is not a process.
+    assert.deepEqual(gateStatus(gate({ command: 'moag:standards v3', exitCode: 1, passed: false, standardsCounts: NONE })), { word: 'stopped', tone: 'fail' });
+    assert.deepEqual(gateStatus(gate({ command: 'moag:standards', exitCode: 1, passed: false, timedOut: true })), { word: 'stopped', tone: 'fail' });
     assert.deepEqual(gateStatus(gate({})), { word: 'pass', tone: 'pass' });
     assert.deepEqual(gateStatus(gate({ exitCode: 1, passed: false })), { word: 'fail', tone: 'fail' });
     assert.deepEqual(gateStatus(gate({ exitCode: 124, passed: false, timedOut: true })), { word: 'timeout', tone: 'fail' });
@@ -257,10 +262,42 @@ describe('verification report — the gates table never calls the standards row 
     ]);
     assert.doesNotMatch(html, /<script>|<img/);
     assert.match(html, /npm run &quot;lint&quot; &amp;&amp; &lt;script&gt;x&lt;\/script&gt;/);
-    assert.match(html, /<td style="color:#dc3545">fail<\/td>\s*<td>2<\/td>/);
+    assert.ok(html.includes(`<td style="color:${REPORT_COLOR.fail}">fail</td>`));
+    assert.match(html, />fail<\/td>\s*<td>2<\/td>/);
     assert.match(html, /&lt;img src=x onerror=1&gt;/, 'the last non-empty output line');
-    assert.match(rowOf(html, 'npm run slow'), /<td style="color:#dc3545">timeout<\/td>[\s\S]*<td style="[^"]*">—<\/td>/);
+    assert.ok(rowOf(html, 'npm run slow').includes(`<td style="color:${REPORT_COLOR.fail}">timeout</td>`));
+    assert.match(rowOf(html, 'npm run slow'), />timeout<\/td>[\s\S]*<td style="[^"]*">—<\/td>/);
     assert.equal(verificationGateRows([]), '');
+  });
+
+  it('a standards row that stopped the release is red and says "stopped", with no exit code', () => {
+    const html = verificationGateRows([gate({ command: 'moag:standards v3', exitCode: 1, passed: false, output: 'Project standards stop this release' })]);
+    const row = rowOf(html, 'moag:standards v3');
+    assert.ok(row.includes(`<td style="color:${REPORT_COLOR.fail}">stopped</td>`), row);
+    assert.match(row, />stopped<\/td>\s*<td>—<\/td>/);
+    assert.doesNotMatch(row, />fail</);
+  });
+
+  it('every colour is a design-system token with the standalone report colour as its documented fallback', () => {
+    const tokens = designSystemCssTokens();
+    for (const [name, value] of Object.entries(REPORT_COLOR)) {
+      const m = /^var\((--ds-[a-z-]+), (#[0-9a-f]{3,6})\)$/.exec(value);
+      assert.ok(m, `${name}: ${value} is var(--ds-token, #fallback)`);
+      assert.ok(tokens.includes(`${m[1]}:`), `${m[1]} is a token the design system defines`);
+    }
+    // The fallbacks are the colours the standalone browser report has always had.
+    assert.deepEqual(REPORT_COLOR, { pass: 'var(--ds-success, #28a745)', fail: 'var(--ds-error, #dc3545)', muted: 'var(--ds-muted, #999)' });
+    // Outside that one table the module holds no raw colour, and the markup it writes uses the table.
+    const source = fs.readFileSync(path.resolve(__dirname, '..', '..', '..', 'ui', 'standards-report-html.ts'), 'utf-8');
+    const [, afterTable] = source.split('} as const;');
+    assert.ok(afterTable && afterTable.length > 1000, 'the colour table is closed before the markup');
+    assert.doesNotMatch(afterTable, /#[0-9a-fA-F]{3,8}\b|rgba?\(/, 'no raw colour after the table');
+    assert.match(source, /In the standalone report[\s\S]*no `--ds-\*` token exists/i, 'the fallback is documented where it is defined');
+    const html = verificationGateRows([gate({}), gate({ command: 'npm run lint', exitCode: 2, passed: false })]);
+    for (const colour of html.match(/color:[^";]+/g) ?? []) {
+      assert.match(colour, /^color:var\(--ds-(success|error|muted), #[0-9a-f]{3,6}\)$/, colour);
+    }
+    assert.equal((html.match(/color:/g) ?? []).length, 4, 'two status cells and two output cells');
   });
 
   it('the report is built through it: extension.ts has no gate-status wording of its own', () => {

@@ -39,7 +39,13 @@ export interface RequirementStatusRow {
   /** What that check left open — advisory findings, rules and files not checked; null when none was recorded */
   standardsCounts: StandardsCheckCounts | null;
   tasks: Array<{ id: string; status: TaskStatus }>;
-  gates: Array<{ command: string; exitCode: number }>;
+  /**
+   * The latest gates. The synthetic standards row carries what its check left open
+   * (`standardsCounts`, numbers only) when it was recorded with it, so a reader can tell
+   * "no blocking rules configured" from "nothing blocking", and always says which in a word
+   * (`standards`, see `StandardsGateWord`). No other row has either key.
+   */
+  gates: Array<{ command: string; exitCode: number; standards?: StandardsGateWord; standardsCounts?: StandardsCheckCounts }>;
   /** ID of the Failed/Blocked/Skipped task that keeps the requirement from shipping */
   blockedBy?: string;
 }
@@ -200,12 +206,53 @@ export function standardsGateCommand(version: number | null): string {
 }
 
 /**
+ * The one pattern that recognises the standards row. The hosted web app is plain browser
+ * JavaScript and cannot import this module, so `web/js/screens/trace.js` holds the same
+ * pattern under the same name; a unit test compares the two, source and behaviour.
+ */
+export const STANDARDS_GATE_COMMAND = /^moag:standards(?: v\d+)?$/;
+
+/**
  * True for the synthetic standards row ({@link standardsGateCommand}), whatever its version.
  * A surface that words gate rows must ask this first: the row is not a command, so it is
- * never said to have passed — see `gateStatus` in ui/standards-report-html.ts.
+ * never said to have passed — see {@link standardsGateWord}.
  */
 export function isStandardsGateCommand(command: string): boolean {
-  return /^moag:standards(?: v\d+)?$/.test(command);
+  return STANDARDS_GATE_COMMAND.test(command);
+}
+
+/**
+ * The three things the standards row can say, on every surface that words it — the VS Code
+ * gate table, the hosted trace, the evidence handed to a model, the stored verification report:
+ *
+ *   - `stopped`: the row stopped the release (a blocking row failed or was not checked);
+ *   - `no blocking rules configured`: the profile had no command and no promoted rule;
+ *   - `nothing blocking`: there was a blocking set and nothing in it stops the release.
+ *
+ * Never "pass": most of what the row covers is a scan, and a scan that found nothing has
+ * not proved that nothing is there.
+ */
+export type StandardsGateWord = 'stopped' | 'no blocking rules configured' | 'nothing blocking';
+
+/** See {@link StandardsGateWord}. `passed` is the row's own result: exit 0, not timed out. */
+export function standardsGateWord(passed: boolean, counts?: StandardsCheckCounts | null): StandardsGateWord {
+  if (!passed) { return 'stopped'; }
+  return counts?.noBlockingRules === true ? 'no blocking rules configured' : 'nothing blocking';
+}
+
+/**
+ * What a check left open, in words: "2 advisory findings · 1 rule not checked · 3 files not
+ * checked". Zero counts are left out; '' when nothing was left open or no counts were recorded.
+ */
+export function standardsOpenText(counts?: StandardsCheckCounts | null): string {
+  if (!counts) { return ''; }
+  const part = (n: number, one: string, many: string): string | null =>
+    (Number.isInteger(n) && n > 0 ? `${n} ${n === 1 ? one : many}` : null);
+  return [
+    part(counts.advisoryFindings, 'advisory finding', 'advisory findings'),
+    part(counts.notCheckedRules, 'rule not checked', 'rules not checked'),
+    part(counts.notCheckedFiles, 'file not checked', 'files not checked'),
+  ].filter((x): x is string => x !== null).join(' · ');
 }
 
 /**
@@ -297,7 +344,17 @@ export function requirementStatuses(plan: Plan): RequirementStatusRow[] {
       standardsVersion: lastRelease?.standardsVersion ?? null,
       standardsCounts: lastRelease?.standardsCounts ? copyCounts(lastRelease.standardsCounts) : null,
       tasks: tasks.map(t => ({ id: t.id, status: t.status })),
-      gates: (record?.gates ?? []).map(g => ({ command: g.command, exitCode: g.exitCode })),
+      gates: (record?.gates ?? []).map(g => {
+        if (!isStandardsGateCommand(g.command)) { return { command: g.command, exitCode: g.exitCode }; }
+        // The standards row is not a command: it is worded, never left to read as "exit 0 = pass".
+        // Its counts are numbers only: never a file name or a finding.
+        return {
+          command: g.command,
+          exitCode: g.exitCode,
+          standards: standardsGateWord(g.exitCode === 0 && !g.timedOut, g.standardsCounts),
+          ...(g.standardsCounts ? { standardsCounts: copyCounts(g.standardsCounts) } : {}),
+        };
+      }),
     };
     const blocker = tasks.find(t =>
       t.status === TaskStatus.Failed || t.status === TaskStatus.Blocked || t.status === TaskStatus.Skipped);

@@ -461,6 +461,16 @@ export function createApp(deps: AppDeps): App {
    * 409 `review-errors` otherwise; `lead` prefixes the message.
    */
   const requireReviewPasses = (review: PlanReview, also: readonly PlanFilePlaylist[] = [], lead = ''): void => {
+    const problems = reviewProblems(review, also);
+    if (problems) { throw new HttpError(409, problems.code, `${lead}${problems.errors.join(' ')}`, { errors: problems.errors }); }
+  };
+
+  /**
+   * What {@link requireReviewPasses} would refuse the plan for right now, or null when it
+   * passes. The guards throw from it and the DTOs read it, so a plan card never offers an
+   * Approve or a Start run that the server would then refuse.
+   */
+  function reviewProblems(review: PlanReview, also: readonly PlanFilePlaylist[] = []): { errors: string[]; code: 'engine-not-allowed' | 'review-errors' } | null {
     const errors = new Set<string>(review.review && !review.review.ok ? review.review.errors : []);
     const engineErrors = new Set<string>();
     for (const pl of [review.playlist, ...also]) {
@@ -470,11 +480,26 @@ export function createApp(deps: AppDeps): App {
     }
     const list = [...errors];
     if (list.length === 0) {
-      if (!review.review || review.review.ok) { return; }
+      if (!review.review || review.review.ok) { return null; }
       list.push('This plan did not pass review.');
     }
-    const code = list.every((e) => engineErrors.has(e)) ? 'engine-not-allowed' : 'review-errors';
-    throw new HttpError(409, code, `${lead}${list.join(' ')}`, { errors: list });
+    return { errors: list, code: list.every((e) => engineErrors.has(e)) ? 'engine-not-allowed' : 'review-errors' };
+  }
+
+  /** Dehydrated playlists per loaded plan object; a plan loaded again is a new object, so nothing here goes stale. */
+  const dehydratedPlaylists = new WeakMap<Plan, PlanFilePlaylist[]>();
+
+  /** The copy of an approved plan's playlist held by `plan` (the canonical plan, or a run's snapshot); [] when it has none. */
+  const playlistCopyOf = (review: PlanReview, plan: Plan): PlanFilePlaylist[] => {
+    if (review.playlistIndex === undefined) { return []; }
+    // One project DTO asks for every approved plan of the same loaded plan: dehydrate it once.
+    let playlists = dehydratedPlaylists.get(plan);
+    if (!playlists) {
+      playlists = dehydratePlan(plan).playlists;
+      dehydratedPlaylists.set(plan, playlists);
+    }
+    const pl = playlists[review.playlistIndex];
+    return pl ? [pl] : [];
   };
 
   /** True when any engine the plan references is known to be missing (the DTO mirror of {@link requirePlanEngines}). */
@@ -511,6 +536,8 @@ export function createApp(deps: AppDeps): App {
     jobActive: boolean; runsDisabled: boolean; budgetExhausted: boolean; engineUnavailable: boolean; engineChanged: boolean;
     /** False only when the plan was generated under standards and the store now has no approved version. */
     standardsApproved: boolean;
+    /** What the review rules say about the plan NOW (the approved playlist and its canonical copy); [] when it passes. */
+    reviewErrors: string[];
   }
   /** The engine a reviewer approved the plan under (legacy approvals: the engine it was generated with). */
   const lockedEngine = (review: PlanReview): EngineId => review.approvedEngine ?? review.engine;
@@ -521,22 +548,41 @@ export function createApp(deps: AppDeps): App {
     engineUnavailable: planEngineUnavailable(canonical),
     engineChanged: (review.status === 'approved' || review.status === 'ran') && lockedEngine(review) !== project.defaultEngine,
     standardsApproved: !standardsLost(project, review),
+    // Only a plan that could start is re-validated: the same two playlists run start checks.
+    reviewErrors: review.status === 'approved' || review.status === 'ran'
+      ? reviewProblems(review, playlistCopyOf(review, canonical))?.errors ?? [] : [],
   });
   const startBlockedReason = (c: StartContext): string | null =>
     c.runsDisabled ? 'runs-disabled' : c.jobActive ? 'job-active' : c.engineChanged ? 'engine-changed'
       : c.engineUnavailable ? 'engine-unavailable' : !c.standardsApproved ? 'standards-not-approved'
-        : c.budgetExhausted ? 'budget-exhausted' : null;
+        : c.reviewErrors.length > 0 ? 'review-errors' : c.budgetExhausted ? 'budget-exhausted' : null;
 
-  /** Plan review DTO. `start` (when given) adds `run.start` for approved plans and why it is blocked. */
-  const planDto = (p: PlanReview, u: UserRecord, start?: StartContext) => ({
-    ...p,
-    requestedByName: usernameOf(p.requestedBy),
-    decidedByName: usernameOf(p.decidedBy),
-    ...(start && (p.status === 'approved' || p.status === 'ran') ? { startBlockedReason: startBlockedReason(start) } : {}),
-    allowedActions: allowedActions(actorOf(u), start ? ['plan.approve', 'plan.reject', 'plan.cancel', 'run.start'] : ['plan.approve', 'plan.reject', 'plan.cancel'], {
-      planStatus: p.status, requestedBy: p.requestedBy, ...(start ?? {}),
-    }),
-  });
+  /**
+   * Plan review DTO. `start` (when given) adds `run.start` for approved plans and why it is blocked.
+   *
+   * The review rules are applied again here, not read from what was stored when the plan was
+   * generated: a pending plan a rule now refuses is sent with `review.ok: false` and the
+   * errors of today, and without `plan.approve`; an approved plan a rule now refuses is sent
+   * with `startBlockedReason: 'review-errors'`, the errors in `startBlockedErrors`, and
+   * without `run.start`. Reject and cancel stay possible: they are the way out.
+   */
+  const planDto = (p: PlanReview, u: UserRecord, start?: StartContext) => {
+    const decided = p.status === 'approved' || p.status === 'ran';
+    const pendingErrors = p.status === 'pending' ? reviewProblems(p)?.errors ?? [] : [];
+    const blocked = start && decided ? startBlockedReason(start) : null;
+    return {
+      ...p,
+      ...(pendingErrors.length > 0 ? { review: { ...(p.review ?? { commands: [] }), ok: false, errors: pendingErrors } } : {}),
+      requestedByName: usernameOf(p.requestedBy),
+      decidedByName: usernameOf(p.decidedBy),
+      ...(start && decided ? { startBlockedReason: blocked } : {}),
+      ...(start && blocked === 'review-errors' ? { startBlockedErrors: start.reviewErrors } : {}),
+      allowedActions: allowedActions(actorOf(u), start ? ['plan.approve', 'plan.reject', 'plan.cancel', 'run.start'] : ['plan.approve', 'plan.reject', 'plan.cancel'], {
+        planStatus: p.status, requestedBy: p.requestedBy, ...(start ?? {}),
+        reviewPasses: pendingErrors.length === 0 && (start?.reviewErrors.length ?? 0) === 0,
+      }),
+    };
+  };
 
   const runDto = (r: RunRecord, u: UserRecord, project: ProjectRecord, st: ProjectState) => {
     const live = r.status === 'running' ? jobs.view(project.id) : null;
@@ -2068,8 +2114,7 @@ export function createApp(deps: AppDeps): App {
       // An approval is not a waiver: a plan approved before a review rule existed
       // (a `parallel` playlist, a `cwd` outside the workspace) never starts. Both
       // the approved playlist and the canonical copy the runner would load are checked.
-      const runs = review.playlistIndex === undefined ? undefined : dehydratePlan(canonical).playlists[review.playlistIndex];
-      requireReviewPasses(review, runs ? [runs] : [], 'This plan no longer passes review, so it cannot start. ');
+      requireReviewPasses(review, playlistCopyOf(review, canonical), 'This plan no longer passes review, so it cannot start. ');
       const remaining = requireBudget(p, st, review.forVersionCreatedAt);
       const workspace = requireWorkspace(p);
       // The run is held to the standards in effect NOW — the latest approved version, which
@@ -2182,6 +2227,13 @@ export function createApp(deps: AppDeps): App {
       }
       snapshot.defaultEngine = p.defaultEngine;
       requirePlanEngines(snapshot);
+      // A ship-gate decision that resumes the run is a start like any other: the review rules
+      // are applied again, to the approved playlist and to the snapshot copy the next segment
+      // would load. A run that halted at its gate before a rule existed (a `parallel`
+      // playlist, a `cwd` outside the workspace) does not resume under it. Nothing has been
+      // written or spawned yet, and the run stays awaiting approval: rejecting the ship is
+      // still possible, and is the way to close it.
+      requireReviewPasses(review, playlistCopyOf(review, snapshot), 'This plan no longer passes review, so the run cannot resume. Reject the ship and request a new plan. ');
       writeFileAtomicSync(snapshotPath, JSON.stringify(dehydratePlan(snapshot), null, 2), 0o600);
       spawnRunSegment(p, run, review, remaining, workspace);
       run.status = 'running';

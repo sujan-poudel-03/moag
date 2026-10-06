@@ -52,6 +52,7 @@ function blockedText(app, reason, engine) {
   if (reason === 'engine-unavailable') { return STR.C17(engine, app.can('users.manage')).text; }
   if (reason === 'engine-changed') { return STR.C30(engine).text; }
   if (reason === 'standards-not-approved') { return STR.C46.text; }
+  if (reason === 'review-errors') { return STR.C60.text; }
   if (reason === 'budget-exhausted') { return 'The cost cap for this PRD version is used up. A product owner or admin can raise it in Settings.'; }
   return 'Ready to run. Waiting for a reviewer or admin to start it.';
 }
@@ -258,7 +259,10 @@ function planCard(app, project, p, refresh) {
             blockedText(app, p.startBlockedReason, project.defaultEngine),
             p.startBlockedReason === 'job-active' ? [' ', h('a', { href: `${projectPath}/run`, dataset: { link: '' } }, 'Open run')] : null,
             p.startBlockedReason === 'standards-not-approved' ? [' ', h('a', { href: `${projectPath}/standards`, dataset: { link: '' } }, 'Open standards')] : null,
-            p.startBlockedReason === 'engine-unavailable' && app.can('users.manage') ? [' ', h('span', { class: 'muted' }, 'Check the engine on the server.')] : null));
+            p.startBlockedReason === 'engine-unavailable' && app.can('users.manage') ? [' ', h('span', { class: 'muted' }, 'Check the engine on the server.')] : null),
+        // What the review rules say today, one per line: the reason no Start run is offered.
+        !allowed.has('run.start') && p.startBlockedReason === 'review-errors' && Array.isArray(p.startBlockedErrors) && p.startBlockedErrors.length > 0
+          ? h('ul', { class: 'diff-list', role: 'alert' }, p.startBlockedErrors.map((e) => h('li', null, e))) : null);
     }
 
     case 'rejected':

@@ -117,7 +117,9 @@ describe('project detector — detectProjectConventions', () => {
     });
   });
 
-  it('samples source file names shallowest first, bounded, and leaves out noise and configuration', () => {
+  it('samples source file names shallowest first, bounded, and leaves out noise and configuration', function () {
+    // Writes and walks 1,008 real files: 0.4-1 s normally, past mocha's 2 s default on a busy Windows disk.
+    this.timeout(30_000);
     const files: Record<string, string> = { 'package.json': '{}', 'vite.config.ts': 'export default {};\n', 'node_modules/dep/index.js': 'x();\n' };
     for (let i = 0; i < 1_005; i++) { files[`src/deep/f${String(i).padStart(4, '0')}.ts`] = ''; }
     files['src/useAuth.ts'] = 'export const useAuth = 1;\n';
