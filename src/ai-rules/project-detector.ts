@@ -402,7 +402,10 @@ export interface ConventionDetection {
   formatConfigs: DetectedConfig[];
   testRunner: Detected<string> | null;
   componentLibrary: Detected<string> | null;
-  /** package.json script NAMES only — never their bodies. */
+  /**
+   * package.json script NAMES only — never their bodies. A script whose body runs nothing
+   * (empty, or the `npm init` test placeholder) is left out.
+   */
   scripts: Detected<string[]> | null;
   /** Source files found, counted up to the walk limit. Zero means greenfield. */
   sourceFileCount: number;
@@ -494,6 +497,19 @@ const MANIFEST_FILES = [
 
 /** A script name plain enough to report. */
 const SAFE_SCRIPT_NAME = /^[\w:.-]{1,40}$/;
+
+/** The `test` body `npm init` writes: a script that proves there is no test. */
+const NPM_INIT_TEST_PLACEHOLDER = /^echo\s+["']?Error: no test specified["']?\s*&&\s*exit\s+1$/i;
+
+/**
+ * True when a package.json script body runs something: a non-empty string that is not the
+ * `npm init` test placeholder. The body is only tested here, never reported or copied.
+ */
+function isRealScriptBody(body: unknown): boolean {
+  if (typeof body !== 'string') { return false; }
+  const trimmed = body.trim();
+  return trimmed.length > 0 && !NPM_INIT_TEST_PLACEHOLDER.test(trimmed);
+}
 
 function emptyDetection(): ConventionDetection {
   return {
@@ -851,8 +867,11 @@ export function detectProjectConventions(cwd: string, opts: ConventionDetectionO
     if (/^\[tool\.black\b/m.test(pyproject)) { out.formatConfigs.push({ tool: 'black', file: 'pyproject.toml' }); }
 
     // ── Scripts (names only) ──
+    // A script that runs nothing (empty, or npm init's "no test specified") is not listed:
+    // it proves no tool, and a proposal would otherwise turn it into a command that fails.
     if (pkg && isRecord(pkg.scripts)) {
-      const names = Object.keys(pkg.scripts).filter((name) => SAFE_SCRIPT_NAME.test(name)).slice(0, 100);
+      const scripts = pkg.scripts;
+      const names = Object.keys(scripts).filter((name) => SAFE_SCRIPT_NAME.test(name) && isRealScriptBody(scripts[name])).slice(0, 100);
       if (names.length > 0) { out.scripts = { value: names, evidence: 'package.json' }; }
     }
 

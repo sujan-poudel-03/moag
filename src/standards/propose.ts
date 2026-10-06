@@ -98,10 +98,13 @@ function noCommandsNote(stack: StackId): string {
 }
 
 /**
- * Fixed command templates. Style is enforced by the stack's own linter and formatter, not
- * by this checker's heuristics — so wherever a config file proves a tool is set up, its
- * standard check command is proposed. A script NAME selects a template; a script body is
- * never copied, and no command is proposed for a tool nothing in the repository configures.
+ * Fixed command templates. Style is enforced by the stack's own linter and formatter, and
+ * correctness by the project's own tests, not by this checker's heuristics — so wherever a
+ * file proves a tool is set up, its standard command is proposed: lint, format and typecheck
+ * from configs or scripts, `npm test` from a real `test` script, `pytest` where a pytest file
+ * or dependency proves it, `go test ./...` from go.mod. A script NAME selects a template; a
+ * script body is never copied, and no command is proposed for a tool nothing in the
+ * repository configures. Every command is shown verbatim and needs a reviewer's approval.
  */
 function proposeCommands(detection: ConventionDetection): { commands: StandardsProfile['commands']; evidence: string | null } {
   const commands: StandardsProfile['commands'] = [];
@@ -135,6 +138,9 @@ function proposeCommands(detection: ConventionDetection): { commands: StandardsP
     if (!scripts.includes('format:check') && prettier) { add('Format', 'npx prettier --check .', prettier.file); }
     if (stack === 'static-web' && stylelint) { add('Stylelint', 'npx stylelint "**/*.css"', stylelint.file); }
   }
+  // Tests after the style checks. The detector lists a `test` script only when it runs
+  // something, never npm init's "no test specified" placeholder.
+  if (scripts.includes('test')) { add('Test', 'npm test', scriptFile); }
   if (stack === 'python') {
     const ruff = lintConfig('ruff');
     const flake8 = lintConfig('flake8');
@@ -142,12 +148,20 @@ function proposeCommands(detection: ConventionDetection): { commands: StandardsP
     if (ruff) { add('Lint', 'ruff check .', ruff.file); }
     else if (flake8) { add('Lint', 'flake8', flake8.file); }
     if (black) { add('Format', 'black --check .', black.file); }
+    // pytest is proposed only where a file proves it: pytest.ini, conftest.py, or a
+    // manifest that depends on it (the detector's own evidence).
+    if (detection.testRunner?.value === 'pytest') { add('Test', 'pytest', detection.testRunner.evidence); }
   }
   if (stack === 'go') {
-    add('Vet', 'go vet ./...', detection.stack?.evidence ?? 'go.mod');
+    const goMod = detection.stack?.evidence ?? 'go.mod';
+    add('Vet', 'go vet ./...', goMod);
     const golangci = lintConfig('golangci-lint');
     if (golangci) { add('Lint', 'golangci-lint run', golangci.file); }
+    // go.mod makes `go test ./...` the module's test command, with no further guess.
+    add('Test', 'go test ./...', goMod);
   }
+  // Java and .NET get no test command: the wrapper (mvnw, gradlew) or the project file a
+  // test run needs is not something the detection proves, so nothing is guessed.
   if (stack === 'dotnet') {
     const editorconfig = formatConfig('editorconfig');
     if (editorconfig) { add('Format', 'dotnet format --verify-no-changes', editorconfig.file); }
@@ -324,6 +338,11 @@ export function proposeProfile(stack: StackId, detection: ConventionDetection): 
   if (detection.testRunner) {
     profile.testing.runner = clip(detection.testRunner.value);
     set('testing', detection.testRunner.evidence);
+  } else if (detection.scripts?.value.includes('test')) {
+    // No framework was recognised, but the project's own test script is real: `npm test`
+    // (the runner the profile names) is what the project runs.
+    profile.testing.runner = 'npm test';
+    set('testing', detection.scripts.evidence, 'test script');
   }
 
   // ── Commands ──

@@ -10,6 +10,9 @@ export function renderLogin(app, _params, view) {
   const pass = field({ label: 'Password', input: h('input', { type: 'password', autocomplete: 'current-password', required: true }) });
   const err = h('p', { class: 'form-error', role: 'alert', hidden: true });
   const submitBtn = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Sign in');
+  // Why the user was signed out (C61/C62), shown once.
+  const notice = app.notice;
+  app.notice = null;
 
   const submit = async (e) => {
     e.preventDefault();
@@ -29,6 +32,7 @@ export function renderLogin(app, _params, view) {
 
   mount(view, h('div', { class: 'auth-card' },
     h('h1', null, 'MOAG'),
+    notice ? h('div', { class: ['card', 'card-info'], role: 'status' }, h('p', null, notice)) : null,
     h('form', { on: { submit }, novalidate: true },
       user.wrap, pass.wrap, err,
       h('div', { class: 'form-actions' }, submitBtn)),

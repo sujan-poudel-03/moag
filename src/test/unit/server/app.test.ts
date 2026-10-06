@@ -241,6 +241,35 @@ describe('server app', function () {
     assert.deepEqual(audit[0].after, { roles: ['approver'] });
   });
 
+  it('an admin changing their OWN roles is told the session ended; the next request is 401 unauthenticated, not 403 forbidden', async () => {
+    const add = await h.request('POST', '/api/admin/users', { as: 'admin', body: { username: 'admin2', roles: ['admin'], password: PASSWORD } });
+    assert.equal(add.status, 201, add.raw);
+
+    // Someone else's change leaves the caller's session alone, and says nothing about it.
+    const other = await h.request('PATCH', `/api/admin/users/${h.accounts.reviewer.id}`, { as: 'admin', body: { roles: ['approver'] } });
+    assert.equal(other.status, 200, other.raw);
+    assert.equal(other.body.sessionEnded, undefined);
+    assert.equal((await h.request('GET', '/api/admin/users', { as: 'admin' })).status, 200);
+
+    const own = await h.request('PATCH', `/api/admin/users/${h.accounts.admin.id}`, { as: 'admin', body: { roles: ['reviewer'] } });
+    assert.equal(own.status, 200, own.raw);
+    assert.equal(own.body.sessionEnded, true);
+    assert.deepEqual((own.body.user as { roles: string[] }).roles, ['reviewer']);
+
+    // The session is gone: that is a 401 the client signs out on, never the "no permission" 403.
+    const after = await h.request('GET', '/api/admin/users', { as: 'admin' });
+    assert.equal(after.status, 401);
+    assert.equal(after.body.error, 'unauthenticated');
+    const session = await h.request('GET', '/api/session', { as: 'admin' });
+    assert.equal(session.status, 200);
+    assert.ok(!session.body.user, 'GET /api/session answers signed out');
+
+    // Forbidden stays forbidden: a signed-in user without the permission is 403, not 401.
+    const forbidden = await h.request('GET', '/api/admin/users', { as: 'po' });
+    assert.equal(forbidden.status, 403);
+    assert.equal(forbidden.body.error, 'forbidden');
+  });
+
   it('PATCH users: the last-admin guard is 409', async () => {
     const r = await h.request('PATCH', `/api/admin/users/${h.accounts.admin.id}`, { as: 'admin', body: { roles: ['reviewer'] } });
     assert.equal(r.status, 409);

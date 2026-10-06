@@ -116,6 +116,8 @@ Wrong bootstrap tokens are rate-limited **per client IP** (the same limiter as s
 
 Roles are `product-owner`, `reviewer`, `approver` and `admin`. One user can hold several. The server always keeps at least one active admin.
 
+Changing a user's roles, disabling them or setting a temporary password (`PATCH /api/admin/users/:id`) signs that user out of every session. When the admin changes **their own** account, that includes the session the request came on: the answer is `200` with `"sessionEnded": true` beside the user, and every later request on that session is `401 unauthenticated` (a signed-in user who lacks a permission gets `403 forbidden` instead). The web app then goes to the sign-in page with "Your roles changed, so you were signed out. Sign in again." (or "Your account changed, …" for a disable or password change), never the "no permission" message.
+
 ## Engine CLIs and API keys
 
 The base image ships no engine CLIs. Install them in a derived image. Log in as the `moag` user, with `HOME` on the data volume so the login survives container upgrades:
@@ -135,7 +137,7 @@ docker exec -it moag claude      # complete the login flow once
 
 Ollama can run as a sidecar. Point at it with `OLLAMA_HOST`, which is always passed to agents.
 
-**Admin → Engines** shows which CLIs the server found (a `--version` probe, run at boot and on **Re-check**). MOAG makes no live provider call to check sign-in, so CLI auth always shows "unknown". `copilot` and `custom` are not supported in the web app. A run whose engine the probe did not find is refused with "isn't installed on this server".
+**Admin → Engines** shows which CLIs the server found (a `--version` probe, run at boot and on **Re-check**). The probe spawns the command exactly as a run does: on Windows through cmd.exe, so it reports the binary cmd resolves by PATH order and PATHEXT (an npm `claude.cmd` earlier on PATH wins over a `claude.exe` later on it), and the version shown is the version a run starts. A configured command that is not a plain name or path (spaces, quotes or shell characters) is never put on a shell line by the probe; it shows no version. MOAG makes no live provider call to check sign-in, so CLI auth always shows "unknown". `copilot` and `custom` are not supported in the web app. A run whose engine the probe did not find is refused with "isn't installed on this server".
 
 The **anthropic** API key is set on the Engines screen:
 
@@ -326,6 +328,20 @@ Limits and refusals:
 - The text a prompt carries is at most 4,000 characters. The structured rules are always included in full; a profile whose structured rules alone exceed the cap is refused. Free text is added as a quoted block and cut to the room that is left. Built-in rule bodies are inlined while they fit, and listed by name otherwise.
 
 Each proposed field is tagged `detected` (with the file that proved it) or `assumed` (the stack default). The tags are stored beside the profile as `provenance`. A detected directory's evidence ends in `tracked by git`; when git gave no listing, the structure fields are `assumed` and their evidence says why no directory was proposed.
+
+For an existing repository the proposal's `commands` are the project's own tools, because only commands block a release. Each is a fixed template chosen by what a file proves; a script body is never copied:
+
+| Proposed command | Proved by |
+|---|---|
+| `npm run lint`, `npm run format:check`, `npm run typecheck` | a script of that name in `package.json` |
+| `npx eslint .`, `npx biome check .`, `npx prettier --check .`, `npx stylelint "**/*.css"` | the tool's config file, when no script covers it |
+| `npm test` | a `test` script in `package.json` that runs something. The `npm init` placeholder (`echo "Error: no test specified" && exit 1`) and an empty script prove nothing |
+| `ruff check .`, `flake8`, `black --check .` | the tool's config (`ruff.toml`, `.flake8`, `[tool.ruff]` / `[tool.black]` in `pyproject.toml`) |
+| `pytest` | `pytest.ini`, `conftest.py`, or a Python manifest that lists `pytest` |
+| `go vet ./...`, `go test ./...` | `go.mod`; plus `golangci-lint run` from a golangci config |
+| `dotnet format --verify-no-changes` | `.editorconfig` in a .NET repository |
+
+Java and .NET get no test command: the build wrapper or project file a test run needs is not proved by the detection, so it is left to the reviewer. Package.json, like every other file, counts only when git tracks it (when git gives no listing, it is read from disk, as the lint configuration is). The `commands` area is tagged `detected` with the first command's proving file and the note `not executed`; when no command can be proposed it stays `assumed` and names the stack's usual tools. A `test` script with no recognised framework also makes the testing area `detected` (`package.json — test script`). Every proposed command is shown verbatim and, as an enforcement change, needs the reviewer's acknowledged approval before it runs.
 
 For an existing repository the file-naming rule follows the names the repository already has, measured over the first 1,000 source files. If at least 70% of the names a rule covers fit one style, that style is proposed, and tagged `detected` when a name proves it (`useAuth` proves camelCase; `index` proves nothing). If the names fit no single style, no naming rule is proposed and `naming/files` reports `not-checked`.
 

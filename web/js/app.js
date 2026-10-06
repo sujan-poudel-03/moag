@@ -30,7 +30,10 @@ const app = {
   pre: null,
   /** The project the current route belongs to (GET /api/projects/:id body), or null. */
   project: null,
+  /** A one-time message for the sign-in page (why the user was signed out), or null. */
+  notice: null,
   api,
+  endSession,
   navigate,
   can,
   login,
@@ -154,6 +157,21 @@ async function login(username, password) {
     return again;
   }
   return r;
+}
+
+/**
+ * The server ended this user's own session (their roles or account changed). Drop it
+ * and go to the sign-in page, which shows `notice` once. After signing in the user lands
+ * on the projects list: the screen they were on may not be theirs any more.
+ * @param {string} notice
+ */
+async function endSession(notice) {
+  app.session = null;
+  app.project = null;
+  app.notice = notice || null;
+  nextAfterLogin = null;
+  await refreshSession();
+  navigate('/login', { replace: true });
 }
 
 /** Load the project for a project route; the rail and header read it. */

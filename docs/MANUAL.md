@@ -265,6 +265,17 @@ are never required. A required directory must be a path inside the repository
 (no absolute path, no `..`), and is compared case-sensitively with the paths
 git lists: `SRC` does not satisfy `src`.
 
+The proposal's commands are the project's own tools, as fixed commands chosen
+by what a file proves (a script body is never copied): `npm run lint`,
+`npm run format:check` and `npm run typecheck` from those scripts; `npm test`
+from a `test` script that runs something (not npm init's
+`echo "Error: no test specified" && exit 1`); the linter or formatter a config
+file sets up (ESLint, Biome, Prettier, Ruff, flake8, black, golangci-lint,
+`dotnet format`); `pytest` where `pytest.ini`, `conftest.py` or a manifest
+proves it; `go vet ./...` and `go test ./...` from `go.mod`. Java and .NET get
+no test command. Nothing is run while proposing; review each command before
+you write the proposal.
+
 **Nested repositories.** A directory that is a git repository of its own hides
 its files from git. One that no tracked `.gitmodules` declares — a gitlink, or
 an untracked directory with a `.git` — is a finding of

@@ -273,7 +273,7 @@ This is by design and **not a regression**. It is the finding: deciding that a r
    - A dry-run requires the fake's marker (`moag-bench-fake`).
    - If the server's own probe reports a version, that must be the fake too.
    - Otherwise the bench stops (exit 2) without planning anything.
-   - Windows note: the server's probe runs the CLI without a shell, and Node will not run a `.cmd` that way. On Windows the probe therefore reports no version for the fake, and the shell check is what proves the fake is in place.
+   - The server's probe spawns the CLI exactly as runs do (through cmd.exe on Windows), so on every platform it reports the version of the binary a run would start: here, the fake's `claude.cmd`.
 2. A **paid** run refuses to start if it sees the marker.
 3. At the end of a dry-run, `fake-bin/calls.jsonl` must exist and be non-empty, or the bench exits 2.
 

@@ -124,8 +124,11 @@ describe('standards proposal — brownfield fixtures', () => {
     assert.equal(profile.frontend.componentKit, 'MUI');
     assert.equal(profile.testing.runner, 'Mocha');
     // The project's own lint script wins over a bare eslint call; the Prettier config has no
-    // script of its own, so the formatter's standard check is proposed for it.
-    assert.deepEqual(profile.commands, [{ label: 'Lint', run: 'npm run lint' }, { label: 'Format', run: 'npx prettier --check .' }]);
+    // script of its own, so the formatter's standard check is proposed for it. The real
+    // `test` script is proposed as `npm test`, after the style checks.
+    assert.deepEqual(profile.commands, [
+      { label: 'Lint', run: 'npm run lint' }, { label: 'Format', run: 'npx prettier --check .' }, { label: 'Test', run: 'npm test' },
+    ]);
     assert.ok(!JSON.stringify(profile).includes('evil.example'), 'a script body is never copied');
     assert.ok(!JSON.stringify(profile).includes('deploy now'));
 
@@ -154,6 +157,7 @@ describe('standards proposal — brownfield fixtures', () => {
     assert.deepEqual(proposal.profile.commands, [
       { label: 'Lint', run: 'ruff check .' },
       { label: 'Format', run: 'black --check .' },
+      { label: 'Test', run: 'pytest' },
     ]);
     assert.equal(proposal.profile.testing.runner, 'pytest');
     assert.deepEqual(proposal.profile.structure.requiredDirs, ['app', 'tests']);
@@ -165,7 +169,7 @@ describe('standards proposal — brownfield fixtures', () => {
     const proposal = proposeProfile('go', detectTracked(dir));
     assertWellFormed(dir, proposal);
     assert.deepEqual(proposal.profile.backend.forbiddenImports, [{ from: 'internal', to: 'cmd' }]);
-    assert.deepEqual(proposal.profile.commands.map((c) => c.run), ['go vet ./...', 'golangci-lint run']);
+    assert.deepEqual(proposal.profile.commands.map((c) => c.run), ['go vet ./...', 'golangci-lint run', 'go test ./...']);
     assert.equal(proposal.profile.testing.runner, 'go test');
     assert.deepEqual(proposal.profile.structure.requiredDirs, ['cmd', 'internal']);
   });
@@ -464,6 +468,74 @@ describe('standards proposal — style is enforced by the stack\'s own tools', (
       assert.equal(new Set(runs).size, runs.length, stack);
     }
   });
+});
+
+describe('standards proposal — the project\'s own test command blocks by default', () => {
+  const NODE = { 'tsconfig.json': '{}', 'src/index.ts': TS_SOURCE };
+  const pkg = (scripts: Record<string, unknown>): string => JSON.stringify({ devDependencies: { typescript: '5' }, scripts });
+
+  it('a real test script is proposed as npm test, detected from package.json, and the testing area is detected too', () => {
+    const dir = makeRepo('moag-prop-test-', { ...NODE, 'package.json': pkg({ test: 'node --test test/' }) });
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.deepEqual(proposal.profile.commands, [{ label: 'Test', run: 'npm test' }]);
+    assert.deepEqual(proposal.provenance.commands, { tag: 'detected', evidence: `package.json${EVIDENCE_NOTE_SEPARATOR}not executed` });
+    assert.equal(proposal.profile.testing.runner, 'npm test');
+    assert.deepEqual(proposal.provenance.testing, { tag: 'detected', evidence: `package.json${EVIDENCE_NOTE_SEPARATOR}test script` });
+    assert.ok(!JSON.stringify(proposal.profile).includes('node --test'), 'the script body is never copied');
+  });
+
+  it('lint and typecheck scripts come first; test is last', () => {
+    const dir = makeRepo('moag-prop-test-all-', { ...NODE, 'package.json': pkg({ test: 'mocha', lint: 'eslint .', typecheck: 'tsc --noEmit' }) });
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assert.deepEqual(proposal.profile.commands.map((c) => c.run), ['npm run lint', 'npm run typecheck', 'npm test']);
+  });
+
+  it('npm init\'s "no test specified" placeholder, an empty body or a non-string body proposes nothing', () => {
+    for (const test of ['echo "Error: no test specified" && exit 1', "echo 'Error: no test specified' && exit 1", '  ', '', 7, null]) {
+      const dir = makeRepo('moag-prop-test-ph-', { ...NODE, 'package.json': pkg({ test }) });
+      const detection = detectTracked(dir);
+      assert.equal(detection.scripts, null, JSON.stringify(test));
+      const proposal = proposeProfile('node-ts', detection);
+      assert.deepEqual(proposal.profile.commands, [], JSON.stringify(test));
+      assert.equal(proposal.provenance.commands.tag, 'assumed');
+      assert.equal(proposal.provenance.testing.tag, 'assumed', 'the default runner stays an assumption');
+    }
+    // A placeholder `test` beside a real `lint` drops only the placeholder.
+    const dir = makeRepo('moag-prop-test-ph2-', { ...NODE, 'package.json': pkg({ test: 'echo "Error: no test specified" && exit 1', lint: 'eslint .' }) });
+    assert.deepEqual(proposeProfile('node-ts', detectTracked(dir)).profile.commands.map((c) => c.run), ['npm run lint']);
+  });
+
+  it('an untracked package.json proves no script', () => {
+    const dir = makeRepo('moag-prop-test-untracked-', { ...NODE, 'package.json': pkg({ test: 'mocha' }) });
+    const detection = detectProjectConventions(dir, { tracked: { ok: true, files: everyFile(dir).filter((f) => f !== 'package.json') } });
+    assert.equal(detection.scripts, null);
+    assert.ok(!proposeProfile('node-ts', detection).profile.commands.some((c) => c.run === 'npm test'));
+  });
+
+  it('python proposes pytest only on pytest evidence; go always gets go test ./... from go.mod', () => {
+    const conftest = commandsFor('python', { 'requirements.txt': 'flask\n', 'conftest.py': '', 'app/main.py': 'value = 1\n' });
+    assert.deepEqual(conftest.profile.commands, [{ label: 'Test', run: 'pytest' }]);
+    assert.deepEqual(conftest.provenance.commands, { tag: 'detected', evidence: `conftest.py${EVIDENCE_NOTE_SEPARATOR}not executed` });
+    const none = commandsFor('python', { 'requirements.txt': 'flask\n', 'app/main.py': 'value = 1\n' });
+    assert.deepEqual(none.profile.commands, [], 'no pytest file or dependency: nothing guessed');
+
+    const go = commandsFor('go', { 'go.mod': 'module example.com/app\n', 'main.go': 'package main\n\nfunc main() {}\n' });
+    assert.deepEqual(go.profile.commands.map((c) => c.run), ['go vet ./...', 'go test ./...']);
+    assert.deepEqual(go.provenance.commands, { tag: 'detected', evidence: `go.mod${EVIDENCE_NOTE_SEPARATOR}not executed` });
+  });
+
+  it('java and dotnet get no guessed test command', () => {
+    assert.deepEqual(commandsFor('java', REPOS.java).profile.commands, []);
+    assert.deepEqual(commandsFor('dotnet', REPOS.dotnet).profile.commands, []);
+  });
+
+  function commandsFor(stack: StackId, files: Record<string, string>): StandardsProposal {
+    const dir = makeRepo('moag-prop-tests-', files);
+    const proposal = proposeProfile(stack, detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    return proposal;
+  }
 });
 
 describe('standards proposal — commands block, every scan advises, and only tracked directories are proposed', () => {

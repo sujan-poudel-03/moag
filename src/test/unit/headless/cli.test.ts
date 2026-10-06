@@ -1816,7 +1816,7 @@ describe('headless CLI: moag standards', () => {
     assert.equal(proposed.schemaVersion, 1);
     assert.equal(proposed.profile.stackTemplateId, 'node-ts', 'the stack is detected when --stack is not given');
     assert.equal(proposed.profile.repoState, 'brownfield');
-    assert.deepEqual(proposed.profile.commands, [{ label: 'Lint', run: 'npm run lint' }], 'a fixed template, never the script body');
+    assert.deepEqual(proposed.profile.commands, [{ label: 'Lint', run: 'npm run lint' }, { label: 'Test', run: 'npm test' }], 'fixed templates, never the script body');
     assert.equal(fs.existsSync(file), false, 'no file without --write');
     assert.equal(fs.existsSync(path.join(dir, '.moag')), false, 'not even the directory');
     assert.match(err, /nothing was written\. Re-run with --write/);

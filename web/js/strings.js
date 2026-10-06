@@ -110,6 +110,8 @@ export const STR = Object.freeze({
   /** @param {number} failed @param {number} notChecked */
   C59: (failed, notChecked) => m(`This ship can't be approved yet: the standards check before the gate shows ${failed > 0 ? `${failed} blocking rule${failed === 1 ? '' : 's'} or command${failed === 1 ? '' : 's'} failed` : `${notChecked} blocking rule${notChecked === 1 ? '' : 's'} or command${notChecked === 1 ? '' : 's'} not checked`}. Reject the ship, or fix the work and run again.`, ['control:view-standards-report']),
   C60: m('This plan no longer passes review, so it can\'t start. The review rules are applied again each time a plan is shown, approved or started. Request a new plan.'),
+  C61: m('Your roles changed, so you were signed out. Sign in again.', ['route:/login']),
+  C62: m('Your account changed, so you were signed out. Sign in again.', ['route:/login']),
   /** @param {string} rule the scanner rule being made blocking */
   C54: (rule) => m(`Heuristic rule. As a blocking rule, ${rule} can stop correct code and can miss real violations. Prefer a command (a linter, formatter or test) for anything that must stop a release.`),
 });

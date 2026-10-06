@@ -1473,23 +1473,31 @@ export function createApp(deps: AppDeps): App {
       if (policy) { throw new HttpError(400, 'weak-password', policy); }
     }
     let current = target;
+    let endedSessions = false;
     if (b.roles !== undefined) {
       const before = current.roles;
       current = users.setRoles(target.id, b.roles);
       sessions.destroyAllForUser(target.id);
+      endedSessions = true;
       writeAudit(ctx, { action: 'user.role-change', target: target.username, before: { roles: before }, after: { roles: current.roles } });
     }
     if (b.disabled !== undefined && b.disabled !== current.disabled) {
       current = b.disabled ? users.disable(target.id) : users.enable(target.id);
       sessions.destroyAllForUser(target.id);
+      endedSessions = true;
       writeAudit(ctx, { action: b.disabled ? 'user.disable' : 'user.enable', target: target.username });
     }
     if (b.password !== undefined) {
       current = await users.setPassword(target.id, b.password, true);
       sessions.destroyAllForUser(target.id);
+      endedSessions = true;
       writeAudit(ctx, { action: 'user.password-set', target: target.username, after: { temporary: true } });
     }
-    sendJson(ctx.res, 200, { user: toPublicUser(current) });
+    // An admin who changed their own account has just lost the session this request came
+    // on. Say so, so the client signs them out instead of reading the next 401 (or its own
+    // missing permissions) as "forbidden".
+    const sessionEnded = endedSessions && target.id === ctx.user!.id;
+    sendJson(ctx.res, 200, sessionEnded ? { user: toPublicUser(current), sessionEnded: true } : { user: toPublicUser(current) });
   };
 
   H['GET /api/admin/audit'] = async (ctx) => {

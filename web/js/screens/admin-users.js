@@ -1,7 +1,9 @@
 // ─── /admin/users — accounts and roles (UX §2.10) ───
 //
 // Role changes, disabling and temporary passwords sign the user out of every
-// session (server-side epoch bump). The last active admin cannot be removed or
+// session (server-side epoch bump). Done to your own account, that includes the
+// session you are using: the app then sends you to sign in with C61/C62, never the
+// "no permission" message (C21). The last active admin cannot be removed or
 // disabled (409, C26). Role choices come from the server's closed list.
 
 import { h, mount, badge, toast, confirmDialog, openModal, field, skeleton, errorCard, uid } from '../dom.js';
@@ -22,6 +24,24 @@ function roleChecks(allRoles, selected) {
   };
 }
 
+/**
+ * The sign-in notice to show when a successful PATCH ended the signed-in user's own
+ * session, or null when that session survives. The server says so (`sessionEnded`); a
+ * change to the user's own account that the server did not flag is read the same way,
+ * because a role change, disable or password set always signs the target out. Pure.
+ * @param {{ ok: boolean, body: object }} resp
+ * @param {{ roles?: string[], disabled?: boolean, password?: string }} body what was sent
+ * @param {boolean} isSelf the target is the signed-in user
+ */
+export function ownSessionEndedNotice(resp, body, isSelf) {
+  if (!resp || !resp.ok) { return null; }
+  const sent = body || {};
+  const flagged = !!(resp.body && resp.body.sessionEnded === true);
+  const ownChange = isSelf && (sent.roles !== undefined || sent.disabled !== undefined || sent.password !== undefined);
+  if (!flagged && !ownChange) { return null; }
+  return sent.roles !== undefined ? STR.C61.text : STR.C62.text;
+}
+
 export async function render(app, _params, view) {
   app.setTitle('Users');
   if (!app.can('users.manage')) { mount(view, h('div', { class: 'card' }, h('p', null, STR.C21.text))); return; }
@@ -36,9 +56,14 @@ export async function render(app, _params, view) {
     const resp = await app.api('PATCH', `/api/admin/users/${encodeURIComponent(u.id)}`, body);
     if (!resp.ok) {
       if (resp.status === 409 && resp.body.error === 'last-admin') { toast(STR.C26.text, 'error'); }
-      else if (resp.status !== 403) { toast(serverMessage(resp), 'error'); }
+      // 403 forbidden (C21) and 401 session ended (the sign-in prompt) are shown by app.api.
+      else if (resp.status !== 403 && resp.status !== 401) { toast(serverMessage(resp), 'error'); }
       return false;
     }
+    // Changing your own roles (or account) signs you out: say why and go to sign-in,
+    // instead of re-rendering a screen the now signed-out user cannot see (C21).
+    const ended = ownSessionEndedNotice(resp, body, u.id === app.session.user.id);
+    if (ended) { await app.endSession(ended); return true; }
     toast(success, 'success');
     if (u.id === app.session.user.id) { await app.refreshSession(); }
     await reload();

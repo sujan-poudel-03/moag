@@ -1,7 +1,7 @@
 // ─── Engine adapter interface and registry ───
 
 import { EngineId, EngineResult } from '../models/types';
-import { OutputCallback } from './base-cli';
+import { OutputCallback, probeVersion } from './base-cli';
 import { commandExists } from '../utils/command-exists';
 import { costLedger } from '../utils/cost-ledger';
 
@@ -165,28 +165,6 @@ export interface EngineAvailability {
 }
 
 /**
- * Probe a command with --version (or --help fallback) and return the first line of output.
- * Returns null if the command is not found or times out (5s).
- */
-async function probeVersion(command: string): Promise<string | null> {
-  const { execFile } = await import('child_process');
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), 5000);
-    execFile(command, ['--version'], { timeout: 5000, windowsHide: true }, (err, stdout, stderr) => {
-      clearTimeout(timer);
-      if (err) {
-        // Some CLIs only respond to --help
-        resolve(null);
-        return;
-      }
-      const output = (stdout || stderr || '').trim();
-      const firstLine = output.split('\n')[0]?.trim() || null;
-      resolve(firstLine);
-    });
-  });
-}
-
-/**
  * Check availability of multiple engines in parallel.
  * Returns a Map from EngineId to availability info.
  * First checks PATH existence, then probes --version for available engines.
@@ -210,7 +188,9 @@ export async function checkEngineAvailability(
         results.set(id, { available: false, command, displayName: adapter.displayName });
         return;
       }
-      // Probe --version to verify the command actually works
+      // Probe --version the way a run spawns the command (base-cli's engineSpawnShape),
+      // so on Windows the version is that of the binary cmd resolves (a .cmd shim
+      // earlier on PATH), not of a .exe a shell-less lookup would find instead.
       const version = await probeVersion(command);
       results.set(id, {
         available: true,
