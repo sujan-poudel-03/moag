@@ -112,6 +112,17 @@ describe('server config', () => {
     }
   });
 
+  it('validates MOAG_GATE_TIMEOUT_MS to a whole number of ms in [1000, 3600000]', () => {
+    assert.equal(ok(base()).gateTimeoutMs, null, 'unset: verify keeps its default');
+    assert.equal(ok({ ...base(), MOAG_GATE_TIMEOUT_MS: ' ' }).gateTimeoutMs, null);
+    assert.equal(ok({ ...base(), MOAG_GATE_TIMEOUT_MS: '1800000' }).gateTimeoutMs, 1_800_000);
+    assert.equal(ok({ ...base(), MOAG_GATE_TIMEOUT_MS: '1000' }).gateTimeoutMs, 1000);
+    assert.equal(ok({ ...base(), MOAG_GATE_TIMEOUT_MS: '3600000' }).gateTimeoutMs, 3_600_000);
+    for (const bad of ['999', '3600001', '0', '-5', '1.5', 'abc', 'Infinity', 'NaN']) {
+      assert.match(err({ ...base(), MOAG_GATE_TIMEOUT_MS: bad }), /MOAG_GATE_TIMEOUT_MS/, bad);
+    }
+  });
+
   it('validates MOAG_PORT', () => {
     assert.equal(ok({ ...base(), MOAG_PORT: '0' }).port, 0);
     assert.match(err({ ...base(), MOAG_PORT: '70000' }), /MOAG_PORT/);

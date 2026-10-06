@@ -87,6 +87,11 @@ export interface WorkerConfig {
     'engines.claude.outputFormat': 'json';
     /** `--max-budget-usd` for every Claude call (0 = none); see {@link perCallBudgetUsd}. */
     'engines.claude.maxBudgetUsdPerCall': number;
+    /**
+     * How long verify lets one gate command run. Present only when the operator set
+     * `MOAG_GATE_TIMEOUT_MS`; absent, verify keeps its own default (600000).
+     */
+    'prdLoop.gateTimeoutMs'?: number;
   };
 }
 
@@ -114,9 +119,13 @@ export function perCallBudgetUsd(capUsd: number, maxUsdPerCall: number | null): 
  * CLI's own reported `total_cost_usd`, and every Claude call gets
  * `--max-budget-usd` = {@link perCallBudgetUsd} — the only bound on a call that
  * reports no cost (killed, timed out, unparsable).
+ *
+ * `gateTimeoutMs` (the operator's `MOAG_GATE_TIMEOUT_MS`, or null) becomes
+ * `prdLoop.gateTimeoutMs`. Null leaves the key out, so verify keeps its default.
  */
 export function buildWorkerConfig(
   project: Pick<ProjectRecord, 'defaultEngine' | 'versionBudgetUsd'>, remainingUsd: number, maxUsdPerCall: number | null = null,
+  gateTimeoutMs: number | null = null,
 ): WorkerConfig {
   let cap = 0;
   if (project.versionBudgetUsd > 0) {
@@ -133,6 +142,7 @@ export function buildWorkerConfig(
       'prdLoop.uat.mode': 'off',
       'engines.claude.outputFormat': 'json',
       'engines.claude.maxBudgetUsdPerCall': perCallBudgetUsd(cap, maxUsdPerCall),
+      ...(gateTimeoutMs !== null ? { 'prdLoop.gateTimeoutMs': gateTimeoutMs } : {}),
     },
   };
 }

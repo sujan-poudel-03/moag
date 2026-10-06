@@ -14,6 +14,9 @@ export const MAX_CONCURRENT_JOBS_LIMIT = 8;
 export const MIN_BOOTSTRAP_TOKEN_LENGTH = 24;
 /** Upper bound for `MOAG_MAX_USD_PER_ENGINE_CALL` (a typo guard, not a policy). */
 export const MAX_USD_PER_ENGINE_CALL_LIMIT = 1000;
+/** Bounds for `MOAG_GATE_TIMEOUT_MS` (one verify gate command): 1 s to 1 h. */
+export const MIN_GATE_TIMEOUT_MS = 1_000;
+export const MAX_GATE_TIMEOUT_MS = 3_600_000;
 const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
 
 /** Why runs are refused server-wide, or null when runs are allowed. */
@@ -39,6 +42,12 @@ export interface ServerConfig {
   runsDisabledReason: RunsDisabledReason;
   /** `MOAG_MAX_USD_PER_ENGINE_CALL`: server-wide cap on one engine call (Claude `--max-budget-usd`), or null. */
   maxUsdPerEngineCall: number | null;
+  /**
+   * `MOAG_GATE_TIMEOUT_MS`: how long one verify gate command (e.g. `npm test`) may run in a
+   * run job, or null for verify's default (600000). Operator-set only: a repository's own
+   * `.moag/config.json` is never read, so a project cannot raise it for itself.
+   */
+  gateTimeoutMs: number | null;
 }
 
 export type ServerConfigResult = { ok: true; config: ServerConfig } | { ok: false; error: string };
@@ -134,6 +143,15 @@ export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfigResult {
     maxUsdPerEngineCall = n;
   }
 
+  let gateTimeoutMs: number | null = null;
+  if (env.MOAG_GATE_TIMEOUT_MS !== undefined && env.MOAG_GATE_TIMEOUT_MS.trim() !== '') {
+    const n = Number(env.MOAG_GATE_TIMEOUT_MS);
+    if (!Number.isInteger(n) || n < MIN_GATE_TIMEOUT_MS || n > MAX_GATE_TIMEOUT_MS) {
+      return fail(`MOAG_GATE_TIMEOUT_MS must be a whole number of milliseconds from ${MIN_GATE_TIMEOUT_MS} to ${MAX_GATE_TIMEOUT_MS}.`);
+    }
+    gateTimeoutMs = n;
+  }
+
   const runEnvPassthrough: string[] = [];
   for (const name of (env.MOAG_RUN_ENV_PASSTHROUGH ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
     if (!ENV_NAME_RE.test(name)) { return fail(`MOAG_RUN_ENV_PASSTHROUGH: "${name}" is not a valid variable name.`); }
@@ -160,6 +178,7 @@ export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfigResult {
       allowSshClone: flag(env.MOAG_ALLOW_SSH_CLONE),
       runsDisabledReason: env.CI === 'true' ? 'ci' : null,
       maxUsdPerEngineCall,
+      gateTimeoutMs,
     },
   };
 }

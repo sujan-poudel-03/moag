@@ -107,7 +107,7 @@ export interface ActionState {
   standardsAcceptable?: boolean;
   /**
    * plan.generate*: the project has an approved standards version.
-   * run.start: false only when the plan was generated under standards and none is approved now.
+   * run.start: false when the project has no approved standards version now (a legacy plan included).
    */
   standardsApproved?: boolean;
 }

@@ -76,7 +76,7 @@ A scenario is a JSON file. Relative paths resolve against the scenario's directo
 | `versionTimeoutMin` | Default 60. Covers plan generation plus every run segment of one version. |
 | `passEnv` | Variable names passed to agents (`MOAG_RUN_ENV_PASSTHROUGH`). `CI` and `MOAG_*` are refused. |
 | `gateCommands` | The bench's **acceptance gates**: at least one. |
-| `gateTimeoutMs` | Default 600000, per gate command. |
+| `gateTimeoutMs` | Default 600000, per gate command, from 1000 to 3600000. It bounds the bench's acceptance gates and environment probes, and it is passed to the server as `MOAG_GATE_TIMEOUT_MS`, so MOAG's own verify gives each of its gate commands the same time. |
 | `environmentProbes` | Optional. Commands MOAG's own verify is expected to run. The bench runs each once in the untouched workspace, before any plan. See [Environment probes](#environment-probes). Same format rules as `allowedCommands`. |
 | `allowedCommands` | Optional. Extra shell commands a generated plan may carry and still be approved unread. Exact strings, never patterns. See [The command allow-list](#the-command-allow-list). |
 | `versions[]` | `{id, prdFile, intendedBump, dryRunFixture?}`. The first version's bump must be `initial`, and only the first may be. Later versions use `patch`, `minor` or `major`. |
@@ -144,11 +144,12 @@ If the plan request itself answers `409 standards-not-approved`, the version is 
 
 **`brownfield-moag`** ($5):
 
-- A fresh clone of this repository at the HEAD of `feat/sdlc-automation`, followed by `npm ci`.
+- A fresh clone of this repository at the HEAD of `feat/sdlc-automation`, followed by `npm ci` and `npm run compile`. The unit suite reads compiled output (the webview scripts in `out/webview`), so without the compile step the `npm test` probe fails in the untouched clone (11 failures) and a paid run stops there.
 - One small PRD: a `formatUsd` helper and its mocha test file.
 - The bench's acceptance gates are `npm run compile` and that one mocha file (`npx mocha --require ts-node/register src/test/unit/utils/usd-format.test.ts`).
 - Also allowed in a plan: `npm run lint`, `npm test`, `npm run test`, and the same mocha command with the file path in double quotes.
 - Standards: its own profile, `standards.json` — the built-in `node-ts` profile as `brownfield`, plus the one command `npm run compile` (already an acceptance gate of the scenario), so that its blocking path is real. Its required directory is advisory, as in every built-in, and so is every scan.
+- `gateTimeoutMs` is 1800000 (30 minutes). MOAG's verify runs the full unit suite (`npm test`), which takes longer than the 600000 default on a typical machine; with the default, verify killed it and the version could never ship. The bench passes the value to the server as `MOAG_GATE_TIMEOUT_MS`. A clone's own `.moag/config.json` would not help: the server never reads it.
 
 **`standards-violation`** ($3):
 

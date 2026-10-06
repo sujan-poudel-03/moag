@@ -148,6 +148,14 @@ describe('run-env', () => {
       assert.equal(perCallBudgetUsd(0, null), 0);
     });
 
+    it('carries the operator gate timeout as prdLoop.gateTimeoutMs, and leaves it out when none is set', () => {
+      const set = buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0, null, 1_800_000).agentTaskPlayer;
+      assert.equal(set['prdLoop.gateTimeoutMs'], 1_800_000);
+      const unset = buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0, null).agentTaskPlayer;
+      assert.equal('prdLoop.gateTimeoutMs' in unset, false, 'null: verify keeps its own default');
+      assert.equal('prdLoop.gateTimeoutMs' in buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0, null, null).agentTaskPlayer, false);
+    });
+
     it('a run config leaves engine auto-approve at its defaults', () => {
       const c = buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0).agentTaskPlayer as Record<string, unknown>;
       assert.equal('engines.claude.autoApprove' in c, false);
@@ -204,6 +212,27 @@ describe('run-env', () => {
         fs.rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+
+  it('the headless shim hands verify the run config gate timeout the way cli.ts asks for it', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-runcfg-'));
+    const prev = process.env.MOAG_CONFIG_PATH;
+    try {
+      const file = path.join(dir, 'config.json');
+      process.env.MOAG_CONFIG_PATH = file;
+      // The exact lookup in headless/cli.ts (default 600000).
+      const lookup = (): number | undefined => shimWorkspace.getConfiguration('agentTaskPlayer').get<number>('prdLoop.gateTimeoutMs', 600_000);
+      fs.writeFileSync(file, JSON.stringify(buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0, null, 1_800_000)));
+      __setWorkspaceRoot(dir);
+      assert.equal(lookup(), 1_800_000);
+      fs.writeFileSync(file, JSON.stringify(buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0, null, null)));
+      __setWorkspaceRoot(dir);
+      assert.equal(lookup(), 600_000, 'no operator value: the verify default');
+    } finally {
+      if (prev === undefined) { delete process.env.MOAG_CONFIG_PATH; } else { process.env.MOAG_CONFIG_PATH = prev; }
+      __setWorkspaceRoot(process.cwd());
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   describe('planner lockdown', () => {

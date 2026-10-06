@@ -12,7 +12,7 @@ import { sampleProfile } from '../standards/fixtures';
 import { Scenario, ScenarioVersion } from '../../../bench/scenario';
 import { CommandResult } from '../../../bench/workspace';
 import { FakeEngine } from '../../../bench/fake-engine';
-import { LaunchedServer } from '../../../bench/server-launcher';
+import { LaunchOptions, LaunchedServer } from '../../../bench/server-launcher';
 import { startHarness, Harness, FakeWorker, attestStandards } from '../server/app-harness';
 import { loadPlan, dehydratePlan } from '../../../models/plan';
 import { recordGateResults } from '../../../models/requirement-trace';
@@ -410,6 +410,24 @@ describe('bench harness (scripted workers behind the real app)', function () {
       deps({ runGates, ...fakeCheck }));
     return { r, v: r.summary!.versions[0], calls, seen };
   }
+
+  it('the scenario gate timeout reaches the server launch; a verify gate that still times out leaves the version not shipped', async () => {
+    const seen = { plans: 0, runs: 0 };
+    // What the worker reports when verify kills `npm test` at its gate timeout: the command gate failed.
+    scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]], verifyFailsAt: 'npm test' }, seen);
+    const launched: LaunchOptions[] = [];
+    const server: LaunchedServer = { url: h.url, projectsRoot: h.root, bootstrapToken: BOOT, serverEnv: { ...process.env }, stop: async () => undefined };
+    const r = await runBench(scenario({ gateTimeoutMs: 1_800_000 }, 1), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet },
+      deps({ launchServer: async (opts) => { launched.push(opts); return server; } }));
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    assert.equal(launched.length, 1);
+    assert.equal(launched[0].gateTimeoutMs, 1_800_000, 'the server verify gets the scenario gate timeout');
+    const v = r.summary!.versions[0];
+    assert.deepEqual(v.moagVerify, { passed: false, failedGate: 'command', failedCommand: 'npm test' });
+    assert.equal(v.outcome, 'not-shipped');
+    assert.equal(v.endState, 'run-gaps');
+    assert.ok(Object.values(v.trace).every((status) => status !== 'shipped'), JSON.stringify(v.trace));
+  });
 
   it('a paid run stops at a failing environment probe before any plan request: exit 2, the probe and its exit code named', async () => {
     const { r, v, calls, seen } = await verifyStopsAtNpmTest(1, 'v24.16.0', {});

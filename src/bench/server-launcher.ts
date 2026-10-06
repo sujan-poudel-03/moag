@@ -8,7 +8,8 @@
 // The server gets a BUILT environment — a copy, never `process.env` itself:
 // its data dir and projects root under the bench's out dir, a loopback
 // address on a free port, a random bootstrap token, one job at a time, the
-// per-call engine cap, the scenario's passthrough names, a bench git identity,
+// per-call engine cap, the scenario's gate timeout (so the server's own verify
+// gives a gate command as long as the bench's gates get), the scenario's passthrough names, a bench git identity,
 // no `CI`, and exactly one PATH key. In dry-run the PATH starts with the fake
 // engine's bin dir and every directory holding a real `claude` is removed.
 
@@ -23,6 +24,8 @@ export interface LaunchOptions {
   fakeBinDir: string | null;
   passEnv: string[];
   maxUsdPerCall: number | null;
+  /** The scenario's per-gate-command timeout, passed as `MOAG_GATE_TIMEOUT_MS` (null: the server default). */
+  gateTimeoutMs: number | null;
   /** Environment to copy (default `process.env`); never mutated. */
   baseEnv?: NodeJS.ProcessEnv;
 }
@@ -64,6 +67,8 @@ export function buildServerEnv(base: NodeJS.ProcessEnv, opts: LaunchOptions): { 
   env.MOAG_BOOTSTRAP_TOKEN = bootstrapToken;
   env.MOAG_MAX_CONCURRENT_JOBS = '1';
   if (opts.maxUsdPerCall !== null) { env.MOAG_MAX_USD_PER_ENGINE_CALL = String(opts.maxUsdPerCall); }
+  // typeof, not `!== null`: a plain-JS caller that omits the field must not set "undefined" (a boot error).
+  if (typeof opts.gateTimeoutMs === 'number') { env.MOAG_GATE_TIMEOUT_MS = String(opts.gateTimeoutMs); }
   if (opts.passEnv.length > 0) { env.MOAG_RUN_ENV_PASSTHROUGH = opts.passEnv.join(','); }
   env.GIT_AUTHOR_NAME = 'moag-bench';
   env.GIT_AUTHOR_EMAIL = 'bench@moag.invalid';

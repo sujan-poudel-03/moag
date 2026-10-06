@@ -426,7 +426,7 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
       log.write({ kind: 'fake-engine', binDir: fake.binDir });
     }
     progress(`starting the server (${mode}, cap $${capUsd.toFixed(2)})…`);
-    server = await deps.launchServer({ outDir, fakeBinDir: fake?.binDir ?? null, passEnv: scenario.passEnv, maxUsdPerCall: scenario.perCallCapUsd });
+    server = await deps.launchServer({ outDir, fakeBinDir: fake?.binDir ?? null, passEnv: scenario.passEnv, maxUsdPerCall: scenario.perCallCapUsd, gateTimeoutMs: scenario.gateTimeoutMs });
     log.write({ kind: 'server', url: server.url, projectsRoot: server.projectsRoot });
     client = new BenchClient(server.url, (entry) => log.write(entry));
     check();

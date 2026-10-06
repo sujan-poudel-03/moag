@@ -55,6 +55,7 @@ Everything is configured with environment variables, validated once at boot. A b
 | `MOAG_MASTER_KEY_FILE` or `MOAG_MASTER_KEY` | for API keys | Master secret for encrypting engine API keys, 16+ characters. The file must be **outside** the data dir. |
 | `MOAG_MAX_CONCURRENT_JOBS` | no | Worker processes server-wide, 1–8, default 2. Extra requests get 429. There is no queue. |
 | `MOAG_MAX_USD_PER_ENGINE_CALL` | no | Cap in USD on any single Claude call, greater than 0 and at most 1000. Passed as `--max-budget-usd`, together with what remains of the version cap (the smaller wins). See [Cost reporting](#cost-reporting). |
+| `MOAG_GATE_TIMEOUT_MS` | no | How long, in milliseconds, verify lets one gate command (for example `npm test`) run in a run job: a whole number from 1000 to 3600000. Default 600000. A command still running then is killed and the gate fails, so nothing ships. A project cannot change it: the server never reads the repository's `.moag/config.json`. |
 | `MOAG_RUN_ENV_PASSTHROUGH` | no | Comma-separated extra variable names passed to agents (see [below](#moag_run_env_passthrough)). |
 | `MOAG_ALLOW_SSH_CLONE` | no | `1` to allow `ssh://` clone URLs as well as `https://`. |
 
@@ -369,7 +370,7 @@ Approving a version lets its `commands` run in the project workspace on every ru
 - `POST /api/projects/:id/plans` answers `409 standards-not-approved` while no version is approved. No job starts and nothing is audited. The response carries `state` (`pending`, `rejected` or `none`) and `pendingVersion`.
 - The PRD resource omits the generate actions from `allowedActions` in that state and sets `planBlockedReason: "standards-not-approved"`.
 - The check is made again when a plan is approved, so a plan that was pending before the project had standards cannot be approved while none are approved.
-- A run is refused with the same code only when its plan was generated under standards and the store no longer has an approved version (loss or tampering). The server fails closed.
+- A run is refused with the same code whenever the project has no approved version, whatever its plan was generated under (a plan approved before the project had standards included, and a store that lost its versions). The plan card says why (`startBlockedReason: "standards-not-approved"`). Approving or skipping a ship gate is refused the same way; rejecting the ship stays possible.
 
 ### New and existing projects
 
@@ -379,7 +380,8 @@ Approving a version lets its `commands` run in the project workspace on every ru
 - A migrated project has two ways forward:
   - a reviewer approves the proposal (or a product owner edits it first), or
   - an admin **accepts the defaults**. This is offered only while the project is `migrated` and its pending version is still the untouched automatic one. It is audited as `standards.accept-defaults`, never as an approval, and the version is shown as "not reviewed". It needs the same acknowledgement as an approval when the proposal changes enforcement.
-- Until then, new plans are blocked. Plans that were approved before the project had standards can still run. Such a run is not checked, has no standards report, and stamps no standards version on the trace.
+- Until then, new plans are blocked, and so are runs, including runs of plans approved before the project had standards. Once a version is approved (or the defaults accepted), such a plan can start without being approved again, and its run is held to the standards then in effect like any other.
+- A run that was started before the upgrade carries no standards version. Its ship gate can be approved only while the project has approved standards. Approving it freezes the standards then in effect onto the run, so the resumed segment runs the standards check in its verification pass and nothing ships unless that check passes. The check diffs from the last ship or, failing that, the earliest recorded run base. With neither, it checks every file, because HEAD may already include the run's own work. No pre-gate report exists for such a run, so the approver sees none. Skipping its gate freezes nothing, since a skip ships nothing.
 - Changing a project's stack proposes nothing. The standards resource reports `stackMismatch: true` and the screen says so.
 - Rolling back to an older server build is safe: it ignores `standards.json`. The standards version on a release row is dropped the next time that build saves the plan.
 

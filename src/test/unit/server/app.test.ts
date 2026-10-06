@@ -2227,6 +2227,119 @@ describe('server app', function () {
     assert.equal(h.state.load(projectId).lastShipped, undefined);
   });
 
+  // ─── A run started before standards existed, approved at its ship gate afterwards ───
+
+  /** A run halted at its ship gate, rewound to how a run started before the upgrade looks: nothing frozen. */
+  async function legacyRunAtShipGate(): Promise<{ projectId: string; runId: string }> {
+    const halted = await haltAtShipGate();
+    h.state.update(halted.projectId, (s) => {
+      delete s.runs[0].standardsVersion;
+      delete s.runs[0].standardsHash;
+      delete s.runs[0].baseRef;
+    });
+    return halted;
+  }
+
+  it('legacy run: gate approve freezes the effective standards onto the run, and the resumed segment carries them', async () => {
+    const { projectId, runId } = await legacyRunAtShipGate();
+    const effective = h.standards.effective(projectId)!;
+    const w = await resumedAfterApprove(projectId, runId);
+    const run = h.state.load(projectId).runs[0];
+    assert.deepEqual([run.standardsVersion, run.standardsHash], [effective.version, effective.contentHash]);
+    // No ship and no other run recorded a base: never HEAD now (it may be past this run's work), the whole tree.
+    assert.equal(run.baseRef, null);
+    const job = w.job as RunJob;
+    assert.equal(job.standardsPath, path.join(h.state.runDir(projectId, runId), 'standards.json'));
+    const file = readStandardsJobFile(job.standardsPath!);
+    assert.deepEqual([file.version, file.contentHash, file.baseRef], [effective.version, effective.contentHash, null]);
+  });
+
+  it('legacy run: approved, but the verify pass sends no standards report → gaps, nothing shipped', async () => {
+    const { projectId, runId } = await legacyRunAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], 'none');
+    w.exit(0);
+    await assertNothingShipped(projectId, /the verification pass sent no standards report/);
+  });
+
+  it('legacy run: approved, and the approved command failed in the verify pass → gaps, nothing shipped', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await legacyRunAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [{ rule: 'command', result: 'failed', command: 'npm run lint', exitCode: 1, tail: 'src/a.ts: 3 problems' }],
+      totals: { passed: 0, noFindings: 0, failed: 1, notChecked: 0, findings: 0 },
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /a failed blocking rule/);
+  });
+
+  it('legacy run: approved and the check proved → shipped, stamped with the standards version frozen at approve', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await legacyRunAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).some((r) => r.releases.length > 0));
+    const rows = await traceRows(projectId) as unknown as Array<{ status: string; standardsVersion: number | null }>;
+    assert.deepEqual(rows.map((row) => [row.status, row.standardsVersion]), [['shipped', 1], ['shipped', 1]]);
+  });
+
+  it('legacy run: the frozen base is the last ship when there is one', async () => {
+    const { projectId, runId } = await legacyRunAtShipGate();
+    const shippedRef = 'a'.repeat(40);
+    h.state.update(projectId, (s) => { s.lastShipped = { ref: shippedRef, runId: 'earlier', at: '2000-01-01T00:00:00.000Z' }; });
+    const w = await resumedAfterApprove(projectId, runId);
+    assert.equal(h.state.load(projectId).runs[0].baseRef, shippedRef);
+    assert.equal(readStandardsJobFile((w.job as RunJob).standardsPath!).baseRef, shippedRef);
+  });
+
+  it('legacy run: a ship or run base recorded after the legacy run started is never its base — it may already hold that run\'s committed work', async () => {
+    const { projectId, runId } = await legacyRunAtShipGate();
+    const later = '9999-01-01T00:00:00.000Z';
+    h.state.update(projectId, (s) => {
+      s.lastShipped = { ref: 'b'.repeat(40), runId: 'newer', at: later };
+      s.runs.push({ ...s.runs[0], id: 'newer-run', startedAt: later, baseRef: 'c'.repeat(40) });
+    });
+    const w = await resumedAfterApprove(projectId, runId);
+    const run = h.state.load(projectId).runs.find((r) => r.id === runId)!;
+    assert.equal(run.baseRef, null, 'neither newer base is used: the whole tree is checked');
+    assert.equal(readStandardsJobFile((w.job as RunJob).standardsPath!).baseRef, null);
+  });
+
+  it('legacy run: a skip freezes nothing (it ships nothing), and a refused approve leaves the run unfrozen', async () => {
+    const a = await legacyRunAtShipGate();
+    // The job manager refuses the segment AFTER the standards were set on the in-memory record:
+    // the project's job.lock is held by this server with no job of its own behind it.
+    const lockPath = h.app.jobs.lockPath(a.projectId);
+    fs.writeFileSync(lockPath, String(process.pid));
+    const workers = h.workers.length;
+    const audited = h.auditEntries().length;
+    const refused = await h.request('POST', `/api/projects/${a.projectId}/runs/${a.runId}/gate/approve`, { as: 'approver', body: {} });
+    fs.rmSync(lockPath, { force: true });
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.error, 'project-locked');
+    assert.equal(h.workers.length, workers, 'no segment was spawned');
+    assert.equal(h.auditEntries().length, audited, 'nothing audited');
+    const kept = h.state.load(a.projectId).runs[0];
+    assert.deepEqual([kept.status, kept.standardsVersion, kept.standardsHash, 'baseRef' in kept], ['awaiting-approval', undefined, undefined, false],
+      'a refused approve leaves the run exactly as it was');
+    assert.deepEqual(kept.gateDecisions ?? [], []);
+    // With the lock gone the same approval goes through, and freezes then.
+    assert.equal((await h.request('POST', `/api/projects/${a.projectId}/runs/${a.runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    assert.equal(h.state.load(a.projectId).runs[0].standardsVersion, h.standards.effective(a.projectId)!.version);
+
+    await h.close();
+    h = await startHarness();
+    const b = await legacyRunAtShipGate();
+    const skipped = await h.request('POST', `/api/projects/${b.projectId}/runs/${b.runId}/gate/skip`, { as: 'admin', body: { reason: 'documentation only' } });
+    assert.equal(skipped.status, 202, skipped.raw);
+    const run = h.state.load(b.projectId).runs[0];
+    assert.equal(run.standardsVersion, undefined, 'a skip ships nothing, so nothing is frozen');
+    assert.equal((h.workers.at(-1)!.job as RunJob).standardsPath, undefined);
+  });
+
   it('a malformed verify-standards payload is dropped without throwing; the run carries on and a later valid report is kept', async () => {
     const { projectId, planId } = await approvedProject(h);
     assert.equal((await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } })).status, 202);
@@ -2598,6 +2711,21 @@ describe('server app', function () {
     const rcfg = JSON.parse(fs.readFileSync(String(h.workers.at(-1)!.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
     assert.equal('engines.claude.autoApprove' in rcfg, false);
     assert.equal('engines.codex.args' in rcfg, false, 'run jobs keep the configured codex args');
+  });
+
+  it('MOAG_GATE_TIMEOUT_MS reaches a run job\'s worker config as prdLoop.gateTimeoutMs; unset, the key is absent', async () => {
+    const hx = await startHarness({ config: { gateTimeoutMs: 1_800_000 } });
+    try {
+      const { projectId, planId } = await approvedProject(hx);
+      const r = await hx.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+      assert.equal(r.status, 202, r.raw);
+      const rcfg = JSON.parse(fs.readFileSync(String(hx.workers.at(-1)!.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
+      assert.equal(rcfg['prdLoop.gateTimeoutMs'], 1_800_000);
+    } finally { await hx.close(); }
+    const { projectId, planId } = await approvedProject(h);
+    await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    const dcfg = JSON.parse(fs.readFileSync(String(h.workers.at(-1)!.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
+    assert.equal('prdLoop.gateTimeoutMs' in dcfg, false, 'no operator value: verify keeps its 600000 default');
   });
 
   // ─── Planner lockdown (no file/tool access during plan generation) ───
@@ -3208,11 +3336,114 @@ describe('server app — standards gate', function () {
     assert.equal(ok.status, 200, ok.raw);
   });
 
-  it('run start: a plan generated under standards fails closed when the store has lost them; a legacy approved plan still runs', async () => {
+  /** Approve standards, generate and approve a plan. Returns its id. */
+  const approvedPlan = async (): Promise<string> => {
     await approveStandards();
     const planId = await pendingPlan();
     const hash = h.state.load(projectId).plans[0].contentHash;
     assert.equal((await h.request('POST', `/api/projects/${projectId}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } })).status, 200);
+    return planId;
+  };
+  /** Rewind to what an upgraded server holds: the approved plan has no standards version, and the boot migration proposed v1 (pending). */
+  const rewindToLegacy = async (): Promise<void> => {
+    h.state.update(projectId, (s) => { delete s.plans[0].standardsVersion; });
+    fs.rmSync(h.standards.filePath(projectId));
+    assert.deepEqual(await migrateStandards(h.projects, h.standards, h.audit, () => undefined), [projectId]);
+    assert.equal(h.standards.effective(projectId), null);
+  };
+  const planCard = async (): Promise<{ startBlockedReason: string | null; allowedActions: string[]; status: string }> =>
+    ((await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' })).body.plans as Array<{ startBlockedReason: string | null; allowedActions: string[]; status: string }>)[0];
+
+  it('run start: a legacy approved plan is refused while the project has no approved standards, and says why on the plan card', async () => {
+    const planId = await approvedPlan();
+    await rewindToLegacy();
+    const card = await planCard();
+    assert.equal(card.startBlockedReason, 'standards-not-approved', 'a legacy plan is blocked too');
+    assert.ok(!card.allowedActions.includes('run.start'), card.allowedActions.join(','));
+    const auditBefore = h.auditEntries().length;
+    const workersBefore = h.workers.length;
+    const refused = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.error, 'standards-not-approved');
+    assert.equal(refused.body.state, 'pending');
+    assert.equal(refused.body.pendingVersion, 1);
+    assert.match(String(refused.body.message), /no approved standards.*Standards v1 is waiting for a reviewer/);
+    assert.equal(h.workers.length, workersBefore, 'no run worker was spawned');
+    assert.deepEqual(h.state.load(projectId).runs, []);
+    assert.equal(h.state.load(projectId).plans[0].status, 'approved', 'the plan stays approved');
+    assert.equal(h.auditEntries().length, auditBefore, 'nothing was audited');
+  });
+
+  it('run start: once the migrated standards are approved, the legacy plan starts without being approved again, held to them', async () => {
+    const planId = await approvedPlan();
+    await rewindToLegacy();
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } })).status, 409);
+    const pending = h.standards.pending(projectId)!;
+    const accepted = await h.request('POST', `/api/projects/${projectId}/standards/accept-defaults`, { as: 'admin', body: { contentHash: pending.contentHash, acknowledgedEnforcementHash: pending.contentHash } });
+    assert.equal(accepted.status, 200, accepted.raw);
+    const card = await planCard();
+    assert.equal(card.status, 'approved');
+    assert.equal(card.startBlockedReason, null);
+    assert.ok(card.allowedActions.includes('run.start'), card.allowedActions.join(','));
+    const started = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(started.status, 202, started.raw);
+    assert.equal(h.auditEntries().filter((e) => e.action === 'plan.approve').length, 1, 'no second plan approval');
+    const run = h.state.load(projectId).runs[0];
+    const effective = h.standards.effective(projectId)!;
+    assert.equal(run.standardsVersion, effective.version, 'the run is held to the standards now in effect');
+    assert.equal(run.standardsHash, effective.contentHash);
+    const job = h.workers.at(-1)!.job as RunJob;
+    assert.ok(job.standardsPath, 'the worker gets the standards job file');
+    assert.notEqual(verifyArgv(job).at(-1), '--no-standards');
+  });
+
+  /** Start an approved plan's run and halt it at its ship gate, as a real worker would. Returns the run id. */
+  const haltAtGateHere = async (planId: string): Promise<string> => {
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    const w = h.workers.at(-1)!;
+    const snapPath = (w.job as { planPath: string }).planPath;
+    const snap = JSON.parse(fs.readFileSync(snapPath, 'utf-8'));
+    for (const t of snap.playlists.at(-1).tasks) {
+      t.status = t.id === 't-impl' ? 'completed' : t.id === 't-gate' ? 'failed' : 'blocked';
+    }
+    fs.writeFileSync(snapPath, JSON.stringify(snap));
+    w.line({ event: 'state', state: 'playing' });
+    w.line({ event: 'task-completed', id: 't-impl', name: 'Implement checkout' });
+    w.line({ event: 'manual-gate', id: 't-gate', name: 'Release gate' });
+    w.exit(3);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'awaiting-approval');
+    return (r.body.run as { id: string }).id;
+  };
+
+  it('gate approve and skip are refused while the project has no approved standards (legacy run included); reject stays possible', async () => {
+    const runId = await haltAtGateHere(await approvedPlan());
+    fs.rmSync(h.standards.filePath(projectId));
+    assert.equal(h.standards.effective(projectId), null);
+    const spawned = h.workers.length;
+    for (const legacy of [false, true]) {
+      if (legacy) { h.state.update(projectId, (s) => { delete s.runs[0].standardsVersion; delete s.runs[0].standardsHash; }); }
+      for (const kind of ['approve', 'skip'] as const) {
+        const r = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/${kind}`,
+          { as: kind === 'skip' ? 'admin' : 'approver', body: kind === 'skip' ? { reason: 'hotfix' } : {} });
+        assert.equal(r.status, 409, `${kind} (legacy ${legacy}): ${r.raw}`);
+        assert.equal(r.body.error, 'standards-not-approved', `${kind} (legacy ${legacy})`);
+        assert.match(String(r.body.message), /no approved standards/);
+      }
+      const run = h.state.load(projectId).runs[0];
+      assert.equal(run.status, 'awaiting-approval', 'still waiting');
+      assert.equal(run.segments, 1);
+      assert.deepEqual(run.gateDecisions ?? [], []);
+      assert.equal(h.workers.length, spawned, 'no segment was spawned');
+    }
+    assert.equal(h.auditEntries().some((e) => e.action === 'gate.approve' || e.action === 'gate.skip'), false);
+    const rej = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/reject`, { as: 'approver', body: { note: 'no standards' } });
+    assert.equal(rej.status, 200, rej.raw);
+    assert.equal(h.state.load(projectId).runs[0].status, 'ship-rejected');
+  });
+
+  it('run start: a plan generated under standards fails closed when the store has lost them', async () => {
+    const planId = await approvedPlan();
 
     // The standards file is gone (store loss or tampering) but the plan says it was generated under v1.
     fs.rmSync(h.standards.filePath(projectId));
@@ -3228,20 +3459,12 @@ describe('server app — standards gate', function () {
     assert.equal(h.workers.length, workersBefore, 'no run worker was spawned');
     assert.deepEqual(h.state.load(projectId).runs, []);
 
-    // The same plan as a legacy one (approved before the project had standards): it runs.
+    // The same plan as a legacy one (approved before the project had standards) is refused too.
     h.state.update(projectId, (s) => { delete s.plans[0].standardsVersion; });
-    const legacyDto = await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' });
-    assert.equal((legacyDto.body.plans as Array<{ startBlockedReason: string | null }>)[0].startBlockedReason, null);
-    const started = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
-    assert.equal(started.status, 202, started.raw);
-    // ...unchecked, and it says so everywhere: no job file, --no-standards, nothing on the record, no report.
-    const job = h.workers.at(-1)!.job as RunJob;
-    assert.equal(job.standardsPath, undefined);
-    assert.equal(verifyArgv(job).at(-1), '--no-standards');
-    const run = h.state.load(projectId).runs[0];
-    assert.deepEqual([run.standardsVersion, run.standardsHash, run.baseRef, run.standardsSummary], [undefined, undefined, undefined, undefined]);
-    assert.equal(fs.existsSync(path.join(h.state.runDir(projectId, run.id), 'standards.json')), false);
-    const detail = (await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' })).body.currentRun as object;
-    assert.equal('standardsReport' in detail, false, 'a legacy run has no standards report');
+    assert.equal((await planCard()).startBlockedReason, 'standards-not-approved');
+    const legacy = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(legacy.status, 409, legacy.raw);
+    assert.equal(legacy.body.error, 'standards-not-approved');
+    assert.equal(h.workers.length, workersBefore);
   });
 });

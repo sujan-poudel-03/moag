@@ -511,7 +511,7 @@ export function createApp(deps: AppDeps): App {
     const configPath = path.join(dir, 'config.json');
     const doc = kind === 'plan'
       ? buildPlanWorkerConfig(project, remaining, config.maxUsdPerEngineCall)
-      : buildWorkerConfig(project, remaining, config.maxUsdPerEngineCall);
+      : buildWorkerConfig(project, remaining, config.maxUsdPerEngineCall, config.gateTimeoutMs);
     writeFileAtomicSync(configPath, JSON.stringify(doc, null, 2), 0o600);
     return configPath;
   };
@@ -534,7 +534,7 @@ export function createApp(deps: AppDeps): App {
   /** What can stop a run from starting right now, beyond role and plan status (shared by DTOs and the run guard). */
   interface StartContext {
     jobActive: boolean; runsDisabled: boolean; budgetExhausted: boolean; engineUnavailable: boolean; engineChanged: boolean;
-    /** False only when the plan was generated under standards and the store now has no approved version. */
+    /** False when the project has no approved standards version now (whatever the plan was generated under). */
     standardsApproved: boolean;
     /** What the review rules say about the plan NOW (the approved playlist and its canonical copy); [] when it passes. */
     reviewErrors: string[];
@@ -547,7 +547,7 @@ export function createApp(deps: AppDeps): App {
     budgetExhausted: project.versionBudgetUsd > 0 && !(project.versionBudgetUsd - (st.versionSpend[review.forVersionCreatedAt] ?? 0) > 0),
     engineUnavailable: planEngineUnavailable(canonical),
     engineChanged: (review.status === 'approved' || review.status === 'ran') && lockedEngine(review) !== project.defaultEngine,
-    standardsApproved: !standardsLost(project, review),
+    standardsApproved: standardsView(project.id).effective !== null,
     // Only a plan that could start is re-validated: the same two playlists run start checks.
     reviewErrors: review.status === 'approved' || review.status === 'ran'
       ? reviewProblems(review, playlistCopyOf(review, canonical))?.errors ?? [] : [],
@@ -781,15 +781,6 @@ export function createApp(deps: AppDeps): App {
   };
 
   /**
-   * True when a plan generated under standards can no longer be held to any:
-   * the store has no approved version (lost or tampered with). Approved versions
-   * are immutable, so this never happens in normal use; a run then refuses to
-   * start. A legacy plan that never carried a standards version is not affected.
-   */
-  const standardsLost = (project: ProjectRecord, review: PlanReview): boolean =>
-    review.standardsVersion !== undefined && standardsView(project.id).effective === null;
-
-  /**
    * The ref a new run's standards check diffs against: everything the project has
    * not shipped yet.
    *
@@ -807,6 +798,22 @@ export function createApp(deps: AppDeps): App {
     const earliest = st.runs.find((r) => r.baseRef !== undefined);
     if (earliest) { return earliest.baseRef ?? null; }
     return gitHead(workspace, deps.exec);
+  };
+
+  /**
+   * The base for a run that started before standards existed, frozen when its ship is
+   * approved. Like `standardsBaseRef`, but HEAD is never a fallback: by the time the gate
+   * is approved HEAD may already be past this run's own work, and diffing from it would
+   * forgive that work. With no recorded ship and no recorded run base, null — the check
+   * diffs against the empty tree and every file counts. More is checked, never less.
+   * Only a ship or run base recorded before this run started counts: a newer one may
+   * already include this run's committed work and would forgive it.
+   */
+  const legacyRunBaseRef = (st: ProjectState, startedAt: string): string | null => {
+    const before = (at: string | undefined): boolean => typeof at === 'string' && at <= startedAt;
+    if (st.lastShipped?.ref && before(st.lastShipped.at)) { return st.lastShipped.ref; }
+    const earliest = st.runs.find((r) => r.baseRef !== undefined && before(r.startedAt));
+    return earliest ? earliest.baseRef ?? null : null;
   };
 
   /**
@@ -2105,9 +2112,10 @@ export function createApp(deps: AppDeps): App {
         throw new HttpError(409, 'job-active', 'This project already has a run in progress.');
       }
       requireApprovedEngine(p, review);
-      // A plan generated under standards never runs unchecked: if the store has lost every
-      // approved version, fail closed. (A legacy plan with no standards version still runs.)
-      if (standardsLost(p, review)) { requireStandards(p); }
+      // No run starts while the project has no approved standards — whatever the plan was
+      // generated under. A legacy plan (no standards version) is held to the standards in
+      // effect once they are approved, without being approved again.
+      const frozen = requireStandards(p);
       // Stamped with the project's engine: the snapshot's defaultEngine is what the runner uses.
       const canonical = state.loadCanonicalPlan(p.id, p.name, p.defaultEngine);
       requirePlanEngines(canonical);
@@ -2119,15 +2127,13 @@ export function createApp(deps: AppDeps): App {
       const workspace = requireWorkspace(p);
       // The run is held to the standards in effect NOW — the latest approved version, which
       // may be newer than the one its plan was generated under — and that version is frozen
-      // on the run record with the base its check diffs against. A project with no approved
-      // version (a legacy plan) runs without standards, and says so.
-      const frozen = standardsView(p.id).effective;
+      // on the run record with the base its check diffs against.
       // No job can start in this project while we wait: every start runs under this lock.
-      const baseRef = frozen ? await standardsBaseRef(st, workspace) : null;
+      const baseRef = await standardsBaseRef(st, workspace);
       const run: RunRecord = {
         id: randomUUID(), planId: review.id, status: 'running', startedBy: ctx.user!.id, startedAt: now().toISOString(),
         versionCreatedAt: review.forVersionCreatedAt, stack: p.stack, segments: 1,
-        ...(frozen ? { standardsVersion: frozen.version, standardsHash: frozen.contentHash, baseRef } : {}),
+        standardsVersion: frozen.version, standardsHash: frozen.contentHash, baseRef,
       };
       const dir = state.runDir(p.id, run.id);
       writeFileAtomicSync(path.join(dir, 'plan.json'), JSON.stringify(dehydratePlan(canonical), null, 2), 0o600);
@@ -2208,6 +2214,9 @@ export function createApp(deps: AppDeps): App {
         }
       }
       requireRunsEnabled();
+      // Approving or skipping resumes the run, and nothing ships from a project with no
+      // approved standards (rejecting stays possible: it is the way out).
+      const effectiveStandards = requireStandards(p);
       if (jobs.isActive(p.id)) { throw new HttpError(409, 'job-active', 'This project already has a job running.'); }
       const review = st.plans.find((x) => x.id === run.planId);
       if (!review) { throw new HttpError(409, 'plan-missing', 'The plan for this run no longer exists.'); }
@@ -2234,6 +2243,18 @@ export function createApp(deps: AppDeps): App {
       // written or spawned yet, and the run stays awaiting approval: rejecting the ship is
       // still possible, and is the way to close it.
       requireReviewPasses(review, playlistCopyOf(review, snapshot), 'This plan no longer passes review, so the run cannot resume. Reject the ship and request a new plan. ');
+      // A run started before standards existed carries no standards version. Approving its
+      // ship freezes the standards in effect NOW onto the run, so the resumed segment is handed
+      // the standards job file and its verify pass must prove the check (`standardsCheckProblem`)
+      // before anything is stamped shipped. Its base is the last ship or the earliest recorded
+      // run base — never HEAD now, which is past this run's own work: with neither, the base is
+      // null and every file is checked. Set on the in-memory record only; it is saved below
+      // after the segment starts, so a refused spawn leaves the run exactly as it was.
+      if (kind === 'approve' && run.standardsVersion === undefined) {
+        run.standardsVersion = effectiveStandards.version;
+        run.standardsHash = effectiveStandards.contentHash;
+        run.baseRef = legacyRunBaseRef(st, run.startedAt);
+      }
       writeFileAtomicSync(snapshotPath, JSON.stringify(dehydratePlan(snapshot), null, 2), 0o600);
       spawnRunSegment(p, run, review, remaining, workspace);
       run.status = 'running';

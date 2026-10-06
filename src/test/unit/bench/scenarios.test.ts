@@ -72,7 +72,9 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     if (s.repo.kind !== 'clone') { return; }
     assert.equal(path.resolve(s.repo.path), REPO, 'the clone source is this repository');
     assert.equal(s.repo.ref, 'feat/sdlc-automation');
-    assert.deepEqual(s.setupCommands, ['npm ci']);
+    // The unit suite reads compiled output (out/webview): without the compile
+    // step the npm test probe fails in the untouched clone with 11 failures.
+    assert.deepEqual(s.setupCommands, ['npm ci', 'npm run compile']);
     assert.deepEqual(s.passEnv, ['NODE_OPTIONS']);
     assert.equal(s.gateCommands.length, 2);
     assert.equal(s.gateCommands[0], 'npm run compile');
@@ -84,6 +86,9 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     // The full suite is what MOAG's own verify auto-detects: probed in the
     // untouched clone so a machine that cannot run it is reported as such.
     assert.deepEqual(s.environmentProbes, ['npm test']);
+    // The full suite runs for several minutes: 30 min per gate command, for the
+    // bench's own gates and (through MOAG_GATE_TIMEOUT_MS) the server's verify.
+    assert.equal(s.gateTimeoutMs, 1_800_000);
     assert.deepEqual(s.versions.map((v) => v.intendedBump), ['initial']);
     assert.equal(dryRunProblem(s), null);
     // What the real planner must emit for this repository (a Testing playlist
