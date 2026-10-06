@@ -61,6 +61,9 @@ import { PromptLibraryStore } from './templates/prompt-library';
 import { SandboxManager } from './sandbox/sandbox-manager';
 import { resolveBrowserRunner } from './sandbox/browser-driver';
 import { runGate } from './runner/evidence';
+import { clearStandardsBase, rememberStandardsBase, resolveStandardsBase } from './runner/standards-base';
+import { standardsReportSection, verificationGateRows } from './ui/standards-report-html';
+import { createLocalStandardsProvider, loadLocalStandards } from './standards/local-store';
 import { captureScreenshot } from './sandbox/screenshot';
 import { resolveDeveloperEmail } from './utils/git-identity';
 import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
@@ -1435,6 +1438,10 @@ export function activate(context: vscode.ExtensionContext): void {
   // Initialize AI rules store
   aiRulesStore = new AiRulesStore(context.globalStorageUri.fsPath);
   runner.setAiRulesStore(aiRulesStore);
+  runner.setStandardsProvider(createLocalStandardsProvider(() => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath));
+  // Before a run's first task: remember where the tree stood, so the standards check still
+  // sees work the run committed (git.autoCommit, or an agent that commits).
+  runner.setRunStartHook((cwd) => rememberStandardsBase(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? cwd));
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
@@ -4752,8 +4759,15 @@ import {
  * Read the PRD loop configuration block.
  * Dotted keys resolve under the headless shim too, so both surfaces read the same values.
  */
+/**
+ * Throws a file-naming error when `.moag/standards.json` exists but is invalid — the
+ * caller surfaces it, so a broken file stops verification instead of disabling the gate.
+ */
 function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
   const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  // Local standards are the workspace's own file. The base ref is filled in by the caller,
+  // which can await git; null would make every file in the repository count as added.
+  const standardsDoc = loadLocalStandards(cwd);
   return {
     cwd,
     maxFixIterations: cfg.get<number>('prdLoop.maxFixIterations', 3),
@@ -4771,6 +4785,9 @@ function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
       specPath: cfg.get<string>('prdLoop.uat.specPath', ''),
       timeoutMs: cfg.get<number>('prdLoop.uat.timeoutMs', 900_000),
     },
+    standards: standardsDoc
+      ? { profile: standardsDoc.profile, version: standardsDoc.version, baseRef: null }
+      : null,
   };
 }
 
@@ -5029,19 +5046,8 @@ function buildVerificationReportHtml(planName: string, prdText: string, report: 
   }).join('');
 
   // Deterministic gates — the facts the verdict actually rests on.
-  const gateRows = report.gates.map(gate => {
-    const statusColor = gate.passed ? '#28a745' : '#dc3545';
-    const status = gate.passed ? 'pass' : gate.timedOut ? 'timeout' : 'fail';
-    const snippet = gate.output
-      .split('\n').map(l => l.trim()).reverse().find(l => l.length > 0)?.substring(0, 160) ?? '—';
-    return `<tr>
-      <td><code>${escapeReportHtml(gate.command)}</code></td>
-      <td style="color:${statusColor}">${status}</td>
-      <td>${gate.exitCode}</td>
-      <td>${gate.durationMs}ms</td>
-      <td style="font-size:0.8em;color:#999">${escapeReportHtml(snippet)}</td>
-    </tr>`;
-  }).join('');
+  // The synthetic `moag:standards` row is worded there too, and never as a pass.
+  const gateRows = verificationGateRows(report.gates);
 
   const gateEmptyNote = report.gateCommandsEmpty
     ? '<p style="color:#f0ad4e;font-size:0.85em">No gate command could be detected for this repository — set <code>agentTaskPlayer.prdLoop.gateCommands</code> so verification rests on evidence, not judgment.</p>'
@@ -5149,6 +5155,7 @@ ${bannerHtml}
   ${uatSkipNote}
   <p class="meta">Iterations: ${report.iterations} · Model calls: ${report.modelCallsMade}${report.failedGate ? ' · verdict reached without a model' : ''}</p>
 </div>
+${standardsReportSection(report.standards)}
 <div class="section file-list">
   <h2>Changed files (${report.changedFiles.length})</h2>
   ${changedFilesHtml}
@@ -5198,7 +5205,14 @@ async function runPrdLoopInteractive(options: { fix: boolean; title: string }): 
       async (progress, token) => {
         const cancelSub = token.onCancellationRequested(() => abort.abort());
         try {
-          const controller = createPrdLoop(getPrdLoopConfig(cwd, options.fix), {
+          const loopConfig = getPrdLoopConfig(cwd, options.fix);
+          if (loopConfig.standards) {
+            // The standards gate judges everything since the base captured when the run
+            // started — so work the run committed is still in the diff — or since HEAD
+            // when no run captured one.
+            loopConfig.standards.baseRef = await resolveStandardsBase(cwd);
+          }
+          const controller = createPrdLoop(loopConfig, {
             plan: activePlan,
             resolvePrdText: async () => {
               const text = await resolvePrdTextInteractive(plan, cwd);
@@ -5219,7 +5233,10 @@ async function runPrdLoopInteractive(options: { fix: boolean; title: string }): 
             signal: abort.signal,
           });
           holder.controller = controller;
-          await controller.run();
+          const verified = await controller.run();
+          // Verified: the work since the captured base was judged and accepted, so the next
+          // run captures a new one. Anything else keeps the base — nothing unverified drops out.
+          if (verified.passed && loopConfig.standards) { clearStandardsBase(cwd); }
         } finally {
           cancelSub.dispose();
         }

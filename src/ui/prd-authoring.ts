@@ -26,6 +26,7 @@ import * as UserMsg from '../utils/user-messages';
 import { MAX_PRD_VERSIONS } from '../models/plan';
 import { PromptInputViewProvider } from './prompt-input-view';
 import { ensureMoagDir } from '../workspace/moag-paths';
+import { loadLocalPlannerText } from '../standards/local-store';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 /** Everything this module needs from extension.ts, passed in explicitly. */
@@ -851,7 +852,16 @@ export async function generatePlanFromPrdText(prdText: string): Promise<void> {
     return;
   }
 
-  const prdPrompt = buildFullPlanPrompt(prdText);
+  // A plan generated without the project's standards would be reviewed against them later
+  // and fail; a broken standards file stops generation here instead.
+  let standardsText: string | undefined;
+  try {
+    standardsText = loadLocalPlannerText(cwd);
+  } catch (err) {
+    UserMsg.showError(UserMsg.standardsLoadError(err instanceof Error ? err.message : String(err)));
+    return;
+  }
+  const prdPrompt = buildFullPlanPrompt(prdText, standardsText);
   let stdout = '';
 
   try {
@@ -979,11 +989,19 @@ export async function cmdGenerateDeltaPlan(args?: { prdText?: string }): Promise
   // Re-check after the modal: a run may have started while it was open.
   if (deps.isRunnerBusy()) { UserMsg.showWarning(UserMsg.runnerBusy()); return; }
 
+  let deltaStandardsText: string | undefined;
+  try {
+    deltaStandardsText = loadLocalPlannerText(cwd);
+  } catch (err) {
+    UserMsg.showError(UserMsg.standardsLoadError(err instanceof Error ? err.message : String(err)));
+    return;
+  }
+
   deltaInFlight = true;
   let outcome;
   try {
     outcome = await withPlanGenerationEngine('Generating delta plan…', cwd,
-      (runEngine, signal) => generateDeltaPlan(plan, { runEngine, signal }));
+      (runEngine, signal) => generateDeltaPlan(plan, { runEngine, signal, standardsText: deltaStandardsText }));
   } finally {
     deltaInFlight = false;
   }

@@ -324,6 +324,21 @@ export async function gitTopLevel(dir: string, exec: ExecFn = execFileAsync): Pr
   }
 }
 
+/**
+ * The commit `dir`'s work tree is based on, or null when there is none: not a
+ * repository, git failed, or the repository has no commits yet. A run records
+ * it at start as the base its standards check diffs against.
+ */
+export async function gitHead(dir: string, exec: ExecFn = execFileAsync): Promise<string | null> {
+  try {
+    const r = await exec('git', ['-C', dir, 'rev-parse', '--verify', '--quiet', 'HEAD'], { timeoutMs: 30_000 });
+    const head = r.stdout.trim();
+    return r.exitCode === 0 && /^[0-9a-f]{40,64}$/.test(head) ? head : null;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Planning context (no repo code runs) ───
 
 /** Most paths the planning prompt's repository listing carries. */
@@ -336,9 +351,12 @@ export const REPO_LISTING_MAX_CHARS = 100_000;
  * standing instructions when it runs with cwd = the workspace: hooks, MCP
  * servers and tool grants (`.claude`, `.mcp.json`, `.gemini`, `.codex`), agent
  * instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules`) and
- * MOAG's workspace AI rules injected into every task prompt (`.moag/rules.json`).
- * Plan generation never runs there; an approved run does. Paths are relative to
- * the workspace root, `/`-separated.
+ * MOAG's workspace AI rules file (`.moag/rules.json`). A hosted run does NOT
+ * inject that file — the server worker never builds an AI rules store, and its
+ * task prompts carry only the approved project standards — but a local
+ * `moag run` or VS Code session in the same checkout does, so the reviewer is
+ * still told it is there. Plan generation never runs in the workspace; an
+ * approved run does. Paths are relative to the workspace root, `/`-separated.
  */
 export const REPO_ENGINE_CONFIG_ENTRIES = [
   '.claude', '.mcp.json', '.gemini', '.codex',

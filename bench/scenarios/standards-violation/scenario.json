@@ -1,0 +1,22 @@
+{
+  "name": "standards-violation",
+  "description": "A negative scenario for the standards gate. One small PRD (a slugify helper) whose dry-run fixture passes its own tests but breaks the project's approved standards: it leaves a line of commented-out code and a banned placeholder phrase. Expected dry-run result: the bench acceptance gate is green, MOAG's verify stops at the standards gate, the run ends with gaps and nothing is marked shipped.",
+  "repo": { "kind": "template", "templateDir": "template" },
+  "setupCommands": [],
+  "stack": "node-ts",
+  "engine": "claude",
+  "budgetUsd": 3,
+  "perCallCapUsd": 1.0,
+  "minVersionUsd": 1,
+  "reserveFactor": 1.5,
+  "versionTimeoutMin": 30,
+  "passEnv": [],
+  "gateCommands": ["npm test"],
+  "gateTimeoutMs": 600000,
+  "allowedCommands": ["npm run test", "npm run lint"],
+  "versions": [
+    { "id": "v1", "prdFile": "prd/v1.md", "intendedBump": "initial", "dryRunFixture": "dry-run/v1" }
+  ],
+  "dryRun": { "planCommand": "npm test" },
+  "standardsProfile": "standards.json"
+}

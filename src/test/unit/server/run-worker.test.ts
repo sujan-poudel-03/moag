@@ -6,8 +6,14 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  runJob, WorkerDeps, RunnerLike, DeltaOutcomeLike, guardParentPipes, withRepoListing, MAX_REPO_LISTING_CHARS, NON_EVIDENCE_FAILURE_CATEGORIES,
+  heldStandards,
+  runJob, WorkerDeps, RunnerLike, DeltaOutcomeLike, guardParentPipes, withRepoListing, MAX_REPO_LISTING_CHARS, NON_EVIDENCE_FAILURE_CATEGORIES, verifyArgv,
 } from '../../../server/run-worker';
+import * as sinon from 'sinon';
+import { parseArgs, resolveVerifyStandards } from '../../../headless/cli';
+import { readStandardsJobFile } from '../../../standards/local-store';
+import { profileHash, renderPlannerStandards, renderStandardsText } from '../../../standards/profile';
+import { sampleProfile } from '../standards/fixtures';
 import { RunJob, PlanJob, parseWorkerLine } from '../../../server/worker-protocol';
 import { buildDeltaPlanPrompt, buildFullPlanPrompt } from '../../../runner/prd-plan';
 import { resolveRequirements } from '../../../models/requirements';
@@ -413,6 +419,283 @@ describe('run-worker', () => {
       assert.equal(disposed, 1);
     });
 
+    // ─── Standards on a run ───
+
+    it('a job with a standardsPath gives the runner the server-rendered prompt text; a job without one sets no provider', async () => {
+      type Provider = (cwd: string) => { text: string; version: number } | null;
+      const set: Provider[] = [];
+      const read: string[] = [];
+      const mk = () => {
+        const runner = new FakeRunner(async () => {});
+        (runner as unknown as { setStandardsProvider: (fn: Provider) => void }).setStandardsProvider = (fn) => { set.push(fn); };
+        return harness(runner, {
+          readStandardsJobFile: (p) => { read.push(p); return { version: 4, promptText: 'APPROVED PROMPT TEXT v4', plannerText: 'planner' }; },
+        });
+      };
+      assert.equal(await runJob({ ...RUN_JOB, standardsPath: '/data/runs/r1/standards.json' }, mk().deps), 0);
+      assert.deepEqual(read, ['/data/runs/r1/standards.json']);
+      assert.equal(set.length, 1);
+      // The same approved text whatever directory a task runs in: nothing is looked up per workspace.
+      assert.deepEqual(set[0]('/any/task/cwd'), { text: 'APPROVED PROMPT TEXT v4', version: 4 });
+      assert.deepEqual(set[0](RUN_JOB.workspace), { text: 'APPROVED PROMPT TEXT v4', version: 4 });
+
+      assert.equal(await runJob(RUN_JOB, mk().deps), 0);
+      assert.equal(read.length, 1, 'no standardsPath: nothing is read');
+      assert.equal(set.length, 1, 'and no provider is set');
+    });
+
+    it('a run whose standards file cannot be read or used never plays: exit 2, no verify', async () => {
+      const job: RunJob = { ...RUN_JOB, standardsPath: '/data/runs/r1/standards.json' };
+      const cases: Array<[string, Partial<WorkerDeps>, boolean, RegExp]> = [
+        ['tampered file', { readStandardsJobFile: () => { throw new Error('"standards.json" does not match its content hash; refusing to use it.'); } }, true, /content hash/],
+        ['no reader', {}, true, /no reader/],
+        ['runner cannot carry standards', { readStandardsJobFile: () => ({ version: 1, promptText: 't', plannerText: 'p' }) }, false, /cannot carry standards/],
+      ];
+      for (const [name, over, withSetter, message] of cases) {
+        const runner = new FakeRunner(async () => {});
+        if (withSetter) { (runner as unknown as { setStandardsProvider: () => void }).setStandardsProvider = () => { /* never reached */ }; }
+        const h = harness(runner, over);
+        assert.equal(await runJob(job, h.deps), 2, name);
+        assert.equal(runner.playArgs.length, 0, `${name}: the plan never plays without its standards`);
+        assert.equal(h.verifyCalls, 0, name);
+        assert.match(String(h.events.find((e) => e.event === 'error')?.message), message, name);
+      }
+    });
+
+    it('verifyArgv always names --standards <job file> or --no-standards, and never a gate command', () => {
+      const withFile = verifyArgv({ ...RUN_JOB, standardsPath: '/data/runs/r1/standards.json' });
+      assert.deepEqual(withFile, ['verify', '/snap/plan.json', '--cwd', RUN_JOB.workspace, '--no-uat', '--standards', '/data/runs/r1/standards.json']);
+      const without = verifyArgv(RUN_JOB);
+      assert.deepEqual(without, ['verify', '/snap/plan.json', '--cwd', RUN_JOB.workspace, '--no-uat', '--no-standards']);
+      for (const argv of [withFile, without]) {
+        assert.ok(!argv.includes('--gate') && !argv.includes('--fix') && !argv.includes('--base'));
+        assert.equal(argv.filter((a) => a === '--standards' || a === '--no-standards').length, 1);
+      }
+    });
+
+    it('a server run never reads <workspace>/.moag/rules.json or <workspace>/.moag/standards.json', async () => {
+      const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-hostile-ws-'));
+      const data = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-hostile-data-'));
+      try {
+        // A repository shipping its own rules and standards. Both are invalid JSON, so a
+        // reader that touched either would also throw.
+        fs.mkdirSync(path.join(ws, '.moag'));
+        fs.writeFileSync(path.join(ws, '.moag', 'rules.json'), '{ "rules": [ HOSTILE');
+        fs.writeFileSync(path.join(ws, '.moag', 'standards.json'), '{ "profile": HOSTILE');
+        fs.writeFileSync(path.join(ws, '.moag', 'routing.json'), '{}');
+        const profile = sampleProfile();
+        const jobFile = path.join(data, 'standards.json');
+        fs.writeFileSync(jobFile, JSON.stringify({
+          schemaVersion: 1, version: 2, contentHash: profileHash(profile), baseRef: null, profile,
+          promptText: renderStandardsText(profile, 2), plannerText: renderPlannerStandards(profile, 2),
+        }));
+
+        // Stubbed on the real module object: every `import * as fs` in the code under test reads through it.
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const nodeFs = require('fs') as typeof fs;
+        const touched: string[] = [];
+        const spy = <K extends 'readFileSync' | 'statSync' | 'lstatSync' | 'existsSync' | 'readdirSync' | 'openSync'>(name: K) =>
+          sinon.stub(nodeFs, name).callsFake(((...args: unknown[]) => {
+            touched.push(path.resolve(String(args[0])));
+            return (nodeFs[name] as unknown as { wrappedMethod: (...a: unknown[]) => unknown }).wrappedMethod.apply(nodeFs, args);
+          }) as never);
+        const stubs = [spy('readFileSync'), spy('statSync'), spy('lstatSync'), spy('existsSync'), spy('readdirSync'), spy('openSync')];
+        let fromJobFile: unknown;
+        let withoutStandards: unknown;
+        const provided: Array<{ text: string; version: number } | null> = [];
+        try {
+          for (const standardsPath of [jobFile, undefined]) {
+            const job: RunJob = { ...RUN_JOB, workspace: ws, ...(standardsPath ? { standardsPath } : {}) };
+            const runner = new FakeRunner(async () => {});
+            (runner as unknown as { setStandardsProvider: (fn: (cwd: string) => { text: string; version: number } | null) => void })
+              .setStandardsProvider = (fn) => { provided.push(fn(ws)); };
+            const h = harness(runner, {
+              readStandardsJobFile: (p) => readStandardsJobFile(p),
+              // What main() wires: cli.parseArgs(verifyArgv(job)), then the loop config's standards.
+              runVerifyCore: async () => {
+                const resolved = resolveVerifyStandards(parseArgs(verifyArgv(job)));
+                if (standardsPath) { fromJobFile = resolved; } else { withoutStandards = resolved; }
+                return 0;
+              },
+            });
+            assert.equal(await runJob(job, h.deps), 0);
+          }
+        } finally { for (const s of stubs) { s.restore(); } }
+
+        // The standards came from the server's file, or there were none — never the repository's.
+        assert.deepEqual(fromJobFile, { profile, version: 2, baseRef: null });
+        assert.equal(withoutStandards, null);
+        assert.deepEqual(provided, [{ text: renderStandardsText(profile, 2), version: 2 }]);
+        const hostile = [path.join(ws, '.moag', 'rules.json'), path.join(ws, '.moag', 'standards.json')].map((p) => path.resolve(p));
+        assert.deepEqual(touched.filter((p) => hostile.includes(p)), [], 'neither repository file was opened, stat-ed or probed');
+        // Non-vacuous: the spies saw the files a server run does read.
+        assert.ok(touched.includes(path.resolve(jobFile)), 'the server job file was read');
+        assert.ok(touched.includes(path.resolve(ws, '.moag', 'routing.json')), 'routing.json (validated, values dropped) was read');
+      } finally {
+        fs.rmSync(ws, { recursive: true, force: true });
+        fs.rmSync(data, { recursive: true, force: true });
+      }
+    });
+
+    // ─── Pre-gate standards check ───
+
+    /** A runner that halts at the ship gate, optionally doing something right after the gate event. */
+    function gateRunner(afterGate: () => void = () => {}): FakeRunner {
+      const runner = new FakeRunner(async (r, plan) => {
+        r.emit('task-started', plan.playlists[0].tasks[1], plan.playlists[0]);
+        r.emit('manual-gate', plan.playlists[0].tasks[1]);
+        afterGate();
+        await tick();
+        await tick();
+      });
+      (runner as unknown as { setStandardsProvider: () => void }).setStandardsProvider = () => { /* accepted */ };
+      return runner;
+    }
+    const STANDARDS_JOB: RunJob = { ...RUN_JOB, standardsPath: '/data/runs/r1/standards.json' };
+    const reader = { readStandardsJobFile: () => ({ version: 1, promptText: 't', plannerText: 'p' }) };
+
+    it('a gate halt runs the pre-gate standards check once, after play settled, and still exits 3 — with zero engine calls', async () => {
+      const order: string[] = [];
+      let engines = 0;
+      let signalAborted: boolean | null = null;
+      let h!: Harness;
+      h = harness(gateRunner(), {
+        ...reader,
+        getEngine: () => { engines++; return { runTask: async () => ({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 }) }; },
+        runStandardsCheck: async (signal) => {
+          signalAborted = signal.aborted;
+          order.push(`check:after-${h.events.at(-1)?.event}`);
+          h.deps.emit({ event: 'verify-standards', phase: 'pre-gate', version: 1, rules: [], findings: [] });
+        },
+      });
+      const code = await runJob(STANDARDS_JOB, h.deps);
+      assert.equal(code, 3);
+      assert.deepEqual(order, ['check:after-manual-gate'], 'once, and only after the run halted');
+      assert.equal(signalAborted, false, 'a gate halt is not a stop request: the check is allowed to run');
+      const names = h.events.map((e) => e.event);
+      assert.ok(names.indexOf('verify-standards') > names.indexOf('manual-gate'));
+      assert.equal(h.events.find((e) => e.event === 'verify-standards')?.phase, 'pre-gate');
+      assert.deepEqual(h.events.at(-1), { event: 'run-finished', code: 3 });
+      assert.equal(h.verifyCalls, 0, 'the authoritative verify pass still waits for approval');
+      assert.equal(engines, 0, 'getEngine was never invoked');
+    });
+
+    // The job file sits in the run directory, which the agent can write. The worker reads it
+    // once, before any task runs; every later check gets that copy, never a second read.
+    it('the job file is read exactly once, at start: the pre-gate check is handed that copy', async () => {
+      const profile = { commands: [{ label: 'Lint', run: 'npm run lint' }] };
+      const reads: string[] = [];
+      const handed: unknown[] = [];
+      let readsAtCheck = -1;
+      const h = harness(gateRunner(), {
+        readStandardsJobFile: (p) => { reads.push(p); return { version: 4, promptText: 't', plannerText: 'p', profile, baseRef: 'f00dfeed' }; },
+        runStandardsCheck: async (_signal, standards) => { readsAtCheck = reads.length; handed.push(standards); },
+      });
+      assert.equal(await runJob(STANDARDS_JOB, h.deps), 3);
+      assert.deepEqual(reads, ['/data/runs/r1/standards.json'], 'one read for the whole job');
+      assert.equal(readsAtCheck, 1, 'and it happened before the check, not for it');
+      assert.equal(handed.length, 1);
+      const got = handed[0] as { version: number; profile: unknown; baseRef: string };
+      assert.equal(got.profile, profile, 'the very object read at start');
+      assert.deepEqual([got.version, got.baseRef], [4, 'f00dfeed']);
+    });
+
+    it('the verification pass is handed the same copy, and the file is still read only once', async () => {
+      const profile = { commands: [] };
+      let reads = 0;
+      const handed: unknown[] = [];
+      const runner = new FakeRunner(async () => { /* every task completes */ });
+      (runner as unknown as { setStandardsProvider: () => void }).setStandardsProvider = () => { /* accepted */ };
+      const h = harness(runner, {
+        readStandardsJobFile: () => { reads++; return { version: 2, promptText: 't', plannerText: 'p', profile, baseRef: null }; },
+        runVerifyCore: async (_plan, _events, standards) => { handed.push(standards); return 0; },
+      });
+      assert.equal(await runJob(STANDARDS_JOB, h.deps), 0);
+      assert.equal(reads, 1);
+      assert.equal((handed[0] as { profile: unknown }).profile, profile);
+    });
+
+    it('a job with no standards hands none to verify', async () => {
+      const handed: unknown[] = [];
+      const h = harness(new FakeRunner(async () => { /* completes */ }), {
+        runVerifyCore: async (_plan, _events, standards) => { handed.push(standards); return 0; },
+      });
+      assert.equal(await runJob(RUN_JOB, h.deps), 0);
+      assert.deepEqual(handed, [undefined]);
+    });
+
+    it('heldStandards turns what was read into what a check takes, and is null when there is no profile to hold', () => {
+      const profile = { commands: [] };
+      assert.deepEqual(heldStandards({ version: 3, promptText: 't', plannerText: 'p', profile, baseRef: 'abc1234' }), { profile, version: 3, baseRef: 'abc1234' });
+      assert.deepEqual(heldStandards({ version: 3, promptText: 't', plannerText: 'p', profile }), { profile, version: 3, baseRef: null });
+      assert.equal(heldStandards({ version: 3, promptText: 't', plannerText: 'p' }), null);
+      assert.equal(heldStandards(undefined), null);
+    });
+
+    it('main() wires both checks to the held copy: neither re-reads the job file after the agent ran', () => {
+      const source = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'server', 'run-worker.ts'), 'utf-8');
+      const wiring = source.slice(source.indexOf('const deps: WorkerDeps = {'));
+      const verify = wiring.slice(wiring.indexOf('runVerifyCore: (plan, events, standards) =>'), wiring.indexOf('runStandardsCheck:'));
+      const preGate = wiring.slice(wiring.indexOf('runStandardsCheck: (signal, standards) =>'), wiring.indexOf('emit: emitLine'));
+      assert.match(verify, /heldStandards\(standards\)/);
+      assert.match(verify, /cli\.runVerifyCore\(args, ctx, plan, events, 'plan', held \? \{ standards: held \} : \{\}\)/);
+      assert.match(preGate, /cli\.runStandardsCheckCore\(cli\.parseArgs\(verifyArgv\(job\)\), signal, heldStandards\(standards\) \?\? undefined\)/);
+      // The reader is called from one place only: the start of the job.
+      assert.equal(source.split('readJobStandards(job.standardsPath, deps)').length - 1, 2, 'once for a run job, once for a plan job');
+    });
+
+    it('the pre-gate check is skipped once a stop was requested', async () => {
+      let checks = 0;
+      let h!: Harness;
+      h = harness(gateRunner(() => h.triggerStop()), { ...reader, runStandardsCheck: async () => { checks++; } });
+      assert.equal(await runJob(STANDARDS_JOB, h.deps), 3);
+      assert.equal(checks, 0);
+    });
+
+    it('a stop that arrives while the check runs aborts it, and the exit code is still 3', async () => {
+      let h!: Harness;
+      let abortedDuring = false;
+      h = harness(gateRunner(), {
+        ...reader,
+        runStandardsCheck: (signal) => new Promise<void>((resolve) => {
+          signal.addEventListener('abort', () => { abortedDuring = true; resolve(); }, { once: true });
+          setImmediate(() => h.triggerStop()); // the user presses Stop mid-check
+        }),
+      });
+      assert.equal(await runJob(STANDARDS_JOB, h.deps), 3);
+      assert.equal(abortedDuring, true);
+    });
+
+    it('a throwing pre-gate check becomes a warning event; the run still exits 3', async () => {
+      const h = harness(gateRunner(), {
+        ...reader,
+        runStandardsCheck: async () => { throw new Error('"standards.json" does not match its content hash; refusing to use it.'); },
+      });
+      assert.equal(await runJob(STANDARDS_JOB, h.deps), 3);
+      const warning = h.events.find((e) => e.event === 'warning');
+      assert.match(String(warning?.message), /Standards could not be checked before the ship gate: .*content hash/);
+      assert.ok(parseWorkerLine(JSON.stringify(warning)), 'the warning is a protocol event');
+      assert.equal(h.events.some((e) => e.event === 'error'), false, 'not an error: the gate halt is the outcome');
+      assert.deepEqual(h.events.at(-1), { event: 'run-finished', code: 3 });
+    });
+
+    it('no pre-gate check without a standards file, and none on any exit other than the gate halt', async () => {
+      let checks = 0;
+      const over = { ...reader, runStandardsCheck: async () => { checks++; } };
+      // A legacy run (no standards) halting at the gate.
+      assert.equal(await runJob(RUN_JOB, harness(gateRunner(), over).deps), 3);
+      // Runs with standards that do not halt at a gate: completed (0), task failed (1), budget (4).
+      const plain = (script: ConstructorParameters<typeof FakeRunner>[0]): FakeRunner => {
+        const r = new FakeRunner(script);
+        (r as unknown as { setStandardsProvider: () => void }).setStandardsProvider = () => { /* accepted */ };
+        return r;
+      };
+      assert.equal(await runJob(STANDARDS_JOB, harness(plain(async () => {}), over).deps), 0);
+      assert.equal(await runJob(STANDARDS_JOB, harness(plain(async (_r, plan) => { plan.playlists[0].tasks[0].status = 'failed'; }), over).deps), 1);
+      assert.equal(await runJob(STANDARDS_JOB, harness(plain(async (r) => { r.emit('budget-exceeded', { totalCost: 2, budget: 1 }); await tick(); }), over).deps), 4);
+      assert.equal(checks, 0);
+    });
+
     it('warns for each routing.json value the validator drops', async () => {
       const ws = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-worker-'));
       try {
@@ -492,6 +775,47 @@ describe('run-worker', () => {
       await runJob({ kind: 'plan', mode: 'delta', workspace: dir, planPath: '/p', outPath: path.join(dir, 'o.json'), engine: 'codex' }, h.deps);
       assert.equal(opts!.cwd, dir);
       assert.equal(opts!.costLabel, 'plan-generation');
+    });
+
+    it('a job with a standardsPath hands the planner text from the injected reader to the generator; one without hands nothing', async () => {
+      const read: string[] = [];
+      const seen: Array<Record<string, unknown>> = [];
+      const h = harness(new FakeRunner(async () => {}), {
+        readStandardsJobFile: (p) => { read.push(p); return { version: 3, promptText: 'TASK TEXT', plannerText: 'PLANNER TEXT v3' }; },
+        generateDeltaPlan: async (_p, d) => { seen.push(d as unknown as Record<string, unknown>); return { kind: 'no-delta' }; },
+      });
+      const job: PlanJob = { kind: 'plan', mode: 'delta', workspace: dir, planPath: '/p', outPath: path.join(dir, 'o.json'), engine: 'claude' };
+      assert.equal(await runJob({ ...job, standardsPath: '/data/plans/x/standards.json' }, h.deps), 0);
+      assert.deepEqual(read, ['/data/plans/x/standards.json']);
+      assert.equal(seen[0].standardsText, 'PLANNER TEXT v3', 'the planner text, not the task text');
+
+      assert.equal(await runJob(job, h.deps), 0);
+      assert.equal(read.length, 1, 'no standardsPath: the reader is not called');
+      assert.equal('standardsText' in seen[1], false);
+    });
+
+    it('an unreadable standards file fails the plan job before any engine call (exit 2), and so does a worker with no reader', async () => {
+      let generated = 0;
+      let engines = 0;
+      const job: PlanJob = { kind: 'plan', mode: 'delta', workspace: dir, planPath: '/p', outPath: path.join(dir, 'o.json'), engine: 'claude', standardsPath: path.join(dir, 'standards.json') };
+      const over: Partial<WorkerDeps> = {
+        getEngine: () => { engines++; return { runTask: async () => ({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 }) }; },
+        generateDeltaPlan: async () => { generated++; return { kind: 'no-delta' }; },
+      };
+      const tampered = harness(new FakeRunner(async () => {}), {
+        ...over,
+        readStandardsJobFile: () => { throw new Error('"standards.json" does not match its content hash; refusing to use it.'); },
+      });
+      assert.equal(await runJob(job, tampered.deps), 2);
+      assert.match(String(tampered.events.find((e) => e.event === 'error')?.message), /does not match its content hash/);
+
+      const noReader = harness(new FakeRunner(async () => {}), over);
+      assert.equal(await runJob(job, noReader.deps), 2);
+      assert.match(String(noReader.events.find((e) => e.event === 'error')?.message), /no reader/);
+
+      assert.equal(generated, 0);
+      assert.equal(engines, 0);
+      assert.equal(fs.existsSync(job.outPath), false, 'no outcome was written');
     });
 
     it('puts the server repository listing in a context section before the output-format rules; cwd stays the scratch dir', async () => {

@@ -8,6 +8,7 @@
 
 import { h, mount, clear, badge, glyph, toast, announce, confirmDialog, field, fmtTime, fmtUsd, fmtAgo } from '../dom.js';
 import { STR, serverMessage } from '../strings.js';
+import { cappedList } from './version-panel.js';
 
 const TASK_STATUS = {
   pending: { glyph: '○', label: 'Pending', badge: null },
@@ -38,6 +39,236 @@ const RUN_STATUS_BADGE = {
 };
 
 const TAIL_LINES = 6;
+
+/**
+ * A rule MOAG decides itself — every row that is not a profile command (the server's
+ * `isScannerRule`). Never worded "Passed" or "Failed": only a command, judged by the exit
+ * code of the project's own tool, is.
+ */
+const isScanner = (row) => row.rule !== 'command';
+
+/** The stored results, in the order a table lists them. "Not checked" is never counted as a pass. */
+const RESULT_ORDER = { failed: 0, 'not-checked': 1, passed: 2 };
+
+/**
+ * How one row's outcome is worded. A command passes or fails; every other rule has
+ * findings or no findings — that a scan found nothing is not proof nothing is there.
+ */
+export function ruleOutcome(row) {
+  if (row.result === 'not-checked') { return { glyph: '○', label: 'Not checked', cls: 'muted' }; }
+  if (isScanner(row)) {
+    return row.result === 'failed'
+      ? { glyph: '✗', label: 'Findings', cls: isAdvisory(row) ? 'text-warning' : 'text-error' }
+      : { glyph: '–', label: 'No findings', cls: 'muted' };
+  }
+  return row.result === 'failed' ? { glyph: '✗', label: 'Failed', cls: 'text-error' } : { glyph: '✓', label: 'Passed', cls: 'text-success' };
+}
+
+/** The well-known empty tree: the diff base of a repository that had no commit. */
+const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
+
+/** A rule row or finding is blocking unless it says it is advisory; a command always blocks. */
+const isAdvisory = (row) => row.rule !== 'command' && row.severity === 'advisory';
+/**
+ * A blocking row the profile configures that ended not checked, whatever the reason: a
+ * command that did not run, or a promoted rule that could not read what it had to or found
+ * nothing to judge. Mirrors the server's `isBlockingNotChecked`.
+ */
+const isUnreadBlocking = (row) => row.result === 'not-checked' && !isAdvisory(row) && row.unconfigured !== true;
+/** A profile with no command and no configured promoted rule: nothing in the report can stop a release. */
+const hasNoBlockingRules = (rules) => !rules.some((r) => !isAdvisory(r) && r.unconfigured !== true);
+
+/**
+ * A standards report in the shape the card renders, or null when `data` is not
+ * one. The server validates what it stores; a live event is checked here too.
+ */
+export function asStandardsReport(data) {
+  if (!data || !Array.isArray(data.rules) || !Array.isArray(data.findings)) { return null; }
+  const rules = data.rules.filter((r) => r && typeof r.rule === 'string' && RESULT_ORDER[r.result] !== undefined);
+  const findings = data.findings.filter((f) => f && typeof f.file === 'string' && typeof f.rule === 'string');
+  const notCheckedFiles = (Array.isArray(data.notCheckedFiles) ? data.notCheckedFiles : [])
+    .filter((f) => f && typeof f.file === 'string' && typeof f.reason === 'string');
+  const t = data.totals && typeof data.totals === 'object' ? data.totals : {};
+  const atLeast = (key, listed) => (Number.isFinite(t[key]) ? Math.max(t[key], listed) : listed);
+  // Every rule count comes from the rows themselves, so the card can never show a total that
+  // disagrees with the table under it. "Passed" counts commands only; a rule MOAG decides
+  // itself that found nothing is counted as "no findings".
+  const failedRows = rules.filter((r) => r.result === 'failed');
+  const cleanRows = rules.filter((r) => r.result === 'passed');
+  return {
+    version: Number.isFinite(data.version) ? data.version : null,
+    baseRef: typeof data.baseRef === 'string' ? data.baseRef : null,
+    rules,
+    findings,
+    notCheckedFiles,
+    totals: {
+      passed: cleanRows.filter((r) => !isScanner(r)).length,
+      noFindings: cleanRows.filter(isScanner).length,
+      failed: failedRows.filter((r) => !isAdvisory(r)).length,
+      advisory: failedRows.filter(isAdvisory).length,
+      notChecked: rules.filter((r) => r.result === 'not-checked').length,
+      blockingNotChecked: rules.filter(isUnreadBlocking).length,
+      noBlockingRules: hasNoBlockingRules(rules),
+      findings: atLeast('findings', findings.length),
+      advisoryFindings: atLeast('advisoryFindings', findings.filter(isAdvisory).length),
+      notCheckedFiles: atLeast('notCheckedFiles', notCheckedFiles.length),
+    },
+  };
+}
+
+/** "Standards v3" for a run: the version its report names, else the one frozen at run start. */
+function standardsName(run, stored) {
+  const version = (stored && stored.report.version) || run.standardsVersion || null;
+  return version ? `Standards v${version}` : 'Standards';
+}
+
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+
+/** The one-line tally under the card heading, in the words each kind of rule is given. */
+function totalsLine(t) {
+  return [
+    `${t.passed} passed`, `${t.noFindings} no findings`, `${t.failed} blocking`,
+    `${t.advisory} advisory with findings`, `${plural(t.notChecked, 'rule')} not checked`,
+    `${plural(t.notCheckedFiles, 'file')} not checked`,
+  ].join(' · ');
+}
+
+/**
+ * The standards report card. `stored` is `{ phase, report }` or null. A run
+ * with no report says why: "no report" is never shown as a pass.
+ */
+function standardsCard(run, stored) {
+  const name = standardsName(run, stored);
+  const heading = h('h2', { tabindex: '-1', dataset: { focus: 'standards-report' } }, name);
+  if (!stored) {
+    const text = !run.standardsVersion ? STR.C39.text
+      : run.status === 'running' ? 'Checked when the run verifies.'
+        : run.status === 'awaiting-approval' ? 'Not checked yet for this run.'
+          : 'Standards were not checked: the run ended first.';
+    return h('section', { class: 'card' }, h('div', { class: 'card-head' }, heading), h('p', { class: 'muted' }, text));
+  }
+  const report = stored.report;
+  const t = report.totals;
+  const open = t.notChecked > 0 || t.advisory > 0 || t.notCheckedFiles > 0;
+  // Stopped: something blocking failed, or something blocking was never evaluated.
+  const stopped = t.failed > 0 || t.blockingNotChecked > 0;
+  const kind = stopped ? 'card-error' : open || t.noBlockingRules ? 'card-warning' : 'card-success';
+  const extras = [
+    t.advisory > 0 ? `${t.advisoryFindings} ADVISORY` : null,
+    t.notChecked > 0 ? `${plural(t.notChecked, 'RULE')} NOT CHECKED` : null,
+    t.notCheckedFiles > 0 ? `${plural(t.notCheckedFiles, 'FILE')} NOT CHECKED` : null,
+  ].filter(Boolean);
+  // "PASSED" is never the badge: most rows are scans, and a scan does not pass. A profile
+  // with no command and no promoted rule says so in so many words.
+  const state = t.failed > 0 ? badge(`✗ ${t.failed} BLOCKING`, 'error')
+    : t.blockingNotChecked > 0 ? badge(`✗ ${t.blockingNotChecked} BLOCKING NOT CHECKED`, 'error')
+      : t.passed === 0 && t.noFindings === 0 && t.advisory === 0 && !t.noBlockingRules ? badge('○ NOT CHECKED', 'muted')
+        : t.noBlockingRules ? badge(['NO BLOCKING RULES CONFIGURED', ...extras].join(' · '), 'warning')
+          : extras.length > 0 ? badge(`NOTHING BLOCKING · ${extras.join(' · ')}`, 'warning')
+            : badge('✓ NOTHING BLOCKING', 'success');
+  const truncated = t.findings > report.findings.length;
+  const perRule = {};
+  for (const f of report.findings) { perRule[f.rule] = (perRule[f.rule] || 0) + 1; }
+  const byResult = (a, b) => RESULT_ORDER[a.result] - RESULT_ORDER[b.result];
+  // Groups that are never mixed: what blocks, what only advises, and what was not checked.
+  const decided = report.rules.filter((r) => r.result !== 'not-checked');
+  const blockingRows = decided.filter((r) => !isAdvisory(r)).sort(byResult);
+  const advisoryRows = decided.filter(isAdvisory).sort(byResult);
+  // Blocking rules that could not read a changed file lead the not-checked group.
+  const notCheckedRows = report.rules.filter((r) => r.result === 'not-checked')
+    .sort((a, b) => Number(isUnreadBlocking(b)) - Number(isUnreadBlocking(a)));
+  const blockingFindings = report.findings.filter((f) => !isAdvisory(f));
+  const advisoryFindings = report.findings.filter(isAdvisory);
+  // Scanner rules this project made blocking: said out loud wherever a report is shown.
+  const promoted = report.rules.filter((r) => isScanner(r) && !isAdvisory(r) && r.unconfigured !== true).map((r) => r.rule);
+
+  const ruleRow = (r) => {
+    const info = ruleOutcome(r);
+    const isCommand = r.rule === 'command';
+    const n = perRule[r.rule] || 0;
+    const unread = isUnreadBlocking(r);
+    return h('tr', null,
+      h('th', { scope: 'row', class: 'diff-id' }, isCommand ? `command: ${r.command || ''}` : r.rule),
+      h('td', null,
+        unread
+          ? h('span', { class: 'text-warning' }, glyph('⚠'), ' Blocking rule, not checked')
+          : h('span', { class: info.cls }, glyph(info.glyph), ' ', info.label),
+        // On a decided rule the reason names the vendored or generated files it did not check.
+        r.reason ? h('div', { class: 'muted' }, r.reason) : null,
+        isCommand && r.tail ? h('details', null, h('summary', null, 'Output'), h('pre', { class: 'tail' }, r.tail)) : null),
+      h('td', { class: 'col-optional' },
+        isCommand ? (Number.isFinite(r.exitCode) ? `exit ${r.exitCode}` : '—')
+          : r.result === 'not-checked' ? '—' : `${n}${truncated && n > 0 ? '+' : ''}`));
+  };
+  const ruleTable = (title, rows, summary) => (rows.length === 0 ? null : [
+    h('h3', { class: 'section-header' }, title),
+    h('div', { class: 'table-wrap' }, h('table', { class: 'data' },
+      h('caption', null, `${name}, ${summary}`),
+      h('thead', null, h('tr', null,
+        h('th', { scope: 'col' }, 'Rule'), h('th', { scope: 'col' }, 'Result'), h('th', { scope: 'col', class: 'col-optional' }, 'Findings'))),
+      h('tbody', null, rows.map(ruleRow))))]);
+  const findingList = (title, findings, isOpen) => (findings.length === 0 ? null : h('details', { class: 'diff-group', open: isOpen },
+    h('summary', null, `${title}  ${findings.length}${truncated ? '+' : ''}`),
+    cappedList(findings, (f) => h('li', null,
+      h('span', { class: 'diff-id' }, `${f.file}:${f.line}`), f.rule,
+      f.message ? h('span', { class: 'muted' }, ` · ${f.message}`) : null))));
+  const stopping = (rows) => rows.filter((r) => r.result === 'failed').length;
+  const filesShown = report.notCheckedFiles.length;
+
+  return h('section', { class: ['card', kind] },
+    h('div', { class: 'card-head' }, heading, h('span', { class: 'header-spacer' }), state),
+    h('p', null, totalsLine(t)),
+    // The one line nobody may miss: a rule that can stop a release read nothing.
+    t.blockingNotChecked > 0 ? h('p', { class: 'text-warning', role: 'alert' }, glyph('⚠'), ' ', STR.C48(t.blockingNotChecked).text) : null,
+    t.noBlockingRules ? h('p', { class: 'text-warning', role: 'note' }, glyph('⚠'), ' ', STR.C58.text) : null,
+    promoted.length > 0 ? h('p', { class: 'text-warning' }, glyph('⚠'), ' ', STR.C52(promoted.join(', ')).text) : null,
+    t.notChecked > 0 ? h('p', { class: 'muted' }, STR.C40.text) : null,
+    stored.phase === 'pre-gate' ? h('p', { class: 'muted' }, 'Checked before the ship gate. The run is checked again when it verifies.') : null,
+    report.baseRef ? h('p', { class: 'muted' },
+      report.baseRef === EMPTY_TREE ? 'Diff base: the empty tree, so every file counts as added.' : `Diff base: ${report.baseRef.slice(0, 12)}`) : null,
+    ruleTable(`Blocking  ${stopping(blockingRows)} stopping`, blockingRows, 'blocking rules and commands: a failure or a finding here stops the release'),
+    findingList('Blocking findings', blockingFindings, true),
+    ruleTable(`Advisory  ${stopping(advisoryRows)} with findings`, advisoryRows, 'advisory rules: heuristic scans, reported, never blocking'),
+    advisoryFindings.length > 0 ? h('p', { class: 'muted' }, STR.C49.text) : null,
+    findingList('Advisory findings', advisoryFindings, false),
+    ruleTable(`Rules not checked  ${notCheckedRows.length}`, notCheckedRows, 'rules that were not checked: not a pass'),
+    t.notCheckedFiles > 0 ? h('details', { class: 'diff-group' },
+      h('summary', null, `Files not checked  ${t.notCheckedFiles}`),
+      h('p', { class: 'muted' }, STR.C53.text),
+      cappedList(report.notCheckedFiles, (f) => h('li', null,
+        h('span', { class: 'diff-id' }, f.file), h('span', { class: 'muted' }, ` · not checked (${f.reason})`))),
+      t.notCheckedFiles > filesShown ? h('p', { class: 'muted' }, `Listing the first ${filesShown} of ${t.notCheckedFiles} files.`) : null) : null,
+    truncated ? h('p', { class: 'muted' }, `Showing the first ${report.findings.length} of ${t.findings} findings.`) : null);
+}
+
+/** The read-only standards line inside the ship-gate card (the full table stays in the report card). */
+function standardsGateLine(run, stored, focusReport) {
+  if (!stored && !run.standardsVersion) {
+    return h('p', { class: 'muted' }, 'Standards: none. This plan predates project standards.');
+  }
+  const name = standardsName(run, stored);
+  if (!stored) { return h('p', null, `${name}: not checked yet for this run.`); }
+  const t = stored.report.totals;
+  const view = h('button', { type: 'button', class: 'btn-link', on: { click: focusReport } }, 'View report');
+  if (t.failed > 0) {
+    return h('p', null, `${name}: `, h('span', { class: 'text-error' }, glyph('✗'),
+      ` ${plural(t.failed, 'blocking rule or command')} stop${t.failed === 1 ? 's' : ''} this release, ${plural(t.findings, 'finding')}.`), ' ', view);
+  }
+  if (t.blockingNotChecked > 0) {
+    return h('p', null, `${name}: `, h('span', { class: 'text-error' }, glyph('✗'),
+      ` ${plural(t.blockingNotChecked, 'blocking rule or command')} ${t.blockingNotChecked === 1 ? 'was' : 'were'} not checked, which stops this release.`), ' ', view);
+  }
+  // What the approver decides on: nothing blocks, and here is what was only advised or never read.
+  const parts = [
+    t.noBlockingRules ? h('span', { class: 'text-warning' }, glyph('⚠'), ' no blocking rules configured') : null,
+    t.passed > 0 ? [glyph('✓'), ` ${t.passed} passed`] : null,
+    t.noFindings > 0 ? `${plural(t.noFindings, 'scan')} with no findings` : null,
+    t.advisory > 0 ? h('span', { class: 'text-warning' }, glyph('⚠'), ` ${plural(t.advisoryFindings, 'advisory finding')} (not blocking)`) : null,
+    t.notChecked > 0 ? [glyph('○'), ` ${plural(t.notChecked, 'rule')} not checked`] : null,
+    t.notCheckedFiles > 0 ? [glyph('○'), ` ${plural(t.notCheckedFiles, 'file')} not checked`] : null,
+  ].filter(Boolean);
+  return h('p', null, `${name}: `, parts.map((part, i) => [i > 0 ? ' · ' : null, part]), '. ', view);
+}
 
 /** Fold one worker event into the live view (mirrors the server's foldRunEvent). */
 export function foldEvent(view, ev) {
@@ -229,9 +460,22 @@ export function render(app, params, view) {
     eventsPre.textContent = events.slice(-200).map((e) => JSON.stringify(e)).join('\n');
   };
 
+  // ─── Standards report ───
+  const storedRaw = detail && detail.runId === run.id ? detail.standardsReport : null;
+  const storedReport = storedRaw ? asStandardsReport(storedRaw.report) : null;
+  const standardsHost = h('div');
+  const standards = {
+    stored: storedReport ? { phase: storedRaw.phase === 'pre-gate' ? 'pre-gate' : 'verify', report: storedReport } : null,
+    focusReport: () => {
+      const target = standardsHost.querySelector('[data-focus="standards-report"]');
+      if (target) { target.focus(); }
+    },
+  };
+  const renderStandards = () => mount(standardsHost, standardsCard(run, standards.stored));
+
   // ─── Banners and the gate card ───
   const bannerHost = h('div');
-  const renderBanner = () => mount(bannerHost, haltBanner(app, project, run, tasks, statusOf, live, runnable, base, refresh));
+  const renderBanner = () => mount(bannerHost, haltBanner(app, project, run, tasks, statusOf, live, runnable, base, refresh, standards));
 
   const startedText = `started by ${run.startedByName || '—'} · ${fmtTime(run.startedAt)} · ${elapsed(run.startedAt, run.endedAt)}`;
   mount(view,
@@ -241,12 +485,14 @@ export function render(app, params, view) {
     progressHost,
     pdto.runsDisabledReason ? h('div', { class: ['card', 'card-error'], role: 'alert' }, glyph('✗'), ' ', STR.C18.text) : null,
     bannerHost,
+    standardsHost,
     h('div', { class: 'card' }, playlistHead, tree,
       h('details', { class: 'diff-group' }, eventsSummary, eventsPre)));
   renderHeaderState();
   renderProgress();
   renderTree();
   renderEvents();
+  renderStandards();
   renderBanner();
   const gateHeading = bannerHost.querySelector('[data-focus="gate"]');
   if (gateHeading) { gateHeading.focus(); }
@@ -267,6 +513,18 @@ export function render(app, params, view) {
     if (ev.event === 'task-failed' && ev.status === 'blocked') { announce(`${ev.name} blocked.`, { assertive: true, key: 'blocked', plural: (k) => `${k} tasks blocked.` }); }
     else if (ev.event === 'task-failed') { announce(`${ev.name} failed.`, { assertive: true, key: 'failed', plural: (k) => `${k} tasks failed.` }); }
     if (ev.event === 'manual-gate') { announce(`Halted at the ship gate: ${ev.name}.`, { assertive: true }); }
+    if (ev.event === 'verify' && ev.name === 'verify-standards') {
+      const report = asStandardsReport(ev.data);
+      if (report) {
+        standards.stored = { phase: ev.data.phase === 'pre-gate' ? 'pre-gate' : 'verify', report };
+        renderStandards();
+        // Never "passed": most of the check is a scan, and a scan does not pass.
+        const tt = report.totals;
+        if (tt.failed > 0) { announce('Standards stopped the release.', { assertive: true }); }
+        else if (tt.passed > 0 || tt.noFindings > 0 || tt.advisory > 0) { announce(`Standards: nothing blocking. ${tt.advisoryFindings} advisory finding${tt.advisoryFindings === 1 ? '' : 's'}.`); }
+        else { announce('Standards could not be checked.'); }
+      }
+    }
     const t = tasks.find((x) => x.id === ev.id);
     if (t) { renderRow(t); }
     renderHeaderState();
@@ -296,14 +554,14 @@ export function render(app, params, view) {
   });
 }
 
-function haltBanner(app, project, run, tasks, statusOf, live, runnable, base, refresh) {
+function haltBanner(app, project, run, tasks, statusOf, live, runnable, base, refresh, standards) {
   const failed = tasks.filter((t) => ['failed', 'blocked'].includes(statusOf(t)));
   const notRun = tasks.filter((t) => ['pending', 'blocked', 'skipped'].includes(statusOf(t))).length;
   const canEditCap = (project.allowedActions || []).includes('project.update');
   const lastDecision = (run.gateDecisions || []).slice(-1)[0];
   switch (run.status) {
     case 'awaiting-approval':
-      return gateCard(app, project, run, tasks, statusOf, live, refresh);
+      return gateCard(app, project, run, tasks, statusOf, live, refresh, standards);
     case 'budget':
       return h('div', { class: ['card', 'card-warning'], role: 'status' },
         h('h2', null, glyph('⊘'), ' Run stopped: cost cap reached'),
@@ -311,10 +569,17 @@ function haltBanner(app, project, run, tasks, statusOf, live, runnable, base, re
         h('div', { class: 'inline-row' },
           canEditCap ? h('a', { href: `${base}/settings`, dataset: { link: '' }, class: 'btn btn-secondary' }, 'Edit cost cap') : null,
           runnable ? h('a', { href: `${base}/plan`, dataset: { link: '' }, class: 'btn btn-primary' }, 'Start run') : null));
-    case 'gaps':
+    case 'gaps': {
+      // Every task can be complete under a GAPS badge when the standards check is what failed: say so.
+      const st = standards.stored ? standards.stored.report.totals : null;
       return h('div', { class: ['card', 'card-error'], role: 'status' },
         h('h2', null, glyph('✗'), ' Run finished with gaps'),
+        st && st.failed > 0 ? h('p', null, STR.C41(st.failed, st.findings).text, ' ',
+          h('button', { type: 'button', class: 'btn-link', on: { click: standards.focusReport } }, 'View report')) : null,
+        // Set by the server when a run exited cleanly without proving its standards check.
+        run.errorTail ? h('p', null, run.errorTail) : null,
         failed.length > 0 ? h('ul', { class: 'diff-list' }, failed.map((t) => h('li', null, `${t.name} — ${(TASK_STATUS[statusOf(t)] || TASK_STATUS.pending).label}`))) : null);
+    }
     case 'error':
       return h('div', { class: ['card', 'card-error'], role: 'status' },
         h('h2', null, glyph('✗'), ' Run could not continue'),
@@ -336,7 +601,7 @@ function haltBanner(app, project, run, tasks, statusOf, live, runnable, base, re
   }
 }
 
-function gateCard(app, project, run, tasks, statusOf, live, refresh) {
+function gateCard(app, project, run, tasks, statusOf, live, refresh, standards) {
   const allowed = new Set(run.allowedActions || []);
   const gate = run.gate || { name: 'Ship gate', taskId: '' };
   const gateIndex = tasks.findIndex((t) => t.id === gate.taskId);
@@ -349,7 +614,9 @@ function gateCard(app, project, run, tasks, statusOf, live, refresh) {
   const url = (action) => `/api/projects/${encodeURIComponent(project.id)}/runs/${encodeURIComponent(run.id)}/gate/${action}`;
 
   const conflict = async (r) => {
-    if (r.status === 409 && r.body.lastDecision) {
+    if (r.status === 409 && r.body.error === 'standards-blocking') {
+      toast(STR.C59(Number(r.body.failed) || 0, Number(r.body.blockingNotChecked) || 0).text, 'error');
+    } else if (r.status === 409 && r.body.lastDecision) {
       const d = r.body.lastDecision;
       const verb = d.action === 'approve' ? 'approved' : d.action === 'reject' ? 'rejected' : 'skipped';
       toast(STR.C22(verb, '', fmtTime(d.at)).text, 'warning');
@@ -392,6 +659,10 @@ function gateCard(app, project, run, tasks, statusOf, live, refresh) {
   };
 
   const canDecide = allowed.has('gate.approve') || allowed.has('gate.reject');
+  // The server refuses to approve a ship over a pre-gate standards check that stops it; the
+  // button says so up front instead of letting the approver find out from an error.
+  const preGate = standards.stored && standards.stored.phase === 'pre-gate' ? standards.stored.report.totals : null;
+  const standardsStop = !!preGate && (preGate.failed > 0 || preGate.blockingNotChecked > 0);
   const approversLine = h('p', { class: 'muted' }, 'Waiting for an approver.');
   if (!canDecide) {
     void app.api('GET', '/api/users/approvers').then((r) => {
@@ -406,11 +677,13 @@ function gateCard(app, project, run, tasks, statusOf, live, refresh) {
     h('p', null, `"${gate.name}" is waiting for an approver. Halted ${run.endedAt ? fmtAgo(run.endedAt) : 'just now'}.`),
     h('p', null, `${beforeDone}/${before.length} tasks before the gate completed.`),
     h('p', null, cost.noCap ? `Cost so far ${fmtUsd(live.spentUsd)} · no cap set` : `Cost so far ${fmtUsd(live.spentUsd)} of ${fmtUsd(cost.capUsd)}`),
+    standardsGateLine(run, standards.stored, standards.focusReport),
     after.length > 0 ? h('p', null, `Tasks that run after approval: ${after.join(', ')}`) : null,
     canDecide ? [note.wrap,
       h('div', { class: 'form-actions gate-actions' },
         allowed.has('gate.reject') ? h('button', { type: 'button', class: 'btn btn-danger', on: { click: reject } }, 'Reject') : null,
-        allowed.has('gate.approve') ? h('button', { type: 'button', class: 'btn btn-primary', on: { click: approve } }, 'Approve and ship') : null)]
+        allowed.has('gate.approve') ? h('button', { type: 'button', class: 'btn btn-primary', disabled: standardsStop, on: { click: approve } }, 'Approve and ship') : null),
+      standardsStop ? h('p', { class: 'text-error', role: 'alert' }, glyph('✗'), ' ', STR.C59(preGate.failed, preGate.blockingNotChecked).text) : null]
       : approversLine,
     allowed.has('gate.skip') ? [h('hr', { class: 'panel-divider' }),
       h('button', { type: 'button', class: 'btn-link', on: { click: skip } }, 'Skip gate without approval…')] : null);

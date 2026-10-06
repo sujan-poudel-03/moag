@@ -10,7 +10,7 @@
 // state; single-stack, poor-completion and detected-differs show it as evidence.
 
 import { h, mount, field, toast, confirmDialog, fmtUsd, badge } from '../dom.js';
-import { serverMessage } from '../strings.js';
+import { STR, serverMessage } from '../strings.js';
 
 const STACK_CHANGE_TEXT = 'Changing the stack affects future runs and recommendations only. Past outcomes keep the stack they were recorded with.';
 
@@ -175,7 +175,8 @@ export function renderCreate(app, _params, view) {
       return;
     }
     toast(`Project ${r.body.project.name} created.`, 'success');
-    app.navigate(`/p/${encodeURIComponent(r.body.project.id)}/prd`);
+    // Standards v1 was proposed with the project: that is the next thing to look at.
+    app.navigate(`/p/${encodeURIComponent(r.body.project.id)}/standards`);
   };
 
   mount(view,
@@ -193,6 +194,7 @@ export function renderCreate(app, _params, view) {
         h('h2', { class: 'section-header' }, 'Tech stack'),
         recHost,
         stack.wrap,
+        h('div', { class: 'field' }, h('span', { class: 'label' }, 'Project standards'), h('p', { class: 'hint' }, STR.C44.text)),
         formErr,
         h('div', { class: 'form-actions' },
           h('a', { href: '/projects', dataset: { link: '' }, class: 'btn btn-secondary' }, 'Cancel'),

@@ -267,6 +267,35 @@ Dynamic task queue with runtime injection support.
 
 ---
 
+### 10. Project standards (`src/standards/`)
+
+A project can have one versioned standards profile. It reaches the PRD workflow at three points:
+
+- **Planning.** `buildFullPlanPrompt` and `buildDeltaPlanPrompt` take the standards text and place it before the `Rules:` line. For a greenfield repository the text also tells the planner that the first task scaffolds the required directories.
+- **Execution.** Every task prompt carries the text under `## Project Standards`, directly before `## AI Rules`.
+- **Verification.** `runPrdLoop` checks the diff against the profile before any model call. The gate order is: status, change, standards (static rules), repository gate commands, standards (profile commands), browser UAT, artifacts, then the model. A standards failure is reported as `failedGate: "standards"` with `modelCallsMade: 0`.
+
+Rules of the gate:
+
+- MOAG blocks on the project's own tools; its own scans are advisory unless promoted. What blocks by default is the profile's commands (real tools, judged by exit code) and nothing else. Every rule MOAG decides itself — required directories, nested repositories, placement, layout, naming, layering, raw patterns, the comment policy, generated markers — is advisory unless the profile promotes it.
+- Each rule is stored as `passed`, `failed` or `not-checked`. A scanner rule is shown as "no findings" or "findings", never as passed. **Not checked is not a pass**: it is reported with its reason and never counted as passed or as "no findings".
+- A rule that found nothing in the diff to judge is `not-checked`. An empty diff therefore passes nothing.
+- Every changed file the line rules did not read (vendored, generated, no lexer, an unsupported type such as `.yml` or `Dockerfile`, unreadable) is listed in the report with its reason and counted, and so is every nested repository and submodule.
+- One synthetic gate row `moag:standards v<N>` carries the result. It is written with exit 0 once the **blocking set was evaluated** — every profile command ran, every promoted rule the profile configures was decided, and none stops the release — or when the profile has no blocking set at all, in which case its text and its counts say `no blocking rules configured` and never that anything passed. It is written with exit 1 when a blocking rule or command failed, and also when one ended **not checked**: unevaluated blocking evidence stops the release like a failure. The row records how many advisory findings, rules not checked and files not checked the check left open, and the release stamp copies them (`standardsCounts`).
+- Locally the diff base is `HEAD` (captured before the run for `moag run --verify`). Work that was committed before that point is outside the diff; pass `--base <ref>` to include it. Content that is committed or staged and no longer in the working tree is judged from the commit or the index.
+- A base that was named but is not a commit in the repository does not turn the gate off. The diff is taken against the empty tree, every file is judged as added, and the loop reports a warning. If no diff can be taken at all against a named base, the gate fails as `standards`. Only a run with no base at all (a workspace that is not a repository) leaves the diff-based rules `not-checked`.
+- With `--fix`, a standards failure costs one model call per fix iteration (ceiling 3). Detection, proposal and checking cost nothing.
+- `PrdLoopConfig.standards` is required and nullable: a caller must say explicitly that a run has no standards.
+
+Where the profile comes from:
+
+- **VS Code and headless:** `<workspace>/.moag/standards.json`. There is no approval step.
+- **Hosted server:** the version a reviewer approved, delivered to the worker in a server-written job file. Plan generation is refused with `409 standards-not-approved` until a version is approved.
+
+The profile format, the review flow, migration of existing projects and the `moag standards` verbs are described in [server.md → Project standards](server.md#project-standards).
+
+---
+
 ## New Settings
 
 ```json

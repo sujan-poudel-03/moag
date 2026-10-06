@@ -2,7 +2,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  latestRequirements, taggedTasks, recordGateResults, recordCommit, stampRelease, requirementStatuses,
+  latestRequirements, taggedTasks, recordGateResults, recordCommit, stampRelease, requirementStatuses, standardsGateCommand,
   MAX_TRACE_COMMITS, MAX_TRACE_RELEASES, MAX_TRACE_GATES,
 } from '../../../models/requirement-trace';
 import { Plan, Task, TaskStatus, TaskType } from '../../../models/types';
@@ -355,5 +355,191 @@ describe('requirement-trace — module boundary', () => {
     const source = fs.readFileSync(path.join(__dirname, '../../../models/requirement-trace.ts'), 'utf-8');
     assert.ok(!/from 'vscode'/.test(source));
     assert.ok(!/require\('vscode'\)/.test(source));
+  });
+});
+
+// ─── Standards version on the release stamp ───
+
+describe('requirement-trace — standards version on the release', () => {
+  it('stampRelease records the standards version on the release, and the status row reports it', () => {
+    const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+    recordGateResults(plan, pass, AT);
+    assert.deepEqual(stampRelease(plan, 'v1.2.3', AT, { standardsVersion: 3 }).shipped, ['R-1']);
+    assert.deepEqual(plan.requirementTrace![0].releases, [
+      { releaseTag: 'v1.2.3', prdVersion: '2.0.0', at: AT, taskIds: ['t-1'], standardsVersion: 3 },
+    ]);
+    const r = row(plan, 'R-1');
+    assert.equal(r.status, 'shipped');
+    assert.equal(r.standardsVersion, 3);
+  });
+
+  it('a release with no standards stamps no version: the key is absent and the row says null', () => {
+    const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+    recordGateResults(plan, pass, AT);
+    stampRelease(plan, 'v1.0.0', AT);
+    assert.equal('standardsVersion' in plan.requirementTrace![0].releases[0], false);
+    assert.equal(row(plan, 'R-1').standardsVersion, null);
+    // An unreleased requirement reports null too, never undefined.
+    assert.equal(row(plan, 'R-2').standardsVersion, null);
+  });
+
+  it('a value that is not an integer >= 1 is never recorded', () => {
+    for (const bad of [0, -2, 1.5, Number.NaN, '3' as unknown as number]) {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, pass, AT);
+      stampRelease(plan, 'v1.0.0', AT, { standardsVersion: bad });
+      assert.equal('standardsVersion' in plan.requirementTrace![0].releases[0], false, String(bad));
+    }
+  });
+
+  it('the row reports the version of the LAST release, and a later release without one reports null', () => {
+    const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+    recordGateResults(plan, pass, AT);
+    stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 2 });
+    stampRelease(plan, 'v1.1.0', AT, { standardsVersion: 5 });
+    assert.equal(row(plan, 'R-1').standardsVersion, 5);
+    stampRelease(plan, 'v1.2.0', AT);
+    assert.equal(row(plan, 'R-1').standardsVersion, null);
+  });
+
+  // What a check left open is recorded beside the version it was made against: a release
+  // that was checked is not always a clean one, and the trace says by how much.
+  describe('what the check left open is recorded beside the version', () => {
+    const COUNTS = { advisoryFindings: 4, notCheckedRules: 2, notCheckedFiles: 7 };
+    const withCounts = (version: number, exitCode = 0) =>
+      [{ command: standardsGateCommand(version), exitCode, timedOut: false, standardsCounts: COUNTS }, ...pass];
+
+    it('recordGateResults keeps the counts on the standards row, as a copy, and on no other row', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, withCounts(3), AT);
+      const gates = plan.requirementTrace![0].gates;
+      assert.deepEqual(gates[0], { command: 'moag:standards v3', exitCode: 0, timedOut: false, at: AT, standardsCounts: COUNTS });
+      assert.notEqual(gates[0].standardsCounts, COUNTS, 'a copy: the caller\'s object is not kept');
+      assert.ok(gates.slice(1).every((g) => !('standardsCounts' in g)));
+    });
+
+    it('a local stamp takes the counts from the passing standards row, and the status row reports them', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, withCounts(3), AT);
+      stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true });
+      assert.deepEqual(plan.requirementTrace![0].releases[0],
+        { releaseTag: 'v1.0.0', prdVersion: '2.0.0', at: AT, taskIds: ['t-1'], standardsVersion: 3, standardsCounts: COUNTS });
+      assert.deepEqual(row(plan, 'R-1').standardsCounts, COUNTS);
+    });
+
+    it('a release checked against standards with no blocking rules is stamped as exactly that, from the row or from the caller', () => {
+      const none = { advisoryFindings: 1, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true as const };
+      // From the row the PRD loop wrote (local runs).
+      const local = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(local, [{ command: standardsGateCommand(3), exitCode: 0, timedOut: false, standardsCounts: none }, ...pass], AT);
+      assert.deepEqual(stampRelease(local, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true }).shipped, ['R-1'], 'it ships');
+      assert.deepEqual(local.requirementTrace![0].releases[0].standardsCounts, none);
+      assert.notEqual(local.requirementTrace![0].releases[0].standardsCounts, none, 'a copy');
+      assert.deepEqual(row(local, 'R-1').standardsCounts, none);
+      assert.equal(row(local, 'R-1').standardsVersion, 3);
+      // From the caller (the hosted server).
+      const hosted = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(hosted, pass, AT);
+      stampRelease(hosted, 'v1.0.0', AT, { standardsVersion: 3, standardsCounts: none });
+      assert.deepEqual(row(hosted, 'R-1').standardsCounts, none);
+      // A check that had a blocking set carries no such key, and nothing else rides along.
+      const leaky = { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: false, file: 'src/x.ts' } as unknown as typeof none;
+      const other = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(other, pass, AT);
+      stampRelease(other, 'v1.0.0', AT, { standardsVersion: 3, standardsCounts: leaky });
+      assert.deepEqual(other.requirementTrace![0].releases[0].standardsCounts, { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0 });
+    });
+
+    it('counts the caller knows (the hosted server) take the place of the row\'s', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, pass, AT);
+      const given = { advisoryFindings: 1, notCheckedRules: 0, notCheckedFiles: 3 };
+      stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsCounts: given });
+      assert.deepEqual(plan.requirementTrace![0].releases[0].standardsCounts, given);
+      assert.deepEqual(row(plan, 'R-1').standardsCounts, given);
+    });
+
+    it('never without a version: no stamp, no counts — whatever the row or the caller says', () => {
+      // The standards row is for another version than the one offered.
+      const other = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(other, withCounts(2), AT);
+      stampRelease(other, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true, standardsCounts: COUNTS });
+      assert.equal('standardsVersion' in other.requirementTrace![0].releases[0], false);
+      assert.equal('standardsCounts' in other.requirementTrace![0].releases[0], false);
+      assert.equal(row(other, 'R-1').standardsCounts, null);
+      // No version offered at all.
+      const none = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(none, withCounts(3), AT);
+      stampRelease(none, 'v1.0.0', AT, { standardsCounts: COUNTS });
+      assert.equal('standardsCounts' in none.requirementTrace![0].releases[0], false);
+    });
+
+    it('a row recorded before the counts existed stamps the version with no counts, and the row says null', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, [{ command: standardsGateCommand(3), exitCode: 0, timedOut: false }, ...pass], AT);
+      stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true });
+      assert.equal(plan.requirementTrace![0].releases[0].standardsVersion, 3);
+      assert.equal('standardsCounts' in plan.requirementTrace![0].releases[0], false);
+      assert.equal(row(plan, 'R-1').standardsCounts, null);
+    });
+  });
+
+  // A local release happens inside a run; whether the standards were checked is read from
+  // the gates the last verification recorded — the passing standards row is there only when
+  // the blocking set was really evaluated.
+  describe('with standardsFromGates: the version is stamped only when the last verification evaluated the blocking set', () => {
+    const judged = (version: number | null) => [{ command: standardsGateCommand(version), exitCode: 0, timedOut: false }, ...pass];
+
+    it('names the gate row the PRD loop records', () => {
+      assert.equal(standardsGateCommand(3), 'moag:standards v3');
+      assert.equal(standardsGateCommand(null), 'moag:standards');
+    });
+
+    it('stamps the version when the latest gates hold a passing standards row for it', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, judged(3), AT);
+      assert.deepEqual(stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true }).shipped, ['R-1']);
+      assert.equal(row(plan, 'R-1').standardsVersion, 3);
+    });
+
+    it('ships without a version when no standards row was recorded: every rule was not-checked, or the gate was off', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, pass, AT);
+      assert.deepEqual(stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true }).shipped, ['R-1']);
+      assert.equal('standardsVersion' in plan.requirementTrace![0].releases[0], false);
+      assert.equal(row(plan, 'R-1').status, 'shipped');
+      assert.equal(row(plan, 'R-1').standardsVersion, null);
+    });
+
+    it('a row for another version, or an unversioned one, is not this version\'s check', () => {
+      for (const recorded of [2, null]) {
+        const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+        recordGateResults(plan, judged(recorded), AT);
+        stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true });
+        assert.equal('standardsVersion' in plan.requirementTrace![0].releases[0], false, String(recorded));
+      }
+    });
+
+    it('decides per requirement: one judged, one not', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed), task('t-2', ['R-2'], TaskStatus.Completed)]);
+      recordGateResults(plan, judged(3), AT);
+      plan.requirementTrace!.find(r => r.id === 'R-2')!.gates = pass.map(g => ({ ...g, at: AT }));
+      assert.deepEqual(stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true }).shipped, ['R-1', 'R-2']);
+      assert.equal(row(plan, 'R-1').standardsVersion, 3);
+      assert.equal(row(plan, 'R-2').standardsVersion, null);
+    });
+
+    it('a failed standards row blocks the release altogether, like any failed gate', () => {
+      const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+      recordGateResults(plan, [{ command: standardsGateCommand(3), exitCode: 1, timedOut: false }, ...pass], AT);
+      assert.deepEqual(stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3, standardsFromGates: true }).shipped, []);
+    });
+  });
+
+  it('a gate that failed still blocks the stamp, whatever standards version is offered', () => {
+    const plan = planWith([task('t-1', ['R-1'], TaskStatus.Completed)]);
+    recordGateResults(plan, fail, AT);
+    assert.deepEqual(stampRelease(plan, 'v1.0.0', AT, { standardsVersion: 3 }).shipped, []);
+    assert.equal(row(plan, 'R-1').standardsVersion, null);
   });
 });

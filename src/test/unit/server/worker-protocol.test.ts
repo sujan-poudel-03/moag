@@ -212,10 +212,15 @@ describe('worker-protocol', () => {
       assert.deepEqual(parseJob({ kind: 'probe' }), { kind: 'probe' });
       const run = { kind: 'run', runId: 'r1', workspace: '/w', planPath: '/p.json', startPlaylistIndex: 2, verify: true, allowedEngines: ['claude'] };
       assert.deepEqual(parseJob(run), run);
+      const runWithStandards = { ...run, standardsPath: '/data/projects/p/runs/r1/standards.json' };
+      assert.deepEqual(parseJob(runWithStandards), runWithStandards, 'a run job round-trips its standards file path');
+      assert.equal('standardsPath' in (parseJob(run) as object), false, 'absent stays absent');
       const plan = { kind: 'plan', mode: 'initial', workspace: '/w', planPath: '/p', outPath: '/o', engine: 'codex' };
       assert.deepEqual(parseJob(plan), plan);
       const listed = { ...plan, repoListingPath: '/data/projects/p/plans/x/repo-files.txt' };
       assert.deepEqual(parseJob(listed), listed);
+      const withStandards = { ...listed, standardsPath: '/data/projects/p/plans/x/standards.json' };
+      assert.deepEqual(parseJob(withStandards), withStandards, 'a plan job round-trips its standards file path');
     });
 
     it('rejects malformed jobs', () => {
@@ -228,6 +233,10 @@ describe('worker-protocol', () => {
       assert.equal(parseJob({ kind: 'plan', mode: 'delta', workspace: '/w', planPath: '/p', outPath: '/o', engine: 'nope' }), null);
       assert.equal(parseJob({ kind: 'plan', mode: 'delta', workspace: '/w', planPath: '/p', outPath: '/o', engine: 'claude', repoListingPath: 42 }), null);
       assert.equal(parseJob({ kind: 'plan', mode: 'delta', workspace: '/w', planPath: '/p', outPath: '/o', engine: 'claude', repoListingPath: '' }), null);
+      for (const bad of [42, '', null, ['/x'], { path: '/x' }, true]) {
+        assert.equal(parseJob({ kind: 'run', runId: 'r', workspace: '/w', planPath: '/p', startPlaylistIndex: 0, verify: true, allowedEngines: ['claude'], standardsPath: bad }), null, `run standardsPath ${JSON.stringify(bad)}`);
+        assert.equal(parseJob({ kind: 'plan', mode: 'delta', workspace: '/w', planPath: '/p', outPath: '/o', engine: 'claude', standardsPath: bad }), null, `plan standardsPath ${JSON.stringify(bad)}`);
+      }
     });
   });
 });

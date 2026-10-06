@@ -40,7 +40,7 @@ describe('web assets (static scan)', () => {
   it('has the shell, the app module and the screens', () => {
     for (const f of ['index.html', 'app.css', 'js/app.js', 'js/dom.js', 'js/strings.js',
       'js/screens/login.js', 'js/screens/bootstrap.js', 'js/screens/projects.js', 'js/screens/project-form.js',
-      'js/screens/prd.js', 'js/screens/version-panel.js', 'js/screens/plan.js', 'js/screens/run.js',
+      'js/screens/prd.js', 'js/screens/standards.js', 'js/screens/version-panel.js', 'js/screens/plan.js', 'js/screens/run.js',
       'js/screens/trace.js', 'js/screens/admin-users.js', 'js/screens/admin-audit.js']) {
       assert.ok(fs.existsSync(path.join(WEB, f)), `missing web/${f}`);
     }

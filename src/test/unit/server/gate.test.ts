@@ -162,4 +162,20 @@ describe('stampApprovedShip', () => {
     assert.deepEqual(stampApprovedShip(plan, 'r1', AT), [], 'whole plan: the old failed release blocks');
     assert.deepEqual(stampApprovedShip(plan, 'r1', AT, 1), ['R-1']);
   });
+
+  it('records the run\'s standards version on each stamp; a legacy run (none) stamps no version', () => {
+    const withStandards = shipPlan(TaskStatus.Completed);
+    assert.deepEqual(stampApprovedShip(withStandards, 'r1', AT, 0, 4), ['R-1']);
+    assert.deepEqual(withStandards.requirementTrace![0].releases.map((r) => [r.releaseTag, r.standardsVersion]), [['ship-r1', 4]]);
+
+    const legacy = shipPlan(TaskStatus.Completed);
+    assert.deepEqual(stampApprovedShip(legacy, 'r2', AT, 0), ['R-1']);
+    assert.equal('standardsVersion' in legacy.requirementTrace![0].releases[0], false);
+  });
+
+  it('a run whose release did not complete stamps nothing, standards version or not', () => {
+    const plan = shipPlan(TaskStatus.Failed);
+    assert.deepEqual(stampApprovedShip(plan, 'r1', AT, 0, 4), []);
+    assert.deepEqual(plan.requirementTrace![0].releases, []);
+  });
 });

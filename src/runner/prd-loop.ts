@@ -2,8 +2,9 @@
 //
 // The loop that answers "does the work actually satisfy the PRD?". Every gate it
 // applies is deterministic and runs BEFORE any model call: if nothing changed, if
-// a task failed, if a gate command exited non-zero, or if a declared artifact is
-// missing, the verdict is already known and no model is asked. A model only ever
+// a task failed, if the diff breaks the project standards, if a gate command exited
+// non-zero, or if a declared artifact is missing, the verdict is already known and
+// no model is asked. A model only ever
 // gets to say "not yet" — it can never override a failed gate.
 //
 // Dependency-injected in the style of `headless/daemon.ts` and free of VS Code API
@@ -11,19 +12,26 @@
 
 import { EngineResult, Plan, Playlist, Task, TaskStatus } from '../models/types';
 import * as nodeFs from 'fs';
-import { recordGateResults } from '../models/requirement-trace';
+import { recordGateResults, standardsGateCommand } from '../models/requirement-trace';
 import { commandFactId, recordFact } from './knowledge';
 import { decisionFor, park, ParkReason } from './park-queue';
 import {
   captureBaseRef,
   checkArtifacts,
   collectDiffEvidence,
+  collectStandardsInput,
   GateResult,
   resolveGateCommands,
   resolveUatGate,
   runGate,
   summarizeEvidence,
 } from './evidence';
+import {
+  checkStandards, commandRow, groupStandardsRules, isBlockingNotChecked, isUnreadBlocking, NO_BLOCKING_RULES, promotedScannerRules,
+  recountTotals, ruleOutcomeLabel, SCANNER_PROMOTION_WARNING, severityOf, skippedStandardsReport, standardsBlocked,
+  standardsBlockingState, standardsCheckCounts, StandardsReport,
+} from '../standards/checker';
+import type { StandardsProfile } from '../standards/profile';
 
 // ─── Types ───
 
@@ -59,6 +67,13 @@ export interface PrdLoopConfig {
    * every host surface makes an explicit decision.
    */
   versionBudgetUsd: number;
+  /**
+   * The project standards this run is checked against, or null when the workspace has
+   * none. Required — not optional — so every host surface decides explicitly instead of
+   * silently running unchecked. `baseRef` is what the standards gate diffs against; null
+   * means "no commits yet" and makes every file count as added.
+   */
+  standards: { profile: StandardsProfile; version: number | null; baseRef: string | null } | null;
 }
 
 /** Why the loop stopped short of a verdict. */
@@ -73,7 +88,7 @@ export type HaltReason =
   | 'no-gates';
 
 /** Which deterministic gate rejected the work, if any. */
-export type FailedGate = 'change' | 'command' | 'artifact' | 'status' | null;
+export type FailedGate = 'change' | 'command' | 'artifact' | 'status' | 'standards' | null;
 
 /** The single result object every terminal path produces. */
 export interface PrdLoopReport {
@@ -95,6 +110,11 @@ export interface PrdLoopReport {
   uatRan: boolean;
   /** Why UAT did not run, or null when it ran (or was never asked for). */
   uatSkipReason: string | null;
+  /**
+   * Per-rule standards results for the last iteration, or null when the loop had no
+   * standards (or stopped before reaching them). A `not-checked` rule is never a pass.
+   */
+  standards: StandardsReport | null;
 }
 
 /**
@@ -180,6 +200,8 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
   /** Set when the gate could not run at all, which is a different fix from a gate that ran and failed. */
   let capabilityMissing = false;
   let lastFingerprint: string | null = null;
+  /** Standards results of the current iteration. Closure state, like every other halt flag. */
+  let standards: StandardsReport | null = null;
 
   const makeReport = (over: Partial<PrdLoopReport> = {}): PrdLoopReport => ({
     passed: false,
@@ -196,6 +218,7 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
     gateCommandsEmpty,
     uatRan,
     uatSkipReason,
+    standards,
     ...over,
   });
 
@@ -293,6 +316,7 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
       gates = [];
       uatRan = false;
       uatSkipReason = null;
+      standards = null;
 
       let failedGate: FailedGate = null;
       let failureDetail = '';
@@ -315,6 +339,97 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
           : 'No changed files could be detected (git unavailable).';
       }
 
+      // c2. Standards, static half — free, so it runs before any command: a diff that breaks
+      //     the agreed conventions makes a ten-minute test suite pointless.
+      let profileCommands: StandardsProfile['commands'] = [];
+      /**
+       * Where the standards row goes once the whole blocking set — the profile's commands and
+       * any promoted rule — is known. Null while the static half never ran to an end.
+       */
+      let standardsRow: { index: number; durationMs: number } | null = null;
+      if (cfg.standards) {
+        const std = cfg.standards;
+        if (failedGate) {
+          standards = skippedStandardsReport(std.profile, std.version, std.baseRef, `The ${failedGate} gate failed first`);
+        } else {
+          if (deps.signal.aborted) {
+            return makeReport({ haltReason: 'aborted' });
+          }
+          deps.onProgress('standards', `Checking the diff against ${standardsGateName(std.version)}`);
+          const startedAt = Date.now();
+          const input = await collectStandardsInput(cfg.cwd, std.baseRef, { probeDirs: std.profile.structure.requiredDirs });
+          const checked = checkStandards(std.profile, input);
+          checked.version = std.version;
+          // "No base recorded" (null: a repository with no commits) is not the same as "a base
+          // was recorded and cannot be used". The second must never read as nothing to check.
+          const baseLost = std.baseRef !== null && input.baseRef !== std.baseRef;
+          const baseUnusable = baseLost && input.baseRef === null;
+          if (baseLost && !baseUnusable) {
+            deps.onProgress(
+              'warning',
+              `The standards base ${std.baseRef} is not in this repository any more — every file is checked as if it were new.`,
+            );
+          }
+          for (const cmd of std.profile.commands) {
+            checked.rules.push(commandRow({ result: 'not-checked', reason: COMMAND_NOT_REACHED, command: cmd.run }));
+          }
+          checked.totals = recountTotals(checked);
+          standards = checked;
+
+          // Only a BLOCKING rule stops the run. An advisory rule's findings are in the report —
+          // file, line and rule — for the reviewer and the approver, and go no further.
+          const staticFailed = standardsBlocked(checked);
+          const promoted = promotedScannerRules(checked);
+          if (promoted.length > 0) {
+            deps.onProgress('warning', `Standards: ${promoted.join(', ')} can stop this release. ${SCANNER_PROMOTION_WARNING}`);
+          }
+          const unread = checked.rules.filter(isUnreadBlocking);
+          if (unread.length > 0) {
+            // Not a pass and not a failure: said out loud so nobody reads silence as "checked".
+            deps.onProgress(
+              'warning',
+              `Standards: ${unread.length} blocking rule${unread.length === 1 ? '' : 's'} could not be checked ` +
+              `(${unread.map((r) => r.rule).join(', ')}) — ${unread[0].reason ?? 'no reason given'}`,
+            );
+          }
+          if (staticFailed) {
+            // A blocking rule was evaluated and it stops the release: that is a result, and it is recorded.
+            gates.push({
+              command: standardsGateName(std.version),
+              exitCode: 1,
+              passed: false,
+              output: describeStandards(checked),
+              durationMs: Date.now() - startedAt,
+              timedOut: false,
+            });
+            failedGate = 'standards';
+            failureDetail = describeStandards(checked);
+            setCommandReason(checked, 'A standards rule failed first');
+          } else if (baseUnusable) {
+            // Fail closed: the run was started against a base, and no diff against it — or
+            // against anything — could be taken. Shipping on "nothing was checked" is not an option.
+            failedGate = 'standards';
+            failureDetail = `Project standards could not be checked: no diff could be taken against the recorded base ${std.baseRef}.`;
+            gates.push({
+              command: standardsGateName(std.version),
+              exitCode: 1,
+              passed: false,
+              output: failureDetail,
+              durationMs: Date.now() - startedAt,
+              timedOut: false,
+            });
+            setCommandReason(checked, 'The standards base could not be used');
+            checked.totals = recountTotals(checked);
+          } else {
+            profileCommands = std.profile.commands;
+            // The row is not written yet. What it says — checked, not checked, or no blocking
+            // rules configured — is only known once the profile's commands, the other half of
+            // the blocking set, have run too.
+            standardsRow = { index: gates.length, durationMs: Date.now() - startedAt };
+          }
+        }
+      }
+
       // d. G2 — the repository's own checks must pass
       if (!failedGate) {
         const commands = resolveGateCommands(cfg.cwd, cfg.gateCommands);
@@ -333,6 +448,7 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
             'No gate commands could be resolved — verification rests on model judgment alone.',
           );
         }
+        const repoResults: GateResult[] = [];
         for (const command of commands) {
           if (deps.signal.aborted) {
             return makeReport({ haltReason: 'aborted' });
@@ -344,8 +460,10 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
             timeoutMs: cfg.gateTimeoutMs,
           });
           gates.push(result);
+          repoResults.push(result);
           // A gate that ran is proof about this repository, whichever way it
           // went. Recorded here because this is where a real exit code exists.
+          // (The synthetic standards row never comes through here: it is not a command.)
           learnFromGate(cfg.cwd, result);
           if (!result.passed) {
             failedGate = 'command';
@@ -353,6 +471,83 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
               (result.timedOut ? ' (timed out)' : '') +
               `\nOutput tail:\n${tail(result.output, 2_000)}`;
             break;
+          }
+        }
+
+        // ── G2a — standards, command half ──
+        // The approved profile's own lint/format commands, after the repo gates and through
+        // the same runGate. A command the repo gates already ran is not run a second time.
+        if (standards) {
+          const report: StandardsReport = standards;
+          const firstCommandRow = report.rules.length - profileCommands.length;
+          if (failedGate) {
+            setCommandReason(report, `The ${failedGate} gate failed first`);
+          } else {
+            for (let i = 0; i < profileCommands.length; i++) {
+              if (deps.signal.aborted) {
+                return makeReport({ haltReason: 'aborted' });
+              }
+              const command = profileCommands[i].run;
+              let result = repoResults.find((g) => g.command === command);
+              if (!result) {
+                deps.onProgress('standards-command', command);
+                result = await runGate(command, {
+                  cwd: cfg.cwd,
+                  signal: deps.signal,
+                  timeoutMs: cfg.gateTimeoutMs,
+                });
+                gates.push(result);
+                learnFromGate(cfg.cwd, result);
+              }
+              report.rules[firstCommandRow + i] = commandRow({
+                result: result.passed ? 'passed' : 'failed',
+                command,
+                exitCode: result.exitCode,
+                tail: tail(result.output, 2_000),
+              });
+              if (!result.passed) {
+                failedGate = 'standards';
+                failureDetail = `Standards command failed: ${result.command}\nExit code: ${result.exitCode}` +
+                  (result.timedOut ? ' (timed out)' : '') +
+                  `\nOutput tail:\n${tail(result.output, 2_000)}`;
+                setCommandReason(report, 'An earlier standards command failed');
+                break;
+              }
+            }
+          }
+          report.totals = recountTotals(report);
+          // Now, and only now, the blocking set is known. The row is put where the static
+          // check ran, ahead of the commands; its text carries what was only advised and what
+          // was not checked, so a reader of the trace sees those beside the result.
+          const blockingState = standardsBlockingState(report);
+          if (!failedGate && standardsRow && blockingState === 'not-checked') {
+            // Unevaluated blocking evidence is not a pass: a promoted rule that could not read
+            // what it had to, or a command that never ran, stops the release like a failure.
+            const open = report.rules.filter(isBlockingNotChecked);
+            failedGate = 'standards';
+            failureDetail = `Project standards could not be checked: ${open.length} blocking rule${open.length === 1 ? ' was' : 's were'} not checked.\n` +
+              open.map((r) => `- ${r.rule === 'command' ? `command: ${r.command ?? ''}` : r.rule} — ${r.reason ?? 'no reason given'}`).join('\n');
+            gates.splice(standardsRow.index, 0, {
+              command: standardsGateName(report.version),
+              exitCode: 1,
+              passed: false,
+              output: `${failureDetail}\n${describeStandards(report)}`,
+              durationMs: standardsRow.durationMs,
+              timedOut: false,
+            });
+          } else if (standardsRow && blockingState !== 'not-checked' && !standardsBlocked(report)) {
+            // Either the blocking set was evaluated and nothing in it stops the release, or the
+            // profile has no blocking set at all — which the row says in so many words
+            // (`describeStandards`, `standardsCounts.noBlockingRules`) and never calls a pass.
+            gates.splice(standardsRow.index, 0, {
+              command: standardsGateName(report.version),
+              exitCode: 0,
+              passed: true,
+              output: describeStandards(report),
+              durationMs: standardsRow.durationMs,
+              timedOut: false,
+              standardsCounts: standardsCheckCounts(report),
+            });
           }
         }
 
@@ -496,7 +691,7 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
       }
 
       // h. No-progress guard — same failing gates over the same files twice
-      const fingerprint = buildFingerprint(gates, changedFiles);
+      const fingerprint = buildFingerprint(gates, changedFiles, standards);
       if (lastFingerprint !== null && fingerprint === lastFingerprint) {
         return makeReport({
           haltReason: 'no-progress',
@@ -662,11 +857,101 @@ function tail(text: string, maxChars: number): string {
   return trimmed.length <= maxChars ? trimmed : trimmed.slice(trimmed.length - maxChars);
 }
 
-/** Stable identity of a failure: which gates failed, over which files. */
-function buildFingerprint(gates: GateResult[], changedFiles: string[]): string {
+/**
+ * Stable identity of a failure: which gates failed, over which files, with which
+ * BLOCKING standards findings. The findings matter: the standards row exits 1 while any
+ * blocking finding remains, so without them a fix that cleared nine of ten would read as
+ * no progress. Advisory findings are left out — they fail nothing, so they are not part
+ * of what a fix has to change.
+ */
+function buildFingerprint(gates: GateResult[], changedFiles: string[], standards: StandardsReport | null): string {
   const failing = gates.filter((g) => !g.passed).map((g) => `${g.command}:${g.exitCode}`).sort();
   const files = [...changedFiles].sort();
-  return JSON.stringify({ failing, files });
+  const findings = (standards?.findings ?? []).filter((f) => severityOf(f) === 'blocking')
+    .map((f) => `${f.file}:${f.line}:${f.rule}`).sort();
+  return JSON.stringify(findings.length > 0 ? { failing, files, findings } : { failing, files });
+}
+
+/** Why a profile command has no result yet. Replaced as soon as the command runs. */
+const COMMAND_NOT_REACHED = 'Verification stopped before the standards commands ran';
+/** Most findings spelled out in a failure message or fix prompt. */
+const MAX_FINDINGS_DESCRIBED = 40;
+
+/** Name of the synthetic gate row that carries the static standards result. */
+function standardsGateName(version: number | null): string {
+  return standardsGateCommand(version);
+}
+
+/** Give every profile command that has not run yet the same not-checked reason. */
+function setCommandReason(report: StandardsReport, reason: string): void {
+  for (const row of report.rules) {
+    if (row.rule === 'command' && row.result === 'not-checked') { row.reason = reason; }
+  }
+}
+
+/** One group of findings as text: a heading, then one line per finding, capped. */
+function describeFindings(heading: string, findings: StandardsReport['findings']): string[] {
+  if (findings.length === 0) { return []; }
+  const lines = findings.slice(0, MAX_FINDINGS_DESCRIBED).map((f) => `- ${f.file}:${f.line} ${f.rule} — ${f.message}`);
+  if (findings.length > MAX_FINDINGS_DESCRIBED) { lines.push(`…and ${findings.length - MAX_FINDINGS_DESCRIBED} more`); }
+  return [heading, ...lines];
+}
+
+/** `n thing` / `n things`. */
+function plural(n: number, word: string): string {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+/**
+ * The static standards result as text, in the groups every surface shows: what BLOCKS (the
+ * only part a fix must change), what is ADVISORY (reported, never blocking), and what was
+ * NOT CHECKED — rules and files — never a pass, with blocking rules that could not read a
+ * changed file named first.
+ *
+ * The words follow the rule: a scanner rule has "findings" or "no findings" and is never
+ * said to have passed; "passed" and "failed" are kept for commands. A profile with no blocking
+ * set says "no blocking rules configured".
+ * The first line carries the counts a trace reader needs beside the result: advisory
+ * findings, rules not checked and files not checked.
+ */
+function describeStandards(report: StandardsReport): string {
+  const statics: StandardsReport = { ...report, rules: report.rules.filter((r) => r.rule !== 'command') };
+  const groups = groupStandardsRules(statics);
+  const stopping = groups.blocking.filter((r) => r.result === 'failed');
+  const blockingFindings = report.findings.filter((f) => severityOf(f) === 'blocking');
+  const advisoryFindings = report.findings.filter((f) => severityOf(f) === 'advisory');
+  const unread = groups.notChecked.filter(isUnreadBlocking);
+  const files = report.notCheckedFiles ?? [];
+  const t = report.totals;
+  // The same three numbers the trace records beside the row (`standardsCheckCounts`).
+  const open = standardsCheckCounts(statics);
+
+  const counts = `${plural(open.advisoryFindings, 'advisory finding')}, ${plural(open.notCheckedRules, 'rule')} not checked, ` +
+    `${plural(open.notCheckedFiles, 'file')} not checked`;
+  const head = stopping.length > 0
+    ? `Project standards stop this release: ${stopping.map((r) => `${r.rule} (${ruleOutcomeLabel(r)})`).join(', ')} — ` +
+      `${plural(blockingFindings.length, 'blocking finding')}; ${counts}.`
+    : standardsBlockingState(report) === 'none-configured' ? `Project standards: ${NO_BLOCKING_RULES} (${counts}).`
+      : `Project standards: nothing blocking (${counts}).`;
+  const out = [
+    head,
+    ...describeFindings('Blocking — these must be fixed:', blockingFindings),
+    ...describeFindings('Advisory — reported by a heuristic scan, not blocking:', advisoryFindings),
+  ];
+  const promoted = promotedScannerRules(statics);
+  if (promoted.length > 0) { out.push(`Promoted to blocking: ${promoted.join(', ')}. ${SCANNER_PROMOTION_WARNING}`); }
+  if (unread.length > 0) {
+    out.push('Not checked — blocking rules that could not read a changed file (not a pass):');
+    for (const r of unread) { out.push(`- ${r.rule} — ${r.reason ?? 'no reason given'}`); }
+  }
+  if (files.length > 0) {
+    out.push(`Files not checked (${t.notCheckedFiles}) — nothing in them counts towards "no findings":`);
+    for (const f of files.slice(0, MAX_FINDINGS_DESCRIBED)) { out.push(`- ${f.file} — not checked (${f.reason})`); }
+    if (t.notCheckedFiles > Math.min(files.length, MAX_FINDINGS_DESCRIBED)) {
+      out.push(`…and ${t.notCheckedFiles - Math.min(files.length, MAX_FINDINGS_DESCRIBED)} more`);
+    }
+  }
+  return out.join('\n');
 }
 
 function buildVerifyPrompt(prdText: string, evidenceSummary: string): string {

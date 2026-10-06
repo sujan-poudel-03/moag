@@ -17,8 +17,9 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { isDeepStrictEqual } from 'util';
 import { URL } from 'url';
-import { ENGINE_IDS, EngineId, Plan, PlanFilePlaylist, SEMVER_BUMPS, TaskStatus, TaskType } from '../models/types';
+import { ENGINE_IDS, EngineId, Plan, PlanFilePlaylist, SEMVER_BUMPS, StandardsCheckCounts, TaskStatus, TaskType } from '../models/types';
 import { STACK_IDS } from './stacks';
 import { WEB_ROLES } from './web-roles';
 import { dehydratePlan, hydratePlan, loadPlan } from '../models/plan';
@@ -41,9 +42,9 @@ import {
 import { obj, str, opt, nullable, num, bool, oneOf, engineId as engineIdV, bump as bumpV, stack as stackV, roles as rolesV, parseBody, ValidationError, Validator } from './validate';
 import {
   ProjectStore, ProjectRecord, ProjectInputError, intakeProject, ExecFn, ProjectIntakeInput, resolveProjectPath,
-  buildRepoListing, detectRepoEngineConfig,
+  buildRepoListing, detectRepoEngineConfig, gitHead,
 } from './projects';
-import { ProjectStateStore, PlanReview, RunRecord, RunStatus, ProjectState } from './project-state';
+import { ProjectStateStore, PlanReview, RunRecord, RunStatus, ProjectState, StandardsReportPhase } from './project-state';
 import { JobManager, JobEnd, SpawnSpec, WorkerProcess, JobNotice, redactSecrets } from './jobs';
 import { buildWorkerConfig, buildPlanWorkerConfig, buildWorkerEnv, referencedEngines, plannerFileAccessRefusal, PLANNER_LOCKED_ENGINES } from './run-env';
 import { ServerSettingsStore } from './server-settings';
@@ -60,6 +61,20 @@ import {
 import { prepareGateResume, GateResumeError, GateResumeResult, stampApprovedShip } from './gate';
 import { createStaticServer } from './static';
 import { ServerAction, canPerform, allowedActions, Actor } from './permissions';
+import {
+  StandardsStore, StandardsStoreError, StandardsVersionRecord, MAX_STANDARDS_VERSIONS, SYSTEM_ACTOR, inEffectBefore, proposeAutomatic,
+  enforcementReview, standardsChangeAudit,
+} from './standards-store';
+import {
+  MAX_STANDARDS_COMMANDS, MAX_STANDARDS_COMMAND_CHARS, MAX_STANDARDS_FREE_TEXT_CHARS, PROVENANCE_FIELDS, ProvenanceField,
+  DEFAULT_RULE_SEVERITY, STANDARDS_RULE_IDS, StandardsProfile, StandardsProvenance, renderPlannerStandards, renderStandardsText,
+  isScannerRule, ruleSeverity, validateProfile,
+} from '../standards/profile';
+import type { StandardsJobFile } from '../standards/local-store';
+import {
+  BlockingSetState, StandardsReport, applyProfileSeverity, commandRow, parseStandardsReport, recountTotals, standardsBlockingState,
+  standardsCheckCounts,
+} from '../standards/checker';
 
 // ─── Route table (data) ───
 
@@ -105,6 +120,11 @@ export const ROUTES: readonly RouteSpec[] = Object.freeze([
   { method: 'GET', path: '/api/projects/:id/prd', action: null, mutating: false, auth: 'session' },
   { method: 'POST', path: '/api/projects/:id/prd/versions', action: 'prd.save', mutating: true, auth: 'session' },
   { method: 'POST', path: '/api/projects/:id/prd/versions/latest/bump', action: 'prd.bump-override', mutating: true, auth: 'session' },
+  { method: 'GET', path: '/api/projects/:id/standards', action: null, mutating: false, auth: 'session' },
+  { method: 'POST', path: '/api/projects/:id/standards/versions', action: 'standards.propose', mutating: true, auth: 'session' },
+  { method: 'POST', path: '/api/projects/:id/standards/versions/:version/approve', action: 'standards.approve', mutating: true, auth: 'session' },
+  { method: 'POST', path: '/api/projects/:id/standards/versions/:version/reject', action: 'standards.reject', mutating: true, auth: 'session' },
+  { method: 'POST', path: '/api/projects/:id/standards/accept-defaults', action: 'standards.accept-defaults', mutating: true, auth: 'session' },
   { method: 'POST', path: '/api/projects/:id/plans', action: 'plan.generate', mutating: true, auth: 'session' },
   { method: 'POST', path: '/api/projects/:id/plans/:planId/approve', action: 'plan.approve', mutating: true, auth: 'session' },
   { method: 'POST', path: '/api/projects/:id/plans/:planId/reject', action: 'plan.reject', mutating: true, auth: 'session' },
@@ -177,6 +197,8 @@ export interface AppDeps {
   settings?: ServerSettingsStore;
   /** Stack evidence store; default: `outcomes.jsonl` in the data dir. */
   outcomes?: OutcomeStore;
+  /** Project standards store; default: `projects/<id>/standards.json` in the data dir. */
+  standards?: StandardsStore;
   /** SSE heartbeat (and session re-check) interval; default {@link SSE_HEARTBEAT_MS}. Tests shorten it. */
   sseHeartbeatMs?: number;
 }
@@ -247,7 +269,28 @@ const S = {
   setKey: obj({ value: str(8, 512, API_KEY_RE) }),
   patchSettings: obj({ allowPlannerFileAccess: opt(bool()) }),
   forceRelease: obj({ reason: LONG_TEXT }),
+  // `profile` is checked in full by `validateProfile` (unknown keys, caps, credential shapes);
+  // this schema only fixes the envelope.
+  proposeStandards: obj({ profile: ((v: unknown) => v) as Validator<unknown>, baseVersion: nullable(num(1, MAX_STANDARDS_VERSIONS, { integer: true })) }),
+  // `acknowledgedEnforcementHash` is the reviewer's tick on the enforcement diff: the content
+  // hash of the version whose changes they were shown. The store refuses without it whenever
+  // the version changes commands, severities or required directories.
+  approveStandards: obj({ contentHash: str(64, 64, /^[0-9a-f]{64}$/), acknowledgedEnforcementHash: opt(str(64, 64, /^[0-9a-f]{64}$/)) }),
+  rejectStandards: obj({ reason: LONG_TEXT }),
 };
+
+/** The profile sections a version is compared by for its "changed from vN" markers. */
+const STANDARDS_SECTIONS: readonly (keyof StandardsProfile)[] = [
+  'stackTemplateId', 'repoState', 'structure', 'frontend', 'backend', 'naming', 'comments', 'testing',
+  'commands', 'builtInRuleIds', 'freeText', 'severity',
+];
+
+/** Every rule's severity under a profile, defaults filled in: what the review screen shows. */
+const resolvedSeverity = (profile: StandardsProfile) =>
+  Object.fromEntries(STANDARDS_RULE_IDS.map((rule) => [rule, ruleSeverity(profile, rule)]));
+
+/** Where a project stands on standards: the gate's answer and the rail badge's. */
+export type StandardsState = 'approved' | 'pending' | 'rejected' | 'none';
 
 /** `POST /api/projects` body: a source union the generic `obj` cannot express. */
 const createProjectV: Validator<ProjectIntakeInput> = (v, field) => {
@@ -293,6 +336,7 @@ export function createApp(deps: AppDeps): App {
   const engineAvailable = deps.engineAvailable ?? ((e: EngineId) => engineCache.isAvailable(e, keyStatus));
   const outcomes = deps.outcomes ?? new OutcomeStore(config.dataDir, log);
   const settings = deps.settings ?? new ServerSettingsStore(config.dataDir);
+  const standards = deps.standards ?? new StandardsStore(config.dataDir);
 
   /** Per run-segment job: what an outcome needs that the worker event does not carry. */
   interface RunJobContext {
@@ -463,7 +507,11 @@ export function createApp(deps: AppDeps): App {
   const usernameOf = (id: string | undefined): string | null => (id ? users.findById(id)?.username ?? null : null);
 
   /** What can stop a run from starting right now, beyond role and plan status (shared by DTOs and the run guard). */
-  interface StartContext { jobActive: boolean; runsDisabled: boolean; budgetExhausted: boolean; engineUnavailable: boolean; engineChanged: boolean }
+  interface StartContext {
+    jobActive: boolean; runsDisabled: boolean; budgetExhausted: boolean; engineUnavailable: boolean; engineChanged: boolean;
+    /** False only when the plan was generated under standards and the store now has no approved version. */
+    standardsApproved: boolean;
+  }
   /** The engine a reviewer approved the plan under (legacy approvals: the engine it was generated with). */
   const lockedEngine = (review: PlanReview): EngineId => review.approvedEngine ?? review.engine;
   const startContext = (project: ProjectRecord, st: ProjectState, review: PlanReview, canonical: Plan): StartContext => ({
@@ -472,10 +520,12 @@ export function createApp(deps: AppDeps): App {
     budgetExhausted: project.versionBudgetUsd > 0 && !(project.versionBudgetUsd - (st.versionSpend[review.forVersionCreatedAt] ?? 0) > 0),
     engineUnavailable: planEngineUnavailable(canonical),
     engineChanged: (review.status === 'approved' || review.status === 'ran') && lockedEngine(review) !== project.defaultEngine,
+    standardsApproved: !standardsLost(project, review),
   });
   const startBlockedReason = (c: StartContext): string | null =>
     c.runsDisabled ? 'runs-disabled' : c.jobActive ? 'job-active' : c.engineChanged ? 'engine-changed'
-      : c.engineUnavailable ? 'engine-unavailable' : c.budgetExhausted ? 'budget-exhausted' : null;
+      : c.engineUnavailable ? 'engine-unavailable' : !c.standardsApproved ? 'standards-not-approved'
+        : c.budgetExhausted ? 'budget-exhausted' : null;
 
   /** Plan review DTO. `start` (when given) adds `run.start` for approved plans and why it is blocked. */
   const planDto = (p: PlanReview, u: UserRecord, start?: StartContext) => ({
@@ -557,10 +607,242 @@ export function createApp(deps: AppDeps): App {
         }
       }
     } catch { /* snapshot missing or unreadable: show the record only */ }
-    return { runId: r.id, playlistName, tasks, errorTails, events, afterGate };
+    // The standards report as the worker last sent it. Absent — not empty — for a run that
+    // has none (a legacy plan, or a run that ended before any check): "no report" is not a pass.
+    const standardsReport = readStandardsReport(dir);
+    return { runId: r.id, playlistName, tasks, errorTails, events, afterGate, ...(standardsReport ? { standardsReport } : {}) };
   };
 
-  const projectDto = (p: ProjectRecord, u: UserRecord) => ({
+  // ─── Project standards ───
+
+  interface StandardsView {
+    migrated: boolean;
+    /** Shared with the store's cache: read-only. */
+    versions: readonly StandardsVersionRecord[];
+    /** The latest approved version: what plans and runs are held to. */
+    effective: StandardsVersionRecord | null;
+    pending: StandardsVersionRecord | null;
+    state: StandardsState;
+  }
+
+  /**
+   * A project's standards as the gates and DTOs see them. A store that cannot be
+   * read counts as "nothing approved": the plan gate stays closed (fail closed)
+   * and the project list still loads.
+   */
+  const standardsView = (projectId: string): StandardsView => {
+    try {
+      const { migrated, versions } = standards.load(projectId);
+      const approved = versions.filter((v) => v.status === 'approved');
+      const effective = approved.length > 0 ? approved[approved.length - 1] : null;
+      const pending = versions.find((v) => v.status === 'pending') ?? null;
+      const last = versions.length > 0 ? versions[versions.length - 1] : null;
+      const state: StandardsState = effective ? 'approved' : pending ? 'pending' : last?.status === 'rejected' ? 'rejected' : 'none';
+      return { migrated, versions, effective, pending, state };
+    } catch (err) {
+      log(`standards ${projectId}: ${(err as Error).message}`);
+      return { migrated: false, versions: [], effective: null, pending: null, state: 'none' };
+    }
+  };
+
+  /** A store refusal as the HTTP error the client is told about. */
+  const standardsRefusal = (err: unknown): unknown => {
+    if (!(err instanceof StandardsStoreError)) { return err; }
+    const status = err.code === 'invalid-standards' ? 400 : err.code === 'not-found' ? 404 : 409;
+    return new HttpError(status, err.code, err.message, err.details);
+  };
+
+  const standardsDto = (p: ProjectRecord, u: UserRecord) => {
+    const view = standardsView(p.id);
+    const actor = actorOf(u);
+    const current = view.effective ?? view.pending;
+    return {
+      migrated: view.migrated,
+      state: view.state,
+      effectiveVersion: view.effective?.version ?? null,
+      pendingVersion: view.pending?.version ?? null,
+      stack: p.stack,
+      // The profile was proposed for another stack than the project has now (changing the stack proposes nothing).
+      stackMismatch: !!current && current.profile.stackTemplateId !== p.stack,
+      versions: view.versions.map((v) => {
+        // A version is compared with the one in effect while it is (or was) under review —
+        // what approving it replaces — never with its immediate base, which may be a
+        // proposal nobody approved. Only while nothing is in effect at all is the base the
+        // reference for the section markers; severities are then measured against the defaults.
+        const reference = inEffectBefore(view.versions, v);
+        const base = reference ?? (v.baseVersion === null ? undefined : view.versions.find((x) => x.version === v.baseVersion));
+        // The same comparison the audit log and the approval check make (`enforcementReview`):
+        // one function, so the diff shown, the acknowledgement required and the audit flag
+        // can never disagree.
+        const review = enforcementReview(view.versions, v);
+        return {
+          ...v,
+          inEffect: v.version === view.effective?.version,
+          // Verbatim, exactly as a worker would run them: approving the version approves these.
+          commands: v.profile.commands.map((c) => ({ label: c.label, run: c.run })),
+          // Which rules stop a release under this version, and which only report.
+          severity: resolvedSeverity(v.profile),
+          // What this version promotes or demotes relative to what is in effect (`severityComparedTo`),
+          // or to the defaults when nothing is (null) — whatever it was proposed on top of.
+          severityChanged: review.severity,
+          severityComparedTo: review.comparedTo,
+          // Every difference from what is in force in a field that decides what can stop a
+          // release — commands, severities, required directories — with before and after.
+          // Shown un-collapsed on the review screen; while `changed`, an approval must carry
+          // this version's content hash as `acknowledgedEnforcementHash`.
+          enforcementChanged: {
+            comparedTo: review.comparedTo, changed: review.changed, fields: review.fields,
+            commands: review.commands, severity: review.severity, requiredDirs: review.requiredDirs, ruleConfig: review.ruleConfig,
+          },
+          proposedByName: v.proposedBy === SYSTEM_ACTOR ? null : usernameOf(v.proposedBy),
+          decidedByName: usernameOf(v.decidedBy),
+          changedFrom: base
+            ? { version: base.version, sections: STANDARDS_SECTIONS.filter((k) => JSON.stringify(v.profile[k]) !== JSON.stringify(base.profile[k])) }
+            : null,
+          allowedActions: allowedActions(actor, ['standards.approve', 'standards.reject', 'standards.accept-defaults'], {
+            standardsStatus: v.status,
+            standardsAcceptable: view.migrated && v.status === 'pending' && v.origin === 'auto',
+          }),
+        };
+      }),
+      limits: {
+        freeTextChars: MAX_STANDARDS_FREE_TEXT_CHARS, commands: MAX_STANDARDS_COMMANDS,
+        commandChars: MAX_STANDARDS_COMMAND_CHARS, versions: MAX_STANDARDS_VERSIONS,
+      },
+      // What each rule is when a profile says nothing about it.
+      severityDefaults: { ...DEFAULT_RULE_SEVERITY },
+      // The rules MOAG decides by scanning text itself. The editor warns before one is made
+      // blocking: a heuristic can stop correct code and can miss a violation.
+      scannerRules: STANDARDS_RULE_IDS.filter((rule) => isScannerRule(rule)),
+      allowedActions: allowedActions(actor, ['standards.propose']),
+    };
+  };
+
+  /**
+   * The approved standards a new plan must be generated under, or 409
+   * `standards-not-approved` with where the project stands. Like
+   * {@link requireReviewPasses}, this is evaluated NOW at every step that calls
+   * it — plan generation, plan approval — never read from what an earlier step stored.
+   */
+  const requireStandards = (project: ProjectRecord): StandardsVersionRecord => {
+    const view = standardsView(project.id);
+    if (view.effective) { return view.effective; }
+    const why = view.state === 'pending' ? `Standards v${view.pending!.version} is waiting for a reviewer.`
+      : view.state === 'rejected' ? 'The proposed standards were rejected; edit them and submit again.'
+        : 'No standards have been approved.';
+    throw new HttpError(409, 'standards-not-approved', `This project has no approved standards, so this can't continue. ${why}`,
+      { state: view.state, pendingVersion: view.pending?.version ?? null });
+  };
+
+  /**
+   * True when a plan generated under standards can no longer be held to any:
+   * the store has no approved version (lost or tampered with). Approved versions
+   * are immutable, so this never happens in normal use; a run then refuses to
+   * start. A legacy plan that never carried a standards version is not affected.
+   */
+  const standardsLost = (project: ProjectRecord, review: PlanReview): boolean =>
+    review.standardsVersion !== undefined && standardsView(project.id).effective === null;
+
+  /**
+   * The ref a new run's standards check diffs against: everything the project has
+   * not shipped yet.
+   *
+   * HEAD at run start is the wrong base. An agent that commits its work (or a run
+   * left at the ship gate whose work is committed by hand) moves HEAD past that
+   * work, and the next run would then diff from after it — a violation committed
+   * between runs would be forgiven for good and its requirement stamped shipped.
+   * So the base is the ref the project last shipped at; before the first ship, the
+   * base of its earliest run; and only for the very first run, HEAD as it stands.
+   */
+  const standardsBaseRef = async (st: ProjectState, workspace: string): Promise<string | null> => {
+    // A ship recorded without a ref (written by an earlier build when HEAD could not be read)
+    // is no base at all: fall through to the next best one instead of returning null for good.
+    if (st.lastShipped?.ref) { return st.lastShipped.ref; }
+    const earliest = st.runs.find((r) => r.baseRef !== undefined);
+    if (earliest) { return earliest.baseRef ?? null; }
+    return gitHead(workspace, deps.exec);
+  };
+
+  /**
+   * Write the standards job file a worker reads: the approved version, frozen,
+   * with the prompt and planner text rendered HERE — the worker never renders,
+   * infers a command, or reads a standards file from the repository.
+   */
+  const writeStandardsJobFile = (dir: string, v: StandardsVersionRecord, baseRef: string | null): string => {
+    const file = path.join(dir, 'standards.json');
+    const doc: StandardsJobFile = {
+      schemaVersion: 1, version: v.version, contentHash: v.contentHash, baseRef, profile: v.profile,
+      promptText: renderStandardsText(v.profile, v.version),
+      plannerText: renderPlannerStandards(v.profile, v.version),
+    };
+    writeFileAtomicSync(file, JSON.stringify(doc, null, 2), 0o600);
+    return file;
+  };
+
+  /**
+   * The provenance of a version a PERSON proposes.
+   *
+   * A `detected` tag is a statement the server made about a value it read from the
+   * repository, and the approval screen shows it beside commands that will run on
+   * the server. So a tag survives an edit only for an area whose content is still
+   * exactly what the server proposed: each area is compared with the last automatic
+   * version the proposal descends from — not with its immediate base, which may
+   * itself be a person's edit. Every area that differs is tagged `assumed`,
+   * "entered by <proposer>". With no automatic ancestor, every area is.
+   */
+  const userProvenance = (projectId: string, profile: StandardsProfile, baseVersion: number | null, proposer: string): StandardsProvenance => {
+    const versions = standards.load(projectId).versions;
+    const byNumber = (n: number | null): StandardsVersionRecord | undefined => (n === null ? undefined : versions.find((v) => v.version === n));
+    let auto = byNumber(baseVersion);
+    // Version numbers only fall along the chain, so this ends; the bound is belt and braces.
+    for (let steps = 0; auto && auto.origin !== 'auto' && steps <= versions.length; steps++) { auto = byNumber(auto.baseVersion); }
+    if (auto && auto.origin !== 'auto') { auto = undefined; }
+    const at = (source: unknown, field: ProvenanceField): unknown =>
+      field.split('.').reduce<unknown>((value, key) => (value && typeof value === 'object' ? (value as Record<string, unknown>)[key] : undefined), source);
+    const entered = { tag: 'assumed' as const, evidence: `entered by ${proposer}` };
+    const provenance = {} as StandardsProvenance;
+    for (const field of PROVENANCE_FIELDS) {
+      const untouched = !!auto && auto.provenance?.[field] !== undefined && isDeepStrictEqual(at(profile, field), at(auto.profile, field));
+      provenance[field] = untouched ? { ...auto!.provenance[field] } : { ...entered };
+    }
+    return provenance;
+  };
+
+  /** The audit payload of every standards mutation: identity only, never profile text. */
+  const standardsAudit = (v: StandardsVersionRecord) => ({ version: v.version, contentHash: v.contentHash, origin: v.origin });
+
+  /**
+   * What `v` changes about enforcement relative to the standards in effect — if `v` is
+   * approved (at propose time), or when it just has been (at approve time): any difference in
+   * the commands (a label, a command line, the order), in a rule's severity, in the required
+   * directories, or in the configuration of a rule that is blocking. Flagged `enforcement-changed`, with what each differing field held
+   * before and after; no attempt is made to call a change a tightening or a loosening.
+   * Measured against the latest approved version other than `v` — never against
+   * `v.baseVersion`, which may be a superseded proposal that already carried the change — and
+   * against an empty baseline when nothing is approved, so a first version is recorded too.
+   * The values are profile text a reviewer approved to run or to require (already refused if
+   * credential-shaped), and exactly what an auditor needs: they decide what can stop a release.
+   *
+   * A store that cannot be read fails closed (`standardsChangeAudit`): the entry is flagged as
+   * an enforcement change that could not be verified, never left unflagged.
+   *
+   * Returns the audit `after` and `flags` of a propose, approve or accept-defaults.
+   */
+  const standardsAuditWithSeverity = (projectId: string, v: StandardsVersionRecord, flags: string[] = []) => {
+    const change = standardsChangeAudit(standards, projectId, v);
+    const all = [...flags, ...change.flags];
+    return {
+      after: { ...standardsAudit(v), ...change.after },
+      ...(all.length > 0 ? { flags: all } : {}),
+    };
+  };
+
+  const projectDto = (p: ProjectRecord, u: UserRecord) => {
+    const view = standardsView(p.id);
+    return { ...projectFields(p, u), standards: { effectiveVersion: view.effective?.version ?? null, pendingVersion: view.pending?.version ?? null, state: view.state } };
+  };
+
+  const projectFields = (p: ProjectRecord, u: UserRecord) => ({
     id: p.id,
     name: p.name,
     workspaceName: path.basename(p.workspacePath),
@@ -572,6 +854,134 @@ export function createApp(deps: AppDeps): App {
     createdBy: p.createdBy,
     allowedActions: allowedActions(actorOf(u), ['project.update', 'prd.save', 'plan.generate', 'run.start']),
   });
+
+  const STANDARDS_REPORT_FILE = 'standards-report.json';
+
+  /** What the latest `verify-standards` line of a run's live segment said it checked against. */
+  interface StandardsAttestation {
+    phase: StandardsReportPhase;
+    version: number | null;
+    /** sha256 of the profile the worker actually checked with; null when it sent none. */
+    contentHash: string | null;
+    /** The base ref the worker was told to diff against; undefined when it sent none. */
+    recordedBaseRef: string | null | undefined;
+    /**
+     * Where the blocking set of the frozen profile stands in the report: `evaluated`,
+     * `none-configured` (nothing can stop a release: it ships, stamped as such) or
+     * `not-checked` (a command never ran, or a promoted rule could not decide: nothing ships).
+     */
+    blockingState: BlockingSetState;
+    failed: number;
+    /** What the check left open — recorded on the release stamp beside the version. */
+    counts: StandardsCheckCounts;
+  }
+  /** Per run, for the segment in flight only: cleared when a segment starts and when it ends. */
+  const standardsAttestations = new Map<string, StandardsAttestation>();
+
+  /**
+   * Why a run that exited 0 must NOT be taken as checked against its standards, or
+   * null when it was.
+   *
+   * The worker re-reads its standards job file after the agent has run, and that file
+   * sits in the agent-writable run dir: a rewrite that empties the profile or moves the
+   * base ref to the current HEAD, with the hash updated to match, is self-consistent and
+   * the worker cannot tell. The server can: the version, hash and base ref it froze on
+   * the run record never left the data dir's state file, and the worker reports what it
+   * really used on its own pipe.
+   */
+  const standardsCheckProblem = (rec: RunRecord, seen: StandardsAttestation | undefined): string | null => {
+    if (rec.standardsVersion === undefined) { return null; }
+    if (!seen || seen.phase !== 'verify') {
+      return 'the verification pass sent no standards report';
+    }
+    if (seen.version !== rec.standardsVersion || seen.contentHash !== rec.standardsHash) {
+      return `the standards check was not made against the approved standards v${rec.standardsVersion}`;
+    }
+    if (seen.recordedBaseRef !== (rec.baseRef ?? null)) {
+      return 'the standards check was not made against the base recorded for this run';
+    }
+    // `failed` counts blocking rules and commands only: an advisory finding never stops a ship.
+    if (seen.failed > 0) {
+      return 'the standards report lists a failed blocking rule';
+    }
+    // Unevaluated blocking evidence is not a pass.
+    if (seen.blockingState === 'not-checked') {
+      return 'the standards report lists a blocking rule or command that was not checked';
+    }
+    return null;
+  };
+
+  /** The run's stored standards report, re-validated on the way out; null when there is none. */
+  const readStandardsReport = (dir: string): { phase: StandardsReportPhase; at: string; report: StandardsReport } | null => {
+    try {
+      const doc = JSON.parse(fs.readFileSync(path.join(dir, STANDARDS_REPORT_FILE), 'utf-8')) as { phase?: unknown; at?: unknown; report?: unknown };
+      const report = parseStandardsReport(doc.report);
+      if (!report) { return null; }
+      return { phase: doc.phase === 'pre-gate' ? 'pre-gate' : 'verify', at: typeof doc.at === 'string' ? doc.at : '', report };
+    } catch {
+      return null;
+    }
+  };
+
+  /**
+   * Keep a worker's `verify-standards` payload: shape-checked and bounded by
+   * `parseStandardsReport` (its strings were already redacted with the job's
+   * credentials by the job manager), written to the run dir — never to
+   * state.json — with only the totals on the run record. A payload that does
+   * not parse is dropped; nothing here throws into the event pipeline.
+   */
+  const recordStandardsReport = (projectId: string, runId: string, dir: string, data: Record<string, unknown>): void => {
+    const parsed = parseStandardsReport(data);
+    if (!parsed) { log(`run ${runId}: malformed standards report dropped`); return; }
+    // What blocks is decided by the profile the SERVER froze on the run, never by what the
+    // worker's report says about itself: a row cannot arrive demoted to advisory.
+    let report = parsed;
+    try {
+      const rec = state.load(projectId).runs.find((x) => x.id === runId);
+      const frozen = rec?.standardsVersion !== undefined ? standards.get(projectId, rec.standardsVersion) : null;
+      report = applyProfileSeverity(parsed, frozen ? frozen.profile : null);
+      // Likewise WHICH commands must have a result is decided by the frozen profile. A command
+      // the report says nothing about was not evaluated: it is added as not checked, so a
+      // report that merely leaves a command out can never read as "nothing blocking".
+      const unreported = (frozen ? frozen.profile.commands : [])
+        .filter((c) => !report.rules.some((r) => r.rule === 'command' && r.command === c.run));
+      if (unreported.length > 0) {
+        report = {
+          ...report,
+          rules: [...report.rules, ...unreported.map((c) => commandRow({ result: 'not-checked', reason: 'The report holds no result for this command', command: c.run }))],
+        };
+        report.totals = recountTotals(report);
+      }
+    } catch (err) {
+      log(`run ${runId}: standards severity could not be re-derived, every rule is taken as blocking: ${(err as Error).message}`);
+      report = applyProfileSeverity(parsed, null);
+    }
+    const phase: StandardsReportPhase = data.phase === 'pre-gate' ? 'pre-gate' : 'verify';
+    const at = now().toISOString();
+    // Kept in memory, straight from the worker's pipe: what the check says it was made
+    // against. The copy in the run dir is for display only — the run dir is agent-writable.
+    standardsAttestations.set(runId, {
+      phase,
+      version: report.version,
+      contentHash: typeof data.contentHash === 'string' ? data.contentHash : null,
+      recordedBaseRef: data.recordedBaseRef === null ? null : typeof data.recordedBaseRef === 'string' ? data.recordedBaseRef : undefined,
+      blockingState: standardsBlockingState(report),
+      failed: report.totals.failed,
+      counts: standardsCheckCounts(report),
+    });
+    try {
+      writeFileAtomicSync(path.join(dir, STANDARDS_REPORT_FILE), JSON.stringify({ phase, at, report }, null, 2), 0o600);
+    } catch (err) {
+      log(`run ${runId}: standards report not saved: ${(err as Error).message}`);
+      return;
+    }
+    void state.withProjectLock(projectId, () => {
+      state.update(projectId, (s) => {
+        const r = s.runs.find((x) => x.id === runId);
+        if (r) { r.standardsSummary = { phase, version: report.version, ...report.totals, at }; }
+      });
+    }).catch((err) => log(`run ${runId}: standards summary not saved: ${(err as Error).message}`));
+  };
 
   const appendRunEvent = (dir: string, ev: WorkerEvent): void => {
     try {
@@ -677,8 +1087,13 @@ export function createApp(deps: AppDeps): App {
   const onRunEnd = (projectId: string, runId: string, snapshotPath: string, seg: { jobId: () => string | null; stack: StackId; engine: EngineId; since: string }) => (end: JobEnd): void => {
     const jobId = seg.jobId();
     if (jobId) { runJobContexts.delete(jobId); }
-    void state.withProjectLock(projectId, () => {
+    // Taken now, synchronously: the next segment of this run clears it when it starts.
+    const attested = standardsAttestations.get(runId);
+    standardsAttestations.delete(runId);
+    void state.withProjectLock(projectId, async () => {
       const project = projects.get(projectId);
+      let shippedAt: string | null = null;
+      let standardsProblem: string | null = null;
       if (project) {
         try {
           const canonical = state.loadCanonicalPlan(projectId, project.name, project.defaultEngine);
@@ -687,14 +1102,38 @@ export function createApp(deps: AppDeps): App {
           // so an approver's approval is what ships. Only a segment that
           // resumed after `approve` and exited 0 (its verify pass ran green)
           // stamps; stampRelease re-checks tasks and gates. A skip never ships.
+          //
+          // Standards need no branch here. A failed standards gate — a static rule
+          // or a profile command — makes the verify pass exit 1, so the segment's
+          // status is `gaps` and the `exitCode === 0` test below is false:
+          // stampApprovedShip is never reached and nothing is marked shipped, even
+          // though the gate was approved and every task completed.
+          //
+          // What does need one: a segment that exits 0 on a run frozen to a standards
+          // version must have PROVED the check — a verify-phase report, made with the
+          // frozen profile hash against the frozen base. Without it the run ends `gaps`.
           const rec = state.load(projectId).runs.find((x) => x.id === runId);
           const lastDecision = rec?.gateDecisions?.[rec.gateDecisions.length - 1];
-          if (end.status === 'completed' && end.exitCode === 0 && lastDecision?.action === 'approve') {
+          if (rec && end.status === 'completed' && end.exitCode === 0) {
+            standardsProblem = standardsCheckProblem(rec, attested);
+            if (standardsProblem) { log(`run ${runId}: ended gaps, nothing shipped: ${standardsProblem}`); }
+          }
+          if (end.status === 'completed' && end.exitCode === 0 && lastDecision?.action === 'approve' && !standardsProblem) {
             // Release tasks run after the gate: their playlist's release must also have succeeded.
             const playlistIndex = state.load(projectId).plans.find((x) => x.id === rec?.planId)?.playlistIndex;
-            const shipped = stampApprovedShip(snapshot, runId, now().toISOString(), playlistIndex);
+            // The trace records which standards version the shipped work was checked against.
+            // A check in which a blocking rule or command came out not-checked never gets here
+            // (`standardsCheckProblem`). One whose profile has no blocking set at all ships, and
+            // its stamp says so: the counts carry `noBlockingRules`, shown as "no blocking
+            // rules configured" and never as a pass.
+            const stampedAt = now().toISOString();
+            const stampVersion = attested && attested.blockingState !== 'not-checked' ? rec?.standardsVersion : undefined;
+            // Beside the version: how many advisory findings, rules and files the check left open.
+            const stampCounts = stampVersion !== undefined ? attested?.counts : undefined;
+            const shipped = stampApprovedShip(snapshot, runId, stampedAt, playlistIndex, stampVersion, stampCounts);
             if (shipped.length > 0) {
               writeFileAtomicSync(snapshotPath, JSON.stringify(dehydratePlan(snapshot), null, 2), 0o600);
+              shippedAt = stampedAt;
             }
             log(`run ${runId}: approved ship stamped ${shipped.length > 0 ? shipped.join(', ') : 'no requirement'}`);
           }
@@ -703,11 +1142,26 @@ export function createApp(deps: AppDeps): App {
           recordGateOutcomes(snapshot, { projectId, runId, stack: seg.stack, engine: seg.engine, since: seg.since });
         } catch (err) { log(`run ${runId}: snapshot merge failed: ${(err as Error).message}`); }
       }
+      // Only a stamped ship moves the standards base forward: HEAD as it stands now is
+      // the last point known to have passed every gate. A run that ended any other way
+      // leaves the base alone, so whatever it committed is still inside the next diff.
+      const shippedRef = project && shippedAt ? await gitHead(project.workspacePath, deps.exec) : null;
+      // A ship whose HEAD could not be read is never stored as the base: a null ref would make
+      // every later check diff against the empty tree until the next ship. The previous base
+      // stays, so the next diff covers this ship's work again — more is checked, never less.
+      if (shippedAt && !shippedRef) { log(`run ${runId}: shipped, but HEAD could not be read; the standards base was not moved`); }
       state.update(projectId, (s) => {
+        if (shippedAt && shippedRef) { s.lastShipped = { ref: shippedRef, runId, at: shippedAt }; }
         const r = s.runs.find((x) => x.id === runId);
         if (!r) { return; }
         r.status = end.status as RunStatus;
         r.exitCode = end.exitCode;
+        if (standardsProblem) {
+          // Exit 0 without proof of the standards check is not a completed run.
+          r.status = 'gaps';
+          r.exitCode = 1;
+          r.errorTail = `Nothing was shipped: ${standardsProblem}.`;
+        }
         r.endedAt = now().toISOString();
         // Segments after a gate resume report only their own tasks: keep the earlier statuses and cost.
         r.view = mergeRunViews(r.view, end.view);
@@ -734,15 +1188,34 @@ export function createApp(deps: AppDeps): App {
       }
     } catch { /* unreadable snapshot: the worker fails on it; inject nothing extra */ }
     const { env, redact } = workerEnv(configPath, engines);
+    // The standards job file is (re)written for every segment from the version RECORDED
+    // on the run, never from whatever is latest: a version approved mid-run does not
+    // change a run in flight, and the base ref stays the one captured at run start.
+    standardsAttestations.delete(run.id);
+    let standardsPath: string | undefined;
+    if (run.standardsVersion !== undefined) {
+      let frozen: StandardsVersionRecord | null = null;
+      try { frozen = standards.get(project.id, run.standardsVersion); } catch (err) { log(`standards ${project.id}: ${(err as Error).message}`); }
+      if (!frozen || frozen.status !== 'approved' || frozen.contentHash !== run.standardsHash) {
+        throw new HttpError(409, 'standards-not-approved',
+          `Standards v${run.standardsVersion}, which this run was started under, is no longer available, so the run can't continue.`,
+          { state: standardsView(project.id).state, pendingVersion: standardsView(project.id).pending?.version ?? null });
+      }
+      standardsPath = writeStandardsJobFile(dir, frozen, run.baseRef ?? null);
+    }
     const job: RunJob = {
       kind: 'run', runId: run.id, workspace, planPath: snapshotPath,
       startPlaylistIndex: review.playlistIndex ?? 0, verify: true, allowedEngines: SERVER_ENGINES,
+      ...(standardsPath ? { standardsPath } : {}),
     };
     let jobId: string | null = null;
     const started = jobs.start({
       projectId: project.id, job, jobPath: path.join(dir, 'job.json'), workspace, env, redact,
       spendKey: run.versionCreatedAt,
-      onEvent: (ev) => appendRunEvent(dir, ev),
+      onEvent: (ev) => {
+        appendRunEvent(dir, ev);
+        if (ev.event === 'verify' && ev.name === 'verify-standards') { recordStandardsReport(project.id, run.id, dir, ev.data); }
+      },
       onEnd: onRunEnd(project.id, run.id, snapshotPath, {
         jobId: () => jobId, stack: run.stack, engine: project.defaultEngine, since: now().toISOString(),
       }),
@@ -1109,6 +1582,17 @@ export function createApp(deps: AppDeps): App {
       projectsRoot: config.projectsRoot, allowSsh: config.allowSshClone, serverEnv: deps.serverEnv, exec: deps.exec,
     });
     writeAudit(ctx, { action: 'project.create', projectId: p.id, target: p.name, after: { stack: p.stack, defaultEngine: p.defaultEngine, versionBudgetUsd: p.versionBudgetUsd, source: p.source.kind } });
+    // Standards v1 is proposed right away (detection over the files git tracks plus the
+    // stack's built-in profile; git is asked asynchronously and no model is), so a reviewer has
+    // something to approve before the first plan. A failure here never fails the
+    // create: the project simply has no proposal yet and a product owner can make one.
+    try {
+      const auto = await state.withProjectLock(p.id, () => proposeAutomatic(standards, p, { migrated: false, now: now() }));
+      if (auto) {
+        // Everything the first version brings is on record, measured against the empty baseline.
+        writeAudit(ctx, { action: 'standards.propose', projectId: p.id, target: `standards v${auto.version}`, ...standardsAuditWithSeverity(p.id, auto, ['auto-proposed']) });
+      }
+    } catch (err) { log(`project ${p.id}: automatic standards proposal failed: ${(err as Error).message}`); }
     sendJson(ctx.res, 201, { project: projectDto(p, ctx.user!) });
   };
 
@@ -1225,6 +1709,7 @@ export function createApp(deps: AppDeps): App {
     const reserved = [...collectReservedRequirementIds(plan)];
     const { saves, overrides } = prdAttribution(p.id);
     const spend = spendFor(p, st, latest?.createdAt);
+    const std = standardsView(p.id);
     sendJson(ctx.res, 200, {
       versions: versions.map((v, i) => {
         // Each version's diff against its predecessor, computed exactly as at save time.
@@ -1248,7 +1733,13 @@ export function createApp(deps: AppDeps): App {
       engine: p.defaultEngine,
       spend,
       runsDisabledReason: config.runsDisabledReason,
+      // Why the generate actions are absent although the role and the PRD allow them
+      // (an absent action alone cannot tell the UI which notice to show).
+      planBlockedReason: std.effective ? null : 'standards-not-approved',
+      standards: { effectiveVersion: std.effective?.version ?? null, pendingVersion: std.pending?.version ?? null, state: std.state },
       allowedActions: allowedActions(actorOf(ctx.user!), ['prd.save', 'prd.bump-override', 'plan.generate', 'plan.generate-initial'], {
+        // Mirrors requireStandards: no plan is generated until a standards version is approved.
+        standardsApproved: std.effective !== null,
         overrideLocked: locked,
         canOverride: !!latest?.recommendedBump && versions.length > 1,
         hasDeltaScope: scope !== null,
@@ -1297,6 +1788,100 @@ export function createApp(deps: AppDeps): App {
     });
   };
 
+  // ─── Standards ───
+
+  H['GET /api/projects/:id/standards'] = async (ctx) => {
+    const p = getProject(ctx.params.id);
+    sendJson(ctx.res, 200, { standards: standardsDto(p, ctx.user!) });
+  };
+
+  /** The `:version` path parameter as a version number; anything else names no version. */
+  const standardsVersionParam = (ctx: Ctx): number => {
+    const raw = ctx.params.version;
+    if (!/^[1-9]\d{0,5}$/.test(raw)) { throw new HttpError(404, 'not-found', 'Standards version not found.'); }
+    return Number(raw);
+  };
+
+  H['POST /api/projects/:id/standards/versions'] = async (ctx) => {
+    const p = getProject(ctx.params.id);
+    const b = await body(ctx, S.proposeStandards);
+    const checked = validateProfile(b.profile);
+    if (!checked.ok) {
+      throw new HttpError(400, 'invalid-standards', 'These standards are not valid. Fix the listed problems and submit again.', { errors: checked.errors });
+    }
+    await state.withProjectLock(p.id, () => {
+      let provenance: StandardsProvenance;
+      try { provenance = userProvenance(p.id, checked.profile, b.baseVersion, ctx.user!.username); }
+      catch (err) { throw standardsRefusal(err); }
+      let created: StandardsVersionRecord;
+      try {
+        created = standards.propose(p.id, {
+          profile: checked.profile, provenance, origin: 'user', proposedBy: ctx.user!.id, baseVersion: b.baseVersion,
+        }, now());
+      } catch (err) { throw standardsRefusal(err); }
+      // Promoting or demoting a rule changes what can stop a release: flagged, and named.
+      writeAudit(ctx, {
+        action: 'standards.propose', projectId: p.id, target: `standards v${created.version}`,
+        ...standardsAuditWithSeverity(p.id, created),
+      });
+      sendJson(ctx.res, 201, { version: created.version, standards: standardsDto(p, ctx.user!) });
+    });
+  };
+
+  H['POST /api/projects/:id/standards/versions/:version/approve'] = async (ctx) => {
+    const p = getProject(ctx.params.id);
+    const version = standardsVersionParam(ctx);
+    const b = await body(ctx, S.approveStandards);
+    await state.withProjectLock(p.id, () => {
+      let decided: StandardsVersionRecord;
+      try {
+        decided = standards.approve(p.id, version, {
+          contentHash: b.contentHash, by: ctx.user!.id, acknowledgedEnforcementHash: b.acknowledgedEnforcementHash,
+        }, now());
+      }
+      catch (err) { throw standardsRefusal(err); }
+      // Someone holding both roles approved their own proposal: allowed, and visible in the audit log.
+      // So is an approval that changes which rules can stop a release.
+      writeAudit(ctx, {
+        action: 'standards.approve', projectId: p.id, target: `standards v${decided.version}`,
+        flags: [],
+        ...standardsAuditWithSeverity(p.id, decided, decided.proposedBy === ctx.user!.id ? ['self-approval'] : []),
+      });
+      sendJson(ctx.res, 200, { version: decided.version, standards: standardsDto(p, ctx.user!) });
+    });
+  };
+
+  H['POST /api/projects/:id/standards/versions/:version/reject'] = async (ctx) => {
+    const p = getProject(ctx.params.id);
+    const version = standardsVersionParam(ctx);
+    const b = await body(ctx, S.rejectStandards);
+    await state.withProjectLock(p.id, () => {
+      let decided: StandardsVersionRecord;
+      try { decided = standards.reject(p.id, version, { reason: b.reason, by: ctx.user!.id }, now()); }
+      catch (err) { throw standardsRefusal(err); }
+      writeAudit(ctx, { action: 'standards.reject', projectId: p.id, target: `standards v${decided.version}`, after: standardsAudit(decided) });
+      sendJson(ctx.res, 200, { version: decided.version, standards: standardsDto(p, ctx.user!) });
+    });
+  };
+
+  H['POST /api/projects/:id/standards/accept-defaults'] = async (ctx) => {
+    const p = getProject(ctx.params.id);
+    const b = await body(ctx, S.approveStandards);
+    await state.withProjectLock(p.id, () => {
+      let decided: StandardsVersionRecord;
+      try {
+        decided = standards.acceptDefaults(p.id, {
+          contentHash: b.contentHash, by: ctx.user!.id, acknowledgedEnforcementHash: b.acknowledgedEnforcementHash,
+        }, now());
+      }
+      catch (err) { throw standardsRefusal(err); }
+      // Recorded under its own action, never as an approval: nobody reviewed this version.
+      // It takes effect all the same, so what it changes about blocking is named here too.
+      writeAudit(ctx, { action: 'standards.accept-defaults', projectId: p.id, target: `standards v${decided.version}`, ...standardsAuditWithSeverity(p.id, decided) });
+      sendJson(ctx.res, 200, { version: decided.version, standards: standardsDto(p, ctx.user!) });
+    });
+  };
+
   // ─── Plans ───
 
   H['POST /api/projects/:id/plans'] = async (ctx) => {
@@ -1329,6 +1914,9 @@ export function createApp(deps: AppDeps): App {
       if (open) { throw new HttpError(409, 'plan-exists', `A plan for this version is already ${open.status}.`, { planId: open.id }); }
       const remaining = requireBudget(p, st, latest.createdAt);
       const repo = requireWorkspace(p);
+      // Before any directory or job exists: no approved standards, no plan — nothing is
+      // created, started or audited.
+      const approvedStandards = requireStandards(p);
 
       const planId = randomUUID();
       const dir = path.join(state.projectDir(p.id), 'plans', planId);
@@ -1344,7 +1932,9 @@ export function createApp(deps: AppDeps): App {
       writeFileAtomicSync(repoListingPath, await buildRepoListing(repo, deps.exec), 0o600);
       writeFileAtomicSync(planPath, JSON.stringify(dehydratePlan(plan), null, 2), 0o600);
       const configPath = writeWorkerConfig(dir, p, remaining, 'plan');
-      const job: PlanJob = { kind: 'plan', mode: b.mode, workspace, planPath, outPath, engine: p.defaultEngine, repoListingPath };
+      // The planner is told the approved standards through a server-written job file.
+      const standardsPath = writeStandardsJobFile(dir, approvedStandards, null);
+      const job: PlanJob = { kind: 'plan', mode: b.mode, workspace, planPath, outPath, engine: p.defaultEngine, repoListingPath, standardsPath };
       const { env, redact } = workerEnv(configPath, [p.defaultEngine]);
       const started = jobs.start({
         projectId: p.id, job, jobPath: path.join(dir, 'job.json'), workspace, env, redact,
@@ -1355,6 +1945,7 @@ export function createApp(deps: AppDeps): App {
         id: planId, status: 'generating', mode: b.mode, engine: p.defaultEngine,
         forVersionCreatedAt: latest.createdAt, forVersionLabel: latest.version,
         requestedBy: ctx.user!.id, requestedAt: now().toISOString(),
+        standardsVersion: approvedStandards.version,
       };
       state.update(p.id, (s) => { s.plans.push(review); s.overrideLocked[latest.createdAt] = true; });
       writeAudit(ctx, { action: 'plan.generate', projectId: p.id, target: `PRD ${formatVersionLabel(latest.version)} ${b.mode}`, after: { planId, engine: p.defaultEngine, ...(plannerUnlocked ? { plannerFileAccess: true } : {}) } });
@@ -1384,6 +1975,9 @@ export function createApp(deps: AppDeps): App {
         sendJson(ctx.res, 200, { plan: planDto(review, ctx.user!) });
         return;
       }
+      // Re-evaluated at approval, not only when the plan was generated: a plan that was
+      // pending before the project had standards is not approved while none is approved.
+      requireStandards(p);
       if ((b as { contentHash: string }).contentHash !== review.contentHash || !review.playlist) {
         throw new HttpError(409, 'hash-mismatch', 'The plan changed since you reviewed it. Reload and review again.');
       }
@@ -1455,7 +2049,7 @@ export function createApp(deps: AppDeps): App {
     const p = getProject(ctx.params.id);
     const b = await body(ctx, S.startRun);
     requireRunsEnabled();
-    await state.withProjectLock(p.id, () => {
+    await state.withProjectLock(p.id, async () => {
       const st = state.load(p.id);
       const review = st.plans.find((x) => x.id === b.planId);
       if (!review || (review.status !== 'approved' && review.status !== 'ran')) {
@@ -1465,6 +2059,9 @@ export function createApp(deps: AppDeps): App {
         throw new HttpError(409, 'job-active', 'This project already has a run in progress.');
       }
       requireApprovedEngine(p, review);
+      // A plan generated under standards never runs unchecked: if the store has lost every
+      // approved version, fail closed. (A legacy plan with no standards version still runs.)
+      if (standardsLost(p, review)) { requireStandards(p); }
       // Stamped with the project's engine: the snapshot's defaultEngine is what the runner uses.
       const canonical = state.loadCanonicalPlan(p.id, p.name, p.defaultEngine);
       requirePlanEngines(canonical);
@@ -1475,9 +2072,17 @@ export function createApp(deps: AppDeps): App {
       requireReviewPasses(review, runs ? [runs] : [], 'This plan no longer passes review, so it cannot start. ');
       const remaining = requireBudget(p, st, review.forVersionCreatedAt);
       const workspace = requireWorkspace(p);
+      // The run is held to the standards in effect NOW — the latest approved version, which
+      // may be newer than the one its plan was generated under — and that version is frozen
+      // on the run record with the base its check diffs against. A project with no approved
+      // version (a legacy plan) runs without standards, and says so.
+      const frozen = standardsView(p.id).effective;
+      // No job can start in this project while we wait: every start runs under this lock.
+      const baseRef = frozen ? await standardsBaseRef(st, workspace) : null;
       const run: RunRecord = {
         id: randomUUID(), planId: review.id, status: 'running', startedBy: ctx.user!.id, startedAt: now().toISOString(),
         versionCreatedAt: review.forVersionCreatedAt, stack: p.stack, segments: 1,
+        ...(frozen ? { standardsVersion: frozen.version, standardsHash: frozen.contentHash, baseRef } : {}),
       };
       const dir = state.runDir(p.id, run.id);
       writeFileAtomicSync(path.join(dir, 'plan.json'), JSON.stringify(dehydratePlan(canonical), null, 2), 0o600);
@@ -1541,6 +2146,22 @@ export function createApp(deps: AppDeps): App {
         return;
       }
 
+      // A ship is never approved over a standards check that says it must not ship. The
+      // pre-gate report is the one the approver is looking at: while it shows a blocking
+      // failure, or a blocking rule or command that was not checked, approving is refused.
+      // (A skip ships nothing, so it stays possible.) Read from the run record in the
+      // server's own state file, never from the agent-writable run directory.
+      if (kind === 'approve') {
+        const pre = run.standardsSummary;
+        if (run.standardsVersion !== undefined && pre && pre.phase === 'pre-gate' && (pre.failed > 0 || (pre.blockingNotChecked ?? 0) > 0)) {
+          const why = pre.failed > 0
+            ? `${pre.failed} blocking rule${pre.failed === 1 ? '' : 's'} or command${pre.failed === 1 ? '' : 's'} failed`
+            : `${pre.blockingNotChecked} blocking rule${pre.blockingNotChecked === 1 ? '' : 's'} or command${pre.blockingNotChecked === 1 ? ' was' : 's were'} not checked`;
+          throw new HttpError(409, 'standards-blocking',
+            `This ship can't be approved: the standards check before the gate shows that ${why}. Reject the ship, or fix the work and run again.`,
+            { failed: pre.failed, blockingNotChecked: pre.blockingNotChecked ?? 0, standardsVersion: run.standardsVersion });
+        }
+      }
       requireRunsEnabled();
       if (jobs.isActive(p.id)) { throw new HttpError(409, 'job-active', 'This project already has a job running.'); }
       const review = st.plans.find((x) => x.id === run.planId);

@@ -16,7 +16,7 @@
 // work to Pending. The approve/skip distinction also lives in the audit log
 // and the run record.
 
-import { Plan, PlanFileTask, TaskStatus } from '../models/types';
+import { Plan, PlanFileTask, StandardsCheckCounts, TaskStatus } from '../models/types';
 import { stampRelease } from '../models/requirement-trace';
 import { SHIPPING_TASK_TYPES, shippingTaskIds } from './prd-ops';
 
@@ -109,10 +109,18 @@ export function serverShipTag(runId: string): string {
  * needs them to have happened: when any `release` or `deploy` task in the
  * run's playlist (`playlistIndex`; every playlist when omitted) is not
  * Completed — failed, skipped, blocked or never reached — nothing is stamped.
+ *
+ * `standardsVersion` is the standards version frozen on the run at its start; it is
+ * recorded on every stamp. A run that had none (a legacy plan) stamps no version, and
+ * neither does one whose check did not evaluate the blocking set — the caller then passes
+ * none. `standardsCounts` is what that check left open (advisory findings, rules and files
+ * not checked); it is recorded beside the version and never without one.
  */
-export function stampApprovedShip(snapshot: Plan, runId: string, at: string, playlistIndex?: number): string[] {
+export function stampApprovedShip(
+  snapshot: Plan, runId: string, at: string, playlistIndex?: number, standardsVersion?: number, standardsCounts?: StandardsCheckCounts,
+): string[] {
   const playlists = playlistIndex === undefined ? snapshot.playlists : [snapshot.playlists[playlistIndex]].filter(Boolean);
   const shippingPending = playlists.some((pl) => pl.tasks.some((t) => SHIPPING_TASK_TYPES.has(t.type ?? 'agent') && t.status !== TaskStatus.Completed));
   if (shippingPending) { return []; }
-  return stampRelease(snapshot, serverShipTag(runId), at).shipped;
+  return stampRelease(snapshot, serverShipTag(runId), at, { standardsVersion, standardsCounts }).shipped;
 }

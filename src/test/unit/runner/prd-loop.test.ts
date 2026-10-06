@@ -10,6 +10,9 @@ import type {
   PrdLoopReport,
   UatSession,
 } from '../../../runner/prd-loop';
+import { builtInProfile } from '../../../standards/built-in-profiles';
+import type { StandardsCheckInput } from '../../../standards/checker';
+import type { StandardsProfile } from '../../../standards/profile';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const proxyquire = require('proxyquire').noCallThru();
@@ -40,6 +43,10 @@ interface EvidenceStubOptions {
   };
   /** Make runGate reject for this command, proving dispose() still fires. */
   throwOnGate?: string;
+  /** One entry per collectStandardsInput call; the last entry repeats. */
+  standardsInputs?: StandardsCheckInput[];
+  /** When given, './knowledge' is stubbed and every recorded fact's `provenBy` lands here. */
+  facts?: string[];
 }
 
 interface LoopHarness {
@@ -47,6 +54,8 @@ interface LoopHarness {
   diffCalls: () => number;
   gateCalls: () => string[];
   gateEnvs: () => Array<Record<string, string> | undefined>;
+  /** Arguments of every collectStandardsInput call, in order. */
+  standardsCalls: () => Array<{ cwd: string; baseRef: string | null; probeDirs: string[] }>;
 }
 
 /** "This repository has no browser test tooling at all." */
@@ -70,10 +79,18 @@ function loadLoop(opts: EvidenceStubOptions = {}): LoopHarness {
   let gateCall = 0;
   const gateCalls: string[] = [];
   const gateEnvs: Array<Record<string, string> | undefined> = [];
+  const standardsCalls: Array<{ cwd: string; baseRef: string | null; probeDirs: string[] }> = [];
   const sequence = opts.changedFilesSequence ?? [['src/a.ts']];
 
   const evidenceStub = {
     captureBaseRef: async () => (opts.baseRef === undefined ? 'base-ref' : opts.baseRef),
+    captureHeadRef: async () => 'head-ref',
+    collectStandardsInput: async (cwd: string, baseRef: string | null, o: { probeDirs?: string[] }) => {
+      const inputs = opts.standardsInputs ?? [];
+      const input = inputs[Math.min(standardsCalls.length, inputs.length - 1)];
+      standardsCalls.push({ cwd, baseRef, probeDirs: o?.probeDirs ?? [] });
+      return input ?? { baseRef: null, files: [], existingDirs: [], topLevel: [], goModulePath: null };
+    },
     collectDiffEvidence: async () => {
       const entry = sequence[Math.min(diffCall, sequence.length - 1)];
       diffCall++;
@@ -105,12 +122,21 @@ function loadLoop(opts: EvidenceStubOptions = {}): LoopHarness {
     summarizeEvidence: () => '## Deterministic evidence\n(stub)',
   };
 
-  const mod = proxyquire('../../../runner/prd-loop', { './evidence': evidenceStub });
+  const stubs: Record<string, unknown> = { './evidence': evidenceStub };
+  if (opts.facts) {
+    const facts = opts.facts;
+    stubs['./knowledge'] = {
+      commandFactId: (kind: string, command: string) => `${kind}:${command}`,
+      recordFact: (_cwd: string, fact: { provenBy: string }) => { facts.push(fact.provenBy); return true; },
+    };
+  }
+  const mod = proxyquire('../../../runner/prd-loop', stubs);
   return {
     createPrdLoop: mod.createPrdLoop,
     diffCalls: () => diffCall,
     gateCalls: () => gateCalls,
     gateEnvs: () => gateEnvs,
+    standardsCalls: () => standardsCalls,
   };
 }
 
@@ -126,6 +152,7 @@ function baseConfig(over: Partial<PrdLoopConfig> = {}): PrdLoopConfig {
     unattended: false,
     uat: { mode: 'off', timeoutMs: 60_000 },
     versionBudgetUsd: 0,
+    standards: null,
     ...over,
   };
 }
@@ -964,6 +991,676 @@ describe('createPrdLoop — requirement trace evidence', () => {
     await createPrdLoop(baseConfig(), h.deps).run();
 
     assert.equal(plan.requirementTrace, undefined);
+  });
+});
+
+// ─── Standards gate ───
+
+describe('createPrdLoop — standards gate', () => {
+  const PASS_VERDICT = '{"passed":true,"score":100,"gaps":[],"suggestion":""}';
+
+  /**
+   * A profile with one lint command and the default comment policy; nothing else configured.
+   * The placeholder-phrase scan is PROMOTED to blocking: it is advisory by default, and most
+   * of this block is about what a blocking static rule does to the loop. `defaults()` is the
+   * same profile as a project gets it, with nothing promoted.
+   */
+  function profile(commands: Array<{ label: string; run: string }> = [{ label: 'Lint', run: 'npm run lint' }]): StandardsProfile {
+    const p = defaults(commands);
+    p.severity = { 'comment-policy/banned-phrase': 'blocking' };
+    return p;
+  }
+
+  function defaults(commands: Array<{ label: string; run: string }> = [{ label: 'Lint', run: 'npm run lint' }]): StandardsProfile {
+    const p = builtInProfile('other');
+    p.commands = commands;
+    return p;
+  }
+
+  function withStandards(p: StandardsProfile = profile(), version: number | null = 3): Partial<PrdLoopConfig> {
+    return { standards: { profile: p, version, baseRef: 'head-ref' } };
+  }
+
+  /** What the collector reports: one changed file whose every line was added. */
+  function diffOf(lines: string[], file = 'src/a.ts'): StandardsCheckInput {
+    return {
+      baseRef: 'head-ref',
+      files: [{ path: file, status: 'added', addedLines: lines.map((_, i) => i + 1), content: lines.join('\n') }],
+      existingDirs: [],
+      topLevel: ['src'],
+      goModulePath: null,
+    };
+  }
+
+  const CLEAN = diffOf(['export const a = 1;', '// Explains the constant.']);
+  // A placeholder comment: under `profile()` the phrase rule is blocking, so this is what fails the gate.
+  const ONE_FINDING = diffOf(['export const a = 1;', '// ... rest of the code ...']);
+  const TWO_FINDINGS = diffOf(['export const a = 1;', '// ... rest of the code ...', 'export const b = 2;', '// your code here']);
+  // Commented-out code: a heuristic, so advisory — reported, never a reason to stop.
+  const ADVISORY_ONLY = diffOf(['export const a = 1;', '// oldCall(a);']);
+  const NO_DIFF: StandardsCheckInput = { baseRef: null, files: [], existingDirs: [], topLevel: [], goModulePath: null };
+
+  it('S1. a failing static rule fails the standards gate with zero model calls and runs no repo gate', async () => {
+    const loop = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.passed, false);
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(loop.gateCalls(), [], 'neither the repo gates nor the profile commands may run');
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode, g.passed]), [['moag:standards v3', 1, false]]);
+    assert.ok(report.standards);
+    assert.equal(report.standards.version, 3);
+    assert.deepEqual(report.standards.findings.map((f) => [f.file, f.line, f.rule, f.severity]),
+      [['src/a.ts', 2, 'comment-policy/banned-phrase', 'blocking']]);
+    const command = report.standards.rules[report.standards.rules.length - 1];
+    assert.deepEqual(command, { rule: 'command', severity: 'blocking', result: 'not-checked', reason: 'A standards rule failed first', command: 'npm run lint' });
+    // A scanner rule has "findings"; it is never said to have failed.
+    assert.match(report.suggestion,
+      /^Project standards stop this release: comment-policy\/banned-phrase \(findings\) — 1 blocking finding; 0 advisory findings, \d+ rules? not checked, 0 files not checked\.\nBlocking — these must be fixed:\n- src\/a\.ts:2 comment-policy\/banned-phrase/);
+    assert.match(report.suggestion, /Promoted to blocking: comment-policy\/banned-phrase\. Scanner rules are heuristic/);
+    assert.ok(h.progress.some((p) => p.phase === 'warning' && /comment-policy\/banned-phrase can stop this release\. Scanner rules are heuristic/.test(p.detail)));
+    assert.deepEqual(loop.standardsCalls(), [{ cwd: '/repo', baseRef: 'head-ref', probeDirs: [] }]);
+    assert.ok(h.progress.some((p) => p.phase === 'standards'));
+    assert.ok(!h.progress.some((p) => p.phase === 'gate'), 'no repo gate was announced');
+  });
+
+  it('S2. a failing profile command fails the standards gate after the repo gates ran', async () => {
+    const loop = loadLoop({
+      standardsInputs: [CLEAN],
+      gateResult: (c) => (c === 'npm run lint' ? FAILING_GATE(c) : { command: c, exitCode: 0, passed: true, output: 'ok', durationMs: 1, timedOut: false }),
+    });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+    const p = profile([{ label: 'Lint', run: 'npm run lint' }, { label: 'Format', run: 'npm run format:check' }]);
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(p)), h.deps).run();
+
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(loop.gateCalls(), ['npm test', 'npm run lint'], 'repo gate first, then the profile command; the second never ran');
+    // No passing moag:standards row: a command of the blocking set failed, and another never ran.
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['npm test', 0], ['npm run lint', 1]]);
+    const rows = report.standards!.rules.filter((r) => r.rule === 'command');
+    assert.deepEqual(rows, [
+      { rule: 'command', severity: 'blocking', result: 'failed', command: 'npm run lint', exitCode: 1, tail: 'AssertionError: expected true to equal false' },
+      { rule: 'command', severity: 'blocking', result: 'not-checked', reason: 'An earlier standards command failed', command: 'npm run format:check' },
+    ]);
+    assert.equal(report.standards!.totals.failed, 1);
+    assert.match(report.suggestion, /Standards command failed: npm run lint\nExit code: 1/);
+    assert.deepEqual(h.progress.filter((p) => p.phase === 'standards-command').map((p) => p.detail), ['npm run lint']);
+  });
+
+  it('S3. with no diff and nothing blocking configured, the row says "no blocking rules configured" and the model is still reached', async () => {
+    // No base was recorded (a workspace that is not a repository), and no diff could be taken.
+    const loop = loadLoop({ standardsInputs: [NO_DIFF] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig({ standards: { profile: defaults([]), version: 3, baseRef: null } }), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.equal(report.modelCallsMade, 1);
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0]]);
+    assert.match(report.gates[0].output, /^Project standards: no blocking rules configured \(/);
+    assert.doesNotMatch(report.gates[0].output, /passed/i, 'never called a pass');
+    assert.equal(report.gates[0].standardsCounts?.noBlockingRules, true);
+    assert.ok(report.standards);
+    assert.ok(report.standards.rules.every((r) => r.result === 'not-checked'));
+    assert.equal(report.standards.totals.passed, 0, 'not-checked is never counted as passed');
+    assert.ok(!h.progress.some((p) => p.phase === 'warning' && /standards base/.test(p.detail)));
+  });
+
+  it('S3a. with no diff, a promoted rule was not checked: that stops the release, with no model call', async () => {
+    const loop = loadLoop({ standardsInputs: [NO_DIFF] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig({ standards: { profile: profile([]), version: 3, baseRef: null } }), h.deps).run();
+
+    assert.equal(report.passed, false);
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode, g.passed]), [['moag:standards v3', 1, false], ['npm test', 0, true]]);
+    assert.match(report.suggestion, /^Project standards could not be checked: 1 blocking rule was not checked\.\n- comment-policy\/banned-phrase — No diff could be taken/);
+    assert.equal(report.standards!.totals.blockingNotChecked, 1);
+  });
+
+  it('S3c. a RECORDED base against which no diff could be taken fails closed: standards gate, exit-1 row, no model call', async () => {
+    const loop = loadLoop({ standardsInputs: [NO_DIFF] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.passed, false);
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(loop.gateCalls(), [], 'neither the repo gates nor the profile commands may run');
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode, g.passed]), [['moag:standards v3', 1, false]]);
+    assert.match(report.suggestion, /no diff could be taken against the recorded base head-ref/);
+    assert.ok(report.standards);
+    assert.equal(report.standards.totals.passed, 0);
+    assert.deepEqual(report.standards.rules[report.standards.rules.length - 1],
+      { rule: 'command', severity: 'blocking', result: 'not-checked', reason: 'The standards base could not be used', command: 'npm run lint' });
+  });
+
+  it('S3d. a recorded base the repository has lost is checked against the empty tree: violations fail the gate, and the loop says why', async () => {
+    // What the collector returns when the base commit was pruned: every file, as added.
+    const fallback: StandardsCheckInput = { ...ONE_FINDING, baseRef: '4b825dc642cb6eb9a060e54bf8d69288fbee4904', topLevel: [] };
+    const loop = loadLoop({ standardsInputs: [fallback] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.passed, false);
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 1]]);
+    assert.equal(report.standards!.baseRef, '4b825dc642cb6eb9a060e54bf8d69288fbee4904', 'the report states the base actually used');
+    assert.ok(h.progress.some((p) => p.phase === 'warning' && /standards base head-ref is not in this repository any more/.test(p.detail)));
+  });
+
+  it('S3b. an empty diff under a promoted rule pushes no exit-0 row: nothing was judged, so the release stops', async () => {
+    // The work was committed and the base is the new HEAD: the diff is empty, nothing was judged.
+    const empty: StandardsCheckInput = { baseRef: 'head-ref', files: [], existingDirs: ['src'], topLevel: ['src'], goModulePath: null };
+    const loop = loadLoop({ standardsInputs: [empty] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+    const p = profile([]);
+    p.structure.requiredDirs = ['src'];
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(p)), h.deps).run();
+
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 1], ['npm test', 0]], 'never an exit-0 standards row');
+    assert.match(report.suggestion, /comment-policy\/banned-phrase — The diff holds nothing for this rule to check/);
+    assert.ok(report.standards);
+    // The two rules that read the tree itself were still decided; they are advisory and vouch for nothing.
+    assert.deepEqual(report.standards.rules.filter((r) => r.result === 'passed').map((r) => r.rule), ['structure/required-dirs', 'structure/nested-repository']);
+    assert.ok(report.standards.rules.filter((r) => r.rule.startsWith('comment-policy/')).every((r) => r.result === 'not-checked'));
+  });
+
+  it('S4. standards: null behaves exactly as before: no collection, no row, no report', async () => {
+    const loop = loadLoop();
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig({ standards: null }), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.equal(report.standards, null);
+    assert.deepEqual(loop.standardsCalls(), []);
+    assert.deepEqual(report.gates.map((g) => g.command), ['npm test']);
+    assert.ok(!h.progress.some((p) => p.phase.startsWith('standards')));
+  });
+
+  it('S5. a profile command equal to a repo gate runs once and its result is reused', async () => {
+    const loop = loadLoop({ standardsInputs: [CLEAN], gateCommands: ['npm run lint', 'npm test'] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.deepEqual(loop.gateCalls(), ['npm run lint', 'npm test']);
+    assert.deepEqual(report.gates.map((g) => g.command), ['moag:standards v3', 'npm run lint', 'npm test']);
+    assert.deepEqual(report.standards!.rules.filter((r) => r.rule === 'command'),
+      [{ rule: 'command', severity: 'blocking', result: 'passed', command: 'npm run lint', exitCode: 0, tail: 'ok' }]);
+  });
+
+  it('S6. a passing check pushes an exit-0 row, runs the commands and lets the model decide', async () => {
+    const loop = loadLoop({ standardsInputs: [CLEAN] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.equal(report.failedGate, null);
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0], ['npm run lint', 0]]);
+    assert.equal(report.standards!.totals.failed, 0);
+    assert.deepEqual(report.standards!.findings, []);
+    assert.equal(h.reports.length, 1);
+    assert.deepEqual(h.reports[0].standards, report.standards, 'the emitted report carries the standards results');
+  });
+
+  it('S7. a failed status gate reports every rule and command not-checked with that reason, without collecting', async () => {
+    const loop = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].status = TaskStatus.Failed;
+    const h = makeDeps(plan);
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.failedGate, 'status');
+    assert.deepEqual(loop.standardsCalls(), []);
+    assert.ok(report.standards);
+    assert.ok(report.standards.rules.length > 1);
+    assert.ok(report.standards.rules.every((r) => r.result === 'not-checked' && r.reason === 'The status gate failed first'));
+    assert.deepEqual(report.gates, []);
+  });
+
+  it('S8. a failed change gate skips the standards gate the same way', async () => {
+    const loop = loadLoop({ changedFilesSequence: [[]], standardsInputs: [ONE_FINDING] });
+    const h = makeDeps(makePlan());
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.failedGate, 'change');
+    assert.deepEqual(loop.standardsCalls(), []);
+    assert.ok(report.standards!.rules.every((r) => r.reason === 'The change gate failed first'));
+  });
+
+  it('S9. a failed repo gate leaves the profile commands not-checked and stays a command failure', async () => {
+    const loop = loadLoop({ standardsInputs: [CLEAN], gateResult: (c) => FAILING_GATE(c) });
+    const h = makeDeps(makePlan());
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.failedGate, 'command');
+    assert.deepEqual(loop.gateCalls(), ['npm test']);
+    assert.deepEqual(report.standards!.rules.filter((r) => r.rule === 'command'),
+      [{ rule: 'command', severity: 'blocking', result: 'not-checked', reason: 'The command gate failed first', command: 'npm run lint' }]);
+    // The static rules found nothing, but the profile command never ran: the blocking set was
+    // not evaluated, so no row says "checked against standards v3".
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['npm test', 1]]);
+  });
+
+  it('S10. a null version names the row without a version', async () => {
+    const loop = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const h = makeDeps(makePlan());
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(profile([]), null)), h.deps).run();
+
+    assert.deepEqual(report.gates.map((g) => g.command), ['moag:standards']);
+    assert.equal(report.standards!.version, null);
+  });
+
+  it('S11. the failing standards row is recorded on the requirement trace and blocks a release', async () => {
+    const loop = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const plan = makePlan({
+      prdVersions: [{ version: '1.0.0', text: '## Requirements\n- [R-1] login', createdAt: '2026-10-01T00:00:00.000Z' }],
+    });
+    plan.playlists[0].tasks[0].requirementIds = ['R-1'];
+    const h = makeDeps(plan, { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    await loop.createPrdLoop(baseConfig(withStandards(profile([]))), h.deps).run();
+
+    const rec = plan.requirementTrace?.find((r) => r.id === 'R-1');
+    assert.ok(rec, 'R-1 must have a trace record');
+    assert.deepEqual(rec.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 1]]);
+    assert.deepEqual(stampRelease(plan, 'v1.0.0', '2026-10-04T00:00:00.000Z').shipped, []);
+    assert.notEqual(requirementStatuses(plan).find((r) => r.id === 'R-1')?.status, 'shipped');
+  });
+
+  it('S12. the synthetic row is never learned as a command fact; real profile commands are', async () => {
+    const facts: string[] = [];
+    const loop = loadLoop({ standardsInputs: [CLEAN], facts });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.deepEqual(facts, ['npm test -> exit 0', 'npm run lint -> exit 0']);
+  });
+
+  it('S13. with --fix, the fix prompt names the standards gate and carries the findings', async () => {
+    const loop = loadLoop({ standardsInputs: [ONE_FINDING, CLEAN] });
+    const h = makeDeps(makePlan());
+    const prompts: string[] = [];
+    h.deps.runEngine = async (prompt: string) => {
+      prompts.push(prompt);
+      return prompts.length === 1
+        ? engineResult('[{"name":"Finish the function","prompt":"Replace the placeholder comment in src/a.ts with the real code"}]')
+        : engineResult(PASS_VERDICT);
+    };
+
+    const report = await loop.createPrdLoop(baseConfig({ ...withStandards(profile([])), fix: true }), h.deps).run();
+
+    assert.match(prompts[0], /^A deterministic standards gate failed during PRD verification\./);
+    assert.match(prompts[0], /src\/a\.ts:2 comment-policy\/banned-phrase/);
+    assert.equal(report.passed, true, 'the second iteration re-checked and found nothing');
+    assert.equal(report.iterations, 2);
+    assert.equal(loop.standardsCalls().length, 2);
+    assert.equal(report.modelCallsMade, 2, 'one fix-generation call, one verdict');
+  });
+
+  it('S14. a shrinking finding list is progress; an identical one halts as no-progress', async () => {
+    const fixTasks = '[{"name":"Fix","prompt":"fix it"}]';
+
+    const shrinking = loadLoop({ standardsInputs: [TWO_FINDINGS, ONE_FINDING, ONE_FINDING] });
+    const h1 = makeDeps(makePlan(), { runEngine: async () => engineResult(fixTasks) });
+    const r1 = await shrinking.createPrdLoop(baseConfig({ ...withStandards(profile([])), fix: true, maxFixIterations: 5 }), h1.deps).run();
+    assert.equal(r1.haltReason, 'no-progress');
+    assert.equal(r1.iterations, 3, 'two findings then one is progress; one then one is not');
+    assert.equal(r1.failedGate, 'standards');
+
+    const stuck = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const h2 = makeDeps(makePlan(), { runEngine: async () => engineResult(fixTasks) });
+    const r2 = await stuck.createPrdLoop(baseConfig({ ...withStandards(profile([])), fix: true, maxFixIterations: 5 }), h2.deps).run();
+    assert.equal(r2.haltReason, 'no-progress');
+    assert.equal(r2.iterations, 2);
+  });
+
+  it('S15. an abort before the check returns aborted without collecting or running anything', async () => {
+    const loop = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const abort = new AbortController();
+    abort.abort();
+    const h = makeDeps(makePlan(), { signal: abort.signal });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.haltReason, 'aborted');
+    assert.deepEqual(loop.standardsCalls(), []);
+    assert.deepEqual(loop.gateCalls(), []);
+  });
+
+  it('S16. an abort between the static check and the profile commands stops before running them', async () => {
+    const abort = new AbortController();
+    const loop = loadLoop({
+      standardsInputs: [CLEAN],
+      gateResult: (c) => { abort.abort(); return { command: c, exitCode: 0, passed: true, output: 'ok', durationMs: 1, timedOut: false }; },
+    });
+    const h = makeDeps(makePlan(), { signal: abort.signal });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.haltReason, 'aborted');
+    assert.deepEqual(loop.gateCalls(), ['npm test'], 'the profile command never started');
+    assert.equal(report.modelCallsMade, 0);
+  });
+
+  it('S17. unattended with no repo gate still reports the standards results it gathered', async () => {
+    const loop = loadLoop({ standardsInputs: [CLEAN], gateCommands: [] });
+    const h = makeDeps(makePlan());
+
+    const report = await loop.createPrdLoop(baseConfig({ ...withStandards(), unattended: true }), h.deps).run();
+
+    assert.equal(report.haltReason, 'no-gates');
+    assert.deepEqual(loop.gateCalls(), []);
+    assert.ok(report.standards);
+    assert.deepEqual(report.standards.rules.filter((r) => r.rule === 'command').map((r) => r.result), ['not-checked']);
+  });
+
+  it('S18. two loops keep their standards results apart', async () => {
+    const failing = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const clean = loadLoop({ standardsInputs: [CLEAN] });
+    const a = failing.createPrdLoop(baseConfig(withStandards(profile([]))), makeDeps(makePlan()).deps);
+    const b = clean.createPrdLoop(baseConfig(withStandards(profile([]))), makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) }).deps);
+
+    const [ra, rb] = await Promise.all([a.run(), b.run()]);
+
+    assert.equal(ra.failedGate, 'standards');
+    assert.equal(rb.passed, true);
+    assert.equal(ra.standards!.findings.length, 1);
+    assert.equal(rb.standards!.findings.length, 0);
+  });
+
+  it('S19. an advisory failure is reported with file, line and rule — and blocks nothing: commands run, the model decides', async () => {
+    const loop = loadLoop({ standardsInputs: [ADVISORY_ONLY] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.equal(report.failedGate, null);
+    assert.equal(report.modelCallsMade, 1);
+    assert.deepEqual(loop.gateCalls(), ['npm test', 'npm run lint'], 'an advisory finding is no reason to skip the commands');
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode, g.passed]),
+      [['moag:standards v3', 0, true], ['npm test', 0, true], ['npm run lint', 0, true]]);
+    assert.ok(report.standards);
+    assert.deepEqual(report.standards.findings.map((f) => [f.file, f.line, f.rule, f.severity]),
+      [['src/a.ts', 2, 'comment-policy/commented-out-code', 'advisory']]);
+    const row = report.standards.rules.find((r) => r.rule === 'comment-policy/commented-out-code');
+    assert.deepEqual([row?.result, row?.severity], ['failed', 'advisory']);
+    assert.deepEqual([report.standards.totals.failed, report.standards.totals.advisory, report.standards.totals.findings], [0, 1, 1]);
+    // The reviewer and the approver read it in the gate row, set apart from anything blocking.
+    assert.match(report.gates[0].output,
+      /^Project standards: nothing blocking \(1 advisory finding, \d+ rules? not checked, 0 files not checked\)\.\nAdvisory — reported by a heuristic scan, not blocking:\n- src\/a\.ts:2 comment-policy\/commented-out-code/);
+    assert.doesNotMatch(report.gates[0].output, /\bpassed\b/i, 'a scan is never said to have passed');
+    assert.doesNotMatch(report.gates[0].output, /Blocking — these must be fixed/);
+  });
+
+  it('S20. the same finding blocks once the profile promotes its rule, and stops blocking again when a blocking rule is demoted', async () => {
+    const promoted = profile([]);
+    promoted.severity = { 'comment-policy/commented-out-code': 'blocking' };
+    const strict = loadLoop({ standardsInputs: [ADVISORY_ONLY] });
+    const blocked = await strict.createPrdLoop(baseConfig(withStandards(promoted)), makeDeps(makePlan()).deps).run();
+    assert.equal(blocked.failedGate, 'standards');
+    assert.equal(blocked.modelCallsMade, 0);
+    assert.deepEqual(blocked.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 1]]);
+    assert.equal(blocked.standards!.findings[0].severity, 'blocking');
+
+    const demoted = profile([]);
+    demoted.severity = { 'comment-policy/banned-phrase': 'advisory' };
+    const lenient = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+    const passed = await lenient.createPrdLoop(baseConfig(withStandards(demoted)), h.deps).run();
+    assert.equal(passed.passed, true);
+    assert.deepEqual(passed.standards!.findings.map((f) => [f.rule, f.severity]), [['comment-policy/banned-phrase', 'advisory']]);
+  });
+
+  it('S21. blocking and advisory findings are listed apart, and only the blocking ones are what a fix must change', async () => {
+    const mixed = diffOf(['export const a = 1;', '// oldCall(a);', '// ... rest of the code ...']);
+    const stillAdvisory = diffOf(['export const a = 1;', '// oldCall(a);']);
+    const loop = loadLoop({ standardsInputs: [mixed, stillAdvisory] });
+    const prompts: string[] = [];
+    const h = makeDeps(makePlan());
+    h.deps.runEngine = async (prompt: string) => {
+      prompts.push(prompt);
+      return prompts.length === 1 ? engineResult('[{"name":"Fix","prompt":"fix it"}]') : engineResult(PASS_VERDICT);
+    };
+
+    const report = await loop.createPrdLoop(baseConfig({ ...withStandards(profile([])), fix: true }), h.deps).run();
+
+    assert.match(prompts[0], /Project standards stop this release: comment-policy\/banned-phrase \(findings\) — 1 blocking finding; 1 advisory finding, /);
+    assert.match(prompts[0], /Blocking — these must be fixed:\n- src\/a\.ts:3 comment-policy\/banned-phrase/);
+    assert.match(prompts[0], /Advisory — reported by a heuristic scan, not blocking:\n- src\/a\.ts:2 comment-policy\/commented-out-code/);
+    // The placeholder is gone; the advisory finding is still there, and the run passes.
+    assert.equal(report.passed, true);
+    assert.equal(report.iterations, 2);
+    assert.equal(report.standards!.totals.advisory, 1);
+  });
+
+  it('S22. a blocking rule that could not read a changed file is said out loud and stops the release: not a pass, never silent', async () => {
+    const unread: StandardsCheckInput = {
+      baseRef: 'head-ref', existingDirs: [], topLevel: ['src'], goModulePath: null,
+      files: [
+        { path: 'src/a.ts', status: 'added', addedLines: [1], content: 'export const a = 1;' },
+        { path: 'src/big.ts', status: 'added', addedLines: [], content: null, skipped: 'File is larger than 512 KB' },
+      ],
+    };
+    const loop = loadLoop({ standardsInputs: [unread] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(profile([]))), h.deps).run();
+
+    const row = report.standards!.rules.find((r) => r.rule === 'comment-policy/banned-phrase');
+    assert.deepEqual([row?.result, row?.severity, row?.undecided], ['not-checked', 'blocking', true]);
+    assert.equal(report.standards!.totals.blockingNotChecked, 1);
+    assert.ok(h.progress.some((p) => p.phase === 'warning'
+      && /Standards: 1 blocking rule could not be checked \(comment-policy\/banned-phrase\) — File is larger than 512 KB \(src\/big\.ts\)/.test(p.detail)));
+    // Unevaluated blocking evidence is not a pass: the gate fails, before any model is asked.
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.passed, false);
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode, g.passed]), [['moag:standards v3', 1, false], ['npm test', 0, true]]);
+    assert.match(report.suggestion,
+      /^Project standards could not be checked: 1 blocking rule was not checked\.\n- comment-policy\/banned-phrase — File is larger than 512 KB \(src\/big\.ts\)/);
+    assert.deepEqual(report.standards!.notCheckedFiles, [{ file: 'src/big.ts', reason: 'File is larger than 512 KB' }]);
+  });
+
+  it('S24. by default a placeholder comment is advisory: it is reported, the commands run, and the commands decide', async () => {
+    const loop = loadLoop({ standardsInputs: [ONE_FINDING] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(defaults())), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.equal(report.failedGate, null);
+    assert.deepEqual(loop.gateCalls(), ['npm test', 'npm run lint']);
+    assert.deepEqual(report.standards!.findings.map((f) => [f.file, f.line, f.rule, f.severity]),
+      [['src/a.ts', 2, 'comment-policy/banned-phrase', 'advisory']]);
+    // The whole blocking set of a default profile: its commands, and nothing MOAG scans for itself.
+    assert.deepEqual(report.standards!.rules.filter((r) => r.severity === 'blocking').map((r) => [r.rule, r.result]), [['command', 'passed']]);
+    assert.ok(!h.progress.some((p) => p.phase === 'warning' && /Scanner rules are heuristic/.test(p.detail)), 'nothing was promoted, so nothing warns');
+    // The same diff with a failing lint command: the command, not a text scan, stops the release.
+    const failing = loadLoop({
+      standardsInputs: [ONE_FINDING],
+      gateResult: (c) => (c === 'npm run lint' ? FAILING_GATE(c) : { command: c, exitCode: 0, passed: true, output: 'ok', durationMs: 1, timedOut: false }),
+    });
+    const stopped = await failing.createPrdLoop(baseConfig(withStandards(defaults())), makeDeps(makePlan()).deps).run();
+    assert.equal(stopped.failedGate, 'standards');
+    assert.match(stopped.suggestion, /^Standards command failed: npm run lint\nExit code: 1/);
+  });
+
+  it('S25. the passing row is written once the whole blocking set was evaluated, and records what the check left open', async () => {
+    // One advisory finding, and one file no line rule can read.
+    const mixed: StandardsCheckInput = {
+      baseRef: 'head-ref', existingDirs: [], topLevel: ['src'], goModulePath: null,
+      files: [
+        { path: 'src/a.ts', status: 'added', addedLines: [1, 2], content: 'export const a = 1;\n// oldCall(a);' },
+        { path: 'src/engine.rs', status: 'added', addedLines: [1], content: 'fn main() {}' },
+      ],
+    };
+    const loop = loadLoop({ standardsInputs: [mixed] });
+    const plan = makePlan({
+      prdVersions: [{ version: '1.0.0', text: '## Requirements\n- [R-1] login', createdAt: '2026-10-01T00:00:00.000Z' }],
+    });
+    plan.playlists[0].tasks[0].requirementIds = ['R-1'];
+    const h = makeDeps(plan, { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(defaults())), h.deps).run();
+
+    assert.equal(report.passed, true);
+    // Written where the static check ran, ahead of the commands — but only after they all ran.
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0], ['npm run lint', 0]]);
+    const counts = { advisoryFindings: 1, notCheckedRules: 2, notCheckedFiles: 1 };
+    assert.deepEqual(report.gates[0].standardsCounts, counts, 'a command ran: no "no blocking rules" marker');
+    assert.match(report.gates[0].output, /^Project standards: nothing blocking \(1 advisory finding, 2 rules not checked, 1 file not checked\)\./);
+    assert.match(report.gates[0].output, /Files not checked \(1\) — nothing in them counts towards "no findings":\n- src\/engine\.rs — not checked \(No checker for \.rs files\)/);
+    assert.ok(report.gates.slice(1).every((g) => g.standardsCounts === undefined), 'only the standards row carries them');
+    // The row describes the finished check: the command it waited for is in the report it was written from.
+    assert.deepEqual(report.standards!.rules.filter((r) => r.rule === 'command').map((r) => r.result), ['passed']);
+    assert.deepEqual(report.standards!.notCheckedFiles, [{ file: 'src/engine.rs', reason: 'No checker for .rs files' }]);
+
+    // The trace keeps the counts beside the row, and a release stamps them beside the version.
+    const rec = plan.requirementTrace!.find((r) => r.id === 'R-1')!;
+    assert.deepEqual(rec.gates[0], { command: 'moag:standards v3', exitCode: 0, timedOut: false, at: rec.gates[0].at, standardsCounts: counts });
+    assert.deepEqual(stampRelease(plan, 'v1.0.0', '2026-10-04T00:00:00.000Z', { standardsVersion: 3, standardsFromGates: true }).shipped, ['R-1']);
+    assert.deepEqual([rec.releases[0].standardsVersion, rec.releases[0].standardsCounts], [3, counts]);
+    assert.deepEqual(requirementStatuses(plan).find((r) => r.id === 'R-1')?.standardsCounts, counts);
+  });
+
+  it('S26. what an advisory scan could not read does not hold the row back: the blocking set is what the stamp vouches for', async () => {
+    // Every line rule is not-checked — no lexer reads the one changed file — yet the command,
+    // which is what blocks, was evaluated.
+    const rust = diffOf(['fn main() {}'], 'src/engine.rs');
+    const loop = loadLoop({ standardsInputs: [rust] });
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(defaults())), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0], ['npm run lint', 0]]);
+    assert.deepEqual(report.gates[0].standardsCounts, { advisoryFindings: 0, notCheckedRules: 3, notCheckedFiles: 1 },
+      'and it says, beside the result, how much was not read');
+    assert.equal(report.standards!.totals.noFindings > 0, true);
+  });
+
+  it('S27. unevaluated blocking evidence is never a pass: a promoted rule that read nothing stops the run, and nothing is stamped', async () => {
+    const plan = (): Plan => {
+      const p = makePlan({ prdVersions: [{ version: '1.0.0', text: '## Requirements\n- [R-1] login', createdAt: '2026-10-01T00:00:00.000Z' }] });
+      p.playlists[0].tasks[0].requirementIds = ['R-1'];
+      return p;
+    };
+    const release = (p: Plan) => {
+      const shipped = stampRelease(p, 'v1.0.0', '2026-10-04T00:00:00.000Z', { standardsVersion: 3, standardsFromGates: true }).shipped;
+      return { shipped, version: p.requirementTrace?.find((r) => r.id === 'R-1')?.releases.at(-1)?.standardsVersion };
+    };
+
+    // A promoted scan that could not read a changed file: the gate fails, and the trace's gates are not all green.
+    const unread: StandardsCheckInput = {
+      baseRef: 'head-ref', existingDirs: [], topLevel: ['src'], goModulePath: null,
+      files: [{ path: 'src/big.ts', status: 'added', addedLines: [], content: null, skipped: 'File is larger than 512 KB' }],
+    };
+    const a = plan();
+    const ra = await loadLoop({ standardsInputs: [unread] }).createPrdLoop(baseConfig(withStandards(profile())),
+      makeDeps(a, { runEngine: async () => engineResult(PASS_VERDICT) }).deps).run();
+    assert.equal(ra.passed, false);
+    assert.equal(ra.failedGate, 'standards');
+    assert.equal(ra.modelCallsMade, 0);
+    // The commands did run and passed; it is the unread rule that stops the release.
+    assert.deepEqual(ra.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 1], ['npm test', 0], ['npm run lint', 0]]);
+    assert.deepEqual(release(a), { shipped: [], version: undefined }, 'nothing ships on a check that left a blocking rule open');
+
+    // The same diff under the defaults: the command is the whole blocking set, it ran, so the stamp is given.
+    const b = plan();
+    const rb = await loadLoop({ standardsInputs: [unread] }).createPrdLoop(baseConfig(withStandards(defaults())),
+      makeDeps(b, { runEngine: async () => engineResult(PASS_VERDICT) }).deps).run();
+    assert.equal(rb.passed, true);
+    assert.deepEqual(rb.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0], ['npm run lint', 0]]);
+    assert.deepEqual(release(b), { shipped: ['R-1'], version: 3 });
+    assert.deepEqual(b.requirementTrace!.find((r) => r.id === 'R-1')!.releases.at(-1)!.standardsCounts,
+      { advisoryFindings: 0, notCheckedRules: 3, notCheckedFiles: 1 });
+  });
+
+  it('S28. a profile with no command and no promoted rule may ship, stamped "no blocking rules configured" and never as passed', async () => {
+    const plan = makePlan({ prdVersions: [{ version: '1.0.0', text: '## Requirements\n- [R-1] login', createdAt: '2026-10-01T00:00:00.000Z' }] });
+    plan.playlists[0].tasks[0].requirementIds = ['R-1'];
+    const loop = loadLoop({ standardsInputs: [ADVISORY_ONLY] });
+    const h = makeDeps(plan, { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const report = await loop.createPrdLoop(baseConfig(withStandards(defaults([]))), h.deps).run();
+
+    assert.equal(report.passed, true);
+    assert.equal(report.failedGate, null);
+    assert.deepEqual(loop.gateCalls(), ['npm test'], 'only the repository gate: the profile has no command');
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0]]);
+    const counts = { advisoryFindings: 1, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true };
+    assert.deepEqual(report.gates[0].standardsCounts, counts);
+    assert.match(report.gates[0].output, /^Project standards: no blocking rules configured \(1 advisory finding, 0 rules not checked, 0 files not checked\)\./);
+    assert.doesNotMatch(report.gates[0].output, /\bpassed\b|nothing blocking/i);
+    assert.equal(report.standards!.totals.passed, 0, 'no command ran, so nothing passed');
+    assert.deepEqual(report.standards!.rules.filter((r) => r.severity === 'blocking'), []);
+
+    // The release ships, and its stamp carries the marker beside the version — through a save and a reload.
+    assert.deepEqual(stampRelease(plan, 'v1.0.0', '2026-10-04T00:00:00.000Z', { standardsVersion: 3, standardsFromGates: true }).shipped, ['R-1']);
+    const rec = plan.requirementTrace!.find((r) => r.id === 'R-1')!;
+    assert.deepEqual([rec.releases[0].standardsVersion, rec.releases[0].standardsCounts], [3, counts]);
+    assert.deepEqual(requirementStatuses(plan).find((r) => r.id === 'R-1')?.standardsCounts, counts);
+  });
+
+  it('S29. a profile command the repository gate left unrun is not checked: the standards gate stops the run', async () => {
+    // The repository gate fails, so the profile's command never runs. That is a failed
+    // command gate first and foremost — and the report must not call the standards checked.
+    const loop = loadLoop({
+      standardsInputs: [CLEAN],
+      gateResult: (c) => (c === 'npm test' ? FAILING_GATE(c) : { command: c, exitCode: 0, passed: true, output: 'ok', durationMs: 1, timedOut: false }),
+    });
+    const report = await loop.createPrdLoop(baseConfig(withStandards(defaults())), makeDeps(makePlan()).deps).run();
+    assert.equal(report.failedGate, 'command');
+    assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['npm test', 1]], 'no standards row at all: neither a pass nor a second failure');
+    assert.equal(report.standards!.totals.blockingNotChecked, 1);
+    assert.deepEqual(report.standards!.rules.filter((r) => r.rule === 'command').map((r) => [r.result, r.reason]),
+      [['not-checked', 'The command gate failed first']]);
+  });
+
+  it('S23. a nested repository is reported by name and is advisory; promoted, it fails the standards gate', async () => {
+    const nested: StandardsCheckInput = { ...CLEAN, nestedRepos: ['cloned'] };
+    const h = makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) });
+
+    const byDefault = await loadLoop({ standardsInputs: [nested] }).createPrdLoop(baseConfig(withStandards(defaults())), h.deps).run();
+    assert.equal(byDefault.failedGate, null);
+    assert.equal(byDefault.passed, true);
+    assert.deepEqual(byDefault.standards!.findings.map((f) => [f.file, f.rule, f.severity]), [['cloned', 'structure/nested-repository', 'advisory']]);
+    assert.deepEqual(byDefault.standards!.notCheckedFiles, [{ file: 'cloned', reason: 'nested repository — files inside were not read' }]);
+    assert.match(byDefault.gates[0].output, /- cloned:1 structure\/nested-repository — cloned is a git repository of its own/);
+    assert.match(byDefault.gates[0].output, /- cloned — not checked \(nested repository — files inside were not read\)/);
+
+    const promoted = defaults();
+    promoted.severity = { 'structure/nested-repository': 'blocking' };
+    const report = await loadLoop({ standardsInputs: [nested] }).createPrdLoop(baseConfig(withStandards(promoted)),
+      makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) }).deps).run();
+    assert.equal(report.failedGate, 'standards');
+    assert.equal(report.modelCallsMade, 0);
+    assert.deepEqual(report.standards!.findings.map((f) => [f.file, f.rule, f.severity]), [['cloned', 'structure/nested-repository', 'blocking']]);
+    assert.match(report.suggestion, /- cloned:1 structure\/nested-repository — cloned is a git repository of its own/);
   });
 });
 

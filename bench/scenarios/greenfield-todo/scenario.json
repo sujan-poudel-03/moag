@@ -26,5 +26,6 @@
     { "id": "v2", "prdFile": "prd/v2.md", "intendedBump": "patch", "dryRunFixture": "dry-run/v2" },
     { "id": "v3", "prdFile": "prd/v3.md", "intendedBump": "minor", "dryRunFixture": "dry-run/v3" }
   ],
-  "dryRun": { "planCommand": "npm test" }
+  "dryRun": { "planCommand": "npm test" },
+  "standardsProfile": "standards.json"
 }

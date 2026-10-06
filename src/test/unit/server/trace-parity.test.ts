@@ -30,7 +30,7 @@ function fixture(): Plan {
   );
   plan.playlists = [pl];
   plan.requirementTrace = [
-    { id: 'R-1', taskIds: ['t-1'], commits: ['abc123'], gates: [{ command: 'npm test', exitCode: 0, timedOut: false, at: createdAt }], releases: [{ releaseTag: 'v2.0.0', prdVersion: '2.0.0', at: createdAt, taskIds: ['t-1'] }] },
+    { id: 'R-1', taskIds: ['t-1'], commits: ['abc123'], gates: [{ command: 'npm test', exitCode: 0, timedOut: false, at: createdAt }], releases: [{ releaseTag: 'v2.0.0', prdVersion: '2.0.0', at: createdAt, taskIds: ['t-1'], standardsVersion: 3 }] },
     { id: 'R-2', taskIds: ['t-2'], commits: [], gates: [{ command: 'npm test', exitCode: 1, timedOut: false, at: createdAt }], releases: [] },
     { id: 'R-3', taskIds: ['t-3'], commits: [], gates: [], releases: [{ releaseTag: 'v1.0.0', prdVersion: '1.0.0', at: createdAt, taskIds: ['t-3'] }] },
   ];
@@ -71,6 +71,9 @@ describe('trace parity: web API vs moag trace', function () {
     });
 
     assert.deepEqual(rows, cli);
+    // The standards version is on both sides: a number where a release recorded one, null elsewhere.
+    assert.deepEqual(rows.map((r) => [r.id, r.standardsVersion]), [['R-1', 3], ['R-2', null], ['R-3', null], ['R-4', null], ['R-5', null]]);
+    assert.ok(cli.every((line: Record<string, unknown>) => 'standardsVersion' in line), 'moag trace prints the key on every line');
     const statuses = new Set(rows.map((r) => r.status));
     for (const s of ['shipped', 'in-progress', 'not-shipped', 'untracked', 'removed']) {
       assert.ok(statuses.has(s), `fixture covers ${s} (got ${[...statuses].join(', ')})`);

@@ -5,7 +5,8 @@
 //
 // Boot order: validate config → scrub secrets from process.env → create the
 // data dir (0700) → refuse to start with zero admins and no bootstrap token →
-// recover state left by a crash → listen. SIGTERM/SIGINT stop every job, then
+// recover state left by a crash → propose standards for projects that have
+// none → listen. SIGTERM/SIGINT stop every job, then
 // close the server. This module never imports `vscode`; engine work happens
 // only in `run-worker.js` child processes.
 
@@ -18,6 +19,7 @@ import { SessionStore } from './sessions';
 import { AuditLog } from './audit';
 import { ProjectStore } from './projects';
 import { ProjectStateStore } from './project-state';
+import { StandardsStore, migrateStandards } from './standards-store';
 import { LoginRateLimiter } from './rate-limit';
 import { createApp, App } from './app';
 import { JobManager, SpawnSpec, WorkerProcess } from './jobs';
@@ -123,13 +125,16 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env): Promise
 
   const projects = new ProjectStore(config.dataDir);
   const state = new ProjectStateStore(config.dataDir);
+  const audit = new AuditLog(config.dataDir);
+  const standards = new StandardsStore(config.dataDir);
   const app = createApp({
     config,
     users,
     sessions: new SessionStore(config.dataDir),
-    audit: new AuditLog(config.dataDir),
+    audit,
     projects,
     state,
+    standards,
     limiter: new LoginRateLimiter(),
     spawnWorker: spawnRunWorker,
     killProcess: (proc) => killProcess(proc as Parameters<typeof killProcess>[0]),
@@ -143,6 +148,9 @@ export async function startServer(env: NodeJS.ProcessEnv = process.env): Promise
   const { recovered, reclaimed } = recoverAfterRestart(ids, app.jobs, state, log);
   if (recovered > 0) { log(`marked ${recovered} interrupted run/plan record(s) after restart`); }
   if (reclaimed.length > 0) { log(`reclaimed ${reclaimed.length} stale job lock(s)`); }
+  // Projects created before project standards existed get an automatic proposal to review.
+  const migrated = await migrateStandards(projects, standards, audit, log);
+  if (migrated.length > 0) { log(`proposed standards for ${migrated.length} project(s) that had none; new plans wait for a reviewer or an admin`); }
   if (config.runsDisabledReason === 'ci') { log('CI=true is set: runs and plan generation are DISABLED (CI would auto-approve ship gates).'); }
 
   await new Promise<void>((resolve, reject) => {

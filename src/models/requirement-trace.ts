@@ -9,7 +9,7 @@
 // input — a requirement is "shipped" only when its tasks completed, its latest gates all
 // exited 0 and a release task stamped it.
 
-import { Plan, RequirementTraceRecord, Task, TaskStatus } from './types';
+import { Plan, RequirementTraceRecord, StandardsCheckCounts, Task, TaskStatus } from './types';
 import { Requirement, resolveRequirements } from './requirements';
 
 // ─── Limits ───
@@ -34,6 +34,10 @@ export interface RequirementStatusRow {
   version: string | null;
   /** Tag of the last release that stamped this requirement */
   releaseTag: string | null;
+  /** Project standards version that release was checked against; null when it had none (or nothing was released) */
+  standardsVersion: number | null;
+  /** What that check left open — advisory findings, rules and files not checked; null when none was recorded */
+  standardsCounts: StandardsCheckCounts | null;
   tasks: Array<{ id: string; status: TaskStatus }>;
   gates: Array<{ command: string; exitCode: number }>;
   /** ID of the Failed/Blocked/Skipped task that keeps the requirement from shipping */
@@ -45,6 +49,16 @@ export interface TraceGateInput {
   command: string;
   exitCode: number;
   timedOut: boolean;
+  /** Only on the standards row: what the check left open (see {@link StandardsCheckCounts}). */
+  standardsCounts?: StandardsCheckCounts;
+}
+
+/** A fresh copy of `counts` holding its three numbers, `noBlockingRules` when set, and nothing else. */
+function copyCounts(counts: StandardsCheckCounts): StandardsCheckCounts {
+  return {
+    advisoryFindings: counts.advisoryFindings, notCheckedRules: counts.notCheckedRules, notCheckedFiles: counts.notCheckedFiles,
+    ...(counts.noBlockingRules === true ? { noBlockingRules: true as const } : {}),
+  };
 }
 
 // ─── Helpers ───
@@ -133,6 +147,7 @@ export function recordGateResults(plan: Plan, gates: readonly TraceGateInput[], 
     exitCode: g.exitCode,
     timedOut: g.timedOut,
     at,
+    ...(g.standardsCounts ? { standardsCounts: copyCounts(g.standardsCounts) } : {}),
   }));
   const tagged = taggedIds(plan);
   for (const record of plan.requirementTrace ?? []) {
@@ -173,12 +188,52 @@ export function recordCommit(plan: Plan, task: Task, sha: string | undefined): v
 }
 
 /**
+ * The name of the gate row that carries the standards result of one verification.
+ * The PRD loop writes a PASSING row only when the blocking set was really evaluated — every
+ * blocking rule the profile configures and every one of its commands came out decided, and
+ * none stops the release — so its presence, exit 0, in a requirement's latest gates is the
+ * evidence that the work was checked against that standards version. The row carries what
+ * the check left open (`standardsCounts`): advisory findings, rules and files not checked.
+ */
+export function standardsGateCommand(version: number | null): string {
+  return version === null ? 'moag:standards' : `moag:standards v${version}`;
+}
+
+/**
+ * True for the synthetic standards row ({@link standardsGateCommand}), whatever its version.
+ * A surface that words gate rows must ask this first: the row is not a command, so it is
+ * never said to have passed — see `gateStatus` in ui/standards-report-html.ts.
+ */
+export function isStandardsGateCommand(command: string): boolean {
+  return /^moag:standards(?: v\d+)?$/.test(command);
+}
+
+/**
  * Stamp a successful release onto every requirement of the latest PRD version that is ready
  * to ship: it has tagged tasks, all of them Completed, and its latest recorded gates are
  * non-empty and all exited 0 without timing out. Returns the IDs stamped and the PRD
  * version label used (`null` when the plan has no PRD versions).
+ *
+ * `opts.standardsVersion` is the project standards version the shipped work was checked
+ * against; it is recorded on each stamp. Anything but an integer >= 1 records nothing.
+ *
+ * With `opts.standardsFromGates` the version is recorded on a requirement only when its
+ * latest gates hold a passing standards row for exactly that version — that is, the last
+ * verification really evaluated the blocking set of it. A requirement verified without the
+ * standards gate, or whose blocking set was not evaluated, still ships, with no standards
+ * version on its stamp: the trace never claims a check that did not happen.
+ *
+ * What the check left open is recorded beside the version: `opts.standardsCounts` when the
+ * caller knows it (the hosted server, from the report its worker sent), else the counts on
+ * the passing standards row. Never without a version.
  */
-export function stampRelease(plan: Plan, releaseTag: string, at: string): { shipped: string[]; prdVersion: string | null } {
+export function stampRelease(
+  plan: Plan, releaseTag: string, at: string,
+  opts: { standardsVersion?: number; standardsFromGates?: boolean; standardsCounts?: StandardsCheckCounts } = {},
+): { shipped: string[]; prdVersion: string | null } {
+  const standardsVersion = typeof opts.standardsVersion === 'number' && Number.isInteger(opts.standardsVersion) && opts.standardsVersion >= 1
+    ? opts.standardsVersion
+    : undefined;
   const versions = plan.prdVersions ?? [];
   if (versions.length === 0) { return { shipped: [], prdVersion: null }; }
   const prdVersion = versions[versions.length - 1].version;
@@ -190,8 +245,19 @@ export function stampRelease(plan: Plan, releaseTag: string, at: string): { ship
     if (!existing || existing.gates.length === 0) { continue; }
     if (!existing.gates.every(g => g.exitCode === 0 && !g.timedOut)) { continue; }
     const taskIds = tasks.map(t => t.id);
+    const row = standardsVersion === undefined ? undefined
+      : existing.gates.find(g => g.command === standardsGateCommand(standardsVersion) && g.exitCode === 0 && !g.timedOut);
+    const judged = standardsVersion !== undefined && (opts.standardsFromGates !== true || row !== undefined);
+    const counts = !judged ? undefined : opts.standardsCounts ?? row?.standardsCounts;
     const record = upsert(plan, req.id, taskIds);
-    record.releases = [...record.releases, { releaseTag, prdVersion, at, taskIds }].slice(-MAX_TRACE_RELEASES);
+    record.releases = [
+      ...record.releases,
+      {
+        releaseTag, prdVersion, at, taskIds,
+        ...(judged ? { standardsVersion } : {}),
+        ...(counts ? { standardsCounts: copyCounts(counts) } : {}),
+      },
+    ].slice(-MAX_TRACE_RELEASES);
     shipped.push(req.id);
   }
   return { shipped, prdVersion };
@@ -228,6 +294,8 @@ export function requirementStatuses(plan: Plan): RequirementStatusRow[] {
       status: 'in-progress',
       version: lastRelease ? lastRelease.prdVersion : null,
       releaseTag: lastRelease ? lastRelease.releaseTag : null,
+      standardsVersion: lastRelease?.standardsVersion ?? null,
+      standardsCounts: lastRelease?.standardsCounts ? copyCounts(lastRelease.standardsCounts) : null,
       tasks: tasks.map(t => ({ id: t.id, status: t.status })),
       gates: (record?.gates ?? []).map(g => ({ command: g.command, exitCode: g.exitCode })),
     };

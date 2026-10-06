@@ -61,6 +61,56 @@ export const STR = Object.freeze({
   C29: (entries) => m(`This repo ships engine config or agent instructions: ${entries}. An approved run starts the agent inside the repo, so they load: config can run commands (hooks, MCP servers) as the server's user, and instruction files steer what the agent does. Approve only if you trust this repository.`),
   /** @param {string} engine the project's current default engine */
   C30: (engine) => m(`The project's engine changed to ${engine} after this plan was approved, so it can't start. Switch the engine back in Settings or request a new plan.`),
+  /** @param {number} n @param {string} state the project's standards state: pending | rejected | none */
+  C31: (n, state) => m(
+    state === 'pending' ? `Plans can't be generated yet. Standards v${n} is waiting for a reviewer; plans start once it is approved.`
+      : state === 'rejected' ? `Plans can't be generated yet. Standards v${n} was rejected. Edit it and submit it again.`
+        : 'Plans can\'t be generated yet. This project has no approved standards.',
+    ['route:standards']),
+  /** @param {number} n @param {number} k number of commands in the version */
+  C32: (n, k) => m(`Approve standards v${n}? Every plan and agent prompt in this project will carry it, and every run is checked against it. ${k === 0 ? 'It runs no commands.' : `Its ${k} command${k === 1 ? '' : 's'} will run in the project workspace on every run, exactly as shown.`}`,
+    ['control:cancel', 'control:approve-standards']),
+  /** @param {number} n @param {number|null} inEffect the version that stays in effect, if any */
+  C33: (n, inEffect) => m(`Standards v${n} rejected. ${inEffect ? `v${inEffect} stays in effect.` : 'The product owner can edit and submit again.'}`),
+  /** @param {number} n @param {string} stack */
+  C34: (n, stack) => m(`Accept standards v${n} without a reviewer? MOAG generated it from the repository and the ${stack} defaults, and nobody has reviewed it. It takes effect now and unblocks plan generation. The audit log records this as defaults accepted by you, not as a review.`,
+    ['control:cancel', 'control:accept-defaults']),
+  /** @param {number} n @param {number|null} inEffect */
+  C35: (n, inEffect) => m(`Standards v${n} submitted for review.${inEffect ? ` v${inEffect} stays in effect until a reviewer approves it.` : ''}`),
+  C36: m('Someone else proposed a newer version while you were editing. Your changes are still here. Review their version, then submit again.', ['control:show-latest']),
+  C37: m('These standards changed after you opened them, so nothing was approved. Review the current version.'),
+  /** @param {number} planV @param {number} nowV */
+  C38: (planV, nowV) => m(`Standards v${nowV} was approved after this plan was generated under v${planV}. The run will use v${nowV}.`),
+  C39: m('This run had no standards version. Its plan was approved before the project had standards, so nothing was checked and no version is recorded on the trace.'),
+  C40: m('Not checked means MOAG could not decide the rule for these files, or the profile does not configure it. It is not a pass.'),
+  /** @param {number} rules @param {number} findings */
+  C41: (rules, findings) => m(`Standards stopped the release: ${rules} blocking rule${rules === 1 ? '' : 's'} or command${rules === 1 ? '' : 's'}, ${findings} finding${findings === 1 ? '' : 's'}. Nothing was marked shipped.`, ['control:view-standards-report']),
+  /** @param {number} n @param {number} cap */
+  C42: (n, cap) => m(`Free-text rules are ${n} characters. The limit is ${cap}.`),
+  C43: m('This project was created before project standards existed. New plans are blocked until a reviewer approves the proposed standards or an admin accepts the defaults. Plans that are already approved can still run; those runs are not checked.'),
+  C44: m('After you create the project, MOAG proposes standards from the repository and this stack. A reviewer approves them before the first plan can be generated.'),
+  C45: m('Shown exactly as written. Approving lets these commands run in the project workspace on every run.'),
+  C46: m('Standards are not approved for this project, so this can\'t continue.', ['route:standards']),
+  C47: m('MOAG blocks on your project\'s own tools: a command (a real linter, formatter, type-checker or test) always blocks and is judged by its exit code. Every rule MOAG checks itself is advisory by default: it is reported with file, line and rule, says "findings" or "no findings", is never said to have passed, and stops nothing unless you promote it to blocking here.'),
+  /** @param {number} n */
+  C48: (n) => m(`${n} blocking rule${n === 1 ? '' : 's'} or command${n === 1 ? ' was' : 's were'} not checked. That is not a pass: nothing failed because nothing was evaluated, and the release is stopped.`),
+  C49: m('Advisory findings come from heuristic scans, which can flag correct code and can miss real violations. They are shown to the reviewer and the approver and do not stop the run.'),
+  C50: m('Changing a rule between blocking and advisory changes what can stop a release. It is a new version for a reviewer to approve, and it is recorded in the audit log.'),
+  /** @param {number} n @param {number|null} approved the approved version it is compared with, or null for the defaults */
+  C51: (n, approved) => m(`This version changes what can stop a release: ${n} rule${n === 1 ? '' : 's'} differ${n === 1 ? 's' : ''} from ${approved ? `v${approved}, the approved version before it` : 'the defaults (nothing was approved before it)'}.`),
+  /** @param {string} rules the promoted scanner rules, comma-separated */
+  C52: (rules) => m(`Heuristic rules that can stop a release here: ${rules}. Scanner rules are heuristic: as blocking rules they can stop correct code, and they can miss real violations.`),
+  C53: m('These were not read by the line rules: vendored or generated files, file types MOAG has no scanner for, unreadable files, and directories that are repositories of their own (a nested repository or a submodule). Nothing in them counts towards "no findings".'),
+  /** @param {number|null} approved the approved version it is compared with, or null */
+  C55: (approved) => m(`Enforcement changes: this version differs from ${approved ? `v${approved}, the approved version before it,` : 'an empty baseline (nothing was approved before it)'} in what can stop a release. Every difference is shown below, before and after. MOAG does not judge whether a change tightens or loosens; read each line before approving.`),
+  C56: m('Nothing was approved: this version changes what can stop a release, and the request did not confirm that you saw those changes. Tick the confirmation under the enforcement changes, then approve again.'),
+  /** @param {number} n the version */
+  C57: (n) => m(`I have read the enforcement changes of standards v${n} shown above (commands, rule severity, required directories) and approve them as they are.`),
+  C58: m('No blocking rules configured: this profile has no command and no promoted rule, so nothing here can stop a release, and nothing here passed. MOAG blocks on your project\'s own tools; add a command to the standards to make a check binding.'),
+  /** @param {number} failed @param {number} notChecked */
+  C59: (failed, notChecked) => m(`This ship can't be approved yet: the standards check before the gate shows ${failed > 0 ? `${failed} blocking rule${failed === 1 ? '' : 's'} or command${failed === 1 ? '' : 's'} failed` : `${notChecked} blocking rule${notChecked === 1 ? '' : 's'} or command${notChecked === 1 ? '' : 's'} not checked`}. Reject the ship, or fix the work and run again.`, ['control:view-standards-report']),
+  /** @param {string} rule the scanner rule being made blocking */
+  C54: (rule) => m(`Heuristic rule. As a blocking rule, ${rule} can stop correct code and can miss real violations. Prefer a command (a linter, formatter or test) for anything that must stop a release.`),
 });
 
 /** Copy for a failed request whose server message should be shown as-is. */

@@ -1,0 +1,174 @@
+{
+  "stackTemplateId": "node-ts",
+  "repoState": "brownfield",
+  "structure": {
+    "requiredDirs": [
+      "src"
+    ],
+    "allowedTopLevel": [
+      "src",
+      "lib",
+      "app",
+      "pages",
+      "components",
+      "hooks",
+      "server",
+      "client",
+      "api",
+      "functions",
+      "test",
+      "tests",
+      "__tests__",
+      "e2e",
+      "packages",
+      "apps",
+      "bin",
+      "public",
+      "static",
+      "assets",
+      "styles",
+      "prisma",
+      "config",
+      "types",
+      "docs",
+      "scripts",
+      ".*",
+      "*.md",
+      "LICENSE*",
+      "LICENCE*",
+      "NOTICE*",
+      "CHANGELOG*",
+      "CODEOWNERS",
+      "Dockerfile*",
+      "Makefile",
+      "*.yml",
+      "*.yaml",
+      "*.lock",
+      "*.toml",
+      "*.json",
+      "*.js",
+      "*.cjs",
+      "*.mjs",
+      "*.ts",
+      "*.mts",
+      "*.html"
+    ],
+    "placement": [
+      {
+        "id": "tests",
+        "files": "**/*.test.ts",
+        "under": [
+          "src",
+          "lib",
+          "app",
+          "pages",
+          "components",
+          "hooks",
+          "server",
+          "client",
+          "api",
+          "functions",
+          "test",
+          "tests",
+          "__tests__",
+          "e2e",
+          "packages",
+          "apps"
+        ]
+      },
+      {
+        "id": "specs",
+        "files": "**/*.spec.ts",
+        "under": [
+          "src",
+          "lib",
+          "app",
+          "pages",
+          "components",
+          "hooks",
+          "server",
+          "client",
+          "api",
+          "functions",
+          "test",
+          "tests",
+          "__tests__",
+          "e2e",
+          "packages",
+          "apps"
+        ]
+      }
+    ]
+  },
+  "frontend": {
+    "componentKit": "",
+    "styleSource": "",
+    "rawPatterns": []
+  },
+  "backend": {
+    "layers": [],
+    "forbiddenImports": [],
+    "importAliases": []
+  },
+  "naming": {
+    "files": [
+      {
+        "globs": [
+          "src/**/*.ts"
+        ],
+        "style": "kebab-case"
+      }
+    ],
+    "notes": "Test files sit beside or mirror the module they cover and end in .test.ts"
+  },
+  "comments": {
+    "maxDensityPct": 30,
+    "minAddedLines": 20,
+    "forbidCommentedOutCode": true,
+    "bannedPhrases": [
+      "// rest of the code",
+      "// rest of code",
+      "// rest of the file",
+      "// rest of the implementation",
+      "// rest of the code goes here",
+      "// rest of the code here",
+      "// rest of the code remains",
+      "// rest of the code unchanged",
+      "// rest of the code remains unchanged",
+      "// rest of the code remains the same",
+      "// existing code here",
+      "// existing code remains",
+      "// existing code remains unchanged",
+      "// existing code remains the same",
+      "// implementation goes here",
+      "// your implementation here",
+      "// your code here",
+      "// your code goes here",
+      "// code goes here",
+      "... rest of the code ...",
+      "... existing code ...",
+      "... remaining code ..."
+    ]
+  },
+  "testing": {
+    "runner": "npm test",
+    "fileGlobs": [
+      "**/*.test.ts",
+      "**/*.spec.ts"
+    ],
+    "notes": "Every new module ships with a test file covering its failure paths"
+  },
+  "commands": [
+    {
+      "label": "Compile",
+      "run": "npm run compile"
+    }
+  ],
+  "builtInRuleIds": [
+    "builtin-clean-code",
+    "builtin-self-documenting",
+    "builtin-tdd",
+    "builtin-error-handling"
+  ],
+  "freeText": ""
+}

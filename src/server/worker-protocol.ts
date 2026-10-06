@@ -18,6 +18,12 @@ export interface RunJob {
   startPlaylistIndex: number;
   verify: true;
   allowedEngines: EngineId[];
+  /**
+   * Server-written standards job file: the version frozen at run start, its prompt text
+   * and the base ref its check diffs against. Absent = the run has no standards (a plan
+   * approved before the project had any); the worker then verifies with `--no-standards`.
+   */
+  standardsPath?: string;
 }
 
 export interface PlanJob {
@@ -30,6 +36,11 @@ export interface PlanJob {
   engine: EngineId;
   /** Server-generated repository file listing (plain text) appended to the planning prompt. */
   repoListingPath?: string;
+  /**
+   * Server-written standards job file (the approved version, frozen). The planner prompt
+   * carries its text; a standards file in the repository is never read.
+   */
+  standardsPath?: string;
 }
 
 export interface ProbeJob { kind: 'probe'; }
@@ -48,18 +59,22 @@ export function parseJob(raw: unknown): WorkerJob | null {
     if (!isStr(j.runId) || !isStr(j.workspace) || !isStr(j.planPath) || j.verify !== true) { return null; }
     if (typeof j.startPlaylistIndex !== 'number' || !Number.isInteger(j.startPlaylistIndex) || j.startPlaylistIndex < 0) { return null; }
     if (!Array.isArray(j.allowedEngines) || !j.allowedEngines.every(isEngine)) { return null; }
+    if (j.standardsPath !== undefined && !isStr(j.standardsPath)) { return null; }
     return {
       kind: 'run', runId: j.runId, workspace: j.workspace, planPath: j.planPath,
       startPlaylistIndex: j.startPlaylistIndex, verify: true, allowedEngines: [...j.allowedEngines],
+      ...(isStr(j.standardsPath) ? { standardsPath: j.standardsPath } : {}),
     };
   }
   if (j.kind === 'plan') {
     if ((j.mode !== 'delta' && j.mode !== 'initial') || !isStr(j.workspace) || !isStr(j.planPath)
       || !isStr(j.outPath) || !isEngine(j.engine)) { return null; }
     if (j.repoListingPath !== undefined && !isStr(j.repoListingPath)) { return null; }
+    if (j.standardsPath !== undefined && !isStr(j.standardsPath)) { return null; }
     return {
       kind: 'plan', mode: j.mode, workspace: j.workspace, planPath: j.planPath, outPath: j.outPath, engine: j.engine,
       ...(isStr(j.repoListingPath) ? { repoListingPath: j.repoListingPath } : {}),
+      ...(isStr(j.standardsPath) ? { standardsPath: j.standardsPath } : {}),
     };
   }
   return null;

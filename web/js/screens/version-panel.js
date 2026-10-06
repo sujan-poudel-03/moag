@@ -29,8 +29,23 @@ function capText(spend) {
   return spend && !spend.noCap ? `${fmtUsd(spend.capUsd)} cost cap` : 'project spend (no cost cap is set)';
 }
 
+/**
+ * The "plans can't be generated yet" notice (C31) with a link to the standards
+ * screen. `standards` is the server's `{ pendingVersion, state }` summary.
+ */
+export function standardsBlockedCard(projectId, standards) {
+  const s = standards || {};
+  // The summary names the pending version only; without a number the general wording is used.
+  const n = s.pendingVersion || null;
+  const text = STR.C31(n, n && s.state === 'pending' ? 'pending' : 'none').text;
+  return h('div', { class: ['card', 'card-warning'], role: 'note' },
+    h('p', null, glyph('⊘'), ' ', text),
+    h('div', { class: 'form-actions' },
+      h('a', { href: `/p/${encodeURIComponent(projectId)}/standards`, dataset: { link: '' }, class: 'btn btn-secondary' }, 'Open standards')));
+}
+
 /** A capped list with "Show all N". */
-function cappedList(items, renderItem) {
+export function cappedList(items, renderItem) {
   const ul = h('ul', { class: 'diff-list' });
   const renderUpTo = (n) => {
     while (ul.firstChild) { ul.removeChild(ul.firstChild); }
@@ -159,6 +174,9 @@ function planRow(app, ctx, v) {
     return h('p', null, glyph('○'), ` A plan for this version is ${dto.openPlan.status}. `, planLink);
   }
 
+  // No approved standards: the server refuses every plan request, so the notice replaces the button.
+  if (dto.planBlockedReason === 'standards-not-approved') { return standardsBlockedCard(projectId, dto.standards); }
+
   const generate = async (mode, ids, count) => {
     const ok = await confirmDialog({
       title: mode === 'initial' ? 'Generate the initial plan?' : 'Request a delta plan?',
@@ -167,7 +185,13 @@ function planRow(app, ctx, v) {
     });
     if (!ok) { return; }
     const r = await app.api('POST', `/api/projects/${encodeURIComponent(projectId)}/plans`, { mode });
-    if (!r.ok) { toast(serverMessage(r), 'error'); ctx.onChanged(); return; }
+    if (!r.ok) {
+      // Standards lost their approval between render and click: say what blocks, not the raw refusal.
+      const blocked = r.status === 409 && r.body.error === 'standards-not-approved';
+      toast(blocked ? STR.C31(r.body.pendingVersion, r.body.pendingVersion && r.body.state === 'pending' ? 'pending' : 'none').text : serverMessage(r), 'error');
+      ctx.onChanged();
+      return;
+    }
     toast('Plan generation started. A reviewer approves it before it can run.', 'success');
     app.navigate(`/p/${encodeURIComponent(projectId)}/plan`);
   };

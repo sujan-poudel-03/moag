@@ -50,6 +50,8 @@ export interface PlanReview {
   playlistIndex?: number;
   /** The project's default engine when the reviewer approved: runs refuse to start on any other. */
   approvedEngine?: EngineId;
+  /** The approved standards version the planner was given. Absent on plans generated before projects had standards. */
+  standardsVersion?: number;
 }
 
 export interface GateDecision {
@@ -79,6 +81,50 @@ export interface RunRecord {
   errorTail?: string;
   /** Pid of the current segment's worker process (also in the project's job.lock). */
   workerPid?: number;
+  /**
+   * The standards version frozen at run start (the latest approved one then). Every
+   * segment of the run uses it, whatever is approved later. Absent: the run had none.
+   */
+  standardsVersion?: number;
+  /** `contentHash` of that version; a resumed segment refuses a store record that no longer matches. */
+  standardsHash?: string;
+  /**
+   * What the standards check diffs against, across every segment: the ref the project
+   * last SHIPPED at ({@link ProjectState.lastShipped}), else the base of its earliest run,
+   * else HEAD at this run's start. Never simply "HEAD now" — work a previous run committed
+   * without shipping must stay inside the diff. null = no commit to diff against, so every
+   * file counts as added.
+   */
+  baseRef?: string | null;
+  /** Totals of the latest standards report the worker sent (the full report is in the run dir). */
+  standardsSummary?: RunStandardsSummary;
+}
+
+/** When in a run a standards report was produced. */
+export type StandardsReportPhase = 'pre-gate' | 'verify';
+
+export interface RunStandardsSummary {
+  /** 'pre-gate' = the informational check at the ship gate; 'verify' = the authoritative one. */
+  phase: StandardsReportPhase;
+  version: number | null;
+  /** Commands that passed. A rule MOAG decides itself is never counted here. */
+  passed: number;
+  /** Scanner rules that read something and found nothing — not a pass. Absent on older summaries. */
+  noFindings?: number;
+  /** BLOCKING rules and commands that failed or have findings: what stops a ship. */
+  failed: number;
+  /** Advisory rules with findings: reported, never blocking. Absent on summaries written before severities existed. */
+  advisory?: number;
+  /** Rules that could not be decided. Never counted as passed. */
+  notChecked: number;
+  /** Blocking rules and commands that ended not checked: any above zero stops a ship. Absent on older summaries. */
+  blockingNotChecked?: number;
+  findings: number;
+  /** How many of the findings are advisory. Absent on older summaries. */
+  advisoryFindings?: number;
+  /** Changed files no line rule read (vendored, generated, no lexer, unreadable). Absent on older summaries. */
+  notCheckedFiles?: number;
+  at: string;
 }
 
 export interface ProjectState {
@@ -87,6 +133,14 @@ export interface ProjectState {
   runs: RunRecord[];
   versionSpend: Record<string, number>;
   overrideLocked: Record<string, true>;
+  /**
+   * HEAD of the workspace when a run last stamped a release — the only moment work is
+   * known to have passed every gate. Later runs diff their standards check against it.
+   * Written only when `stampApprovedShip` stamps; absent until the project first ships.
+   * Never written with a null `ref`: a ship whose HEAD could not be read leaves the previous
+   * value in place. A null stored by an earlier build is ignored when the base is resolved.
+   */
+  lastShipped?: { ref: string | null; runId: string; at: string };
 }
 
 export function emptyProjectState(): ProjectState {

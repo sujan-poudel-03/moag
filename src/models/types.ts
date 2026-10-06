@@ -222,6 +222,25 @@ export interface PrdVersion {
 }
 
 /**
+ * What a standards check left open beside its result: numbers only, never a file name or a
+ * finding. A passing check is not a clean one — these say how far from clean it was.
+ */
+export interface StandardsCheckCounts {
+  /** Findings of advisory rules: reported, never blocking. */
+  advisoryFindings: number;
+  /** Rules the profile configures that were not checked. */
+  notCheckedRules: number;
+  /** Changed files no line rule read (vendored, generated, no lexer for the language, unreadable). */
+  notCheckedFiles: number;
+  /**
+   * Set — and only ever `true` — when the profile checked against had no blocking rule at
+   * all: no command and no promoted rule. Such a check is shown as "no blocking rules
+   * configured", never as passed. Absent whenever a blocking set existed.
+   */
+  noBlockingRules?: true;
+}
+
+/**
  * One gate command's real exit code, recorded against a requirement.
  * IDs only, never requirement text.
  */
@@ -230,6 +249,8 @@ export interface RequirementGateResult {
   exitCode: number;
   timedOut: boolean;
   at: string;
+  /** Only on the `moag:standards` row: what that check left open. Absent on rows recorded before it existed. */
+  standardsCounts?: StandardsCheckCounts;
 }
 
 /**
@@ -241,6 +262,17 @@ export interface RequirementRelease {
   prdVersion: string;
   at: string;
   taskIds: string[];
+  /**
+   * The project standards version the release was checked against (an integer >= 1).
+   * Absent when it shipped with no standards — a plan that predates them — or when the
+   * blocking set of its standards was not evaluated.
+   */
+  standardsVersion?: number;
+  /**
+   * What that standards check left open: advisory findings, rules and files not checked.
+   * Only ever beside a `standardsVersion`; absent on a release stamped before it existed.
+   */
+  standardsCounts?: StandardsCheckCounts;
 }
 
 /**

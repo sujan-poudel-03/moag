@@ -38,8 +38,9 @@ export const PLAN_FILE_DISCLOSURE: Record<keyof PlanFile, Disclosure> = {
   aiRules: 'redact',
   prdVersions: 'redact',
   fixIterations: 'share',
-  // IDs, commit SHAs, exit codes, version labels, release tags and gate command strings —
-  // the same class as task.command. Requirement text never enters the trace.
+  // IDs, commit SHAs, exit codes, version labels, release tags, gate command strings and the
+  // project standards version NUMBER a release was checked against — the same class as
+  // task.command. Requirement text never enters the trace, and neither does standards text.
   requirementTrace: 'share',
   sandbox: 'share',
   validation: 'share',

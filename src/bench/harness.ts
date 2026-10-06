@@ -32,7 +32,9 @@ import {
   BenchEnvironment, BenchSummary, GateRunObservation, Intervention, VersionObservation, buildVersionMetrics, emptyObservation,
   environmentFindings, errorLine, summarize,
 } from './metrics';
-import { Scenario, dryRunProblem, parseScenario, BenchScenarioError } from './scenario';
+import { Scenario, dryRunProblem, parseScenario, scenarioAllowedCommands, BenchScenarioError } from './scenario';
+import { builtInProfile } from '../standards/built-in-profiles';
+import { StandardsProfile, profileHash } from '../standards/profile';
 import { CommandResult, PreparedWorkspace, gatesGreen, prepareWorkspace, runCommand, runGates } from './workspace';
 import { FAKE_VERSION_MARKER, FakeEngine, installFakeEngine, readFakeCalls } from './fake-engine';
 import { LaunchOptions, LaunchedServer, launchServer } from './server-launcher';
@@ -118,14 +120,8 @@ export interface GeneratedPlanForApproval {
   review?: { ok?: boolean; errors?: string[]; commands?: Array<{ taskName?: string; field?: string; value?: string }> };
 }
 
-/**
- * Every shell command a generated plan may carry and still be approved unread:
- * the scenario's gate commands, its author-reviewed `allowedCommands`, and the
- * dry-run plan command. Exact strings only; nothing here is a pattern.
- */
-export function scenarioAllowedCommands(scenario: Pick<Scenario, 'gateCommands' | 'allowedCommands' | 'dryRun'>): string[] {
-  return [...scenario.gateCommands, ...scenario.allowedCommands, ...(scenario.dryRun ? [scenario.dryRun.planCommand] : [])];
-}
+// The allow-list lives with the scenario (its parser needs it for the standards profile).
+export { scenarioAllowedCommands };
 
 /**
  * Why the bench must NOT auto-approve a generated plan, or an empty list when
@@ -157,6 +153,61 @@ export function planApprovalProblems(plan: GeneratedPlanForApproval, allowedComm
     if (!isCommand || !allowed.has(String(c.value ?? '').trim())) {
       problems.push(`task "${String(c.taskName ?? '?')}" ${String(c.field ?? '?')}: ${String(c.value ?? '')}`);
     }
+  }
+  return problems;
+}
+
+// ─── Standards approval policy ───
+
+/** The parts of a proposed standards version the bench inspects before it plays the reviewer. */
+export interface ProposedStandardsForApproval {
+  version?: number;
+  status?: string;
+  contentHash?: string;
+  profile?: { commands?: Array<{ label?: string; run?: string }> };
+  commands?: Array<{ label?: string; run?: string }>;
+}
+
+/**
+ * The profile the bench product owner proposes for `scenario`: the scenario's
+ * own profile, or the stack's built-in one with no commands — which has no
+ * blocking rule at all, so every shipped scenario names a profile with a command. A cloned
+ * repository has code, so the built-in (written for an empty repository) is
+ * proposed as brownfield — the planner is not told to scaffold what exists.
+ */
+export function benchStandardsProfile(scenario: Pick<Scenario, 'stack' | 'repo' | 'standardsProfile'>): StandardsProfile {
+  if (scenario.standardsProfile) { return scenario.standardsProfile.profile; }
+  return { ...builtInProfile(scenario.stack), repoState: scenario.repo.kind === 'clone' ? 'brownfield' : 'greenfield', commands: [] };
+}
+
+/**
+ * Why the bench must NOT approve a proposed standards version, or an empty
+ * list when it may. Approving lets the version's commands run on the server on
+ * every run, and the bench approves without a human reading it, so it refuses:
+ * a version that is not pending; one whose content is not what the bench
+ * proposed (`expectedHash`); and any command — in the verbatim list the
+ * server shows a reviewer or in the profile itself — that is not exactly one of
+ * `allowedCommands` ({@link scenarioAllowedCommands}).
+ */
+export function standardsApprovalProblems(
+  version: ProposedStandardsForApproval | undefined, allowedCommands: readonly string[], expectedHash?: string,
+): string[] {
+  if (!version) { return ['the server returned no standards version to approve.']; }
+  const problems: string[] = [];
+  if (version.status !== 'pending') { problems.push(`standards v${String(version.version ?? '?')} is ${String(version.status ?? 'missing')}, not pending.`); }
+  if (typeof version.contentHash !== 'string' || version.contentHash === '') {
+    problems.push('the server returned no content hash for the standards version.');
+  } else if (expectedHash !== undefined && version.contentHash !== expectedHash) {
+    problems.push('the standards version the server holds is not the profile the bench proposed.');
+  }
+  if (!Array.isArray(version.commands)) { problems.push('the server returned no command list for the standards version.'); }
+  const allowed = new Set(allowedCommands.map((c) => c.trim()));
+  const seen = new Set<string>();
+  for (const c of [...(version.commands ?? []), ...(version.profile?.commands ?? [])]) {
+    const run = String(c.run ?? '');
+    if (allowed.has(run.trim()) || seen.has(run)) { continue; }
+    seen.add(run);
+    problems.push(`standards command "${String(c.label ?? '?')}": ${run}`);
   }
   return problems;
 }
@@ -322,7 +373,9 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
         if (ev.name === 'verify-started') { lastVerifyGateCommand = null; }
         if (ev.name === 'verify-progress' && ev.data) {
           // Verify stops at the first failing gate command, so the last one it
-          // announced is the one that failed. A browser UAT gate is not a repo command.
+          // announced is the one that failed. A browser UAT gate is not a repo command,
+          // and neither is the standards gate: its static rules announce phase 'standards'
+          // and its profile commands 'standards-command', so they never land here.
           if (ev.data.phase === 'gate' && typeof ev.data.detail === 'string') { lastVerifyGateCommand = ev.data.detail; }
           if (ev.data.phase === 'uat') { lastVerifyGateCommand = null; }
         }
@@ -333,6 +386,9 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
             passed: d.passed === true,
             failedGate,
             iterations: typeof d.iterations === 'number' ? d.iterations : 0,
+            // Only a failed REPO command names a command. A 'standards' failure is findings
+            // (or a profile command, reported in the standards report), so it stays null and
+            // is never mistaken for an environment problem with a gate command.
             failedCommand: failedGate === 'command' ? lastVerifyGateCommand : null,
           });
           lastVerifyGateCommand = null;
@@ -449,6 +505,44 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     }), 201, 'create project');
     projectId = (created.body.project as { id: string }).id;
     disposeSse = client.events('admin', projectId, onSse);
+
+    // ── Standards: proposed by the product owner, approved by the reviewer, before any plan ──
+    // The server proposes v1 itself when the project is created; the bench replaces it with
+    // the scenario's profile so the REVIEWED path (propose → approve) is what gets measured.
+    // It never uses accept-defaults. A refusal at any step stops the bench (exit 2) before
+    // a plan is requested. This is project setup, like creating the people: it is logged,
+    // not counted as an intervention.
+    {
+      const profile = benchStandardsProfile(scenario);
+      const source = scenario.standardsProfile ? `scenario profile ${path.basename(scenario.standardsProfile.file)}` : `${scenario.stack} built-in profile`;
+      const seenStd = expect(await client.call('po', 'GET', `/api/projects/${projectId}/standards`), 200, 'GET standards');
+      const before = ((seenStd.body.standards as { versions?: Array<{ version: number }> } | undefined)?.versions ?? []);
+      const baseVersion = before.length > 0 ? before[before.length - 1].version : null;
+      const proposed = await client.call('po', 'POST', `/api/projects/${projectId}/standards/versions`, { profile, baseVersion });
+      if (proposed.status !== 201) {
+        throw new BenchAbort(`standards proposal refused (${source}): HTTP ${proposed.status} ${String(proposed.body.error ?? '')} ${JSON.stringify(proposed.body.errors ?? proposed.body.message ?? '').slice(0, 500)}. No plan was requested.`);
+      }
+      const number = proposed.body.version as number;
+      const record = ((proposed.body.standards as { versions?: ProposedStandardsForApproval[] } | undefined)?.versions ?? []).find((x) => x.version === number);
+      const problems = standardsApprovalProblems(record, scenarioAllowedCommands(scenario), profileHash(profile));
+      if (problems.length > 0) {
+        log.write({ kind: 'standards-refused', version: number, problems });
+        throw new BenchAbort(`the bench will not approve standards v${number} unreviewed: ${problems.join(' ')} No plan was requested.`);
+      }
+      // A first version that brings a command changes enforcement, and the server approves
+      // that only with an acknowledgement. The bench gives it for exactly the content it just
+      // checked above: its own profile (the hash) with allow-listed commands only.
+      const approved = await client.call('reviewer', 'POST', `/api/projects/${projectId}/standards/versions/${number}/approve`, {
+        contentHash: record!.contentHash, acknowledgedEnforcementHash: record!.contentHash,
+      });
+      if (approved.status !== 200) {
+        throw new BenchAbort(`standards approval refused: HTTP ${approved.status} ${String(approved.body.error ?? '')} ${String(approved.body.message ?? '').slice(0, 300)}. No plan was requested.`);
+      }
+      log.write({ kind: 'standards-approved', version: number, contentHash: record!.contentHash, source, commands: profile.commands.map((c) => c.run) });
+      notes.push(`standards v${number} (${source}, ${profile.commands.length} command${profile.commands.length === 1 ? '' : 's'}) proposed by bench-po and approved by bench-reviewer before the first plan`);
+      progress(`standards v${number} approved (${source})`);
+      check();
+    }
 
     // ── Versions ──
     for (let i = 0; i < scenario.versions.length; i++) {
@@ -674,6 +768,17 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
             }
             if (green) {
               const approved = await approveGate(runId, deadline);
+              if (approved === 'standards-blocking') {
+                // The server refuses to ship over a standards check that stops the release (a
+                // failed command, or a blocking rule or command that was not checked). The
+                // approver does what a person would: rejects the ship. Nothing is shipped.
+                const note = 'the standards check before the ship gate stops this release, so the server refused the approval';
+                log.write({ kind: 'ship-refused-standards', version: v.id, runId });
+                expect(await c.call('approver', 'POST', `/api/projects/${pid}/runs/${runId}/gate/reject`, { note }), 200, 'reject gate');
+                unplanned('ship-refused-standards', note);
+                progress(`${v.id}: ${note}`);
+                continue;
+              }
               if (!approved) { break; }
               segments++;
               if (segments > MAX_SEGMENTS) {
@@ -746,8 +851,11 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     progress(`${v.id}: run ${status}; trace ${Object.entries(obs.trace).map(([k, s]) => `${k}=${s}`).join(' ')}`);
   }
 
-  /** Approver approves the halted gate; retries a 409 project-locked (never force-releases). */
-  async function approveGate(runId: string, deadline: number): Promise<boolean> {
+  /**
+   * Approver approves the halted gate; retries a 409 project-locked (never force-releases).
+   * `'standards-blocking'` when the server refuses because the pre-gate standards check stops the ship.
+   */
+  async function approveGate(runId: string, deadline: number): Promise<boolean | 'standards-blocking'> {
     const c = client!;
     const obs = current!;
     const lockDeadline = Math.min(deadline, deps.now() + deps.lockRetryMaxMs);
@@ -761,6 +869,10 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
         if (retries === 2) { obs.unplanned.push({ kind: 'lock-wait', at: at(), detail: 'gate approve got 409 project-locked; waiting for the previous task processes to exit' }); }
         await deps.sleep(deps.lockRetryMs);
         continue;
+      }
+      if (r.status === 409 && r.body.error === 'standards-blocking') {
+        obs.notes.push(`ship approval refused by the server: ${String(r.body.message ?? 'standards-blocking').slice(0, 300)}`);
+        return 'standards-blocking';
       }
       obs.notes.push(`gate approve failed: ${r.status} ${String(r.body.error ?? '')}`);
       if (r.status === 409 && r.body.error === 'project-locked') { obs.unplanned.push({ kind: 'lock-wait', at: at(), detail: 'gave up: the lock was still held' }); }

@@ -15,6 +15,7 @@ import * as path from 'path';
 import { ENGINE_IDS, EngineId, SEMVER_BUMPS, SemverBump } from '../models/types';
 import { SERVER_FORBIDDEN_ENGINES } from '../server/prd-ops';
 import { STACK_IDS, StackId } from '../server/stacks';
+import { StandardsProfile, validateProfile } from '../standards/profile';
 
 /** The intended bump of a PRD version: the first is always `initial`. */
 export type IntendedBump = 'initial' | SemverBump;
@@ -68,6 +69,23 @@ export interface Scenario {
   environmentProbes: string[];
   versions: ScenarioVersion[];
   dryRun?: { planCommand: string };
+  /**
+   * The project standards the bench product owner proposes and the bench
+   * reviewer approves before the first plan: a profile file inside the scenario
+   * directory, validated here. Every command it carries is an exact member of
+   * {@link scenarioAllowedCommands}. Absent: the stack's built-in profile.
+   */
+  standardsProfile?: { file: string; profile: StandardsProfile };
+}
+
+/**
+ * Every shell command a generated plan — or the scenario's standards profile —
+ * may carry and still be approved unread: the scenario's gate commands, its
+ * author-reviewed `allowedCommands`, and the dry-run plan command. Exact
+ * strings only; nothing here is a pattern.
+ */
+export function scenarioAllowedCommands(scenario: Pick<Scenario, 'gateCommands' | 'allowedCommands' | 'dryRun'>): string[] {
+  return [...scenario.gateCommands, ...scenario.allowedCommands, ...(scenario.dryRun ? [scenario.dryRun.planCommand] : [])];
 }
 
 /** A scenario field failed validation. `fieldPath` is the JSON path (e.g. `versions[1].intendedBump`). */
@@ -287,12 +305,38 @@ export function validateScenario(raw: unknown, file: string): Scenario {
     dryRun = { planCommand: reqString(raw.dryRun, 'planCommand', 'dryRun.planCommand', 500) };
   }
 
+  // standards profile: read as data, validated like any proposal, commands allow-listed.
+  let standardsProfile: Scenario['standardsProfile'];
+  if (raw.standardsProfile !== undefined) {
+    const profileFile = insideScenario(dir, reqString(raw, 'standardsProfile', 'standardsProfile'), 'standardsProfile');
+    if (!isFile(profileFile)) { throw new BenchScenarioError('standardsProfile', 'must be an existing file'); }
+    let doc: unknown;
+    try { doc = JSON.parse(fs.readFileSync(profileFile, 'utf-8')); } catch (err) {
+      throw new BenchScenarioError('standardsProfile', `cannot read the profile JSON: ${(err as Error).message}`);
+    }
+    const checked = validateProfile(doc);
+    if (!checked.ok) { throw new BenchScenarioError('standardsProfile', `is not a valid standards profile: ${checked.errors.slice(0, 5).join('; ')}`); }
+    if (checked.profile.stackTemplateId !== stack) {
+      throw new BenchScenarioError('standardsProfile.stackTemplateId', `must be the scenario's stack (${stack})`);
+    }
+    // Approving a profile lets its commands run on every run, so each one must be a
+    // command the scenario author already listed — the same exact-match rule as plans.
+    const allowed = new Set(scenarioAllowedCommands({ gateCommands, allowedCommands, ...(dryRun ? { dryRun } : {}) }).map((c) => c.trim()));
+    checked.profile.commands.forEach((c, i) => {
+      if (!allowed.has(c.run.trim())) {
+        throw new BenchScenarioError(`standardsProfile.commands[${i}].run`, `"${c.run}" is not one of the scenario's gateCommands, allowedCommands or dryRun.planCommand`);
+      }
+    });
+    standardsProfile = { file: profileFile, profile: checked.profile };
+  }
+
   return {
     file: path.resolve(file), dir, name, description, repo, setupCommands,
     stack: stack as StackId, engine: engine as EngineId,
     budgetUsd, perCallCapUsd, minVersionUsd, reserveFactor, versionTimeoutMin,
     passEnv, gateCommands, gateTimeoutMs, allowedCommands, environmentProbes, versions,
     ...(dryRun ? { dryRun } : {}),
+    ...(standardsProfile ? { standardsProfile } : {}),
   };
 }
 

@@ -4,8 +4,13 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as http from 'http';
+import { execFileSync } from 'child_process';
+import { isDeepStrictEqual } from 'util';
+import { collectStandardsInput, EMPTY_TREE_REF } from '../../../runner/evidence';
+import { checkStandards, StandardsReport } from '../../../standards/checker';
 import {
-  startHarness, Harness, waitFor, approvedProject, planWorker, gatedPlaylist, PRD_V1, PASSWORD, FakeWorker, enablePlannerFileAccess,
+  startHarness, Harness, waitFor, approvedProject, planWorker, gatedPlaylist, PRD_V1, PASSWORD, FakeWorker, enablePlannerFileAccess, FAKE_HEAD,
+  attestStandards,
 } from './app-harness';
 import { loadPlan, dehydratePlan } from '../../../models/plan';
 import { recordGateResults } from '../../../models/requirement-trace';
@@ -15,8 +20,13 @@ import { recommendStack } from '../../../server/stack-recommendation';
 import { OutcomeStore } from '../../../server/outcomes';
 import { SecretStore } from '../../../server/secrets';
 import { referencedEngines } from '../../../server/run-env';
-import { PlanJob } from '../../../server/worker-protocol';
+import { PlanJob, RunJob } from '../../../server/worker-protocol';
+import { verifyArgv } from '../../../server/run-worker';
 import { contentHash } from '../../../server/prd-ops';
+import { migrateStandards } from '../../../server/standards-store';
+import { readStandardsJobFile } from '../../../standards/local-store';
+import { profileHash, renderPlannerStandards, renderStandardsText } from '../../../standards/profile';
+import { sampleProfile } from '../standards/fixtures';
 
 describe('server app', function () {
   this.timeout(20000);
@@ -1133,7 +1143,7 @@ describe('server app', function () {
   // ─── Ship: approve → green verify → trace shows shipped ───
 
   /** Halt a fresh run at the SERVER-appended ship gate (the realistic shape: every task before it done). */
-  async function haltAtShipGate(): Promise<{ projectId: string; runId: string; shipGateId: string }> {
+  async function haltAtShipGate(preGate?: Record<string, unknown>): Promise<{ projectId: string; runId: string; shipGateId: string }> {
     const { projectId, planId } = await approvedProject(h);
     const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
     assert.equal(r.status, 202, r.raw);
@@ -1149,9 +1159,12 @@ describe('server app', function () {
     }
     assert.equal(tasks.find((t) => t.id === 't-rel')?.status, 'blocked', 'the release waits behind the ship gate');
     fs.writeFileSync(snapPath, JSON.stringify(snap));
+    // The standards check a real worker makes when it halts at the gate, when the test gives one.
+    if (preGate) { w.line(preGate); }
     w.line({ event: 'manual-gate', id: shipGate.id, name: shipGate.name });
     w.exit(3);
     await waitFor(() => h.state.load(projectId).runs[0].status === 'awaiting-approval');
+    if (preGate) { await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined); }
     return { projectId, runId, shipGateId: shipGate.id };
   }
 
@@ -1164,12 +1177,17 @@ describe('server app', function () {
     fs.writeFileSync(snapPath, JSON.stringify(dehydratePlan(snap)));
   }
 
-  /** What the resumed worker's verify pass leaves in its snapshot: the gate results it recorded. */
-  function verifyPass(w: FakeWorker, gates: Array<{ command: string; exitCode: number }>): void {
+  /**
+   * What the resumed worker's verify pass leaves behind: the gate results it recorded in its
+   * snapshot, and the standards report it sent — a passing one, made with the job file's
+   * own profile and base, unless `standards` says otherwise ('none' sends no report).
+   */
+  function verifyPass(w: FakeWorker, gates: Array<{ command: string; exitCode: number }>, standards: Record<string, unknown> | 'none' = {}): void {
     const snapPath = (w.job as { planPath: string }).planPath;
     const snap = loadPlan(snapPath);
     recordGateResults(snap, gates.map((g) => ({ ...g, timedOut: false })), new Date().toISOString());
     fs.writeFileSync(snapPath, JSON.stringify(dehydratePlan(snap)));
+    if (standards !== 'none') { attestStandards(w, standards); }
   }
 
   async function traceRows(projectId: string): Promise<Array<{ id: string; status: string; releaseTag: string | null }>> {
@@ -1198,6 +1216,19 @@ describe('server app', function () {
       ['R-1', 'shipped', `ship-${runId}`],
       ['R-2', 'shipped', `ship-${runId}`],
     ]);
+    // Each release row records the standards version the run was frozen on.
+    assert.equal(h.state.load(projectId).runs[0].standardsVersion, 1);
+    assert.deepEqual((rows as unknown as Array<{ standardsVersion: number | null }>).map((row) => row.standardsVersion), [1, 1]);
+    const canonical = h.state.loadCanonicalPlan(projectId, 'Acme', 'claude');
+    assert.ok((canonical.requirementTrace ?? []).every((rec) => rec.releases.at(-1)?.standardsVersion === 1), 'the stamp survives the merge into the canonical plan');
+    // This project's standards have no command and promote no rule: the release ships, and its
+    // stamp says "no blocking rules configured" beside the version — never that anything passed.
+    assert.deepEqual(h.standards.effective(projectId)!.profile.commands, []);
+    const counts = { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0, noBlockingRules: true };
+    assert.deepEqual((rows as unknown as Array<{ standardsCounts: unknown }>).map((row) => row.standardsCounts), [counts, counts]);
+    assert.ok((canonical.requirementTrace ?? []).every((rec) => isDeepStrictEqual(rec.releases.at(-1)?.standardsCounts, counts)));
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    assert.equal(h.state.load(projectId).runs[0].standardsSummary!.passed, 0, 'nothing passed: no command ran');
   });
 
   it('gate approve → failing verify: nothing ships', async () => {
@@ -1215,6 +1246,850 @@ describe('server app', function () {
       ['R-1', 'in-progress', null],
       ['R-2', 'in-progress', null],
     ]);
+  });
+
+  // ─── Standards on a run: frozen version, base ref, report, ship blocking ───
+
+  /** A `verify-standards` line as the worker's verify pass (or its pre-gate check) emits it. */
+  function standardsLine(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      event: 'verify-standards', phase: 'verify', version: 1, baseRef: FAKE_HEAD,
+      // A nested repository blocks only where the approved profile promotes the rule (see
+      // `withBlockingNestedRule`); every scan advises by default.
+      rules: [
+        { rule: 'structure/nested-repository', result: 'failed' },
+        { rule: 'naming/files', result: 'passed' },
+        { rule: 'layering/imports', result: 'not-checked', reason: 'No checker for .rs files' },
+        { rule: 'command', result: 'not-checked', reason: 'A standards rule failed first', command: 'npm run lint' },
+      ],
+      findings: [{ file: 'src/api/cart', line: 1, rule: 'structure/nested-repository', message: 'src/api/cart is a git repository of its own' }],
+      notCheckedFiles: [{ file: 'src/engine.rs', reason: 'No checker for .rs files' }],
+      totals: { passed: 0, noFindings: 1, failed: 1, notChecked: 2, findings: 1, notCheckedFiles: 1 },
+      ...over,
+    };
+  }
+
+  it('a run job carries the approved standards from a server-written file, and the run record freezes version, hash and base ref', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    const approved = h.standards.effective(projectId)!;
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    const runId = (r.body.run as { id: string }).id;
+    const job = h.workers.at(-1)!.job as RunJob;
+    assert.equal(job.standardsPath, path.join(h.state.runDir(projectId, runId), 'standards.json'), 'beside job.json, in the data dir');
+    const file = readStandardsJobFile(job.standardsPath!);
+    assert.equal(file.version, approved.version);
+    assert.equal(file.contentHash, approved.contentHash);
+    assert.equal(file.baseRef, FAKE_HEAD, 'HEAD as the server read it at run start');
+    assert.deepEqual(file.profile, approved.profile);
+    assert.equal(file.promptText, renderStandardsText(approved.profile, approved.version), 'the prompt text is rendered by the server');
+    assert.deepEqual(verifyArgv(job).slice(-2), ['--standards', job.standardsPath]);
+
+    const run = h.state.load(projectId).runs[0];
+    assert.equal(run.standardsVersion, approved.version);
+    assert.equal(run.standardsHash, approved.contentHash);
+    assert.equal(run.baseRef, FAKE_HEAD);
+    assert.equal(run.standardsSummary, undefined, 'no report yet');
+    const dto = await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' });
+    assert.equal((dto.body.runs as Array<{ standardsVersion: number }>)[0].standardsVersion, approved.version);
+    assert.equal('standardsReport' in (dto.body.currentRun as object), false, 'no report is not an empty report');
+  });
+
+  it('a version approved after run start does not change the running run, and its command never reaches the worker', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    const v1 = h.standards.effective(projectId)!;
+    // v2 adds a command; it is approved while the run waits at the ship gate.
+    const profile = sampleProfile();
+    profile.commands = [{ label: 'Extra', run: 'npm run added-after-run-start' }];
+    const proposed = await h.request('POST', `/api/projects/${projectId}/standards/versions`, { as: 'po', body: { profile, baseVersion: 1 } });
+    assert.equal(proposed.status, 201, proposed.raw);
+    const v2 = h.standards.pending(projectId)!;
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/standards/versions/2/approve`, {
+      as: 'reviewer', body: { contentHash: v2.contentHash, acknowledgedEnforcementHash: v2.contentHash },
+    })).status, 200);
+    assert.equal(h.standards.effective(projectId)!.version, 2);
+
+    const ap = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(ap.status, 202, ap.raw);
+    const job = h.workers.at(-1)!.job as RunJob;
+    const raw = fs.readFileSync(job.standardsPath!, 'utf-8');
+    const file = readStandardsJobFile(job.standardsPath!);
+    assert.equal(file.version, 1, 'the resumed segment is rewritten from the RECORDED version');
+    assert.deepEqual(file.profile.commands, v1.profile.commands);
+    assert.equal(file.baseRef, FAKE_HEAD, 'and keeps the base ref captured at run start');
+    assert.ok(!raw.includes('added-after-run-start'), 'a command absent from the frozen version is not in the job file');
+    const argv = verifyArgv(job);
+    assert.ok(!argv.includes('--gate') && !argv.join(' ').includes('added-after-run-start'), 'and never in the verify arguments');
+    assert.equal(h.state.load(projectId).runs[0].standardsVersion, 1);
+  });
+
+  it('a repository with no commits freezes a null base ref (every file counts as added)', async () => {
+    await h.close();
+    h = await startHarness({ gitHead: () => null });
+    const { projectId, planId } = await approvedProject(h);
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } })).status, 202);
+    assert.equal(h.state.load(projectId).runs[0].baseRef, null);
+    assert.equal(readStandardsJobFile((h.workers.at(-1)!.job as RunJob).standardsPath!).baseRef, null);
+  });
+
+  // The diff base is the last ref that SHIPPED. With HEAD-at-run-start as the base, work a
+  // run committed without shipping fell out of every later diff and was forgiven for good.
+  it('a violation committed between runs is still in the next run\'s diff: violating run → commit → clean delta run ends gaps, nothing ships', async function () {
+    this.timeout(60000);
+    await h.close();
+    let repo = '';
+    const git = (...args: string[]): string => execFileSync('git', args, { cwd: repo, encoding: 'utf-8' }).trim();
+    // The project's approved standards promote the placeholder-phrase scan: a finding of it stops a ship.
+    h = await startHarness({ gitHead: () => (repo ? git('rev-parse', 'HEAD') : null), promoteRules: ['comment-policy/banned-phrase'] });
+    const workspace = path.join(h.root, 'acme');
+    try {
+      execFileSync('git', ['init', '-q', '.'], { cwd: workspace });
+      repo = workspace;
+      git('config', 'user.email', 't@t.t');
+      git('config', 'user.name', 't');
+      git('config', 'core.autocrlf', 'false');
+      fs.writeFileSync(path.join(repo, 'README.md'), '# acme\n');
+      git('add', '-A');
+      git('commit', '-qm', 'seed');
+    } catch (err) {
+      if (err instanceof Error && /spawn EPERM/i.test(err.message)) { this.skip(); return; }
+      throw err;
+    }
+    const seed = git('rev-parse', 'HEAD');
+
+    /** What a real worker does at verify: check the workspace against the job file, report, exit on the result. */
+    const verifyStandards = async (w: FakeWorker): Promise<StandardsReport> => {
+      const file = readStandardsJobFile((w.job as RunJob).standardsPath!);
+      const report = checkStandards(file.profile, await collectStandardsInput(repo, file.baseRef, { probeDirs: file.profile.structure.requiredDirs }));
+      report.version = file.version;
+      w.line({ event: 'verify-standards', phase: 'verify', ...report, contentHash: file.contentHash, recordedBaseRef: file.baseRef });
+      w.line({ event: 'verify-finished', passed: report.totals.failed === 0, score: 0, failedGate: report.totals.failed > 0 ? 'standards' : null, iterations: 1 });
+      w.exit(report.totals.failed > 0 ? 1 : 0);
+      return report;
+    };
+
+    // Run 1 writes commented-out code and a banned phrase, and ends gaps.
+    const { projectId, planId } = await approvedProject(h);
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } })).status, 202);
+    assert.equal(h.state.load(projectId).runs[0].baseRef, seed, 'the first run diffs against HEAD as it stood');
+    fs.mkdirSync(path.join(repo, 'src', 'api'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'src', 'api', 'orders.ts'),
+      'export const orders = [];\n// const cache = warm(orders);\n// The rest of the code goes here.\n');
+    const first = await verifyStandards(h.workers.at(-1)!);
+    assert.deepEqual(first.findings.map((f) => [f.file, f.line, f.rule]), [
+      ['src/api/orders.ts', 2, 'comment-policy/commented-out-code'],
+      ['src/api/orders.ts', 3, 'comment-policy/banned-phrase'],
+    ]);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'gaps');
+    assert.equal(h.state.load(projectId).lastShipped, undefined, 'a run that did not ship never moves the base');
+
+    // The violating work is committed — what a full-auto agent's `git commit` does.
+    git('add', '-A');
+    git('commit', '-qm', 'orders');
+    const afterCommit = git('rev-parse', 'HEAD');
+    assert.notEqual(afterCommit, seed);
+
+    // PRD v2 adds an unrelated requirement; its delta plan runs and writes only clean code.
+    const prd = await h.request('GET', `/api/projects/${projectId}/prd`, { as: 'po' });
+    const latest = prd.body.latest as { createdAt: string; text: string };
+    await new Promise((r) => setTimeout(r, 3));
+    const v2 = await h.request('POST', `/api/projects/${projectId}/prd/versions`, { as: 'po', body: { text: `${latest.text}- Users can export orders as CSV\n`, baseCreatedAt: latest.createdAt } });
+    assert.equal(v2.status, 201, v2.raw);
+    h.onSpawn = planWorker({
+      kind: 'appended', rejected: [],
+      playlist: { id: 'pl-delta-2', name: 'PRD v1.1.0 delta', autoplay: true, tasks: [{ id: 't-export', name: 'Implement export', prompt: 'do it', requirementIds: ['R-3'] }] },
+    });
+    const gen = await h.request('POST', `/api/projects/${projectId}/plans`, { as: 'po', body: { mode: 'delta' } });
+    assert.equal(gen.status, 202, gen.raw);
+    const deltaId = (gen.body.plan as { id: string }).id;
+    await waitFor(() => h.state.load(projectId).plans.find((p) => p.id === deltaId)?.status === 'pending');
+    const hash = h.state.load(projectId).plans.find((p) => p.id === deltaId)!.contentHash;
+    const ap = await h.request('POST', `/api/projects/${projectId}/plans/${deltaId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    assert.equal(ap.status, 200, ap.raw);
+    h.onSpawn = () => { /* default */ };
+    const started = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId: deltaId } });
+    assert.equal(started.status, 202, started.raw);
+
+    const run2 = h.state.load(projectId).runs[1];
+    assert.equal(run2.baseRef, seed, 'still the base of the earliest unshipped run, not the HEAD the commit moved to');
+    const w2 = h.workers.at(-1)!;
+    const jobFile = readStandardsJobFile((w2.job as RunJob).standardsPath!);
+    assert.equal(jobFile.baseRef, seed);
+    fs.writeFileSync(path.join(repo, 'src', 'api', 'exports.ts'), 'export const toCsv = (rows: string[]): string => rows.join(\'\\n\');\n');
+
+    // From the HEAD the commit moved to, the same tree looks clean: this is the pass the old base gave.
+    const fromNewHead = checkStandards(jobFile.profile, await collectStandardsInput(repo, afterCommit, { probeDirs: jobFile.profile.structure.requiredDirs }));
+    assert.deepEqual(fromNewHead.findings, []);
+
+    const second = await verifyStandards(w2);
+    assert.deepEqual(second.findings.map((f) => [f.file, f.line]), [['src/api/orders.ts', 2], ['src/api/orders.ts', 3]], 'the committed violations are still found');
+    await waitFor(() => h.state.load(projectId).runs[1].status === 'gaps');
+    await waitFor(() => h.state.load(projectId).runs[1].standardsSummary !== undefined);
+    // The promoted placeholder phrase blocks; the commented-out line is advisory and is counted apart.
+    assert.equal(h.state.load(projectId).runs[1].standardsSummary!.failed, 1);
+    assert.equal(h.state.load(projectId).runs[1].standardsSummary!.advisory, 1);
+    assert.equal(h.state.load(projectId).runs[1].standardsSummary!.findings, 2);
+    assert.equal(h.state.load(projectId).runs[1].standardsSummary!.advisoryFindings, 1);
+    const rows = await traceRows(projectId);
+    assert.ok(rows.length >= 3 && rows.every((row) => row.status !== 'shipped' && row.releaseTag === null), JSON.stringify(rows));
+    assert.equal(h.state.load(projectId).lastShipped, undefined);
+  });
+
+  it('a stamped ship records HEAD as the last-shipped ref, and the next run diffs against it wherever HEAD has moved since', async () => {
+    await h.close();
+    let head = 'a'.repeat(40);
+    h = await startHarness({ gitHead: () => head });
+    const { projectId, runId } = await haltAtShipGate();
+    assert.equal(h.state.load(projectId).runs[0].baseRef, 'a'.repeat(40));
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    const w = h.workers.at(-1)!;
+    releaseRan(w, 'completed');
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    // The run committed its work before it shipped.
+    head = 'b'.repeat(40);
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => h.state.load(projectId).lastShipped !== undefined);
+    const shipped = h.state.load(projectId).lastShipped!;
+    assert.deepEqual([shipped.ref, shipped.runId], ['b'.repeat(40), runId]);
+
+    // Someone commits afterwards; the next run still diffs from the shipped ref.
+    head = 'c'.repeat(40);
+    const planId = h.state.load(projectId).runs[0].planId;
+    const again = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(again.status, 202, again.raw);
+    assert.equal(h.state.load(projectId).runs[1].baseRef, 'b'.repeat(40));
+    assert.equal(readStandardsJobFile((h.workers.at(-1)!.job as RunJob).standardsPath!).baseRef, 'b'.repeat(40));
+  });
+
+  it('a ship whose HEAD cannot be read never stores a null base: the previous base stays in force', async () => {
+    await h.close();
+    let head: string | null = 'a'.repeat(40);
+    h = await startHarness({ gitHead: () => head });
+    const { projectId, runId } = await haltAtShipGate();
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    const w = h.workers.at(-1)!;
+    releaseRan(w, 'completed');
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    // git stops answering just as the run ships.
+    head = null;
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => h.state.load(projectId).runs[0].endedAt !== undefined);
+    assert.equal(h.state.load(projectId).lastShipped, undefined, 'no ref, so no base is recorded');
+
+    // The next run diffs from the earliest run's base, not from the empty tree.
+    head = 'c'.repeat(40);
+    const planId = h.state.load(projectId).runs[0].planId;
+    const again = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(again.status, 202, again.raw);
+    assert.equal(h.state.load(projectId).runs[1].baseRef, 'a'.repeat(40));
+  });
+
+  it('a null last-shipped ref stored by an earlier build heals: the base falls back instead of staying null', async () => {
+    await h.close();
+    h = await startHarness({ gitHead: () => 'a'.repeat(40) });
+    const { projectId, runId } = await haltAtShipGate();
+    h.state.update(projectId, (s) => { s.lastShipped = { ref: null, runId, at: '2026-09-01T00:00:00.000Z' }; });
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    const w = h.workers.at(-1)!;
+    releaseRan(w, 'completed');
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).lastShipped?.ref === 'a'.repeat(40));
+
+    h.state.update(projectId, (s) => { s.lastShipped = { ref: null, runId, at: '2026-09-01T00:00:00.000Z' }; });
+    const planId = h.state.load(projectId).runs[0].planId;
+    const again = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(again.status, 202, again.raw);
+    assert.equal(h.state.load(projectId).runs[1].baseRef, 'a'.repeat(40), 'the earliest run\'s base, never null');
+  });
+
+  it('a resumed segment fails closed when the store no longer has the frozen version', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    fs.rmSync(h.standards.filePath(projectId));
+    const before = h.workers.length;
+    const ap = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(ap.status, 409, ap.raw);
+    assert.equal(ap.body.error, 'standards-not-approved');
+    assert.equal(h.workers.length, before, 'no segment was spawned');
+    assert.equal(h.state.load(projectId).runs[0].status, 'awaiting-approval');
+  });
+
+  /** Restart the harness with standards that PROMOTE the nested-repository rule, so a static rule can block. */
+  async function withBlockingNestedRule(): Promise<void> {
+    await h.close();
+    h = await startHarness({ promoteRules: ['structure/nested-repository'] });
+  }
+
+  /** Restart the harness with standards that carry one command: the blocking set every project should have. */
+  async function withLintCommand(): Promise<void> {
+    await h.close();
+    h = await startHarness({ profileCommands: [{ label: 'Lint', run: 'npm run lint' }] });
+  }
+
+  it('approved gate + every task completed + green command gates + a FAILED standards report → gaps, no release stamp, nothing shipped', async () => {
+    await withBlockingNestedRule();
+    const { projectId, runId } = await haltAtShipGate();
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    const w = h.workers.at(-1)!;
+    releaseRan(w, 'completed');
+    // The repository's own gates are all green; only the standards gate failed.
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    const snap = loadPlan((w.job as RunJob).planPath);
+    assert.ok(snap.playlists.at(-1)!.tasks.every((t) => t.status === TaskStatus.Completed), 'every task is completed');
+    w.line(standardsLine());
+    w.line({ event: 'verify-finished', passed: false, score: 0, failedGate: 'standards', iterations: 1 });
+    w.exit(1);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'gaps');
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).length > 0);
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+
+    const run = h.state.load(projectId).runs[0];
+    assert.equal(run.gateDecisions?.at(-1)?.action, 'approve', 'the last gate decision was an approval');
+    assert.equal(run.exitCode, 1);
+    const rows = await traceRows(projectId);
+    assert.deepEqual(rows.map((row) => [row.id, row.status, row.releaseTag]), [['R-1', 'in-progress', null], ['R-2', 'in-progress', null]]);
+    const canonical = h.state.loadCanonicalPlan(projectId, 'Acme', 'claude');
+    assert.ok((canonical.requirementTrace ?? []).every((rec) => rec.releases.length === 0), 'no release stamp was written');
+
+    // The report reached the run: totals on the record, the full report in the run dir.
+    assert.deepEqual({ ...run.standardsSummary, at: '' }, {
+      // One blocking failure (the promoted rule) and one blocking row not checked (the command that never ran).
+      phase: 'verify', version: 1, passed: 0, noFindings: 1, failed: 1, advisory: 0, notChecked: 2, blockingNotChecked: 1,
+      findings: 1, advisoryFindings: 0, notCheckedFiles: 1, at: '',
+    });
+    assert.equal(JSON.stringify(h.state.load(projectId)).includes('api/cart'), false, 'findings never enter state.json');
+    assert.equal(JSON.stringify(h.state.load(projectId)).includes('engine.rs'), false, 'and neither do the names of files that were not checked');
+    const dto = await h.request('GET', `/api/projects/${projectId}`, { as: 'approver' });
+    const detail = dto.body.currentRun as { standardsReport: { phase: string; report: { rules: Array<{ rule: string; result: string; reason?: string }>; findings: unknown[]; notCheckedFiles: unknown[]; totals: Record<string, number> } } };
+    assert.equal(detail.standardsReport.phase, 'verify');
+    assert.deepEqual(detail.standardsReport.report.findings,
+      [{ file: 'src/api/cart', line: 1, rule: 'structure/nested-repository', message: 'src/api/cart is a git repository of its own', severity: 'blocking' }]);
+    // The files no line rule read are in the stored report, with their reason, for the reviewer and the approver.
+    assert.deepEqual(detail.standardsReport.report.notCheckedFiles, [{ file: 'src/engine.rs', reason: 'No checker for .rs files' }]);
+    assert.equal(detail.standardsReport.report.totals.notCheckedFiles, 1);
+    // Not-checked rules are their own result, with a reason, and never in the passed total.
+    const notChecked = detail.standardsReport.report.rules.filter((x) => x.result === 'not-checked');
+    assert.deepEqual(notChecked.map((x) => x.rule), ['layering/imports', 'command']);
+    assert.equal(notChecked[0].reason, 'No checker for .rs files');
+    // A scan that found nothing is counted as "no findings", never as passed.
+    assert.equal(detail.standardsReport.report.totals.passed, 0);
+    assert.equal(detail.standardsReport.report.totals.noFindings, 1);
+  });
+
+  // ─── Exit 0 is not proof: the run must show its check was made with what the server froze ───
+
+  /** Approve the ship gate of a halted run and hand back the resumed worker, release done and gates green. */
+  async function resumedAfterApprove(projectId: string, runId: string): Promise<FakeWorker> {
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+    const w = h.workers.at(-1)!;
+    releaseRan(w, 'completed');
+    return w;
+  }
+
+  async function assertNothingShipped(projectId: string, why: RegExp): Promise<void> {
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'gaps');
+    const run = h.state.load(projectId).runs[0];
+    assert.equal(run.exitCode, 1);
+    assert.match(run.errorTail ?? '', why);
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).length > 0);
+    const rows = await traceRows(projectId);
+    assert.ok(rows.every((row) => row.status !== 'shipped' && row.releaseTag === null), JSON.stringify(rows));
+    const canonical = h.state.loadCanonicalPlan(projectId, 'Acme', 'claude');
+    assert.ok((canonical.requirementTrace ?? []).every((rec) => rec.releases.length === 0), 'no release stamp was written');
+    assert.equal(h.state.load(projectId).lastShipped, undefined, 'and the standards base did not move');
+  }
+
+  it('approved gate + green gates + exit 0 but NO verify-phase standards report → gaps, nothing shipped', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], 'none');
+    w.exit(0);
+    await assertNothingShipped(projectId, /the verification pass sent no standards report/);
+  });
+
+  it('a pre-gate report from the earlier segment, or one in this segment, does not stand in for the verify report', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } })).status, 202);
+    const runId = h.state.load(projectId).runs[0].id;
+    const w1 = h.workers.at(-1)!;
+    const snapPath = (w1.job as RunJob).planPath;
+    const snap = JSON.parse(fs.readFileSync(snapPath, 'utf-8'));
+    const tasks = snap.playlists.at(-1).tasks as Array<{ id: string; name: string; status?: string; dependsOn?: string[] }>;
+    const shipGate = tasks.find((t) => t.name === 'Ship approval')!;
+    for (const t of tasks) { t.status = t.id === shipGate.id ? 'failed' : (t.dependsOn ?? []).includes(shipGate.id) ? 'blocked' : 'completed'; }
+    fs.writeFileSync(snapPath, JSON.stringify(snap));
+    // Segment 1 sends a clean, fully attested VERIFY-shaped report, then halts at the gate.
+    attestStandards(w1);
+    w1.line({ event: 'manual-gate', id: shipGate.id, name: shipGate.name });
+    w1.exit(3);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'awaiting-approval');
+
+    const w2 = await resumedAfterApprove(projectId, runId);
+    verifyPass(w2, [{ command: 'npm test', exitCode: 0 }], 'none');
+    attestStandards(w2, { phase: 'pre-gate' });
+    w2.exit(0);
+    await assertNothingShipped(projectId, /the verification pass sent no standards report/);
+  });
+
+  it('a standards job file rewritten self-consistently after the tasks ran is caught by the server: gaps, nothing shipped', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    const frozen = h.state.load(projectId).runs[0];
+    const w = await resumedAfterApprove(projectId, runId);
+    const jobFile = (w.job as RunJob).standardsPath!;
+
+    // What an agent running as the worker's uid can do between play() and verify: empty the
+    // profile's checks and commands, and update the hash so the file still agrees with itself.
+    const doc = JSON.parse(fs.readFileSync(jobFile, 'utf-8'));
+    doc.profile.comments.forbidCommentedOutCode = false;
+    doc.profile.comments.bannedPhrases = [];
+    doc.profile.commands = [];
+    doc.contentHash = profileHash(doc.profile);
+    fs.writeFileSync(jobFile, JSON.stringify(doc));
+    const reread = readStandardsJobFile(jobFile);
+    assert.notEqual(reread.contentHash, frozen.standardsHash, 'the worker\'s own hash check accepts the rewritten file');
+
+    // The worker reports what it actually used — which is what the rewritten file says.
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    w.exit(0);
+    await assertNothingShipped(projectId, /not made against the approved standards v1/);
+  });
+
+  it('a job file whose base ref was moved to the current HEAD is caught the same way', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    const jobFile = (w.job as RunJob).standardsPath!;
+    const doc = JSON.parse(fs.readFileSync(jobFile, 'utf-8'));
+    assert.equal(doc.baseRef, FAKE_HEAD);
+    doc.baseRef = 'f'.repeat(40);
+    fs.writeFileSync(jobFile, JSON.stringify(doc));
+    assert.equal(readStandardsJobFile(jobFile).baseRef, 'f'.repeat(40), 'the file still reads as valid');
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    w.exit(0);
+    await assertNothingShipped(projectId, /not made against the base recorded for this run/);
+  });
+
+  it('a report that omits what it was checked against, or lists a failed rule at exit 0, ships nothing', async () => {
+    const a = await haltAtShipGate();
+    const wa = await resumedAfterApprove(a.projectId, a.runId);
+    verifyPass(wa, [{ command: 'npm test', exitCode: 0 }], { contentHash: undefined, recordedBaseRef: undefined });
+    wa.exit(0);
+    await assertNothingShipped(a.projectId, /not made against the approved standards v1/);
+
+    await withBlockingNestedRule();
+    const b = await haltAtShipGate();
+    const wb = await resumedAfterApprove(b.projectId, b.runId);
+    verifyPass(wb, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [{ rule: 'structure/nested-repository', result: 'failed' }],
+      findings: [{ file: 'cloned', line: 1, rule: 'structure/nested-repository', message: 'cloned is a git repository of its own' }],
+    });
+    wb.exit(0);
+    await assertNothingShipped(b.projectId, /the standards report lists a failed blocking rule/);
+  });
+
+  it('what blocks is decided by the profile the server froze: a blocking rule the report calls advisory still ships nothing', async () => {
+    await withBlockingNestedRule();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [{ rule: 'structure/nested-repository', result: 'failed', severity: 'advisory' }],
+      findings: [{ file: 'cloned', line: 1, rule: 'structure/nested-repository', message: 'cloned is a git repository of its own', severity: 'advisory' }],
+      totals: { passed: 0, failed: 0, advisory: 1, notChecked: 0, blockingNotChecked: 0, findings: 1, advisoryFindings: 1 },
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /the standards report lists a failed blocking rule/);
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.failed, summary.advisory, summary.advisoryFindings], [1, 0, 0], 'the stored totals are the server\'s, not the report\'s');
+  });
+
+  it('and the other way round: a rule the frozen profile holds as advisory cannot be made to block by the report', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [
+        { rule: 'structure/nested-repository', result: 'passed' },
+        { rule: 'comment-policy/banned-phrase', result: 'failed', severity: 'blocking' },
+      ],
+      findings: [{ file: 'src/a.ts', line: 2, rule: 'comment-policy/banned-phrase', message: 'Banned phrase in a comment', severity: 'blocking' }],
+    });
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.failed, summary.advisory, summary.advisoryFindings], [0, 1, 1], 'a text scan is advisory unless the approved profile promotes it');
+  });
+
+  it('an advisory failure at exit 0 ships: it is stored, shown with its severity, and stops nothing', async () => {
+    await withBlockingNestedRule();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [
+        { rule: 'structure/nested-repository', result: 'passed' },
+        { rule: 'comment-policy/commented-out-code', result: 'failed' },
+        { rule: 'comment-policy/banned-phrase', result: 'passed' },
+      ],
+      findings: [{ file: 'src/a.ts', line: 2, rule: 'comment-policy/commented-out-code', message: 'Commented-out code' }],
+    });
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => h.state.load(projectId).lastShipped !== undefined);
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.failed, summary.advisory, summary.findings], [0, 1, 1]);
+    const rows = await traceRows(projectId);
+    assert.ok(rows.every((row) => row.status === 'shipped'), JSON.stringify(rows));
+    // The reviewer and the approver still see it, marked for what it is.
+    const dto = await h.request('GET', `/api/projects/${projectId}`, { as: 'approver' });
+    const detail = dto.body.currentRun as { standardsReport: { report: { rules: Array<{ rule: string; result: string; severity: string }>; findings: Array<{ rule: string; severity: string }> } } };
+    assert.deepEqual(detail.standardsReport.report.findings.map((f) => [f.rule, f.severity]), [['comment-policy/commented-out-code', 'advisory']]);
+    assert.deepEqual(detail.standardsReport.report.rules.map((r) => [r.rule, r.result, r.severity]), [
+      ['structure/nested-repository', 'passed', 'blocking'],
+      ['comment-policy/commented-out-code', 'failed', 'advisory'],
+      ['comment-policy/banned-phrase', 'passed', 'advisory'],
+    ]);
+    assert.equal(summary.advisoryFindings, 1);
+  });
+
+  // ─── Unevaluated blocking evidence is not a pass: it stops the ship ───
+
+  it('a promoted rule that was not checked ships nothing, whatever the advisory scans read', async () => {
+    await withBlockingNestedRule();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      baseRef: null,
+      rules: [
+        // The one rule that blocks under this profile could not be evaluated; the scans beside it found nothing.
+        { rule: 'structure/nested-repository', result: 'not-checked', undecided: true, reason: 'No diff could be taken (not a git repository, or the base ref is unknown)' },
+        { rule: 'structure/required-dirs', result: 'passed' },
+        { rule: 'naming/files', result: 'passed' },
+        { rule: 'comment-policy/commented-out-code', result: 'passed' },
+      ],
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /the standards report lists a blocking rule or command that was not checked/);
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    assert.equal(h.state.load(projectId).runs[0].standardsSummary!.blockingNotChecked, 1);
+  });
+
+  it('a promoted rule the change gave nothing to judge is not checked either: no reason is weighed', async () => {
+    await withBlockingNestedRule();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [{ rule: 'structure/nested-repository', result: 'not-checked', reason: 'The diff holds nothing for this rule to check' }],
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /a blocking rule or command that was not checked/);
+  });
+
+  it('a profile command that never ran is a blocking row that was not evaluated: nothing ships', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [
+        { rule: 'structure/nested-repository', result: 'passed' },
+        { rule: 'command', result: 'not-checked', reason: 'Commands were not run', command: 'npm run lint' },
+      ],
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /a blocking rule or command that was not checked/);
+  });
+
+  it('a report that leaves an approved command out is not "nothing blocking": the server counts the command as not checked', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await haltAtShipGate();
+    assert.deepEqual(h.standards.effective(projectId)!.profile.commands, [{ label: 'Lint', run: 'npm run lint' }]);
+    const w = await resumedAfterApprove(projectId, runId);
+    // Every row it does send is clean — and the one command the approved profile runs is simply absent.
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [{ rule: 'structure/nested-repository', result: 'passed' }, { rule: 'comment-policy/commented-out-code', result: 'passed' }],
+      totals: { passed: 0, noFindings: 2, failed: 0, notChecked: 0, findings: 0 },
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /a blocking rule or command that was not checked/);
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.passed, summary.notChecked, summary.blockingNotChecked], [0, 1, 1], 'the stored totals are the server\'s');
+    const dto = await h.request('GET', `/api/projects/${projectId}`, { as: 'approver' });
+    const rules = (dto.body.currentRun as { standardsReport: { report: { rules: Array<{ rule: string; result: string; command?: string; reason?: string }> } } }).standardsReport.report.rules;
+    assert.deepEqual(rules.at(-1), { rule: 'command', severity: 'blocking', result: 'not-checked', reason: 'The report holds no result for this command', command: 'npm run lint' });
+  });
+
+  it('a report naming some other command does not stand in for the approved one', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [{ rule: 'command', result: 'passed', command: 'true', exitCode: 0 }],
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /a blocking rule or command that was not checked/);
+  });
+
+  it('a row that calls itself unconfigured cannot take a blocking rule or a command out of the set', async () => {
+    await withBlockingNestedRule();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      // `undecided` and `unconfigured` together: the worker's report cannot have it both ways.
+      rules: [
+        { rule: 'structure/nested-repository', result: 'not-checked', undecided: true, unconfigured: true, reason: 'x' },
+        { rule: 'command', result: 'not-checked', unconfigured: true, command: 'npm run lint' },
+      ],
+    });
+    w.exit(0);
+    await assertNothingShipped(projectId, /a blocking rule or command that was not checked/);
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    assert.equal(h.state.load(projectId).runs[0].standardsSummary!.blockingNotChecked, 2);
+  });
+
+  it('the approved command ran and passed → shipped and stamped, with no "no blocking rules" marker', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }]);
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).some((r) => r.releases.length > 0));
+    const rows = await traceRows(projectId) as unknown as Array<{ status: string; standardsVersion: number | null; standardsCounts: unknown }>;
+    const counts = { advisoryFindings: 0, notCheckedRules: 0, notCheckedFiles: 0 };
+    assert.deepEqual(rows.map((row) => [row.status, row.standardsVersion, row.standardsCounts]), [['shipped', 1, counts], ['shipped', 1, counts]]);
+  });
+
+  // ─── The ship gate itself: no approval over a standards check that stops the release ───
+
+  /** A pre-gate report as the worker sends it when it halts at the ship gate, attested like a real one. */
+  function preGateLine(rules: Array<Record<string, unknown>>, over: Record<string, unknown> = {}): Record<string, unknown> {
+    return { event: 'verify-standards', phase: 'pre-gate', version: 1, baseRef: FAKE_HEAD, rules, findings: [], ...over };
+  }
+
+  it('gate approve is refused 409 while the pre-gate report shows a failed command; reject and skip still work', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await haltAtShipGate(preGateLine([
+      { rule: 'structure/nested-repository', result: 'passed' },
+      { rule: 'command', result: 'failed', command: 'npm run lint', exitCode: 1, tail: 'src/a.ts: 3 problems' },
+    ]));
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.phase, summary.failed, summary.blockingNotChecked], ['pre-gate', 1, 0]);
+
+    const workers = h.workers.length;
+    const audited = h.auditEntries().length;
+    const refused = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: { note: 'ship it anyway' } });
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.error, 'standards-blocking');
+    assert.match(String(refused.body.message), /can't be approved: the standards check before the gate shows that 1 blocking rule or command failed/);
+    assert.deepEqual([refused.body.failed, refused.body.blockingNotChecked, refused.body.standardsVersion], [1, 0, 1]);
+    assert.equal(h.workers.length, workers, 'no segment was spawned');
+    assert.equal(h.auditEntries().length, audited, 'a refused approval writes no audit line');
+    const run = h.state.load(projectId).runs[0];
+    assert.equal(run.status, 'awaiting-approval');
+    assert.deepEqual(run.gateDecisions ?? [], [], 'and records no decision');
+
+    // The approver can still say no.
+    const rejected = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/reject`, { as: 'approver', body: { note: 'lint fails' } });
+    assert.equal(rejected.status, 200, rejected.raw);
+    assert.equal(h.state.load(projectId).runs[0].status, 'ship-rejected');
+  });
+
+  it('gate approve is refused 409 while the pre-gate report shows a blocking command or rule not checked', async () => {
+    await withLintCommand();
+    const a = await haltAtShipGate(preGateLine([
+      { rule: 'structure/nested-repository', result: 'passed' },
+      { rule: 'command', result: 'not-checked', command: 'npm run lint', reason: 'The check was stopped' },
+    ]));
+    const refused = await h.request('POST', `/api/projects/${a.projectId}/runs/${a.runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.error, 'standards-blocking');
+    assert.match(String(refused.body.message), /1 blocking rule or command was not checked/);
+    assert.deepEqual([refused.body.failed, refused.body.blockingNotChecked], [0, 1]);
+
+    // A skip ships nothing, so it is not held back.
+    const skipped = await h.request('POST', `/api/projects/${a.projectId}/runs/${a.runId}/gate/skip`, { as: 'admin', body: { reason: 'documentation only' } });
+    assert.ok(skipped.status === 202 || skipped.status === 403, skipped.raw);
+
+    // A pre-gate report that leaves the approved command out is the same thing.
+    await withLintCommand();
+    const b = await haltAtShipGate(preGateLine([{ rule: 'structure/nested-repository', result: 'passed' }]));
+    const omitted = await h.request('POST', `/api/projects/${b.projectId}/runs/${b.runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(omitted.status, 409, omitted.raw);
+    assert.equal(omitted.body.error, 'standards-blocking');
+
+    // And so is a promoted rule that could not be checked.
+    await withBlockingNestedRule();
+    const c = await haltAtShipGate(preGateLine([
+      { rule: 'structure/nested-repository', result: 'not-checked', undecided: true, reason: 'No diff could be taken' },
+    ]));
+    const unread = await h.request('POST', `/api/projects/${c.projectId}/runs/${c.runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(unread.status, 409, unread.raw);
+    assert.equal(unread.body.error, 'standards-blocking');
+  });
+
+  it('gate approve goes through when the pre-gate report stops nothing: commands passed, findings only advisory', async () => {
+    await withLintCommand();
+    const { projectId, runId } = await haltAtShipGate(preGateLine([
+      { rule: 'command', result: 'passed', command: 'npm run lint', exitCode: 0 },
+      { rule: 'comment-policy/commented-out-code', result: 'failed' },
+      { rule: 'layering/imports', result: 'not-checked', undecided: true, reason: 'No checker for .rs files (src/engine.rs)' },
+    ], { findings: [{ file: 'src/a.ts', line: 2, rule: 'comment-policy/commented-out-code', message: 'Commented-out code' }] }));
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.failed, summary.blockingNotChecked, summary.advisory], [0, 0, 1]);
+    const ap = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(ap.status, 202, ap.raw);
+  });
+
+  it('gate approve goes through with no blocking rules configured, and with no pre-gate report at all', async () => {
+    // The default harness profile: no command, nothing promoted.
+    const a = await haltAtShipGate(preGateLine([{ rule: 'structure/nested-repository', result: 'failed' }], {
+      findings: [{ file: 'cloned', line: 1, rule: 'structure/nested-repository', message: 'cloned is a git repository of its own' }],
+    }));
+    const summary = h.state.load(a.projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.failed, summary.advisory, summary.blockingNotChecked], [0, 1, 0], 'an advisory finding, even a nested repository, stops nothing');
+    assert.equal((await h.request('POST', `/api/projects/${a.projectId}/runs/${a.runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+
+    await h.close();
+    h = await startHarness();
+    const b = await haltAtShipGate();
+    assert.equal(h.state.load(b.projectId).runs[0].standardsSummary, undefined);
+    assert.equal((await h.request('POST', `/api/projects/${b.projectId}/runs/${b.runId}/gate/approve`, { as: 'approver', body: {} })).status, 202);
+  });
+
+  it('the blocking set evaluated → stamped, with what the check left open recorded beside the version', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], {
+      rules: [
+        { rule: 'structure/nested-repository', result: 'passed' },
+        { rule: 'command', result: 'passed', command: 'npm run lint', exitCode: 0 },
+        // Every scan below is advisory under the frozen profile: none of it holds the stamp back.
+        { rule: 'comment-policy/commented-out-code', result: 'failed' },
+        { rule: 'comment-policy/banned-phrase', result: 'not-checked', undecided: true, reason: 'No checker for .rs files (src/engine.rs)' },
+        { rule: 'layering/imports', result: 'not-checked', unconfigured: true, reason: 'Not configured in this profile' },
+      ],
+      findings: [
+        { file: 'src/a.ts', line: 2, rule: 'comment-policy/commented-out-code', message: 'Commented-out code' },
+        { file: 'src/a.ts', line: 9, rule: 'comment-policy/commented-out-code', message: 'Commented-out code' },
+      ],
+      notCheckedFiles: [{ file: 'src/engine.rs', reason: 'No checker for .rs files' }, { file: 'vendor/x/y.go', reason: 'vendored code' }],
+      totals: { findings: 2, advisoryFindings: 2, notCheckedFiles: 2 },
+    });
+    w.exit(0);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).some((r) => r.releases.length > 0));
+    const counts = { advisoryFindings: 2, notCheckedRules: 1, notCheckedFiles: 2 };
+    const rows = await traceRows(projectId) as unknown as Array<{ id: string; status: string; standardsVersion: number | null; standardsCounts: unknown }>;
+    assert.deepEqual(rows.map((row) => [row.id, row.status, row.standardsVersion, row.standardsCounts]),
+      [['R-1', 'shipped', 1, counts], ['R-2', 'shipped', 1, counts]]);
+    const canonical = h.state.loadCanonicalPlan(projectId, 'Acme', 'claude');
+    assert.ok((canonical.requirementTrace ?? []).every((rec) => isDeepStrictEqual(rec.releases.at(-1)?.standardsCounts, counts)), 'the counts survive the merge into the canonical plan');
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    // One pass: the command. The nested-repository scan found nothing, which is not a pass.
+    assert.deepEqual([summary.passed, summary.failed, summary.advisory, summary.advisoryFindings, summary.notCheckedFiles], [1, 0, 1, 2, 2]);
+    // Numbers only: neither a finding's file nor a not-checked file's name enters state.json or the trace.
+    const stored = JSON.stringify(h.state.load(projectId)) + JSON.stringify(canonical.requirementTrace);
+    assert.equal(/engine\.rs|vendor\/x|src\/a\.ts/.test(stored), false);
+  });
+
+  // The stored base lives in the agent-writable `.git`. Losing it must not turn the gate off.
+  it('a base commit removed from the workspace with plain git: the check falls back to the whole tree, the run ends gaps and nothing is stamped', async function () {
+    this.timeout(60000);
+    await h.close();
+    let repo = '';
+    const git = (...args: string[]): string => execFileSync('git', args, { cwd: repo, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    // The approved standards promote the placeholder-phrase scan, so its finding stops the run.
+    h = await startHarness({ gitHead: () => (repo ? git('rev-parse', 'HEAD') : null), promoteRules: ['comment-policy/banned-phrase'] });
+    const workspace = path.join(h.root, 'acme');
+    let branch = '';
+    try {
+      execFileSync('git', ['init', '-q', '.'], { cwd: workspace });
+      repo = workspace;
+      git('config', 'user.email', 't@t.t');
+      git('config', 'user.name', 't');
+      git('config', 'core.autocrlf', 'false');
+      fs.writeFileSync(path.join(repo, 'README.md'), '# acme\n');
+      git('add', '-A');
+      git('commit', '-qm', 'seed');
+      branch = git('rev-parse', '--abbrev-ref', 'HEAD');
+    } catch (err) {
+      if (err instanceof Error && /spawn EPERM/i.test(err.message)) { this.skip(); return; }
+      throw err;
+    }
+    const seed = git('rev-parse', 'HEAD');
+    const { projectId, runId } = await haltAtShipGate();
+    assert.equal(h.state.load(projectId).runs[0].baseRef, seed);
+
+    // Commit X disappears: an orphan history replaces the branch and the old objects are pruned.
+    git('checkout', '-q', '--orphan', 'fresh');
+    git('add', '-A');
+    git('commit', '-qm', 'fresh');
+    git('branch', '-D', branch);
+    git('reflog', 'expire', '--expire=now', '--all');
+    git('gc', '-q', '--prune=now');
+    assert.throws(() => git('cat-file', '-e', `${seed}^{commit}`), 'the recorded base is gone from the repository');
+
+    fs.mkdirSync(path.join(repo, 'src', 'domain'), { recursive: true });
+    fs.writeFileSync(path.join(repo, 'src', 'domain', 'extra.ts'),
+      'export const extra = 1;\n// const cached = cache.get(id);\n// rest of the code goes here\n');
+
+    const w = await resumedAfterApprove(projectId, runId);
+    verifyPass(w, [{ command: 'npm test', exitCode: 0 }], 'none');
+    // What the real verify pass does: check the workspace against the job file and exit on the result.
+    const file = readStandardsJobFile((w.job as RunJob).standardsPath!);
+    assert.equal(file.baseRef, seed, 'the resumed segment still carries the recorded base');
+    const report = checkStandards(file.profile, await collectStandardsInput(repo, file.baseRef, { probeDirs: file.profile.structure.requiredDirs }));
+    report.version = file.version;
+    assert.equal(report.baseRef, EMPTY_TREE_REF, 'not null: the diff was taken, against the empty tree');
+    const found = report.findings.filter((f) => f.file === 'src/domain/extra.ts').map((f) => [f.line, f.rule]);
+    assert.deepEqual(found, [[2, 'comment-policy/commented-out-code'], [3, 'comment-policy/banned-phrase']]);
+    assert.ok(report.totals.failed > 0);
+    w.line({ event: 'verify-standards', phase: 'verify', ...report, contentHash: file.contentHash, recordedBaseRef: file.baseRef });
+    w.line({ event: 'verify-finished', passed: false, score: 0, failedGate: 'standards', iterations: 1 });
+    w.exit(1);
+
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'gaps');
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary?.phase === 'verify');
+    assert.ok(h.state.load(projectId).runs[0].standardsSummary!.failed > 0);
+    await waitFor(() => (h.state.loadCanonicalPlan(projectId, 'Acme', 'claude').requirementTrace ?? []).length > 0);
+    const rows = await traceRows(projectId) as unknown as Array<{ status: string; releaseTag: string | null; standardsVersion: number | null }>;
+    assert.ok(rows.every((row) => row.status !== 'shipped' && row.releaseTag === null && row.standardsVersion === null), JSON.stringify(rows));
+    assert.equal(h.state.load(projectId).lastShipped, undefined);
+  });
+
+  it('a malformed verify-standards payload is dropped without throwing; the run carries on and a later valid report is kept', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } })).status, 202);
+    const runId = h.state.load(projectId).runs[0].id;
+    const w = h.workers.at(-1)!;
+    const reportFile = path.join(h.state.runDir(projectId, runId), 'standards-report.json');
+    for (const bad of [
+      { event: 'verify-standards', rules: 'nope', findings: [] },
+      { event: 'verify-standards', rules: [{ rule: 'made-up/rule', result: 'passed' }], findings: [] },
+      { event: 'verify-standards', rules: [{ rule: 'naming/files', result: 'probably-fine' }], findings: [] },
+      { event: 'verify-standards', rules: [], findings: [{ file: 'a.ts', line: 'one', rule: 'naming/files', message: 'x' }] },
+      { event: 'verify-standards' },
+    ]) { w.line(bad); }
+    w.line({ event: 'task-started', id: 't-impl', name: 'Implement checkout' });
+    await waitFor(() => h.app.jobs.view(projectId)?.tasks['t-impl'] === 'running');
+    assert.equal(fs.existsSync(reportFile), false, 'nothing malformed was stored');
+    assert.equal(h.state.load(projectId).runs[0].standardsSummary, undefined);
+
+    // A report whose claimed totals lie is recounted from its rows, and its command tail is bounded.
+    w.line(standardsLine({
+      phase: 'pre-gate',
+      rules: [{ rule: 'naming/files', result: 'not-checked', reason: 'Not configured in this profile' }, { rule: 'command', result: 'failed', command: 'npm run lint', exitCode: 2, tail: 'x'.repeat(5000) }],
+      findings: [], totals: { passed: 99, failed: 0, notChecked: 0, findings: 0 },
+    }));
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    const summary = h.state.load(projectId).runs[0].standardsSummary!;
+    assert.deepEqual([summary.phase, summary.passed, summary.failed, summary.notChecked], ['pre-gate', 0, 1, 1]);
+    const stored = JSON.parse(fs.readFileSync(reportFile, 'utf-8'));
+    assert.equal(stored.report.rules[1].tail.length, 2000);
   });
 
   it('a red gate never ships, even when the segment exits 0', async () => {
@@ -1320,6 +2195,7 @@ describe('server app', function () {
     for (const s of ['idle', 'stopping']) {
       for (const who of ['po', 'reviewer', 'approver', 'admin']) { assert.deepEqual(seen[s][who], [], `${s}/${who}`); }
     }
+    attestStandards(w);
     w.exit(0);
     await waitFor(() => h.state.load(projectId).runs[0].status === 'completed');
     assert.deepEqual(await runActions(projectId, 'reviewer'), [], 'a finished run offers no stop');
@@ -2029,3 +2905,177 @@ async function withSelfReviewer(h: Harness): Promise<Harness> {
   await h.close();
   return startHarness({ extraAccounts: { 'po-reviewer': ['product-owner', 'reviewer'] } });
 }
+
+// ─── Standards gate: no plan without an approved standards version ───
+
+describe('server app — standards gate', function () {
+  this.timeout(20000);
+  let h: Harness;
+  let projectId: string;
+
+  beforeEach(async () => {
+    // 'manual': nothing approves the automatic proposal behind the test's back.
+    h = await startHarness({ standards: 'manual' });
+    const r = await h.request('POST', '/api/projects', {
+      as: 'po', body: { name: 'Acme', source: { kind: 'path', path: 'acme' }, stack: 'node-ts', defaultEngine: 'claude' },
+    });
+    assert.equal(r.status, 201, r.raw);
+    projectId = (r.body.project as { id: string }).id;
+    const saved = await h.request('POST', `/api/projects/${projectId}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    assert.equal(saved.status, 201, saved.raw);
+  });
+  afterEach(async () => { await h.close(); });
+
+  const generate = () => h.request('POST', `/api/projects/${projectId}/plans`, { as: 'po', body: { mode: 'initial' } });
+  const prdActions = async (): Promise<{ actions: string[]; reason: unknown; standards: unknown }> => {
+    const r = await h.request('GET', `/api/projects/${projectId}/prd`, { as: 'po' });
+    return { actions: r.body.allowedActions as string[], reason: r.body.planBlockedReason, standards: r.body.standards };
+  };
+  const approveStandards = async (): Promise<void> => {
+    const pending = h.standards.pending(projectId)!;
+    const r = await h.request('POST', `/api/projects/${projectId}/standards/versions/${pending.version}/approve`, { as: 'reviewer', body: { contentHash: pending.contentHash, acknowledgedEnforcementHash: pending.contentHash } });
+    assert.equal(r.status, 200, r.raw);
+  };
+  /** Generate a plan and wait until it is pending review. Returns its id. */
+  const pendingPlan = async (): Promise<string> => {
+    h.onSpawn = planWorker({ kind: 'appended', playlist: gatedPlaylist(), rejected: [] });
+    const gen = await generate();
+    assert.equal(gen.status, 202, gen.raw);
+    await waitFor(() => h.state.load(projectId).plans.at(-1)?.status === 'pending');
+    h.onSpawn = () => { /* default */ };
+    return (gen.body.plan as { id: string }).id;
+  };
+
+  it('plan generation is 409 standards-not-approved with the state: no worker, no plan record, no directory, no audit line', async () => {
+    const auditBefore = h.auditEntries().length;
+    const r = await generate();
+    assert.equal(r.status, 409, r.raw);
+    assert.equal(r.body.error, 'standards-not-approved');
+    assert.equal(r.body.state, 'pending');
+    assert.equal(r.body.pendingVersion, 1);
+    assert.equal(h.workers.length, 0, 'no FakeWorker was spawned');
+    assert.equal(h.app.jobs.isActive(projectId), false);
+    assert.deepEqual(h.state.load(projectId).plans, []);
+    assert.equal(fs.existsSync(path.join(h.state.projectDir(projectId), 'plans')), false, 'no plan directory was created');
+    assert.equal(h.auditEntries().length, auditBefore);
+    assert.equal(h.auditEntries().filter((e) => e.action === 'plan.generate').length, 0);
+  });
+
+  it('a rejected proposal keeps the gate closed and says so', async () => {
+    const rj = await h.request('POST', `/api/projects/${projectId}/standards/versions/1/reject`, { as: 'reviewer', body: { reason: 'no test dir' } });
+    assert.equal(rj.status, 200, rj.raw);
+    const r = await generate();
+    assert.equal(r.status, 409);
+    assert.equal(r.body.error, 'standards-not-approved');
+    assert.equal(r.body.state, 'rejected');
+    assert.equal(r.body.pendingVersion, null);
+    assert.equal(h.workers.length, 0);
+  });
+
+  it('the generate actions are absent from the PRD DTO until a version is approved, with the reason', async () => {
+    const before = await prdActions();
+    assert.ok(!before.actions.includes('plan.generate') && !before.actions.includes('plan.generate-initial'), before.actions.join(','));
+    assert.ok(before.actions.includes('prd.save'), 'saving the PRD is not blocked');
+    assert.equal(before.reason, 'standards-not-approved');
+    assert.deepEqual(before.standards, { effectiveVersion: null, pendingVersion: 1, state: 'pending' });
+
+    await approveStandards();
+    const after = await prdActions();
+    assert.ok(after.actions.includes('plan.generate-initial'), after.actions.join(','));
+    assert.equal(after.reason, null);
+    assert.deepEqual(after.standards, { effectiveVersion: 1, pendingVersion: null, state: 'approved' });
+  });
+
+  it('after approval the plan job carries a standardsPath whose file holds the approved text, and the plan records the version', async () => {
+    // v2 is what gets approved; it carries a recognisable rule.
+    const profile = sampleProfile();
+    profile.freeText = 'Every handler validates its input first.';
+    const proposed = await h.request('POST', `/api/projects/${projectId}/standards/versions`, { as: 'po', body: { profile, baseVersion: 1 } });
+    assert.equal(proposed.status, 201, proposed.raw);
+    await approveStandards();
+
+    const planId = await pendingPlan();
+    const worker = h.workers.find((w) => w.job.kind === 'plan')!;
+    const job = worker.job as PlanJob;
+    assert.ok(job.standardsPath, 'the job names a standards file');
+    assert.equal(path.dirname(job.standardsPath!), path.join(h.state.projectDir(projectId), 'plans', planId), 'beside job.json, in the data dir');
+    assert.ok(!path.resolve(job.standardsPath!).startsWith(path.resolve(h.root) + path.sep), 'never inside a workspace');
+
+    const file = readStandardsJobFile(job.standardsPath!);
+    assert.equal(file.version, 2);
+    assert.equal(file.baseRef, null);
+    assert.deepEqual(file.profile, h.standards.effective(projectId)!.profile);
+    assert.equal(file.plannerText, renderPlannerStandards(file.profile, 2));
+    assert.equal(file.promptText, renderStandardsText(file.profile, 2));
+    assert.ok(file.plannerText.includes('> Every handler validates its input first.'));
+    assert.ok(file.plannerText.includes('Lint: npm run lint'), 'the approved command is in the planner text');
+
+    const plan = h.state.load(projectId).plans[0];
+    assert.equal(plan.standardsVersion, 2);
+    const dto = await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' });
+    assert.equal((dto.body.plans as Array<{ standardsVersion: number }>)[0].standardsVersion, 2);
+    assert.equal(h.auditEntries().filter((e) => e.action === 'plan.generate').length, 1);
+  });
+
+  it('a legacy pending plan is refused at approve while nothing is approved, and approvable once defaults are accepted', async () => {
+    await approveStandards();
+    const planId = await pendingPlan();
+    // Rewind to what an upgraded server holds: a pending plan with no standards version,
+    // and a project with no standards file until the boot migration proposes one.
+    h.state.update(projectId, (s) => { delete s.plans[0].standardsVersion; });
+    fs.rmSync(h.standards.filePath(projectId));
+    assert.deepEqual(await migrateStandards(h.projects, h.standards, h.audit, () => undefined), [projectId]);
+
+    const hash = h.state.load(projectId).plans[0].contentHash;
+    const auditBefore = h.auditEntries().length;
+    const refused = await h.request('POST', `/api/projects/${projectId}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.error, 'standards-not-approved');
+    assert.equal(refused.body.state, 'pending');
+    assert.equal(h.state.load(projectId).plans[0].status, 'pending');
+    assert.equal(h.auditEntries().length, auditBefore);
+
+    const pending = h.standards.pending(projectId)!;
+    const accepted = await h.request('POST', `/api/projects/${projectId}/standards/accept-defaults`, { as: 'admin', body: { contentHash: pending.contentHash, acknowledgedEnforcementHash: pending.contentHash } });
+    assert.equal(accepted.status, 200, accepted.raw);
+    const ok = await h.request('POST', `/api/projects/${projectId}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    assert.equal(ok.status, 200, ok.raw);
+  });
+
+  it('run start: a plan generated under standards fails closed when the store has lost them; a legacy approved plan still runs', async () => {
+    await approveStandards();
+    const planId = await pendingPlan();
+    const hash = h.state.load(projectId).plans[0].contentHash;
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } })).status, 200);
+
+    // The standards file is gone (store loss or tampering) but the plan says it was generated under v1.
+    fs.rmSync(h.standards.filePath(projectId));
+    const dto = await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' });
+    const planDto = (dto.body.plans as Array<{ startBlockedReason: string; allowedActions: string[] }>)[0];
+    assert.equal(planDto.startBlockedReason, 'standards-not-approved');
+    assert.ok(!planDto.allowedActions.includes('run.start'));
+    const workersBefore = h.workers.length;
+    const refused = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.error, 'standards-not-approved');
+    assert.equal(refused.body.state, 'none');
+    assert.equal(h.workers.length, workersBefore, 'no run worker was spawned');
+    assert.deepEqual(h.state.load(projectId).runs, []);
+
+    // The same plan as a legacy one (approved before the project had standards): it runs.
+    h.state.update(projectId, (s) => { delete s.plans[0].standardsVersion; });
+    const legacyDto = await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' });
+    assert.equal((legacyDto.body.plans as Array<{ startBlockedReason: string | null }>)[0].startBlockedReason, null);
+    const started = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(started.status, 202, started.raw);
+    // ...unchecked, and it says so everywhere: no job file, --no-standards, nothing on the record, no report.
+    const job = h.workers.at(-1)!.job as RunJob;
+    assert.equal(job.standardsPath, undefined);
+    assert.equal(verifyArgv(job).at(-1), '--no-standards');
+    const run = h.state.load(projectId).runs[0];
+    assert.deepEqual([run.standardsVersion, run.standardsHash, run.baseRef, run.standardsSummary], [undefined, undefined, undefined, undefined]);
+    assert.equal(fs.existsSync(path.join(h.state.runDir(projectId, run.id), 'standards.json')), false);
+    const detail = (await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' })).body.currentRun as object;
+    assert.equal('standardsReport' in detail, false, 'a legacy run has no standards report');
+  });
+});

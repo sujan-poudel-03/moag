@@ -23,8 +23,13 @@ import { WorkerJob } from '../../../server/worker-protocol';
 import { WebRole } from '../../../server/web-roles';
 import { verifyPassword } from '../../../server/passwords';
 import { SecretStore } from '../../../server/secrets';
+import { ProposeInput, StandardsStore, StandardsVersionRecord } from '../../../server/standards-store';
+import { readStandardsJobFile } from '../../../standards/local-store';
+import type { StandardsProfile, StandardsRuleId } from '../../../standards/profile';
 
 export const PASSWORD = 'Correct-Horse-Battery-9';
+/** The commit the stubbed git reports as HEAD of every fixture workspace. */
+export const FAKE_HEAD = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
 
 export class FakeWorker extends EventEmitter implements WorkerProcess {
   pid = 424242;
@@ -60,6 +65,7 @@ export interface Harness {
   audit: AuditLog;
   projects: ProjectStore;
   state: ProjectStateStore;
+  standards: StandardsStore;
   accounts: Record<string, UserRecord>;
   tokens: Record<string, { sid: string; csrfToken: string }>;
   workers: FakeWorker[];
@@ -98,6 +104,26 @@ export async function startHarness(over: {
   sseHeartbeatMs?: number;
   /** Job-lock liveness probe (default: the real one). */
   isPidAlive?: (pid: number) => boolean;
+  /**
+   * 'approved' (default): the store approves every automatic standards proposal at once
+   * ({@link AutoApprovingStandardsStore}), so tests about other features are not blocked
+   * by the standards gate. 'manual': the real store, nothing approved — for tests about
+   * the gate and the standards API themselves.
+   */
+  standards?: 'approved' | 'manual';
+  /**
+   * Scanner rules the auto-approved standards hold as BLOCKING. Every scanner rule is
+   * advisory by default; a test of what a blocking static rule does to a run starts from a
+   * project whose reviewer approved the promotion. Ignored with `standards: 'manual'`.
+   */
+  promoteRules?: StandardsRuleId[];
+  /**
+   * Commands every automatic proposal carries (and the stand-in reviewer approves): the
+   * blocking set of a project whose standards run a tool. Ignored with `standards: 'manual'`.
+   */
+  profileCommands?: Array<{ label: string; run: string }>;
+  /** What `git rev-parse HEAD` answers for a workspace (default: {@link FAKE_HEAD}); null = no commits. */
+  gitHead?: () => string | null;
 } = {}): Promise<Harness> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-app-'));
   const dataDir = path.join(tmp, 'data');
@@ -118,14 +144,21 @@ export async function startHarness(over: {
   const audit = new AuditLog(dataDir);
   const projects = new ProjectStore(dataDir);
   const state = new ProjectStateStore(dataDir);
+  const standards = over.standards === 'manual' ? new StandardsStore(dataDir)
+    : new AutoApprovingStandardsStore(dataDir, over.promoteRules ?? [], over.profileCommands ?? []);
   let verifyCount = 0;
   const workers: FakeWorker[] = [];
+
+  const headAnswer = (): { exitCode: number; stdout: string; stderr: string; timedOut: boolean } => {
+    const head = over.gitHead ? over.gitHead() : FAKE_HEAD;
+    return { exitCode: head === null ? 1 : 0, stdout: head === null ? '' : `${head}\n`, stderr: '', timedOut: false };
+  };
 
   const h = {} as Harness;
   h.onSpawn = () => { /* default: stay running */ };
 
   const app = createApp({
-    config, users, sessions, audit, projects, state,
+    config, users, sessions, audit, projects, state, standards,
     limiter: new LoginRateLimiter(),
     spawnWorker: (spec) => {
       const job = JSON.parse(fs.readFileSync(spec.jobPath, 'utf-8')) as WorkerJob;
@@ -138,7 +171,8 @@ export async function startHarness(over: {
     serverEnv: { PATH: process.env.PATH, MOAG_MASTER_KEY: 'server-master-secret', CI: 'true', SESSION_SECRET: 'nope' },
     verifyPassword: async (pw, stored) => { verifyCount++; return verifyPassword(pw, stored); },
     // `rev-parse --show-toplevel` answers the `-C` dir itself: every fixture folder is a repo root.
-    exec: async (_cmd, args) => ({
+    // `rev-parse HEAD` answers a fixed commit (or fails, for a repository with no commits).
+    exec: async (_cmd, args) => args.includes('HEAD') ? headAnswer() : ({
       exitCode: 0, stdout: args.includes('--show-toplevel') ? `${args[args.indexOf('-C') + 1]}\n` : 'true\n', stderr: '', timedOut: false,
     }),
     log: () => { /* quiet */ },
@@ -162,7 +196,7 @@ export async function startHarness(over: {
 
   Object.assign(h, {
     url: `http://127.0.0.1:${port}`,
-    app, config, dataDir, root, users, sessions, audit, projects, state, accounts, tokens, workers,
+    app, config, dataDir, root, users, sessions, audit, projects, state, standards, accounts, tokens, workers,
     verifyCalls: () => verifyCount,
     waitDone: (projectId: string) => waitFor(() => !app.jobs.isActive(projectId)
       && (state.load(projectId).plans[0]?.status ?? 'generating') !== 'generating'),
@@ -210,6 +244,69 @@ export async function startHarness(over: {
     },
   });
   return h;
+}
+
+/**
+ * A standards store that approves every AUTOMATIC proposal the moment it is made
+ * (as `harness-reviewer`, with no audit line). It stands in for the reviewer in
+ * tests that are about something else, whichever client created the project.
+ * Proposals made by a person are left pending, as in production.
+ */
+export class AutoApprovingStandardsStore extends StandardsStore {
+  /**
+   * `promoteRules`: scanner rules every automatic proposal holds as blocking; `commands`:
+   * commands every automatic proposal carries (see `startHarness`).
+   */
+  constructor(
+    dataDir: string, private readonly promoteRules: StandardsRuleId[] = [],
+    private readonly commands: StandardsProfile['commands'] = [],
+  ) { super(dataDir); }
+
+  propose(projectId: string, input: ProposeInput, now?: Date): StandardsVersionRecord {
+    const auto = input.origin === 'auto' && (this.promoteRules.length > 0 || this.commands.length > 0);
+    const profile = input.profile as StandardsProfile;
+    const promoted: ProposeInput = !auto ? input : {
+      ...input,
+      profile: {
+        ...profile,
+        ...(this.commands.length > 0 ? { commands: this.commands.map((c) => ({ ...c })) } : {}),
+        ...(this.promoteRules.length > 0
+          ? { severity: { ...(profile.severity ?? {}), ...Object.fromEntries(this.promoteRules.map((rule) => [rule, 'blocking'])) } } : {}),
+      },
+    };
+    const created = super.propose(projectId, promoted, now);
+    if (input.origin !== 'auto') { return created; }
+    // The stand-in reviewer acknowledges the enforcement changes too, as a person would have to.
+    return super.approve(projectId, created.version, {
+      contentHash: created.contentHash, by: 'harness-reviewer', acknowledgedEnforcementHash: created.contentHash,
+    }, now);
+  }
+}
+
+/**
+ * What a real worker's verify pass sends when the standards gate passed: a
+ * `verify-standards` line naming the profile hash and base ref it checked with,
+ * both taken from the job file the server wrote. A run frozen to a standards
+ * version ends `gaps` at exit 0 without one. No-op for a job with no standards.
+ */
+export function attestStandards(w: FakeWorker, over: Record<string, unknown> = {}): void {
+  const standardsPath = w.job.kind === 'run' ? w.job.standardsPath : undefined;
+  if (!standardsPath) { return; }
+  const file = readStandardsJobFile(standardsPath);
+  w.line({
+    event: 'verify-standards', phase: 'verify', version: file.version, baseRef: file.baseRef,
+    // Two scans that found nothing, and the blocking set: every command of the approved
+    // profile, run and passed. (A profile with no command has no blocking set at all.)
+    rules: [
+      { rule: 'structure/nested-repository', result: 'passed' },
+      { rule: 'comment-policy/commented-out-code', result: 'passed' },
+      ...file.profile.commands.map((c) => ({ rule: 'command', result: 'passed', command: c.run, exitCode: 0 })),
+    ],
+    findings: [],
+    totals: { passed: file.profile.commands.length, noFindings: 2, failed: 0, notChecked: 0, findings: 0 },
+    contentHash: file.contentHash, recordedBaseRef: file.baseRef,
+    ...over,
+  });
 }
 
 /** Wait until `pred` holds (the job end handlers run asynchronously under the project lock). */

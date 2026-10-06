@@ -113,4 +113,74 @@ describe('stack evidence pipeline (worker → JobManager → outcomes.jsonl)', (
     assert.equal(lines.filter((l) => l.status === 'completed').length, 0);
     assert.equal(lines.length, 1);
   });
+
+  it('a verify-standards report travels worker → JobManager as a verify event with its command tail redacted, and exit 1 ends the job as gaps', async () => {
+    const SECRET = 'sk-live-credential-0123456789';
+    const tasks: T[] = [{ id: 't1', name: 'one', status: 'pending' }];
+    const plan = { defaultEngine: 'claude', playlists: [{ tasks }] };
+    let proc!: PipeProc;
+    const seen: Array<{ event: string; name?: string; data?: Record<string, unknown> }> = [];
+    let end: { status: string; exitCode: number | null } | null = null;
+    const jobs = new JobManager({
+      dataDir: dir,
+      spawnWorker: () => { proc = new PipeProc(); return proc; },
+      maxConcurrent: 1,
+      runsDisabledReason: null,
+      killProcess: () => { /* not reached */ },
+    });
+    const job: RunJob = {
+      kind: 'run', runId: 'r1', workspace: dir, planPath: path.join(dir, 'plan.json'), startPlaylistIndex: 0, verify: true,
+      allowedEngines: ['claude'], standardsPath: path.join(dir, 'standards.json'),
+    };
+    const started = jobs.start({
+      projectId: 'p1', job, jobPath: path.join(dir, 'job.json'), workspace: dir, env: {}, redact: [SECRET],
+      onEvent: (ev) => { seen.push(ev as never); },
+      onEnd: (e) => { end = { status: e.status, exitCode: e.exitCode }; },
+    });
+    assert.equal(started.ok, true);
+
+    const runner = new ScriptedRunner(async (r) => {
+      r.emit('task-started', tasks[0], plan.playlists[0], 'prompt');
+      tasks[0].status = 'completed';
+      r.emit('task-completed', tasks[0], { stdout: '', stderr: '', exitCode: 0, durationMs: 1 });
+    });
+    (runner as unknown as { setStandardsProvider: () => void }).setStandardsProvider = () => { /* accepted */ };
+    const emit = (o: Record<string, unknown>): void => { proc.stdout.emit('data', Buffer.from(JSON.stringify(o) + '\n')); };
+    const deps: WorkerDeps = {
+      runner,
+      loadPlan: () => plan,
+      savePlanAtomic: () => { /* not under test */ },
+      getEngine: () => ({ runTask: async () => ({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 }) }),
+      generateDeltaPlan: async () => ({ kind: 'no-delta' }),
+      readStandardsJobFile: () => ({ version: 3, promptText: 'text', plannerText: 'planner' }),
+      checkAvailability: async () => [],
+      costLedger: { onRecord: () => () => { /* none */ }, onUnreported: () => () => { /* none */ } },
+      // What the verify pass does when the standards gate fails: report per rule, then exit 1.
+      runVerifyCore: async () => {
+        emit({
+          event: 'verify-standards', phase: 'verify', version: 3, baseRef: null,
+          rules: [{ rule: 'command', result: 'failed', command: 'npm run lint', exitCode: 1, tail: `lint failed; env had ${SECRET} in it` }],
+          findings: [], totals: { passed: 0, failed: 1, notChecked: 0, findings: 0 },
+        });
+        return 1;
+      },
+      emit,
+      onStop: () => () => { /* none */ },
+      env: {},
+      validateRoutingConfig: () => ({ dropped: [] }),
+      withSyntheticBaseline: (p) => p,
+      dehydratePlaylist: (_p, pl) => pl,
+    };
+    const code = await runJob(job, deps);
+    assert.equal(code, 1);
+    proc.emit('close', code);
+
+    const report = seen.find((e) => e.event === 'verify' && e.name === 'verify-standards');
+    assert.ok(report, 'the report arrived as a verify event');
+    const tail = String((report!.data!.rules as Array<{ tail: string }>)[0].tail);
+    assert.ok(!tail.includes(SECRET), 'the command tail was redacted before any consumer saw it');
+    assert.ok(tail.startsWith('lint failed; env had '));
+    assert.equal(report!.data!.phase, 'verify');
+    assert.deepEqual(end, { status: 'gaps', exitCode: 1 });
+  });
 });

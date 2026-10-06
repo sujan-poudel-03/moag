@@ -1,6 +1,6 @@
 import { strict as assert } from 'assert';
 import * as sinon from 'sinon';
-import { Plan, TaskStatus, RunnerState, EngineResult, EngineId } from '../../../models/types';
+import { Plan, Task, TaskStatus, RunnerState, EngineResult, EngineId } from '../../../models/types';
 import { createEmptyPlan, createPlaylist, createTask } from '../../../models/plan';
 import type { EngineCallUsage } from '../../../utils/usage-log';
 
@@ -1129,6 +1129,48 @@ describe('TaskRunner', () => {
     assert.equal(release.prdVersion, '2.0.0');
     assert.deepEqual(release.taskIds, [plan.playlists[0].tasks[0].id]);
     assert.ok(output.some((c) => c.includes('[Release] Shipped R-1 in PRD 2.0.0.')));
+    assert.equal('standardsVersion' in release, false, 'no standards on this host: no version is stamped');
+  });
+
+  it('a successful release stamps the standards version only when the last verification judged the diff against it; unreadable standards stamp none and do not fail the release', async () => {
+    const a = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+    a.runner.setStandardsProvider(() => ({ text: 'Project standards v7', version: 7 }));
+    const planA = tracedReleasePlan();
+    // What the PRD loop records when the standards gate really judged the diff: its own row.
+    planA.requirementTrace![0].gates.unshift({ command: 'moag:standards v7', exitCode: 0, timedOut: false, at: '2026-10-03T00:00:00.000Z' });
+    await a.runner.play(planA);
+    assert.equal(planA.playlists[0].tasks[1].status, TaskStatus.Completed);
+    assert.equal(planA.requirementTrace![0].releases[0].standardsVersion, 7);
+
+    // The host carries standards v7, but the last verification never judged the diff against
+    // them (no standards row among the gates): the release ships and claims no check.
+    const unjudged = buildRunner();
+    unjudged.runner.setStandardsProvider(() => ({ text: 'Project standards v7', version: 7 }));
+    const planU = tracedReleasePlan();
+    await unjudged.runner.play(planU);
+    assert.equal(planU.playlists[0].tasks[1].status, TaskStatus.Completed);
+    assert.equal(planU.requirementTrace![0].releases[0].releaseTag, 'v1.2.3');
+    assert.equal('standardsVersion' in planU.requirementTrace![0].releases[0], false);
+
+    // Judged — but against another version than the one in effect now: not this version's stamp.
+    const stale = buildRunner();
+    stale.runner.setStandardsProvider(() => ({ text: 'Project standards v8', version: 8 }));
+    const planS = tracedReleasePlan();
+    planS.requirementTrace![0].gates.unshift({ command: 'moag:standards v7', exitCode: 0, timedOut: false, at: '2026-10-03T00:00:00.000Z' });
+    await stale.runner.play(planS);
+    assert.equal('standardsVersion' in planS.requirementTrace![0].releases[0], false);
+
+    // The tag already exists by the time the stamp is written: a broken standards file
+    // must not turn a release that happened into a failed task.
+    const b = buildRunner();
+    b.runner.setStandardsProvider(() => { throw new Error('".moag/standards.json" contains invalid JSON.'); });
+    const planB = tracedReleasePlan();
+    await b.runner.play(planB);
+    assert.equal(planB.playlists[0].tasks[1].status, TaskStatus.Completed);
+    const release = planB.requirementTrace![0].releases[0];
+    assert.equal(release.releaseTag, 'v1.2.3');
+    assert.equal('standardsVersion' in release, false);
   });
 
   it('a failed git tag fails the release and stamps nothing (F3.5)', async () => {
@@ -1923,5 +1965,235 @@ describe('TaskRunner — deferred stop on manual-gate (server worker path)', () 
     } finally {
       if (prevCi === undefined) { delete process.env.CI; } else { process.env.CI = prevCi; }
     }
+  });
+});
+
+// ─── Project standards in the prompt ───
+
+describe('TaskRunner — project standards', () => {
+  const TEXT = 'Project standards v3 · stack node-ts · brownfield repository\n### Comments\n- Never leave commented-out code';
+  const SECTION = `## Project Standards\n${TEXT}`;
+
+  type ContextMode = 'off' | 'empty' | 'real';
+
+  /** A runner whose engine records every prompt. `real` loads the real context builder. */
+  function build(mode: ContextMode) {
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    const prompts: string[] = [];
+    const contextOptions: Array<Record<string, unknown>> = [];
+    engineRunStub.callsFake(async (opts: { prompt: string }) => { prompts.push(opts.prompt); return mockEngineResult; });
+    spawnStub = sinon.stub().callsFake(() => createSpawnProc());
+
+    const stubs: Record<string, unknown> = {
+      'vscode': vscodeMock,
+      '../adapters/index': { getEngine: () => mockEngine },
+      'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+    };
+    if (mode !== 'real') {
+      stubs['../context/context-builder'] = {
+        buildContext: (opts: Record<string, unknown>) => { contextOptions.push(opts); return ''; },
+        getContextSettings: () => ({ enabled: mode !== 'off', maxContextChars: 30000, maxFileContextChars: 4000 }),
+        runRetrievalCascade: async () => ({ spans: [], usedSemantic: false }),
+        adaptiveContextBudget: (_t: unknown, base: number) => base,
+      };
+    }
+    const { TaskRunner } = proxyquire('../../../runner/runner', stubs);
+    return { runner: new TaskRunner(historyStore), prompts, contextOptions, mockEngine };
+  }
+
+  function plan(tasks: Array<{ name: string; prompt: string; type?: 'agent' | 'command'; command?: string; dependsOn?: string[] }> = [{ name: 'Only', prompt: 'Do the thing' }]): Plan {
+    const p = createEmptyPlan('Standards Plan');
+    const pl = p.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    for (const spec of tasks) {
+      const t = createTask(spec.name, spec.prompt);
+      if (spec.type) { t.type = spec.type; }
+      if (spec.command) { t.command = spec.command; }
+      pl.tasks.push(t);
+    }
+    return p;
+  }
+
+  const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  describe('run-start hook', () => {
+    it('runs once per run, before the first task reaches its engine', async () => {
+      const { runner, prompts } = build('off');
+      const seen: Array<{ cwd: string; promptsSoFar: number }> = [];
+      runner.setRunStartHook(async (cwd: string) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        seen.push({ cwd, promptsSoFar: prompts.length });
+      });
+
+      await runner.play(plan([{ name: 'One', prompt: 'first' }, { name: 'Two', prompt: 'second' }]));
+
+      assert.equal(seen.length, 1, 'once for the run, not once per task');
+      assert.equal(seen[0].promptsSoFar, 0, 'awaited before any task started');
+      assert.equal(typeof seen[0].cwd, 'string');
+      assert.equal(prompts.length, 2);
+    });
+
+    it('a hook that throws or rejects never fails the run', async () => {
+      for (const hook of [() => { throw new Error('disk full'); }, async () => { throw new Error('git missing'); }]) {
+        const { runner, prompts } = build('off');
+        const errors: Error[] = [];
+        runner.on('error', (err: Error) => errors.push(err));
+        runner.setRunStartHook(hook);
+        const p = plan();
+        await runner.play(p);
+        assert.equal(prompts.length, 1);
+        assert.equal(p.playlists[0].tasks[0].status, TaskStatus.Completed);
+        assert.deepEqual(errors, []);
+      }
+    });
+
+    it('fires for a single-task run and a task-list run too, and not at all once cleared', async () => {
+      const single = build('off');
+      let calls = 0;
+      single.runner.setRunStartHook(() => { calls++; });
+      await single.runner.playTask(plan(), 0, 0);
+      assert.equal(calls, 1);
+
+      const list = build('off');
+      list.runner.setRunStartHook(() => { calls++; });
+      await list.runner.playTasks(plan(), [{ playlistIndex: 0, taskIndex: 0 }]);
+      assert.equal(calls, 2);
+
+      const cleared = build('off');
+      cleared.runner.setRunStartHook(() => { calls++; });
+      cleared.runner.setRunStartHook(null);
+      await cleared.runner.play(plan());
+      assert.equal(calls, 2);
+    });
+  });
+
+  it('carries the standards even when context is disabled', async () => {
+    const { runner, prompts } = build('off');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+
+    await runner.play(plan());
+
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0].startsWith(`${SECTION}\n\n`), prompts[0]);
+    assert.ok(prompts[0].includes('Do the thing'));
+  });
+
+  it('hands the text to the context builder, and prepends it when the built context lacks the section', async () => {
+    const { runner, prompts, contextOptions } = build('empty');
+    runner.setStandardsProvider(() => ({ text: `  ${TEXT}\n`, version: 3 }));
+
+    await runner.play(plan());
+
+    assert.equal(contextOptions[0].standards, TEXT, 'trimmed text reaches the builder');
+    assert.equal(occurrences(prompts[0], '## Project Standards'), 1);
+    assert.ok(prompts[0].startsWith(SECTION));
+  });
+
+  it('with the real context builder: ## Project Standards sits directly before ## AI Rules, exactly once', async () => {
+    const { runner, prompts } = build('real');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+    runner.setAiRulesStore({ getEnabledText: () => '### House Rule\nKeep modules small' } as never);
+
+    await runner.play(plan());
+
+    assert.equal(occurrences(prompts[0], '## Project Standards'), 1, 'no duplicate from the fallback');
+    assert.ok(prompts[0].includes(`${SECTION}\n\n## AI Rules\n### House Rule`), prompts[0].slice(0, 600));
+    assert.ok(prompts[0].indexOf('[CONTEXT START]') < prompts[0].indexOf('## Project Standards'));
+  });
+
+  it('with the real context builder and a budget smaller than the block: still whole, still once', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer.context', { maxContextChars: 1000 });
+    const big = `${TEXT}\n${'- another convention line for the agent\n'.repeat(80)}`.trim();
+    assert.ok(big.length > 3000);
+    const { runner, prompts } = build('real');
+    runner.setStandardsProvider(() => ({ text: big, version: 3 }));
+    runner.setAiRulesStore({ getEnabledText: () => '### House Rule\nKeep modules small' } as never);
+
+    await runner.play(plan());
+
+    assert.ok(prompts[0].includes(`## Project Standards\n${big}`), 'the whole block is present');
+    assert.equal(occurrences(prompts[0], '## Project Standards'), 1);
+    assert.ok(!prompts[0].includes('## AI Rules'), 'the squeeze drops other sections, never the standards');
+  });
+
+  it('passes the built-in rules the store already carries as skipRuleNames', async () => {
+    const { runner } = build('off');
+    const seen: Array<{ cwd: string; skipRuleNames: string[] }> = [];
+    runner.setStandardsProvider((cwd: string, opts: { skipRuleNames: string[] }) => { seen.push({ cwd, ...opts }); return { text: TEXT, version: 1 }; });
+    runner.setAiRulesStore({ getEnabledText: () => '### Clean Code\nbody\n\n### Test-Driven Development\nbody\n\n### My Own Rule\nbody' } as never);
+
+    await runner.play(plan());
+
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0].skipRuleNames, ['Clean Code', 'Test-Driven Development']);
+  });
+
+  it('adds nothing when no provider is set, or the provider reports no standards', async () => {
+    const none = build('off');
+    await none.runner.play(plan());
+    assert.ok(!none.prompts[0].includes('## Project Standards'));
+
+    const empty = build('off');
+    empty.runner.setStandardsProvider(() => null);
+    await empty.runner.play(plan());
+    assert.ok(!empty.prompts[0].includes('## Project Standards'));
+
+    const cleared = build('off');
+    cleared.runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+    cleared.runner.setStandardsProvider(null);
+    await cleared.runner.play(plan());
+    assert.ok(!cleared.prompts[0].includes('## Project Standards'));
+  });
+
+  it('a provider that throws fails the task with the file-named error and never calls the engine', async () => {
+    const { runner, prompts } = build('off');
+    runner.setStandardsProvider(() => { throw new Error('".moag/standards.json" contains invalid JSON. Check for syntax errors.'); });
+    const failed: Array<{ name: string; stderr: string; exitCode: number }> = [];
+    const output: string[] = [];
+    runner.on('task-failed', (t: Task, r: EngineResult) => failed.push({ name: t.name, stderr: r.stderr, exitCode: r.exitCode }));
+    runner.on('task-output', (_t: Task, text: string) => output.push(text));
+    runner.on('error', () => undefined);
+
+    const p = plan([{ name: 'First', prompt: 'a' }, { name: 'Second', prompt: 'b' }]);
+    p.playlists[0].tasks[1].dependsOn = [p.playlists[0].tasks[0].id];
+    await runner.play(p);
+
+    assert.equal(prompts.length, 0, 'no agent may run without the standards it is bound by');
+    assert.equal(p.playlists[0].tasks[0].status, TaskStatus.Failed);
+    assert.equal(failed[0].name, 'First');
+    assert.match(failed[0].stderr, /"\.moag\/standards\.json" contains invalid JSON/);
+    assert.equal(failed[0].exitCode, 1);
+    assert.ok(output.some((o) => /\[Standards Error\] "\.moag\/standards\.json" contains invalid JSON/.test(o)));
+    assert.equal(p.playlists[0].tasks[1].status, TaskStatus.Blocked, 'a dependent task is blocked, not run');
+  });
+
+  it('does not ask for standards for a task that sends no prompt to an agent', async () => {
+    const { runner } = build('off');
+    let calls = 0;
+    runner.setStandardsProvider(() => { calls++; throw new Error('must not be reached'); });
+
+    const p = plan([{ name: 'Build', prompt: '', type: 'command', command: 'echo ok' }]);
+    await runner.play(p);
+
+    assert.equal(calls, 0);
+    assert.equal(p.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('keeps the block when a huge task prompt forces the 80K truncation', async () => {
+    const { runner, prompts } = build('off');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+
+    await runner.play(plan([{ name: 'Huge', prompt: 'x'.repeat(90_000) }]));
+
+    assert.ok(prompts[0].startsWith(`${SECTION}\n\n`));
+    assert.ok(prompts[0].includes('[prompt truncated at 80K chars]'));
+    assert.ok(prompts[0].length < 80_100);
   });
 });

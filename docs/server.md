@@ -206,8 +206,9 @@ Mount it read-only (as a file or a Docker/Swarm/Kubernetes secret) and set `MOAG
   probe/                                     engine probe job files
   projects/<id>/plan.json                    canonical plan (outside the workspace)
   projects/<id>/state.json                   plans under review, runs, spend per PRD version
-  projects/<id>/runs/<runId>/                job, config, plan snapshot, events
-  projects/<id>/plans/<planId>/              plan-generation job, repo file listing, outcome; work/ = its empty cwd
+  projects/<id>/standards.json               every proposed version of the project standards (0600)
+  projects/<id>/runs/<runId>/                job, config, plan snapshot, events, standards job file and report
+  projects/<id>/plans/<planId>/              plan-generation job, repo file listing, standards job file, outcome; work/ = its empty cwd
   workspaces/<name>/                         the git checkouts agents work in
 ```
 
@@ -292,6 +293,289 @@ To give agents more, such as a package-registry token, list the names:
 
 Names must match `^[A-Z_][A-Z0-9_]*$`. `MOAG_*` and `CI` are rejected at boot. Anything passed through is readable by every agent on this server.
 
+## Project standards
+
+Every project has one agreed, versioned **standards profile**. Every planner and task prompt carries it, and every run is checked against it before anything is marked shipped. No model is asked at any step: detection, proposal and checking are deterministic.
+
+**MOAG blocks on your project's own tools; its own scans are advisory unless you promote them.** What stops a release is the profile's **commands** — real linters, formatters, type-checkers and tests, judged by their exit code — and nothing else by default. Everything MOAG scans for itself, required directories and nested repositories included, is **advisory**: it is reported with file, line and rule, and stops nothing. See [Blocking and advisory rules](#blocking-and-advisory-rules).
+
+### The profile
+
+A profile is a JSON object with exactly these sections. Unknown keys are rejected at every level.
+
+| Section | Holds |
+|---|---|
+| `stackTemplateId` | One of the server's stack ids. |
+| `repoState` | `greenfield` or `brownfield`. For greenfield, the planner is told that the first task scaffolds the required directories. |
+| `structure` | `requiredDirs`, `allowedTopLevel` (names or globs), and `placement` rules (`{id, files, under[]}`: files matching a glob belong under one of the listed directories). A required directory is a path inside the repository: an absolute path (`/x`, `C:\x`, `\\host\x`), any `..` segment and any invisible or format character are rejected, and separators are normalised to `/` (a leading `./` and a trailing or doubled `/` are dropped). Its case is kept, and it is compared case-sensitively with the paths git lists. |
+| `frontend` | `componentKit`, `styleSource`, and `rawPatterns` (`{id, kind, value, globs[], message}`). `kind` is `literal` (plain text) or `builtin` (`hex-color`, `css-color-function`, `inline-style`). |
+| `backend` | `layers` (`{name, globs[]}`), `forbiddenImports` (`{from, to}` layer names) and `importAliases` (`{prefix, path}`). |
+| `naming` | `files` (`{globs[], style}`, style one of `kebab-case`, `camelCase`, `PascalCase`, `snake_case`) and `notes`. |
+| `comments` | `maxDensityPct`, `minAddedLines`, `forbidCommentedOutCode`, `bannedPhrases[]`. |
+| `testing` | `runner`, `fileGlobs[]`, `notes`. |
+| `commands` | Up to 6 `{label, run}` entries. Each `run` is one line of at most 500 characters. |
+| `builtInRuleIds` | Ids of MOAG's built-in AI rules. The rule text is referenced, never copied. |
+| `freeText` | Up to 20,000 characters of project rules in prose. |
+
+Limits and refusals:
+
+- Lists hold at most 50 entries of at most 200 characters each.
+- A value that looks like a credential (`sk-…`, `ghp_…`, `AKIA…`, a PEM header) is refused.
+- A profile never carries a regular expression. Patterns are literals, globs (`*`, `**`, `?`) or a named built-in.
+- The text a prompt carries is at most 4,000 characters. The structured rules are always included in full; a profile whose structured rules alone exceed the cap is refused. Free text is added as a quoted block and cut to the room that is left. Built-in rule bodies are inlined while they fit, and listed by name otherwise.
+
+Each proposed field is tagged `detected` (with the file that proved it) or `assumed` (the stack default). The tags are stored beside the profile as `provenance`. A detected directory's evidence ends in `tracked by git`; when git gave no listing, the structure fields are `assumed` and their evidence says why no directory was proposed.
+
+For an existing repository the file-naming rule follows the names the repository already has, measured over the first 1,000 source files. If at least 70% of the names a rule covers fit one style, that style is proposed, and tagged `detected` when a name proves it (`useAuth` proves camelCase; `index` proves nothing). If the names fit no single style, no naming rule is proposed and `naming/files` reports `not-checked`.
+
+A `detected` tag is the server's own statement, so a person's edit cannot inherit it:
+
+- When a person proposes a version, each area is compared with the last automatic version the proposal descends from, not with the version it was edited from.
+- An area that is still identical to that automatic version keeps its tag.
+- Every other area is tagged `assumed`, with the evidence `entered by <username>`. This includes a value that is submitted again unchanged on top of someone's edit.
+- A proposal with no automatic ancestor is tagged `entered by <username>` throughout.
+
+The screen also marks what changed since the previous version.
+
+### Versions and who decides
+
+Standards live in `projects/<id>/standards.json` in the data directory, outside the workspace. The server never reads a `.moag/standards.json` or `.moag/rules.json` that a repository ships.
+
+- Proposing always creates version N+1 as `pending`. A pending version that a newer proposal replaces becomes `superseded`.
+- A reviewer approves or rejects a pending version. An approved version is never changed again.
+- The version **in effect** is the latest approved one. It stays in effect while a newer proposal is pending or rejected.
+- A project keeps at most 200 versions.
+
+| Action | Roles | Route |
+|---|---|---|
+| Read | any signed-in user | `GET /api/projects/:id/standards` |
+| `standards.propose` | product-owner, admin | `POST /api/projects/:id/standards/versions` with `{profile, baseVersion}` |
+| `standards.approve` | reviewer | `POST …/standards/versions/:version/approve` with `{contentHash, acknowledgedEnforcementHash?}` |
+| `standards.reject` | reviewer | `POST …/standards/versions/:version/reject` with `{reason}` |
+| `standards.accept-defaults` | admin | `POST …/standards/accept-defaults` with `{contentHash, acknowledgedEnforcementHash?}` |
+
+- `baseVersion` is the latest version the proposer saw. If someone proposed in between, the answer is `409 stale`.
+- Approve and accept-defaults echo the `contentHash` the user saw. If it does not match, the answer is `409 hash-mismatch` and nothing is approved. A version that was already decided answers `409 already-decided`.
+- A version that **changes enforcement** (see [Changing what blocks](#changing-what-blocks)) is put into effect only with an acknowledgement: the approve or accept-defaults body must also carry `acknowledgedEnforcementHash`, equal to that version's `contentHash`. Without it, or with the hash of other content, the answer is `409 acknowledgement-required` with the differing `fields` and `comparedTo`; nothing is approved and nothing is audited. The review screen sends it only after the reviewer ticks the checkbox under the enforcement changes.
+- An invalid profile answers `400 invalid-standards` with the list of problems in `errors`.
+- A **product owner or an admin proposes; a reviewer approves or rejects.** That holds for every change to the standards, including promoting a rule to blocking or demoting one. A reviewer who wants a change asks for a proposal, or rejects the pending one with the reason.
+- A user who holds both roles and approves their own proposal is allowed. The audit entry is flagged `self-approval`.
+- Every mutation writes one audit entry holding the version number, the content hash and the origin (`auto` or `user`), plus what the version changes about enforcement (see **Changing what blocks** below): for each differing field, what it held before and after. That includes command lines and labels, required directories and rule severities — they decide what can stop a release, and an auditor needs to read them. No other profile text (free text, notes, style source) is written to the audit log. A refused request writes nothing.
+
+Approving a version lets its `commands` run in the project workspace on every run. The reviewer is shown each command exactly as it will run.
+
+### The plan gate
+
+- `POST /api/projects/:id/plans` answers `409 standards-not-approved` while no version is approved. No job starts and nothing is audited. The response carries `state` (`pending`, `rejected` or `none`) and `pendingVersion`.
+- The PRD resource omits the generate actions from `allowedActions` in that state and sets `planBlockedReason: "standards-not-approved"`.
+- The check is made again when a plan is approved, so a plan that was pending before the project had standards cannot be approved while none are approved.
+- A run is refused with the same code only when its plan was generated under standards and the store no longer has an approved version (loss or tampering). The server fails closed.
+
+### New and existing projects
+
+- **New project:** `POST /api/projects` proposes v1 at once. Detection reads **only the files git tracks** in the workspace (`git ls-files`, asked asynchronously, with a minimal environment that carries no `GIT_DIR` or `GIT_WORK_TREE`) and lays what it finds over the stack's built-in profile. A directory that `.gitignore` names, or that is merely on disk, is never proposed — as a required directory, in the allowed layout, or anywhere else. A repository with no tracked source files is proposed as greenfield, with every field `assumed`.
+- **When git gives no listing** — the workspace is not a repository or not its root, git is missing or times out, or git refuses the directory (`safe.directory`: "dubious ownership") — no directory is proposed at all, and the provenance of the structure fields says why (for example `no directory is proposed: git refuses this workspace: it is owned by another user (see git safe.directory)`). Facts about the code itself (stack, test runner, lint configuration) are still read from disk.
+- **Existing project:** at boot, each project without a standards file gets the same automatic v1, marked `migrated`. The audit entry is written by `system` with the flags `auto-proposed` and `migration`, plus `enforcement-changed` when the proposal brings a command or a required directory (it is measured against an empty baseline). A migrated workspace usually holds earlier runs' build and test output; none of it is proposed, because only what git tracks is. A second boot proposes nothing. If detection fails, the proposal is the built-in profile with every field `assumed`; the boot never fails for it.
+- A migrated project has two ways forward:
+  - a reviewer approves the proposal (or a product owner edits it first), or
+  - an admin **accepts the defaults**. This is offered only while the project is `migrated` and its pending version is still the untouched automatic one. It is audited as `standards.accept-defaults`, never as an approval, and the version is shown as "not reviewed". It needs the same acknowledgement as an approval when the proposal changes enforcement.
+- Until then, new plans are blocked. Plans that were approved before the project had standards can still run. Such a run is not checked, has no standards report, and stamps no standards version on the trace.
+- Changing a project's stack proposes nothing. The standards resource reports `stackMismatch: true` and the screen says so.
+- Rolling back to an older server build is safe: it ignores `standards.json`. The standards version on a release row is dropped the next time that build saves the plan.
+
+### What a run does with them
+
+1. **At run start** the server freezes the version in effect on the run record, with its content hash and the diff base. A version approved later does not change a run that has started. A resumed segment uses the recorded version.
+   - **The diff base is the last ref that shipped, not `HEAD` at run start.** When a run stamps a release, the server records the workspace's `HEAD` as the project's last-shipped ref, and every later run diffs against it. Before the first ship, a run uses the base of the project's earliest run; only the very first run uses `HEAD` as it stands. A ship whose `HEAD` cannot be read does not move the base: the previous one stays, so the next check covers that ship's work again rather than diffing against the empty tree. A last-shipped entry without a ref (written by an earlier build) is ignored the same way.
+   - This keeps unshipped work inside the check. If a run commits a violation and ends `gaps`, the next run still sees that commit in its diff. Committing work never clears it.
+   - If there is no base (a repository with no commits), every file counts as added.
+   - If a base was recorded but the repository no longer has that commit (its history was rewritten and pruned, or the workspace was cloned again), the check also falls back to the empty tree: every file is judged as added, and the report's `baseRef` shows the empty-tree id. Code written before the run is then in scope and can fail the run. A lost base never turns the check off.
+   - If a base was recorded and no diff can be taken at all, the standards gate fails.
+   - A rule that finds nothing in the diff to judge is `not-checked`, never "no findings". An empty diff clears nothing.
+2. The server writes the version to `projects/<id>/runs/<runId>/standards.json` and gives the worker that path. The file holds the profile and the prompt text, rendered by the server. The worker never renders the text, never infers a command, and never builds an AI-rules store.
+3. **Every task prompt** carries the text under `## Project Standards`, directly before `## AI Rules`. It is present even when context building is turned off or the context budget is smaller than the block.
+4. **Before the ship gate**, when the run halts for approval, the worker checks the standards once with no model call and sends a report marked `pre-gate`. The approver sees it, and it binds: while it shows a blocking failure, or a blocking rule or command that was **not checked**, `POST …/gate/approve` answers `409 standards-blocking` with a message that says which, and nothing resumes. Rejecting the ship is always possible; a skip, which ships nothing, is not held back. The check is made on the totals the server stored on the run record, never on a file in the run directory.
+5. **After the gate**, the run's verification checks the standards again. That check decides.
+6. **When the run ends**, the server accepts a clean exit only with proof of that check. The worker's report names the hash of the profile it used and the base ref it was given, and the server compares both, and the version, with what it froze on the run record at run start. If the run exited 0 without a verify-phase report, or the report was made with a different profile or base, the run ends `gaps` and nothing is shipped. The standards job file sits in the run directory, which an agent can write; this comparison is what detects a rewritten file.
+
+### The verification order
+
+Verification applies its gates in this order and stops at the first failure. No model is called unless all of them pass.
+
+1. **status**: every task reached a completed state.
+2. **change**: the diff is not empty.
+3. **standards, static rules**: the diff is checked against the profile.
+4. **command**: the repository's own gate commands.
+5. **standards, profile commands**: the profile's `commands`. A command that already ran as a repository gate is not run twice.
+6. **UAT** and **artifacts**, as before.
+
+A **blocking** failure in step 3 or 5 is reported as the failed gate `standards`. The run ends with status `gaps` (worker exit 1), the approved ship is not stamped, and no requirement becomes `shipped`, even when every task completed and the ship gate was approved. An **advisory** finding is reported in the same place with the same detail and stops nothing; see [Blocking and advisory rules](#blocking-and-advisory-rules).
+
+With a default profile, step 3 stops nothing: every static rule is advisory. What stops a run is step 5, the profile's commands. Step 3 can stop a run only where a project promoted a rule.
+
+**Unevaluated blocking evidence is not a pass.** After step 5 the blocking set — the commands, and any promoted rule the profile configures — is in one of three states, and the gate row `moag:standards v<N>` says which:
+
+| Blocking set | Gate row | Release |
+|---|---|---|
+| evaluated: every blocking row has a result and none failed | exit 0, `nothing blocking` | ships, stamped with the standards version |
+| a blocking row failed or has findings | exit 1 | stopped (`gaps`) |
+| a blocking row was **not checked**: a command never ran, or a promoted rule could not read a changed file, had no diff, or found nothing in the change to judge | exit 1, `could not be checked`, naming each row and its reason | stopped (`gaps`) |
+| none configured: no command and no promoted rule | exit 0, `no blocking rules configured` | ships; the stamp carries `noBlockingRules` and is shown as "no blocking rules configured", never as passed |
+
+The row's text also gives the number of advisory findings, of rules not checked and of files not checked. When an earlier gate already failed (a repository command, say), the profile's commands are listed as not checked in the report and no standards row is written at all: the run has already failed.
+
+On the hosted server the same rule is applied a second time to the worker's report: which rows block is decided by the profile the server froze on the run, and a command of that profile the report says nothing about is added as not checked. A report that merely leaves a command out therefore stops the ship; it can never read as "no blocking rules".
+
+Release and deploy tasks run after the ship gate and before this verification, as they do for a failing test suite. A deploy can therefore have happened before a standards failure is found. The pre-gate report exists so that the approver sees the result first.
+
+### What is checked
+
+The static rules look only at what the run changed: added lines of changed files, and for naming and placement, added and renamed files. Code the run did not touch is not judged.
+
+- **Renames are detected.** A file git matches to one that existed at the base (`git mv`, or a plain move whose content is byte-for-byte a deleted file) is `renamed`: its new path is judged for placement and naming, and only the lines the change really altered count as added. Moving a legacy file adds no line. Every diff is taken with an explicit rename limit of 20,000 files, so neither a large change nor a `diff.renameLimit` or `diff.renames` setting in the repository's git config can turn detection off. This holds for the committed and staged versions below as well.
+- **A nested repository is reported, never read past.** A directory that is a git repository of its own is one entry to git, which shows none of its files. The rule `structure/nested-repository` reads the **current state of the tree** — no base ref enters into it:
+  - a gitlink in the index that no **tracked** `.gitmodules` declares, and an untracked directory holding a `.git`, are each a finding on the rule, naming the directory, **and** the directory is listed under files not checked as `not checked (nested repository — files inside were not read)`. It makes no difference whether this change added it or it has been there for years;
+  - a submodule a tracked `.gitmodules` declares is listed as `not checked (submodule — files inside were not read)` and is no finding. A `.gitmodules` that exists only in the working tree declares nothing;
+  - untracked directories are taken from git's own listing with its standard excludes, so `.git/info/exclude` and a global excludes file hide one exactly as `git status` would.
+
+  The rule is advisory by default, like every scan; promoted, a finding stops the release.
+- **What is committed is what ships.** A file committed since the base and then deleted or rewritten in the working tree without a commit is judged a second time, from the commit. Its findings say so.
+- **What is staged is what the next commit ships.** Content that was `git add`ed and then deleted from, or rewritten in, the working tree is not in a working-tree diff at all. It is judged from the index, and its findings say so. A staged version that adds no line to a file the working tree still holds (a `git mv` followed by an unstaged edit) is not listed a second time.
+
+Which files changed is decided without trusting git state that leaves no trace in the repository:
+
+- Untracked files are listed honouring `.gitignore` files only. `.git/info/exclude` and a global excludes file are ignored, so a file listed there is still checked. On a developer's own machine this means files hidden only by a global ignore (editor folders, `.DS_Store`) are seen by `moag standards check`; add them to `.gitignore` or to the profile's allowed top level.
+- A tracked file flagged `assume-unchanged` or `skip-worktree` in the index is listed as changed and unread. Its rules are `not-checked`, and the report names it.
+
+Vendored and generated files are not judged like hand-written code. A file under a top-level `vendor/`, `node_modules/` or `third_party/` directory — or under a deeper `node_modules/` beside a `package.json`, or a deeper `vendor/` beside a `go.mod`, `composer.json` or `Gemfile` — a file named `*.pb.go`, `*.g.cs` or `*.Designer.cs`, the Maven and Gradle wrapper scripts, and a file whose first five lines carry `Code generated … DO NOT EDIT`, `@generated` or `<auto-generated` **in a comment** is left out. A directory that merely has the name (`src/vendor/`) and a marker inside a string literal exempt nothing. Such a file is left out of the placement, naming, raw-pattern, layering and comment rules. The top-level rule still applies to it. A profile cannot yet name its own generated directories.
+
+**Every exemption is visible.** The report lists each changed file the line rules did not read, as `not checked (<reason>)`, and counts them (`notCheckedFiles`, `totals.notCheckedFiles`):
+
+- vendored code, and whether this change added it;
+- a generated file, and whether this change added or newly marked it;
+- a file in a language with no lexer (`No checker for .rb files`);
+- a file of a type no scanner reads, as `unsupported type (<type>)`: build scripts (`.gradle`, `.kts`), shell scripts (`.sh`, `.bash`, `.zsh`), component and stylesheet dialects (`.vue`, `.svelte`, `.scss`, `.sass`, `.less`), `.mdx`, `.svg`, pipeline and tool configuration (`.yml`, `.yaml`, `.toml`), `Dockerfile`, `Containerfile` and `Makefile`. These are code or configuration a project is built from; a change to one is listed, never skipped in silence;
+- a file that could not be read or lexed (too large, binary, an ambiguous construct), with the reason;
+- a directory that is a nested repository or a submodule (see above).
+
+Such a file is never evidence for "no findings": a rule that read nothing else is `not-checked`. Plain data and prose (`.json`, `.md`, `.txt`, an image, `LICENSE`) is out of scope for the line rules and is not listed. The list is capped at 200 entries; the count is always the true one.
+
+A file this change **newly marked as generated** — it wrote the marker comment, on a new file or onto an existing one — is also a finding of its own, on the marker's line, under the rule `exemption/newly-generated`. It is advisory by default. A file that is generated by its name or vendored by its directory carries no marker anybody wrote: it is listed as not checked and is no finding.
+
+| Rule | Default | Checks |
+|---|---|---|
+| `structure/required-dirs` | advisory | Each required directory holds at least one path git lists for the tree — tracked, or untracked and not ignored. The comparison is case-sensitive whatever the file system is: `SRC` does not satisfy `src`. An empty directory, and one that only `.gitignore`d files sit in, does not exist for this rule. |
+| `structure/top-level` | advisory | A new top-level entry is in the allowed layout. |
+| `structure/placement` | advisory | An added or renamed file that matches a placement rule sits under one of its directories. |
+| `structure/nested-repository` | advisory | The tree holds no directory that is a git repository of its own and that no tracked `.gitmodules` declares. |
+| `frontend/raw-pattern` | advisory | No added line contains a configured raw pattern. |
+| `layering/imports` | advisory | No added import crosses a forbidden layer boundary. Relative imports, declared aliases, the repository's own workspace packages (`package.json` `workspaces`, `pnpm-workspace.yaml`) and TypeScript path aliases are resolved: `compilerOptions.paths` and `baseUrl` in `tsconfig.json`, `tsconfig.base.json` or `jsconfig.json` at the root and above each changed file, with `extends` followed, and with project `references` followed one level (a "solution" config whose paths live in `tsconfig.app.json`). An alias import that cannot be resolved leaves the rule `not-checked`; it is never reported as "no findings". `.mts` and `.cts` files are read like `.ts`. For Python, `from <package> import <name>` also checks each imported name as a submodule. |
+| `naming/files` | advisory | An added or renamed file's name follows the configured style. |
+| `comment-policy/commented-out-code` | advisory | No added comment is commented-out code. A comment counts when it is unmistakably a statement, or when two code-shaped comment lines sit together. A call-shaped note such as `// O(1)` or `// rgb(0, 0, 0)` is not code on its own, and neither is an indented example in a Go doc comment. |
+| `comment-policy/banned-phrase` | advisory | No added comment contains a banned phrase. Each phrase is matched against **one comment**: a single `//` or `#` comment, or one whole block comment with its lines put back together. Two comments on one line, or on neighbouring lines, are never run together. A phrase written as a comment (`// rest of the code`) must be the whole comment, give or take surrounding dots and brackets, a leading "the" and a leading `TODO:`; an ellipsis in a phrase matches `...`, `..` and `…`. The built-in list holds truncation placeholders only: whole-comment placeholders (`// rest of the code`, `// your code here`) and placeholders between two ellipses (`... existing code ...`). It holds no assistant-voice phrase such as "as an AI", which honest prose also contains, and no bare two-word label such as `// existing code`. A sentence that merely shares the words ("put your code here if you need a custom step") is not matched. A project may add any plain phrase to its own profile. Comments inside inline `<script>` and `<style>` in an HTML file are read like any other. |
+| `comment-policy/density` | advisory | In a file with at least `minAddedLines` added lines, comment lines are at most `maxDensityPct` of them. Documentation comments are not counted. |
+| `exemption/newly-generated` | advisory | No file was newly marked as generated by this change (see above). |
+| profile commands | blocking (always) | Each command exits 0. A command is a real tool with a real exit code, and cannot be made advisory. |
+
+### Blocking and advisory rules
+
+Every rule is `blocking` or `advisory`. The finding detail is the same for both; the difference is what a finding does.
+
+- A **blocking** rule that fails or has findings fails the standards gate: the run ends `gaps` and nothing is marked shipped.
+- An **advisory** rule's findings are listed with file, line and rule in the report, shown to the reviewer and the approver, counted in the totals (`advisory`, `advisoryFindings`), and stop nothing.
+
+**The default blocking set is the profile's commands, and only them.** Each is a real linter, formatter, type-checker or test, and its exit code is the evidence. A command is always blocking and cannot be made advisory.
+
+Every rule MOAG decides itself — required directories, nested repositories, placement, the top-level layout, naming, layering, raw patterns, commented-out code, banned phrases, comment density and generated markers — is **advisory by default**: in the built-in profiles, in every proposal and in the defaults a profile inherits. Each has been shown to flag correct code or to miss real violations. Detecting a required directory in the repository does not make the rule blocking either. Style and structure are meant to be enforced by the stack's own tools as profile commands: a proposal adds the standard check command for each tool whose config file is tracked in the repository, and says so when it found none.
+
+A profile with **no command and no promoted rule** has an empty blocking set. That is allowed: a run under it may ship. Every surface then says `no blocking rules configured` — the CLI, the web cards, the HTML report, the gate row and the release stamp — and none says that anything passed.
+
+Detection proposes only **top-level** directories that hold tracked source files as required directories (a nested test or fixture folder is never required).
+
+**Honest wording.** A scan that found nothing has not proved that nothing is there, so a scanner rule is never said to have passed:
+
+| Kind of row | Outcomes shown |
+|---|---|
+| A profile command | `passed`, `failed`, `not checked` |
+| Every rule MOAG decides itself | `no findings`, `findings`, `not checked` |
+
+The CLI, the web cards, the HTML report and the `moag:standards` gate row all use these words. The stored report keeps one closed set of result values (`passed`, `failed`, `not-checked`) for every row; the words above are how a row is shown. The totals keep the two apart as well: `passed` counts commands only, and `noFindings` counts rules that read something and found nothing.
+
+**Promoting a scanner rule.** A profile changes any rule with `"severity": { "<rule>": "blocking" | "advisory" }`, so a project may still make a scanner rule blocking. The editor warns at the control the moment one is set to blocking, the review screen repeats the warning for the reviewer, and every report of a run names the promoted rules: scanner rules are heuristic, and as blocking rules they can stop correct code and can miss real violations. A product owner or an admin proposes the promotion and a reviewer approves it, like any other change.
+
+#### Changing what blocks
+
+MOAG does not try to tell a change that tightens enforcement from one that loosens it. `npm test` rewritten to `npm test || true` removes nothing and adds nothing, and switches a check off all the same. So **any difference** between a version and the version in force, in a field that decides what can stop a release, is an *enforcement change*:
+
+| Field | A difference is |
+|---|---|
+| `commands` | anything: a command added or removed, a command line edited, a label renamed, the order changed, the list emptied. Compared exactly. |
+| `severity` | a rule promoted or demoted. Compared as each rule resolves, so writing a default out explicitly is not a difference. |
+| `structure.requiredDirs` | anything: an entry added, removed or swapped, the order changed, the list emptied. Compared exactly. |
+| the settings of a rule that is **blocking** (`ruleConfig`) | anything, for a rule that is blocking in either version: a promoted naming rule whose patterns were emptied can stop nothing, though its severity never moved. The settings of an advisory rule are not compared. |
+
+One comparison (`enforcementReview`) drives three things, so none can show or require something another missed:
+
+- **The review screen** shows the differences at the top of the version card, un-collapsed, with what each field held before and after (`enforcementChanged` on each version of `GET …/standards`: `comparedTo`, `changed`, `fields`, `commands`, `severity`, `requiredDirs`, `ruleConfig`). **Approve** (and **Accept defaults**) stay disabled until the reviewer ticks "I have read the enforcement changes…".
+- **The server** refuses to approve such a version without the acknowledgement (`409 acknowledgement-required`; see above). The screen's checkbox is a convenience; this is the enforcement.
+- **The audit log**: the entry of every propose, approve and accept-defaults carries the flag `enforcement-changed` and, in `after.enforcementChanged`, the same before/after for each differing field. `severity-changed` and `commands-changed` are added beside it when those fields are among the differences. The flags `blocking-set-reduced` and `blocking-set-extended` no longer exist.
+
+The comparison is with the version **in force** — the latest approved version below the one being proposed or approved — at propose time and again at approve time. It is never made with the proposal a version was typed on top of, which may be a superseded or rejected one: a change carried along a chain of unapproved proposals under word edits is still shown, still needs the acknowledgement, and is still flagged when the last of them is approved. While nothing is approved the comparison is with an **empty baseline** — no command, default severities, no required directory — so a first version that brings any of them is an enforcement change too. A version that changes none of these fields is not flagged and needs no acknowledgement.
+
+If the store cannot be read when the entry is written, the entry is flagged `enforcement-changed` and `enforcement-reference-unreadable`: a change is then over-reported, never missed.
+
+Promoting or demoting a rule is an edit to the profile like any other: a new version, pending until a reviewer approves it. The review screen also keeps its list of promotions and demotions in the severity section (`severityChanged`, `severityComparedTo`), from the same comparison.
+
+The report shows its groups apart and never mixes them: **Blocking**, **Advisory**, **Rules not checked** and **Files not checked**. A blocking rule or command that was not checked is listed first in its group, marked, and counted on its own (`blockingNotChecked`); any such row stops the release. On the server, severities are re-derived from the standards version frozen on the run, so a report cannot arrive with a blocking rule demoted — or with an advisory one made to block.
+
+Each finding names a file, a line and a rule.
+
+**Not checked is not a pass.** A rule is `not-checked`, with a reason, when:
+
+- it is not configured in the profile;
+- the file's language has no lexer (the supported ones are TypeScript and JavaScript — `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` — Java, C#, Go, Python, HTML and CSS);
+- the file has no extension and starts with `#!`: it is a script the checker cannot read (`LICENSE` and similar prose files are out of scope by name; `Dockerfile` and `Makefile` are listed as an unsupported type);
+- no diff could be taken, or git gave no listing of the tree (every rule then, required directories and nested repositories included);
+- it is a profile command that did not run: an earlier command or gate failed, the check was stopped, or `--no-commands` was given;
+- git was told to ignore changes to the file (`assume-unchanged` or `skip-worktree`);
+- the diff holds only vendored or generated files for that rule;
+- it is a rule the project promoted to blocking and the change itself made a file exempt: it added the file under a vendor directory, added a file with a generated name (`.pb.go`, `.g.cs`, `.Designer.cs`), wrote the generated marker, or added the manifest that marks the directory as third-party. The file is named and counted in `blockingNotChecked`. For an advisory rule, and for a file that was already vendored or generated at the base ref, the rule only notes how many files it did not check. Either way the file is in the report's list of files not checked;
+- a Python `from <package> import (` or `import *` names one of the project's own packages and the imported names are not on that line;
+- the file could not be read with certainty: it is over 512 KB, binary, has an unterminated string or comment, or holds a `/` that may divide or open a regular expression, a `<` that may open a JSX element or a type parameter list, or an inline `<script>` in a language other than JavaScript or JSON. Where the language settles the question the file is read: a property named like a keyword is an operand (`obj.in / 2`, `this.of! / 2` divide), and in a `.tsx` file `<T extends Base>(…)` and a `<T>(…)` after `type Name =` are type parameter lists, as the TypeScript compiler reads them. In a `.js` or `.jsx` file `<T extends …>` cannot be settled and the file is not checked;
+- an import names a workspace package and the workspace could not be read;
+- a tsconfig or jsconfig above the file could not be read, extends a file that was not found, or refers (`references`) to a config that is missing or unreadable: any non-relative import may then be one of its aliases;
+- an earlier gate failed first;
+- it is a layering rule for C#, whose `using` lines cannot be mapped to paths.
+
+A not-checked rule is always shown and never counted as passed or as "no findings". An **advisory** rule that is not-checked stops nothing. A **blocking** row that is not-checked — a command, or a promoted rule the profile configures — stops the release, whatever the reason: no reason is weighed. A promoted scan therefore also stops a change that gives it nothing to judge (a documentation-only change under a promoted comment rule, say); a command always runs and does not have that problem, which is one more reason to block on commands.
+
+The report is stored in the run directory as `standards-report.json`, with only its totals on the run record. Findings are capped at 200, not-checked files at 200 and command output at 2,000 characters; the totals keep the true counts. `GET /api/projects/:id` returns it as `currentRun.standardsReport`; a run with no report has no such field.
+
+When a requirement ships, its release row records the standards version it shipped under (`standardsVersion`). `GET /api/projects/:id/trace` and `moag trace` both show it. A release whose check left a blocking rule or a command not-checked does not ship at all (above), so a recorded version means one of two things, and the counts beside it say which: the blocking set was evaluated and nothing in it failed, or the profile had no blocking set. What the advisory scans managed to read plays no part. A local release task follows the same rule: it stamps the version only when the requirement's latest gates hold an exit-0 `moag:standards v<N>` row for that version.
+
+Beside the version, the release row records what the check left open, as numbers only (`standardsCounts`): `advisoryFindings`, `notCheckedRules` (rules the profile configures that were not checked) and `notCheckedFiles` — and `noBlockingRules: true` when the profile had no command and no promoted rule. The trace screen then shows "no blocking rules configured" beside the version; the key is absent whenever a blocking set existed. A checked release is not always a clean one, and the trace says by how much. The counts are never recorded without a version. A plan file written before they existed loads unchanged.
+
+### Local workspaces
+
+The VS Code extension and the headless CLI use `<workspace>/.moag/standards.json`, which is trusted because the workspace is the user's own. There is no approval step locally.
+
+```json
+{ "schemaVersion": 1, "version": 1, "profile": { "…": "…" }, "provenance": { "…": "…" } }
+```
+
+A file that exists but is invalid is an error that names the file. It is never treated as "no standards".
+
+```
+moag standards show
+moag standards check [--base <ref>] [--no-commands]
+moag standards propose [--stack <id>] [--write [--force]]
+```
+
+- `show` prints the document and the text every prompt carries.
+- `check` checks the diff since `--base`. Without `--base` that is the commit captured when the first run since the last passed verification started (`.moag/standards-base.json`), so work a run committed is still checked; with none captured it is `HEAD`. Its exit codes are: **0** nothing blocking — every command passed, or the profile has no blocking rules configured (the output then says so, and prints no row as passed); **1** a command failed, or a promoted rule has findings; **2** a usage error, or no usable profile; **5** no diff could be taken at all, so nothing was checked; **6** nothing blocking failed, but a command or a promoted rule was **not checked** — unevaluated blocking evidence is not a pass. `--no-commands` leaves every command not checked, so with a profile that has commands it exits 6. Advisory findings are printed and do not change the exit code. The output has four groups — Blocking, Advisory, Rules not checked, Files not checked — with one `file:line rule` line per finding and one `path — not checked (reason)` line per file. Only a command is printed as `passed` or `FAILED`; every rule MOAG decides itself as `no findings` or `FINDINGS`. A blocking row that was not checked is marked `!! BLOCKING RULE NOT CHECKED`. When the profile promotes a scanner rule to blocking, the output says which and repeats the warning.
+- `propose` detects the repository's conventions from the files git tracks (it asks git which they are; with no listing it proposes no directory and says why in the provenance) and prints a proposal. It writes the file, as the next version, only with `--write`. An existing file that differs from the proposal may hold hand edits and is replaced only with `--force`; the file it replaces is kept as `.moag/standards.json.bak`.
+- `--no-standards` on `run` and `verify` turns project standards off for that invocation: task prompts carry no standards block, and verification runs no standards gate.
+
 ## Threat model
 
 **Assets**
@@ -332,6 +616,14 @@ Names must match `^[A-Z_][A-Z0-9_]*$`. `MOAG_*` and `CI` are rejected at boot. A
 | Audit tampering | Append-only API with no edit or delete route | Same-uid writes are not prevented. A hash chain is deferred. |
 | Cost runaway | per-version cap, worker `costBudgetUsd` = remaining, plan generation counted, Claude jobs in JSON mode with `--max-budget-usd` per call ([Cost reporting](#cost-reporting)) | Overshoot by one call (the ceiling check runs after each call, `runner.ts:533-551`) |
 | DoS | 1 MB body cap, SSE limit 5 per session, job concurrency cap, scrypt semaphore | — |
+| Standards text as a prompt-injection carrier (author-written, in every task and planner prompt) | Reviewer approval bound to a content hash. Caps of 20,000 characters of free text and 4,000 characters rendered. Free text is rendered as a `> ` blockquote. A credential-shape scan rejects the proposal. The audit log records the version and hash only | A reviewer who approves hostile text has approved it, the same as a PRD |
+| Profile commands are server-side execution | Commands are shown verbatim before approval. Each is a single line of at most 500 characters, and there are at most 6. The worker never infers them, and takes them from the approved version's job file. Approve echoes `contentHash`. A job file rewritten during the run is detected when the run ends (the reported profile hash no longer matches the frozen one) and the run ends `gaps` | `npm run lint` expands to a repo-defined script the reviewer does not see. This is the same exposure as auto-detected gates. The detection of a rewritten job file comes after verification ran, so a command an agent wrote into the file can execute once before the run is failed. That gives the agent nothing new: it already runs commands as the same user |
+| Repo-shipped `.moag/standards.json` or `.moag/rules.json` steering a server run | The server worker always receives `--standards <jobfile>` or `--no-standards` and never constructs an AI-rules store. A test stubs `fs` and asserts neither path is read | A local headless run trusts both files by design |
+| Standards detector fed a hostile repo | Detection reads files as data. The only processes it starts are bounded, read-only git queries (`git rev-parse --show-prefix`, `git ls-files`) to learn which files the repository tracks — run asynchronously, never on the server's event loop, with a minimal environment from which every inherited `GIT_*` variable is removed; nothing from the repository is executed. Proposed commands are fixed templates, never copied script bodies. File reads are capped, and proposals pass the same validator as user input | Detected values are attacker-influenced until the reviewer reads them, which is why every field is tagged |
+| An agent making the standards checker go blind (same uid) | The server freezes the standards version, its content hash and the base ref on the run record in `state.json`. The worker reads them from a job file in the run directory, which the agent can write, so the file is not trusted: the worker reports the hash of the profile it really used and the base it was given, and the server ends the run `gaps` unless a verify-phase report matches what it froze. The base ref is the last ref that shipped, so committing work does not move it out of the diff. The base commit itself lives in the agent-writable `.git`; if it can no longer be resolved the check diffs against the empty tree and judges every file, and if no diff can be taken the gate fails. The patch is taken with `--text --no-textconv --no-ext-diff`, so a `-diff` or `binary` attribute, a textconv driver or an external diff driver cannot hide hunks. A changed file that has content but no rendered hunk is reported as not checked, never as "no lines added". Untracked files are listed honouring `.gitignore` files only, never `.git/info/exclude` or a global excludes file, with `core.fsmonitor=false`. A tracked file flagged `assume-unchanged` or `skip-worktree` is reported as changed and not checked. A rule that found nothing to judge is not checked, never passed, and a release stamps a standards version only when a diff-based rule was decided. `.moag/` is excluded from the diff | Same-uid tampering cannot be fully closed without isolating the agent. What remains: an agent can turn a failure into `not-checked` by crafting a file the lexer finds ambiguous, by flagging a file in the index, or by putting a generated marker (`@generated`) or a `vendor/` path on a file. All three are named in the report. It can hide a new file by adding it to a `.gitignore`; that edit is itself in the diff, but the hidden file is not reported. Not-checked does not block shipping. An agent that can write `state.json` or the server's memory is outside this row: see **Run = RCE** |
+| Standards pattern denial of service | No profile-authored regular expression. Globs compile through a bounded internal translator. List and length caps apply to every field | — |
+| Standards report as an XSS or leak path | The `verify-standards` payload is shape-validated server-side, findings are capped at 200, command tails at 2,000 characters and redacted with the job's redact list, and the web app renders it with DOM text nodes only | — |
+| Planner prompt splice confusion | The `Rules:` marker line cannot occur inside the rendered standards block, because free text is blockquoted. A test covers a profile whose free text contains a `Rules:` line | — |
 
 ### Who can trigger agents, and how they are contained
 
@@ -350,7 +642,7 @@ Names must match `^[A-Z_][A-Z0-9_]*$`. `MOAG_*` and `CI` are rejected at boot. A
 - **Starting a run** (reviewer, admin) is where repository code and repository config become live: the run's agent starts inside the repo and loads what the repo ships. **A reviewer must trust the repository before approving its first run.** The plan review card warns, listing each of these entries the repo has:
   - engine config: `.claude/`, `.mcp.json`, `.gemini/`, `.codex/`
   - agent instruction files: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules`
-  - MOAG workspace rules: `.moag/rules.json`, which is injected into every task prompt
+  - MOAG workspace rules: `.moag/rules.json`. A hosted run does **not** inject this file: its prompts carry only the approved [project standards](#project-standards). It is listed because a local `moag run` or VS Code session in the same checkout does inject it
 
   Read them before approving.
 - **Stopping a run** (reviewer, admin) asks the worker to stop over IPC, and kills it if it has not exited 30 seconds later. Stop is idempotent: a second stop while the first is still settling returns `200` with `alreadyStopping: true`, changes nothing and is not audited again.

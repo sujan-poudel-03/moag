@@ -13,6 +13,7 @@ import * as bootstrapScreen from './screens/bootstrap.js';
 import * as projectsScreen from './screens/projects.js';
 import * as projectForm from './screens/project-form.js';
 import * as prdScreen from './screens/prd.js';
+import * as standardsScreen from './screens/standards.js';
 import * as planScreen from './screens/plan.js';
 import * as runScreen from './screens/run.js';
 import * as traceScreen from './screens/trace.js';
@@ -51,6 +52,7 @@ const ROUTES = [
   { path: '/p/:id', redirect: (p) => `/p/${p.id}/prd` },
   { path: '/p/:id/overview', redirect: (p) => `/p/${p.id}/prd` },
   { path: '/p/:id/prd', project: true, nav: 'prd', render: prdScreen.render },
+  { path: '/p/:id/standards', project: true, nav: 'standards', render: standardsScreen.render },
   { path: '/p/:id/plan', project: true, nav: 'plan', render: planScreen.render },
   { path: '/p/:id/run', project: true, nav: 'run', render: runScreen.render },
   { path: '/p/:id/trace', project: true, nav: 'trace', render: traceScreen.render },
@@ -62,6 +64,7 @@ const ROUTES = [
 
 const PROJECT_NAV = [
   { id: 'prd', label: 'PRD' },
+  { id: 'standards', label: 'Standards' },
   { id: 'plan', label: 'Plan' },
   { id: 'run', label: 'Run' },
   { id: 'trace', label: 'Trace' },
@@ -348,6 +351,8 @@ function renderRail(active) {
       h('p', { class: 'section-header' }, 'Project'),
       PROJECT_NAV.map((n) => {
         let extra = null;
+        // A standards version is waiting for a reviewer (the server's answer, never a client guess).
+        if (n.id === 'standards' && project.standards && project.standards.pendingVersion) { extra = badge('REVIEW', 'warning'); }
         if (n.id === 'plan' && pendingPlans > 0) { extra = badge(String(pendingPlans), 'warning'); }
         if (n.id === 'run' && lastRun) {
           if (lastRun.status === 'running') { extra = h('span', { class: 'rail-glyph' }, glyph('⟳'), h('span', { class: 'sr-only' }, 'running')); }

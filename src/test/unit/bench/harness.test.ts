@@ -2,12 +2,18 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { runBench, BenchDeps, EventLog, planApprovalProblems, scenarioAllowedCommands } from '../../../bench/harness';
+import {
+  runBench, BenchDeps, EventLog, planApprovalProblems, scenarioAllowedCommands, standardsApprovalProblems, benchStandardsProfile,
+} from '../../../bench/harness';
+import { profileHash } from '../../../standards/profile';
+import { builtInProfile } from '../../../standards/built-in-profiles';
+import { readStandardsJobFile } from '../../../standards/local-store';
+import { sampleProfile } from '../standards/fixtures';
 import { Scenario, ScenarioVersion } from '../../../bench/scenario';
 import { CommandResult } from '../../../bench/workspace';
 import { FakeEngine } from '../../../bench/fake-engine';
 import { LaunchedServer } from '../../../bench/server-launcher';
-import { startHarness, Harness, FakeWorker } from '../server/app-harness';
+import { startHarness, Harness, FakeWorker, attestStandards } from '../server/app-harness';
 import { loadPlan, dehydratePlan } from '../../../models/plan';
 import { recordGateResults } from '../../../models/requirement-trace';
 import { TaskStatus } from '../../../models/types';
@@ -30,6 +36,10 @@ interface Script {
   patch?: (playlist: Record<string, unknown>, tasks: Array<Record<string, unknown>>, n: number) => void;
   /** When set, MOAG's own verify (segment 2) runs `npm run lint`, then stops at this gate command: the run ends with gaps. */
   verifyFailsAt?: string;
+  /** With `verifyFailsAt`: the repo gates all pass and verify ends on the standards gate instead. */
+  verifyFailsOnStandards?: boolean;
+  /** When set, segment 1 sends a pre-gate standards report with these rule rows before it halts at the ship gate. */
+  preGateRules?: Array<Record<string, unknown>>;
 }
 
 /** Scripted workers: plan jobs write an outcome, run segment 1 halts at the ship gate, segment 2 ships. */
@@ -70,6 +80,14 @@ function scriptWorkers(h: Harness, script: Script, seen: { plans: number; runs: 
       }
       for (const c of costs) { w.line({ event: 'cost', ...c }); }
       fs.writeFileSync(job.planPath, JSON.stringify(dehydratePlan(snap), null, 2));
+      if (script.preGateRules && job.standardsPath) {
+        // What a real worker's check at the ship gate sends: made with the job file's own profile and base.
+        const file = readStandardsJobFile(job.standardsPath);
+        w.line({
+          event: 'verify-standards', phase: 'pre-gate', version: file.version, baseRef: file.baseRef,
+          rules: script.preGateRules, findings: [], contentHash: file.contentHash, recordedBaseRef: file.baseRef,
+        });
+      }
       w.line({ event: 'manual-gate', id: gate.id, name: gate.name });
       w.exit(3);
       return;
@@ -80,12 +98,21 @@ function scriptWorkers(h: Harness, script: Script, seen: { plans: number; runs: 
       w.line({ event: 'verify-started', plan: 'p', fix: false });
       w.line({ event: 'verify-progress', phase: 'gate', detail: 'npm run lint' });
       w.line({ event: 'verify-progress', phase: 'gate', detail: script.verifyFailsAt });
+      if (script.verifyFailsOnStandards) {
+        // What the real loop announces: the static check, then a profile command that fails.
+        w.line({ event: 'verify-progress', phase: 'standards', detail: 'Checking the diff against moag:standards v1' });
+        w.line({ event: 'verify-progress', phase: 'standards-command', detail: 'npm run format:check' });
+        w.line({ event: 'verify-finished', passed: false, score: 0, failedGate: 'standards', iterations: 1 });
+        w.exit(1);
+        return;
+      }
       w.line({ event: 'verify-finished', passed: false, score: 0, failedGate: 'command', iterations: 1 });
       w.exit(1);
       return;
     }
     recordGateResults(snap, [{ command: 'npm test', exitCode: 0, timedOut: false }], new Date().toISOString());
     fs.writeFileSync(job.planPath, JSON.stringify(dehydratePlan(snap), null, 2));
+    attestStandards(w);
     w.line({ event: 'verify-finished', passed: true, score: 100, failedGate: null, iterations: 1 });
     w.exit(0);
   };
@@ -241,6 +268,30 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.deepEqual(v.interventions.required.map((i) => i.kind), ['plan-approval', 'ship-approval']);
   });
 
+  it('a ship the server refuses over the pre-gate standards check is rejected by the bench approver: nothing shipped, and it says why', async () => {
+    await manualStandards();
+    const seen = { plans: 0, runs: 0 };
+    // The acceptance gates are green; the profile's own command failed at the gate.
+    scriptWorkers(h, { plans: [], costs: [], preGateRules: [{ rule: 'command', result: 'failed', command: 'npm test', exitCode: 1, tail: '1 failing' }] }, seen);
+    const profile = { ...sampleProfile(), commands: [{ label: 'Test', run: 'npm test' }] };
+    const r = await runBench(scenario({ standardsProfile: { file: path.join(tmp, 'standards.json'), profile } }, 1),
+      { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    const v = r.summary!.versions[0];
+    assert.equal(v.outcome, 'not-shipped');
+    assert.equal(v.endState, 'run-ship-rejected');
+    assert.equal(v.gateFirstRunPass?.pass, true, 'the bench acceptance gates were green: it is the product that refused');
+    assert.deepEqual(v.interventions.required.map((i) => i.kind), ['plan-approval', 'ship-approval']);
+    assert.deepEqual(v.interventions.unplanned.map((i) => i.kind), ['ship-refused-standards']);
+    assert.match(v.interventions.unplanned[0].detail ?? '', /standards check before the ship gate stops this release/);
+    const audit = h.auditEntries().map((e) => e.action);
+    assert.equal(audit.includes('gate.approve'), false, 'the approval never went through');
+    assert.equal(audit.filter((a) => a === 'gate.reject').length, 1);
+    assert.equal(seen.runs, 1, 'no second segment was spawned');
+    assert.ok(fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8').includes('"kind":"ship-refused-standards"'));
+    assert.ok(Object.values(v.trace).every((status) => status !== 'shipped'), JSON.stringify(v.trace));
+  });
+
   it('a 409 project-locked on gate approve is retried (recorded as lock-wait), never force-released', async () => {
     const seen = { plans: 0, runs: 0 };
     scriptWorkers(h, { plans: [], costs: [] }, seen);
@@ -316,9 +367,12 @@ describe('bench harness (scripted workers behind the real app)', function () {
   });
 
   /** One version whose MOAG verify stops at `npm test`, with `npm test` probed first in the untouched workspace. */
-  async function verifyStopsAtNpmTest(probeExit: number, node = 'v24.16.0', opts: { dryRun?: boolean; allowFailedProbes?: boolean } = { allowFailedProbes: true }) {
+  async function verifyStopsAtNpmTest(
+    probeExit: number, node = 'v24.16.0',
+    opts: { dryRun?: boolean; allowFailedProbes?: boolean; onStandards?: boolean } = { allowFailedProbes: true },
+  ) {
     const seen = { plans: 0, runs: 0 };
-    scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]], verifyFailsAt: 'npm test' }, seen);
+    scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]], verifyFailsAt: 'npm test', verifyFailsOnStandards: opts.onStandards === true }, seen);
     const calls: string[][] = [];
     const runGates: BenchDeps['runGates'] = async (commands) => {
       calls.push([...commands]);
@@ -403,6 +457,17 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.ok(events.includes('"kind":"environment-probes"'));
   });
 
+  it('a standards-gate failure names no command and is never excused as an environment problem', async () => {
+    // The probe for "npm test" fails in the untouched workspace AND verify announced "npm test"
+    // as a gate — but verify ended on the standards gate, so neither may be blamed.
+    const { r, v } = await verifyStopsAtNpmTest(1, 'v24.16.0', { allowFailedProbes: true, onStandards: true });
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    assert.deepEqual(v.moagVerify, { passed: false, failedGate: 'standards', failedCommand: null });
+    assert.deepEqual(v.environment, [], JSON.stringify(v.environment));
+    assert.equal(v.outcome, 'not-shipped');
+    assert.equal(v.endState, 'run-gaps');
+  });
+
   it('the same verify failure where the probe passed (Node 20) stays a product failure', async () => {
     const { r, v } = await verifyStopsAtNpmTest(0, 'v20.20.2');
     assert.equal(r.summary!.environment.node, 'v20.20.2');
@@ -474,6 +539,170 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.match(rejectedDetail(v), /parallel/);
     assert.equal(seen.runs, 0);
     assert.equal(serverPlan.status, 'rejected');
+  });
+
+  // ─── Standards: approved through the reviewed path before the first plan ───
+
+  /** Swap the default harness (standards auto-approved) for one where nothing is approved behind the bench's back. */
+  async function manualStandards(): Promise<void> {
+    await h.close();
+    h = await startHarness({ accounts: {}, config: { bootstrapToken: BOOT }, engineAvailable: () => true, standards: 'manual' });
+  }
+
+  /** Every mutating bench request in events.jsonl, in order, as "actor METHOD path-suffix". */
+  const httpLog = (name = 'out'): Array<{ actor: string; method: string; path: string; status: number }> =>
+    fs.readFileSync(path.join(out(name), 'events.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>)
+      .filter((e) => e.kind === 'http' && e.method !== 'GET')
+      .map((e) => ({ actor: String(e.actor), method: String(e.method), path: String(e.path), status: Number(e.status) }));
+
+  it('the bench proposes as product owner and approves as reviewer before the first plan request, never through accept-defaults', async () => {
+    await manualStandards();
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]] }, seen);
+    const sc = scenario({}, 1);
+    const r = await runBench(sc, { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    assert.equal(r.summary!.versions[0].outcome, 'shipped', JSON.stringify(r.summary!.versions[0]));
+
+    // Request order, as the bench sent it: propose (po) → approve (reviewer) → first plan request (po).
+    const calls = httpLog();
+    const propose = calls.findIndex((c) => /\/standards\/versions$/.test(c.path));
+    const approve = calls.findIndex((c) => /\/standards\/versions\/\d+\/approve$/.test(c.path));
+    const firstPlan = calls.findIndex((c) => /\/plans$/.test(c.path));
+    assert.ok(propose >= 0 && approve > propose && firstPlan > approve, JSON.stringify({ propose, approve, firstPlan }));
+    assert.deepEqual([calls[propose].actor, calls[propose].status], ['po', 201]);
+    assert.deepEqual([calls[approve].actor, calls[approve].status], ['reviewer', 200]);
+    assert.equal(calls.some((c) => /accept-defaults/.test(c.path)), false);
+
+    // The same order in the server's own audit log, each step under its own account.
+    const audit = h.auditEntries().map((e) => `${e.action}:${e.actorUsername}`);
+    const approvedAt = audit.indexOf('standards.approve:bench-reviewer');
+    assert.ok(audit.indexOf('standards.propose:bench-po') >= 0 && approvedAt > audit.lastIndexOf('standards.propose:bench-po'), audit.join(','));
+    assert.ok(audit.indexOf('plan.generate:bench-po') > approvedAt, audit.join(','));
+    assert.equal(audit.some((a) => a.startsWith('standards.accept-defaults')), false);
+
+    // What is in effect is exactly the stack's built-in profile, with no commands.
+    const projectId = h.projects.list()[0].id;
+    const effective = h.standards.effective(projectId)!;
+    assert.equal(effective.origin, 'user');
+    assert.equal(effective.decision, 'approved');
+    assert.equal(effective.contentHash, profileHash(benchStandardsProfile(sc)));
+    assert.deepEqual(effective.profile, { ...builtInProfile('node-ts'), commands: [] });
+    // Setup, not an intervention: the per-version required approvals are unchanged, and the summary says what happened.
+    assert.deepEqual(r.summary!.versions[0].interventions.required.map((i) => i.kind), ['plan-approval', 'ship-approval']);
+    assert.deepEqual(r.summary!.versions[0].interventions.unplanned, []);
+    assert.ok(r.summary!.notes.some((n) => /^standards v2 \(node-ts built-in profile, 0 commands\) proposed by bench-po and approved by bench-reviewer/.test(n)), JSON.stringify(r.summary!.notes));
+  });
+
+  it('a scenario profile is what gets approved; a cloned repository gets the built-in as brownfield', async () => {
+    await manualStandards();
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [[{ usd: 0.1, source: 'reported' }]] }, seen);
+    const profile = { ...sampleProfile(), commands: [{ label: 'Test', run: 'npm test' }] };
+    const sc = scenario({ standardsProfile: { file: path.join(tmp, 'standards.json'), profile } }, 1);
+    const r = await runBench(sc, { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    assert.deepEqual(h.standards.effective(h.projects.list()[0].id)!.profile, profile);
+    assert.ok(r.summary!.notes.some((n) => /scenario profile standards\.json, 1 command\)/.test(n)), JSON.stringify(r.summary!.notes));
+
+    assert.equal(benchStandardsProfile(scenario()).repoState, 'greenfield');
+    const cloned = benchStandardsProfile(scenario({ repo: { kind: 'clone', path: tmp, ref: 'main' } }));
+    assert.equal(cloned.repoState, 'brownfield');
+    assert.deepEqual(cloned.commands, []);
+  });
+
+  it('a profile command the scenario does not allow is never approved: exit 2 before any plan request, named in the error', async () => {
+    await manualStandards();
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [] }, seen);
+    // Built by hand, past the scenario parser, the way a programmatic caller could.
+    const profile = { ...sampleProfile(), commands: [{ label: 'Test', run: 'npm test' }, { label: 'Publish', run: 'npm publish' }] };
+    const r = await runBench(scenario({ standardsProfile: { file: path.join(tmp, 'standards.json'), profile } }, 1),
+      { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    assert.equal(r.exitCode, 2);
+    assert.match(r.summary!.harnessError ?? '', /will not approve standards v2 unreviewed: standards command "Publish": npm publish No plan was requested\./);
+    assert.equal(seen.plans, 0);
+    assert.equal(h.workers.length, 0, 'no worker was spawned');
+    const audit = h.auditEntries().map((e) => e.action);
+    assert.equal(audit.includes('standards.approve'), false, 'nothing was approved');
+    assert.equal(audit.includes('plan.generate'), false, 'no plan was requested');
+    assert.equal(h.standards.effective(h.projects.list()[0].id), null);
+    assert.deepEqual([r.summary!.versions[0].outcome, r.summary!.versions[0].endState], ['error', 'harness-error']);
+    assert.ok(fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8').includes('"kind":"standards-refused"'));
+  });
+
+  it('a proposal the server refuses stops the bench (exit 2) before any plan request', async () => {
+    await manualStandards();
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [] }, seen);
+    const profile = { ...sampleProfile(), commands: [], freeText: 'x'.repeat(20_001) };
+    const r = await runBench(scenario({ standardsProfile: { file: path.join(tmp, 'standards.json'), profile } }, 1),
+      { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    assert.equal(r.exitCode, 2);
+    assert.match(r.summary!.harnessError ?? '', /standards proposal refused \(scenario profile standards\.json\): HTTP 400 invalid-standards .*freeText/);
+    assert.equal(seen.plans, 0);
+    assert.equal(h.auditEntries().some((e) => e.action === 'plan.generate' || e.action === 'standards.approve'), false);
+  });
+
+  it('a refused approval stops the bench (exit 2) before any plan request', async () => {
+    await manualStandards();
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [] }, seen);
+    // Someone else proposes between the bench's proposal and its approval: the bench's version is superseded.
+    const realApprove = h.standards.approve.bind(h.standards);
+    h.standards.approve = (projectId, version, input, now) => {
+      h.standards.propose(projectId, { profile: builtInProfile('node-ts'), provenance: h.standards.get(projectId, version)!.provenance, origin: 'user', proposedBy: 'someone-else', baseVersion: version });
+      return realApprove(projectId, version, input, now);
+    };
+    const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    assert.equal(r.exitCode, 2);
+    assert.match(r.summary!.harnessError ?? '', /standards approval refused: HTTP 409 /);
+    assert.equal(seen.plans, 0);
+    assert.equal(h.auditEntries().some((e) => e.action === 'plan.generate'), false);
+  });
+
+  it('a 409 standards-not-approved on the plan request is reported once per version, never retried', async () => {
+    await manualStandards();
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [] }, seen);
+    // The store loses every version right after the bench's approval (loss or tampering): the plan gate fails closed.
+    const realApprove = h.standards.approve.bind(h.standards);
+    h.standards.approve = (projectId, version, input, now) => {
+      const decided = realApprove(projectId, version, input, now);
+      h.standards.load = () => ({ migrated: false, versions: [] });
+      return decided;
+    };
+    const r = await runBench(scenario({}, 2, ['initial', 'minor']), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps());
+    assert.equal(r.exitCode, 0, r.summary?.harnessError ?? '');
+    for (const v of r.summary!.versions) {
+      assert.equal(v.outcome, 'plan-failed', v.id);
+      assert.equal(v.endState, 'plan-request-standards-not-approved', v.id);
+      assert.deepEqual(v.interventions.unplanned.filter((i) => i.kind.startsWith('plan-')).map((i) => i.kind), ['plan-standards-not-approved'], v.id);
+      assert.deepEqual(v.interventions.required, [], v.id);
+    }
+    const planRequests = httpLog().filter((c) => /\/plans$/.test(c.path));
+    assert.deepEqual(planRequests.map((c) => c.status), [409, 409], 'one request per version, none repeated');
+    assert.equal(seen.plans, 0, 'no plan job was started');
+    assert.equal(h.auditEntries().some((e) => e.action === 'plan.generate'), false);
+  });
+
+  it('standardsApprovalProblems: only a pending version with the proposed content and allow-listed commands is approvable', () => {
+    const hash = 'a'.repeat(64);
+    const ok = { version: 2, status: 'pending', contentHash: hash, commands: [{ label: 'Test', run: 'npm test' }], profile: { commands: [{ label: 'Test', run: 'npm test' }] } };
+    assert.deepEqual(standardsApprovalProblems(ok, ['npm test'], hash), []);
+    assert.deepEqual(standardsApprovalProblems({ ...ok, commands: [], profile: { commands: [] } }, [], hash), [], 'no commands needs no allow-list');
+    assert.deepEqual(standardsApprovalProblems(ok, [' npm test '], hash), [], 'compared after trimming, like plan commands');
+    assert.equal(standardsApprovalProblems(undefined, ['npm test']).length, 1, 'no version');
+    assert.match(standardsApprovalProblems({ ...ok, status: 'approved' }, ['npm test'], hash)[0], /is approved, not pending/);
+    assert.match(standardsApprovalProblems({ ...ok, status: 'superseded' }, ['npm test'], hash)[0], /superseded/);
+    assert.match(standardsApprovalProblems(ok, ['npm test'], 'b'.repeat(64))[0], /not the profile the bench proposed/);
+    assert.match(standardsApprovalProblems({ ...ok, contentHash: undefined }, ['npm test'])[0], /no content hash/);
+    assert.match(standardsApprovalProblems({ ...ok, commands: undefined }, ['npm test'], hash)[0], /no command list/);
+    assert.deepEqual(standardsApprovalProblems(ok, ['npm run test'], hash), ['standards command "Test": npm test'], 'exact strings, named once');
+    assert.equal(standardsApprovalProblems(ok, ['NPM TEST', 'npm test && git push', 'npm *'], hash).length, 1, 'case-sensitive, no prefixes, no patterns');
+    // A command the profile carries but the verbatim list hides is still caught.
+    const hidden = { ...ok, profile: { commands: [{ label: 'Test', run: 'npm test' }, { label: 'Push', run: 'git push' }] } };
+    assert.deepEqual(standardsApprovalProblems(hidden, ['npm test'], hash), ['standards command "Push": git push']);
   });
 
   it('a paid run without --max-usd exits 2 before any server start', async () => {

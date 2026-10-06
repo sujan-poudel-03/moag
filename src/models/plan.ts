@@ -7,7 +7,7 @@ import {
   Playlist, Task, TaskStatus, EngineId,
   ContextBudget, PrdVersion, RoleDefinition, RoleId, SandboxConfig, SandboxTarget,
   ValidationProfile, ValidationSettings, ValidationTarget,
-  SEMVER_BUMPS, SemverBump, RequirementTraceRecord, RequirementGateResult, RequirementRelease,
+  SEMVER_BUMPS, SemverBump, RequirementTraceRecord, RequirementGateResult, RequirementRelease, StandardsCheckCounts,
 } from './types';
 import { redactPlanFile } from './plan-redaction';
 import { isRoleId, MAX_ROLE_CHARTER_CHARS } from './roles';
@@ -346,6 +346,36 @@ function parseTraceStringArray(raw: unknown, sourceName: string, field: string):
  * version labels and tags — never requirement text. A missing sub-array defaults to `[]`;
  * a wrongly typed one throws a sourceName-qualified error naming the field.
  */
+/**
+ * Validate the optional `standardsCounts` of a trace gate or release: three whole numbers
+ * of at least 0, the optional `noBlockingRules: true`, and nothing else. Returns a fresh
+ * copy, or undefined when the field is absent.
+ */
+function parseStandardsCounts(raw: unknown, sourceName: string, field: string): StandardsCheckCounts | undefined {
+  if (raw === undefined) { return undefined; }
+  const count = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 0;
+  if (!isRecord(raw) || !count(raw.advisoryFindings) || !count(raw.notCheckedRules) || !count(raw.notCheckedFiles)) {
+    throw traceFieldError(sourceName, field, '{ advisoryFindings, notCheckedRules, notCheckedFiles: integers >= 0 }');
+  }
+  if (raw.noBlockingRules !== undefined && raw.noBlockingRules !== true) {
+    throw traceFieldError(sourceName, `${field}.noBlockingRules`, 'true, or absent');
+  }
+  return {
+    advisoryFindings: raw.advisoryFindings, notCheckedRules: raw.notCheckedRules, notCheckedFiles: raw.notCheckedFiles,
+    ...(raw.noBlockingRules === true ? { noBlockingRules: true as const } : {}),
+  };
+}
+
+/** `counts` as it is written to a plan file: field by field, so nothing else rides along. */
+function dehydrateStandardsCounts(counts: StandardsCheckCounts | undefined): { standardsCounts?: StandardsCheckCounts } {
+  return counts === undefined ? {} : {
+    standardsCounts: {
+      advisoryFindings: counts.advisoryFindings, notCheckedRules: counts.notCheckedRules, notCheckedFiles: counts.notCheckedFiles,
+      ...(counts.noBlockingRules === true ? { noBlockingRules: true as const } : {}),
+    },
+  };
+}
+
 function normalizeRequirementTrace(raw: unknown, sourceName: string): RequirementTraceRecord[] {
   if (!Array.isArray(raw)) {
     throw traceFieldError(sourceName, '', 'an array');
@@ -379,7 +409,10 @@ function normalizeRequirementTrace(raw: unknown, sourceName: string): Requiremen
             sourceName, field, '{ command: string, exitCode: integer, timedOut: boolean, at: string }',
           );
         }
-        return { command: g.command, exitCode: g.exitCode, timedOut: g.timedOut, at: g.at };
+        const gate: RequirementGateResult = { command: g.command, exitCode: g.exitCode, timedOut: g.timedOut, at: g.at };
+        const counts = parseStandardsCounts(g.standardsCounts, sourceName, `${field}.standardsCounts`);
+        if (counts) { gate.standardsCounts = counts; }
+        return gate;
       });
     }
 
@@ -403,7 +436,17 @@ function normalizeRequirementTrace(raw: unknown, sourceName: string): Requiremen
         if (!Array.isArray(r.taskIds) || r.taskIds.some(v => typeof v !== 'string')) {
           throw traceFieldError(sourceName, `${field}.taskIds`, 'an array of strings');
         }
-        return { releaseTag: r.releaseTag, prdVersion: r.prdVersion, at: r.at, taskIds: [...(r.taskIds as string[])] };
+        const release: RequirementRelease = { releaseTag: r.releaseTag, prdVersion: r.prdVersion, at: r.at, taskIds: [...(r.taskIds as string[])] };
+        // Optional: a release stamped before projects had standards carries none.
+        if (r.standardsVersion !== undefined) {
+          if (typeof r.standardsVersion !== 'number' || !Number.isInteger(r.standardsVersion) || r.standardsVersion < 1) {
+            throw traceFieldError(sourceName, `${field}.standardsVersion`, 'an integer >= 1');
+          }
+          release.standardsVersion = r.standardsVersion;
+        }
+        const counts = parseStandardsCounts(r.standardsCounts, sourceName, `${field}.standardsCounts`);
+        if (counts) { release.standardsCounts = counts; }
+        return release;
       });
     }
 
@@ -652,12 +695,19 @@ export function dehydratePlan(plan: Plan): PlanFile {
       id: r.id,
       taskIds: [...r.taskIds],
       commits: [...r.commits],
-      gates: r.gates.map(g => ({ command: g.command, exitCode: g.exitCode, timedOut: g.timedOut, at: g.at })),
+      gates: r.gates.map(g => ({
+        command: g.command, exitCode: g.exitCode, timedOut: g.timedOut, at: g.at,
+        // Written only on the standards row that has them, so every other gate stays unchanged on disk.
+        ...dehydrateStandardsCounts(g.standardsCounts),
+      })),
       releases: r.releases.map(rel => ({
         releaseTag: rel.releaseTag,
         prdVersion: rel.prdVersion,
         at: rel.at,
         taskIds: [...rel.taskIds],
+        // Written only when the release has one, so plans without standards stay unchanged on disk.
+        ...(rel.standardsVersion !== undefined ? { standardsVersion: rel.standardsVersion } : {}),
+        ...dehydrateStandardsCounts(rel.standardsCounts),
       })),
     }));
   }

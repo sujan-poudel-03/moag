@@ -8,6 +8,7 @@
 
 import { h, mount, badge, glyph, toast, announce, confirmDialog, fmtTime, fmtUsd, field } from '../dom.js';
 import { STR, serverMessage } from '../strings.js';
+import { standardsBlockedCard } from './version-panel.js';
 
 const STATUS_BADGE = {
   generating: ['GENERATING', 'info'],
@@ -50,6 +51,7 @@ function blockedText(app, reason, engine) {
   if (reason === 'job-active') { return STR.C19.text; }
   if (reason === 'engine-unavailable') { return STR.C17(engine, app.can('users.manage')).text; }
   if (reason === 'engine-changed') { return STR.C30(engine).text; }
+  if (reason === 'standards-not-approved') { return STR.C46.text; }
   if (reason === 'budget-exhausted') { return 'The cost cap for this PRD version is used up. A product owner or admin can raise it in Settings.'; }
   return 'Ready to run. Waiting for a reviewer or admin to start it.';
 }
@@ -74,7 +76,10 @@ export function render(app, params, view) {
 
   if (!current) {
     parts.push(h('div', { class: 'card' }, h('p', null, 'No plan has been requested yet. '),
-      h('a', { href: `${base}/prd`, dataset: { link: '' } }, 'Request one from the PRD screen')));
+      // Without approved standards the PRD screen offers no request: show why, here too.
+      project.standards && !project.standards.effectiveVersion
+        ? standardsBlockedCard(project.id, project.standards)
+        : h('a', { href: `${base}/prd`, dataset: { link: '' } }, 'Request one from the PRD screen')));
   } else {
     parts.push(planCard(app, project, current, refresh));
   }
@@ -114,9 +119,37 @@ function planCard(app, project, p, refresh) {
   const projectPath = `/p/${encodeURIComponent(project.id)}`;
   const isPo = (app.session.user.roles || []).includes('product-owner');
 
+  /** The standards version the plan was generated under, and a notice when a newer one is in effect. */
+  const standardsLines = () => {
+    const link = h('a', { href: `${projectPath}/standards`, dataset: { link: '' } }, 'Open standards');
+    if (!p.standardsVersion) {
+      return h('p', { class: 'muted' }, 'Standards: none. This plan was generated before the project had standards.');
+    }
+    const who = h('span');
+    // Who approved it is on the standards resource; fill it in when it arrives.
+    void app.api('GET', `/api/projects/${encodeURIComponent(project.id)}/standards`, undefined, { quiet: true }).then((r) => {
+      const all = r.ok && r.body.standards && Array.isArray(r.body.standards.versions) ? r.body.standards.versions : [];
+      const v = all.find((x) => x.version === p.standardsVersion);
+      if (v && v.status === 'approved') {
+        who.textContent = ` · ${v.decision === 'accepted-defaults' ? 'defaults accepted' : 'approved'} by ${v.decidedByName || '—'} · ${fmtTime(v.decidedAt)}`;
+      }
+    });
+    const now = project.standards ? project.standards.effectiveVersion : null;
+    return [
+      h('p', null, `Standards v${p.standardsVersion}`, who, ' ', link),
+      now && now !== p.standardsVersion
+        ? h('p', { class: 'text-warning' }, glyph('⚠'), ' ', STR.C38(p.standardsVersion, now).text) : null,
+    ];
+  };
+
   const tryAgain = isPo ? h('button', { type: 'button', class: 'btn btn-secondary', on: { click: async () => {
     const r = await app.api('POST', `/api/projects/${encodeURIComponent(project.id)}/plans`, { mode: p.mode });
-    if (!r.ok) { toast(serverMessage(r), 'error'); return; }
+    if (!r.ok) {
+      // "Try again" is offered by role, so it can meet the standards gate: explain it (C31), not the raw refusal.
+      const blocked = r.status === 409 && r.body.error === 'standards-not-approved';
+      toast(blocked ? STR.C31(r.body.pendingVersion, r.body.pendingVersion && r.body.state === 'pending' ? 'pending' : 'none').text : serverMessage(r), 'error');
+      return;
+    }
     toast('Plan generation started again.', 'success');
     await refresh();
   } } }, 'Try again') : null;
@@ -145,6 +178,8 @@ function planCard(app, project, p, refresh) {
         if (!r.ok) {
           if (r.status === 409 && r.body.error === 'already-decided') {
             toast(STR.C22(r.body.status || 'decided', '', r.body.decidedAt ? fmtTime(r.body.decidedAt) : '').text, 'warning');
+          } else if (r.status === 409 && r.body.error === 'standards-not-approved') {
+            toast(STR.C46.text, 'error');
           } else if (r.status !== 403) { toast(serverMessage(r), 'error'); }
           await refresh();
           return;
@@ -164,6 +199,7 @@ function planCard(app, project, p, refresh) {
       };
       return h('section', { class: ['card', 'card-warning'] },
         head, meta,
+        standardsLines(),
         repoConfigWarning(app.project.repoEngineConfig),
         taskRows(tasks),
         review.commands && review.commands.length > 0 ? h('div', null,
@@ -201,13 +237,19 @@ function planCard(app, project, p, refresh) {
         });
         if (!ok) { return; }
         const r = await app.api('POST', `/api/projects/${encodeURIComponent(project.id)}/runs`, { planId: p.id });
-        if (!r.ok) { if (r.status !== 403) { toast(serverMessage(r), 'error'); } await refresh(); return; }
+        if (!r.ok) {
+          if (r.status === 409 && r.body.error === 'standards-not-approved') { toast(STR.C46.text, 'error'); }
+          else if (r.status !== 403) { toast(serverMessage(r), 'error'); }
+          await refresh();
+          return;
+        }
         toast('Run started.', 'success');
         app.navigate(`${projectPath}/run`);
       };
       return h('section', { class: ['card', 'card-success'] },
         head,
         h('p', { class: 'muted' }, `Approved by ${p.decidedByName || '—'} · ${fmtTime(p.decidedAt)}`),
+        standardsLines(),
         allowed.has('run.start') ? repoConfigWarning(app.project.repoEngineConfig) : null,
         taskRows(tasks),
         allowed.has('run.start')
@@ -215,6 +257,7 @@ function planCard(app, project, p, refresh) {
           : h('p', { class: p.startBlockedReason && p.startBlockedReason !== 'job-active' ? 'text-warning' : 'muted' },
             blockedText(app, p.startBlockedReason, project.defaultEngine),
             p.startBlockedReason === 'job-active' ? [' ', h('a', { href: `${projectPath}/run`, dataset: { link: '' } }, 'Open run')] : null,
+            p.startBlockedReason === 'standards-not-approved' ? [' ', h('a', { href: `${projectPath}/standards`, dataset: { link: '' } }, 'Open standards')] : null,
             p.startBlockedReason === 'engine-unavailable' && app.can('users.manage') ? [' ', h('span', { class: 'muted' }, 'Check the engine on the server.')] : null));
     }
 

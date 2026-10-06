@@ -2,7 +2,9 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { parseScenario, BenchScenarioError, dryRunProblem, isInsideOrSame } from '../../../bench/scenario';
+import { parseScenario, BenchScenarioError, dryRunProblem, isInsideOrSame, scenarioAllowedCommands } from '../../../bench/scenario';
+import { MAX_STANDARDS_FREE_TEXT_CHARS } from '../../../standards/profile';
+import { sampleProfile } from '../standards/fixtures';
 
 describe('bench scenario', () => {
   let dir: string;
@@ -100,6 +102,55 @@ describe('bench scenario', () => {
     rejects((d) => { versions(d)[1].intendedBump = 'huge'; }, 'versions[1].intendedBump');
     rejects((d) => { versions(d)[0].intendedBump = 'minor'; }, 'versions[0].intendedBump');
     rejects((d) => { d.dryRun = { planCommand: '' }; }, 'dryRun.planCommand');
+  });
+
+  // ─── standardsProfile ───
+
+  /** Write `profile` as the scenario's standards file and name it in the scenario document. */
+  const withProfile = (d: Record<string, unknown>, profile: unknown, name = 'standards.json'): void => {
+    fs.writeFileSync(path.join(dir, name), typeof profile === 'string' ? profile : JSON.stringify(profile));
+    d.standardsProfile = name;
+  };
+
+  it('a scenario without a standardsProfile has none; with one, the validated profile and its absolute path are kept', () => {
+    assert.equal(parseScenario(write(base())).standardsProfile, undefined);
+    const d = base();
+    d.allowedCommands = ['npm run lint'];
+    withProfile(d, sampleProfile());
+    const s = parseScenario(write(d));
+    assert.equal(s.standardsProfile?.file, path.join(dir, 'standards.json'));
+    assert.deepEqual(s.standardsProfile?.profile, sampleProfile());
+  });
+
+  it('a profile command outside the allowed commands fails parsing by field path; an allowed one is an exact match', () => {
+    const profile = sampleProfile();
+    profile.commands = [{ label: 'Test', run: 'npm test' }, { label: 'Lint', run: 'npm run lint' }];
+    // "npm test" is a gate command; "npm run lint" is listed nowhere.
+    rejects((d) => { withProfile(d, profile); }, 'standardsProfile.commands[1].run');
+    // A near miss of a listed command is still refused: entries are exact strings, never patterns.
+    rejects((d) => { d.allowedCommands = ['npm run lint -- --fix', 'npm run *']; withProfile(d, profile); }, 'standardsProfile.commands[1].run');
+    const ok = base();
+    ok.allowedCommands = ['npm run lint'];
+    withProfile(ok, profile);
+    const s = parseScenario(write(ok));
+    for (const c of s.standardsProfile!.profile.commands) { assert.ok(scenarioAllowedCommands(s).includes(c.run), c.run); }
+    // The dry-run plan command counts as allowed too.
+    const viaDryRun = base();
+    viaDryRun.dryRun = { planCommand: 'npm run lint' };
+    withProfile(viaDryRun, profile);
+    assert.equal(parseScenario(write(viaDryRun)).standardsProfile?.profile.commands.length, 2);
+  });
+
+  it('a missing, escaping, malformed or invalid standards profile is refused at standardsProfile', () => {
+    rejects((d) => { d.standardsProfile = 'nope.json'; }, 'standardsProfile');
+    rejects((d) => { d.standardsProfile = '../standards.json'; }, 'standardsProfile');
+    rejects((d) => { d.standardsProfile = 7; }, 'standardsProfile');
+    rejects((d) => { withProfile(d, '{not json'); }, 'standardsProfile');
+    rejects((d) => { withProfile(d, { ...sampleProfile(), commands: [], surprise: true }); }, 'standardsProfile');
+    rejects((d) => { withProfile(d, { ...sampleProfile(), commands: [], freeText: 'x'.repeat(MAX_STANDARDS_FREE_TEXT_CHARS + 1) }); }, 'standardsProfile');
+    rejects((d) => { withProfile(d, { ...sampleProfile(), commands: [{ label: 'Two lines', run: 'npm test\nrm -rf .' }] }); }, 'standardsProfile');
+    // A profile written for another stack than the scenario's is refused by name.
+    rejects((d) => { withProfile(d, { ...sampleProfile(), commands: [], stackTemplateId: 'python' }); }, 'standardsProfile.stackTemplateId');
   });
 
   it('only the first version may be initial', () => {

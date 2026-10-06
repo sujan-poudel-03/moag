@@ -22,6 +22,10 @@ export const SERVER_ACTIONS = [
   'gate.approve',
   'gate.reject',
   'gate.skip',
+  'standards.propose',
+  'standards.approve',
+  'standards.reject',
+  'standards.accept-defaults',
   'users.manage',
   'audit.view',
   'engines.manage',
@@ -47,6 +51,14 @@ export const ROLE_MATRIX: Readonly<Record<ServerAction, readonly WebRole[]>> = O
   'gate.approve': ['approver'],
   'gate.reject': ['approver'],
   'gate.skip': ['admin'],
+  // Project standards: a product owner (or admin) proposes, a reviewer decides. Approving a
+  // profile lets its commands run on the server every run — the same class of decision as
+  // approving a plan, so it sits with the same role.
+  'standards.propose': ['product-owner', 'admin'],
+  'standards.approve': ['reviewer'],
+  'standards.reject': ['reviewer'],
+  // Only for a project that predates standards, while its automatic proposal is untouched.
+  'standards.accept-defaults': ['admin'],
   'users.manage': ['admin'],
   'audit.view': ['admin'],
   // Engine status, re-check and API keys (S3).
@@ -87,6 +99,15 @@ export interface ActionState {
   runnerState?: string;
   /** gate.*: status of the run. */
   runStatus?: string;
+  /** standards.approve / reject: status of the standards version being decided. */
+  standardsStatus?: string;
+  /** standards.accept-defaults: the project predates standards and its pending version is the untouched automatic proposal. */
+  standardsAcceptable?: boolean;
+  /**
+   * plan.generate*: the project has an approved standards version.
+   * run.start: false only when the plan was generated under standards and none is approved now.
+   */
+  standardsApproved?: boolean;
 }
 
 function hasRole(actor: Actor, action: ServerAction): boolean {
@@ -106,17 +127,19 @@ export function canPerform(actor: Actor, action: ServerAction, state: ActionStat
     case 'plan.reject':
       return state.planStatus === undefined || state.planStatus === 'pending';
     case 'plan.generate':
-      if (state.runsDisabled === true || state.openPlan === true || state.budgetExhausted === true) { return false; }
+      if (state.runsDisabled === true || state.openPlan === true || state.budgetExhausted === true
+        || state.standardsApproved === false) { return false; }
       return state.hasDeltaScope === undefined || state.hasDeltaScope;
     case 'plan.generate-initial':
-      if (state.runsDisabled === true || state.openPlan === true || state.budgetExhausted === true) { return false; }
+      if (state.runsDisabled === true || state.openPlan === true || state.budgetExhausted === true
+        || state.standardsApproved === false) { return false; }
       return state.versionCount === undefined || state.versionCount === 1;
     case 'prd.bump-override':
       if (state.overrideLocked === true) { return false; }
       return state.canOverride === undefined || state.canOverride;
     case 'run.start':
       if (state.runsDisabled === true || state.jobActive === true || state.budgetExhausted === true || state.engineUnavailable === true
-        || state.engineChanged === true) { return false; }
+        || state.engineChanged === true || state.standardsApproved === false) { return false; }
       return state.planStatus === undefined || state.planStatus === 'approved' || state.planStatus === 'ran';
     case 'run.stop':
       return state.runnerState === undefined || state.runnerState === 'playing' || state.runnerState === 'paused';
@@ -124,6 +147,11 @@ export function canPerform(actor: Actor, action: ServerAction, state: ActionStat
     case 'gate.reject':
     case 'gate.skip':
       return state.runStatus === undefined || state.runStatus === 'awaiting-approval';
+    case 'standards.approve':
+    case 'standards.reject':
+      return state.standardsStatus === undefined || state.standardsStatus === 'pending';
+    case 'standards.accept-defaults':
+      return state.standardsAcceptable === undefined || state.standardsAcceptable;
     default:
       return true;
   }

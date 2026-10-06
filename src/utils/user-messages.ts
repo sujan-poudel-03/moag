@@ -73,6 +73,13 @@ export function planLoadError(detail?: string): UserMessage {
   };
 }
 
+export function standardsLoadError(detail?: string): UserMessage {
+  const hint = detail ? ` ${truncate(detail, 240)}` : '';
+  return {
+    text: `Could not read the project standards.${hint} Fix or remove .moag/standards.json and try again.`,
+  };
+}
+
 export function clipboardEmpty(): UserMessage {
   return {
     text: 'Nothing found on your clipboard. Copy some text first and try again.',

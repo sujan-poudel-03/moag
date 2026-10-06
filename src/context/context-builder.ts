@@ -5,6 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Plan, Playlist, Task, TaskStatus, HistoryEntry } from '../models/types';
 import { HistoryStore } from '../history/store';
+import { PROJECT_STANDARDS_HEADER } from '../standards/profile';
 import { semanticSearch, formatSpans, SemanticSpan } from './semantic-provider';
 import { KnowledgeGraph, lookupSymbols, buildKG as _buildKG } from './knowledge-graph';
 import { ContextWeights, DEFAULT_WEIGHTS, loadWeights } from './weights';
@@ -91,6 +92,12 @@ export interface ContextOptions {
    * first thing the agent reads and the last thing a budget squeeze would drop.
    */
   roleCharter?: string;
+  /**
+   * The project's approved standards, already rendered. Emitted as `## Project Standards`
+   * directly before `## AI Rules` and PINNED: it is never dropped or truncated by the budget,
+   * and what it uses comes out of the budget the other sections share.
+   */
+  standards?: string;
   /** Pre-formatted text from enabled AI rules — injected as the second-highest-priority context section. */
   aiRules?: string;
   /** Facts this repository has proven about itself. See runner/knowledge.ts. */
@@ -189,6 +196,12 @@ export function buildContext(options: ContextOptions): string {
   // then the constraints that identity works under.
   if (options.roleCharter && options.roleCharter.trim()) {
     sections.push({ priority: -2, header: '## Role', body: options.roleCharter.trim() });
+  }
+
+  // Pushed immediately before the AI rules: the agreed project contract first, then the
+  // author's own rules. Same priority, so push order is what keeps them adjacent.
+  if (options.standards && options.standards.trim()) {
+    sections.push({ priority: -1, header: PROJECT_STANDARDS_HEADER, body: options.standards.trim() });
   }
 
   if (options.aiRules && options.aiRules.trim()) {
@@ -306,7 +319,16 @@ export function buildContext(options: ContextOptions): string {
   }
 
   const beforeTrim = sections.length;
-  const trimmed = applyBudget(sections, settings.maxContextChars);
+  // The standards section is pinned: it is kept whole, and the other sections compete for
+  // what is left. A budget smaller than the block therefore yields the block alone.
+  const pinned = sections.filter((s) => s.header === PROJECT_STANDARDS_HEADER);
+  const pinnedChars = pinned.reduce((sum, s) => sum + s.header.length + 1 + s.body.length + 2, 0);
+  const others = applyBudget(
+    sections.filter((s) => s.header !== PROJECT_STANDARDS_HEADER),
+    Math.max(0, settings.maxContextChars - pinnedChars),
+  );
+  // Stable sort: the pinned section goes in first, so it stays ahead of its priority peers.
+  const trimmed = [...pinned, ...others].sort((a, b) => a.priority - b.priority);
   const sectionsDropped = beforeTrim - trimmed.length;
 
   if (trimmed.length === 0) {

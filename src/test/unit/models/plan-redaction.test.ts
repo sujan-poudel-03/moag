@@ -5,7 +5,7 @@ import * as os from 'os';
 import {
   createEmptyPlan, createTask, dehydratePlan, loadPlan, savePlan, serializePlanForSharing,
 } from '../../../models/plan';
-import { redactPlanFile } from '../../../models/plan-redaction';
+import { PLAN_FILE_DISCLOSURE, redactPlanFile } from '../../../models/plan-redaction';
 import { Plan, PlanFile, TaskStatus } from '../../../models/types';
 
 // Sentinels — none of these strings may appear in shared output.
@@ -218,5 +218,24 @@ describe('redactPlanFile / serializePlanForSharing', () => {
     assert.equal(loaded.customRoles![0].charter, SECRET_CUSTOM_ROLE_CHARTER);
     assert.equal(loaded.playlists[0].role, 'designer');
     assert.equal(loaded.playlists[0].tasks[0].role, 'reviewer');
+  });
+});
+
+// ─── Standards version on a release row ───
+
+describe('plan redaction — the standards version on a release is shared', () => {
+  it('redactPlanFile keeps the release row\'s standards version: a number, the same class as the tag beside it', () => {
+    const plan = createEmptyPlan('share');
+    plan.prdVersions = [{ version: '1.0.0', text: '## Requirements\n- [R-1] secret requirement text\n', createdAt: '2026-10-05T00:00:00.000Z' }];
+    plan.requirementTrace = [{
+      id: 'R-1', taskIds: ['t-1'], commits: [], gates: [],
+      releases: [{ releaseTag: 'ship-run-1', prdVersion: '1.0.0', at: '2026-10-05T00:00:00.000Z', taskIds: ['t-1'], standardsVersion: 3 }],
+    }];
+    const shared = redactPlanFile(dehydratePlan(plan)).file;
+    assert.equal(PLAN_FILE_DISCLOSURE.requirementTrace, 'share');
+    assert.deepEqual(shared.requirementTrace![0].releases[0], {
+      releaseTag: 'ship-run-1', prdVersion: '1.0.0', at: '2026-10-05T00:00:00.000Z', taskIds: ['t-1'], standardsVersion: 3,
+    });
+    assert.ok(!JSON.stringify(shared).includes('secret requirement text'), 'PRD text is still redacted');
   });
 });

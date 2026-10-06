@@ -14,8 +14,18 @@ import {
 
 // ─── Full plan ───
 
-/** The prompt that asks an engine for a complete Design → Development → Testing plan. */
-export function buildFullPlanPrompt(prdText: string): string {
+/** A standards block as its own paragraph, ready to sit directly above the `Rules:` line. */
+function standardsParagraph(standardsText?: string): string {
+  const text = standardsText?.trim();
+  return text ? `${text}\n\n` : '';
+}
+
+/**
+ * The prompt that asks an engine for a complete Design → Development → Testing plan.
+ * `standardsText` (from `renderPlannerStandards`) is placed before the output-format rules,
+ * so those rules stay the last instructions the model reads before the PRD.
+ */
+export function buildFullPlanPrompt(prdText: string, standardsText?: string): string {
   return `You are a senior engineering lead. Given the Product Requirements Document (PRD) below, generate a structured JSON execution plan for an AI coding agent.
 
 The plan MUST have up to three playlists in this order:
@@ -23,7 +33,7 @@ The plan MUST have up to three playlists in this order:
 2. "Development" — implementation tasks (backend, frontend, infrastructure, migrations, etc.)
 3. "Testing" — test writing, QA, edge-case coverage, accessibility checks (set "testPhase": true)
 
-Rules:
+${standardsParagraph(standardsText)}Rules:
 - Each task must have: "id" (unique string e.g. "task-1"), "name" (short title), "prompt" (detailed enough for Claude Code to execute autonomously — include file paths, acceptance criteria, patterns to follow), "status": "pending"
 - Task type rules — include optional "type" field (defaults to "agent"):
   - "agent"       AI coding tasks (most tasks)
@@ -175,16 +185,17 @@ function deltaLines(scope: DeltaScope): string[] {
 
 /**
  * The prompt for a delta plan: tasks for the added and changed requirements only, each
- * citing the IDs it covers, with the full PRD appended as context.
+ * citing the IDs it covers, with the full PRD appended as context. `standardsText` goes
+ * before the output-format rules, as in {@link buildFullPlanPrompt}.
  */
-export function buildDeltaPlanPrompt(input: { fullPrdText: string; scope: DeltaScope }): string {
+export function buildDeltaPlanPrompt(input: { fullPrdText: string; scope: DeltaScope; standardsText?: string }): string {
   const ids = scopeIds(input.scope);
   return `You are a senior engineering lead. A Product Requirements Document (PRD) was revised to ${formatVersionLabel(input.scope.versionLabel)}. Generate a structured JSON execution plan that covers ONLY the requirements listed under "Changed requirements" — nothing else in the PRD.
 
 Changed requirements:
 ${deltaLines(input.scope).join('\n')}
 
-Rules:
+${standardsParagraph(input.standardsText)}Rules:
 - Return a plan JSON object with a single playlist of tasks.
 - Every task MUST have a "requirementIds" array citing ONLY IDs from this list: ${ids.join(', ')}. A task that cites none of them is discarded.
 - Include at least one "command" task that runs the test suite, with "requirementIds": [${ids.map(id => `"${id}"`).join(', ')}].
@@ -280,12 +291,16 @@ export async function generateDeltaPlan(plan: Plan, deps: {
   runEngine: (prompt: string, signal: AbortSignal) => Promise<EngineResult>;
   signal: AbortSignal;
   now?: () => number;
+  /** Project standards for the planning prompt (from `renderPlannerStandards`). */
+  standardsText?: string;
 }): Promise<DeltaPlanOutcome> {
   const scope = describeDeltaScope(plan);
   const versions = plan.prdVersions ?? [];
   if (!scope || versions.length === 0) { return { kind: 'no-delta' }; }
 
-  const prompt = buildDeltaPlanPrompt({ fullPrdText: versions[versions.length - 1].text, scope });
+  const prompt = buildDeltaPlanPrompt({
+    fullPrdText: versions[versions.length - 1].text, scope, standardsText: deps.standardsText,
+  });
   let result: EngineResult;
   try {
     result = await deps.runEngine(prompt, deps.signal);

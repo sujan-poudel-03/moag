@@ -34,10 +34,41 @@ function taskSummaryLabel(tasks) {
   return Object.entries(counts).map(([s, n]) => `${n} ${s}`).join(', ');
 }
 
-function gateSummary(gates) {
-  if (!gates.length) { return '—'; }
-  const pass = gates.filter((g) => g.exitCode === 0).length;
-  return `${pass}/${gates.length} pass`;
+/**
+ * What the standards check behind a release left open, in words, or '' when it left nothing
+ * open or recorded no counts: "2 advisory findings · 1 file not checked". A release whose
+ * standards had no command and no promoted rule leads with "no blocking rules configured":
+ * it was checked against that version, and nothing in the check could have stopped it.
+ */
+export function standardsOpen(counts) {
+  if (!counts || typeof counts !== 'object') { return ''; }
+  const part = (n, one, many) => (Number.isInteger(n) && n > 0 ? `${n} ${n === 1 ? one : many}` : null);
+  return [
+    counts.noBlockingRules === true ? 'no blocking rules configured' : null,
+    part(counts.advisoryFindings, 'advisory finding', 'advisory findings'),
+    part(counts.notCheckedRules, 'rule not checked', 'rules not checked'),
+    part(counts.notCheckedFiles, 'file not checked', 'files not checked'),
+  ].filter(Boolean).join(' · ');
+}
+
+/**
+ * The Gates cell. Only real commands are tallied as "N/M pass". The synthetic
+ * `moag:standards` row is not a command and is never counted as a pass: it is worded beside
+ * the tally — "stopped" when it stopped the release, "no blocking rules configured" when the
+ * profile had nothing that could, otherwise "nothing blocking".
+ */
+export function gateSummary(gates) {
+  if (!Array.isArray(gates) || !gates.length) { return '—'; }
+  const isStandards = (g) => typeof g.command === 'string' && /^moag:standards(?: v\d+)?$/.test(g.command);
+  const commands = gates.filter((g) => !isStandards(g));
+  const standards = gates.filter(isStandards).pop();
+  const parts = [];
+  if (commands.length) { parts.push(`${commands.filter((g) => g.exitCode === 0).length}/${commands.length} pass`); }
+  if (standards) {
+    const noBlocking = standards.standardsCounts && standards.standardsCounts.noBlockingRules === true;
+    parts.push(`standards: ${standards.exitCode !== 0 ? 'stopped' : noBlocking ? 'no blocking rules configured' : 'nothing blocking'}`);
+  }
+  return parts.join(' · ');
 }
 
 export async function render(app, params, view) {
@@ -90,7 +121,12 @@ export async function render(app, params, view) {
           h('td', null, textById.get(row.id) || h('span', { class: 'muted' }, '—'),
             row.blockedBy ? h('div', { class: 'muted' }, `blocked by ${row.blockedBy}`) : null),
           h('td', { class: st.cls }, glyph(st.glyph), ' ', st.label),
-          h('td', null, row.version ? `v${String(row.version).replace(/^v/, '')}` : '—'),
+          // The standards version the release shipped under rides in the version cell (no extra column).
+          h('td', null, row.version ? `v${String(row.version).replace(/^v/, '')}` : '—',
+            row.standardsVersion ? ` · standards v${row.standardsVersion}` : null,
+            // What that check left open rides beside it: a checked release is not always a clean one.
+            row.standardsVersion && standardsOpen(row.standardsCounts)
+              ? h('div', { class: 'muted' }, standardsOpen(row.standardsCounts)) : null),
           h('td', { class: 'col-optional' }, row.releaseTag || '—'),
           h('td', null, h('span', { 'aria-hidden': 'true' }, taskSummary(row.tasks)), h('span', { class: 'sr-only' }, taskSummaryLabel(row.tasks))),
           h('td', { class: 'col-optional' }, gateSummary(row.gates)));

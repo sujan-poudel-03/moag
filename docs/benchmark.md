@@ -23,8 +23,8 @@ The bench creates four users, each with its own session:
 | User | Role | Does |
 |---|---|---|
 | `bench-admin` | admin | Bootstraps the server, creates the other users, reads the engine probe |
-| `bench-po` | product-owner | Creates the project, sets the per-version budget, saves each PRD version, overrides a bump, requests plans |
-| `bench-reviewer` | reviewer | Approves (or rejects) each generated plan, starts and stops runs |
+| `bench-po` | product-owner | Creates the project, proposes its standards, sets the per-version budget, saves each PRD version, overrides a bump, requests plans |
+| `bench-reviewer` | reviewer | Approves the project standards, approves (or rejects) each generated plan, starts and stops runs |
 | `bench-approver` | approver | Approves or rejects each ship gate |
 
 Each non-admin user gets a random temporary password, signs in, and is forced to change it, exactly as a new team member would.
@@ -40,6 +40,7 @@ Setup:
 3. `POST /api/admin/users` creates three users. Each one signs in (`POST /api/login`) and sets a new password (`POST /api/me/password`).
 4. The product owner calls `POST /api/projects` with source `{kind: "path"}` (the prepared workspace), the scenario's stack, and its engine.
 5. The admin opens `GET /api/projects/:id/events` (SSE). Every `job-event` is logged; `cost` events also feed the budget watchdog.
+6. The product owner proposes the project standards (`POST …/standards/versions`) and the reviewer approves them (`POST …/standards/versions/:version/approve`, echoing the `contentHash`). See [Project standards](#project-standards). No plan is requested before this succeeds.
 
 Then, for each PRD version:
 
@@ -80,6 +81,7 @@ A scenario is a JSON file. Relative paths resolve against the scenario's directo
 | `allowedCommands` | Optional. Extra shell commands a generated plan may carry and still be approved unread. Exact strings, never patterns. See [The command allow-list](#the-command-allow-list). |
 | `versions[]` | `{id, prdFile, intendedBump, dryRunFixture?}`. The first version's bump must be `initial`, and only the first may be. Later versions use `patch`, `minor` or `major`. |
 | `dryRun.planCommand` | Dry-run only: the test command the fake planner puts in every plan. |
+| `standardsProfile` | Optional. Path of a standards profile JSON file inside the scenario directory. See [Project standards](#project-standards). |
 
 Tag every requirement line explicitly (`- [R-3] …`). An untagged line whose wording changes gets a new id, which counts as a removal and makes the bump `major`.
 
@@ -96,13 +98,45 @@ The bench approves plans that no human has read, so it approves a plan only when
 
 Put a command in `allowedCommands` only if you would approve it in any plan for that repository. Never list a command that pushes, publishes, tags or deploys.
 
-### The two scenarios in `bench/scenarios/`
+### Project standards
+
+The server generates no plan until a reviewer has approved a standards version for the project. The bench goes through that reviewed path once per run, right after it creates the project:
+
+1. The server proposes v1 itself when the project is created. The bench does not approve that version.
+2. The product owner proposes the scenario's profile as the next version:
+   - the file named by `standardsProfile`, when the scenario has one;
+   - otherwise the built-in profile for the scenario's `stack`, with no commands. A `clone` repository gets it as `brownfield`, a `template` repository as `greenfield`. Such a profile has no blocking rule at all (a run under it ships, stamped "no blocking rules configured"), so every shipped scenario names its own profile with a command.
+3. The bench checks what the server returned before it plays the reviewer. It refuses to approve when the version is not `pending`, when its `contentHash` is not the hash of the profile the bench sent, or when any command in it is not exactly one of `gateCommands`, `allowedCommands` or `dryRun.planCommand`.
+4. The reviewer approves it, echoing the `contentHash` — and, because a first version that brings a command changes enforcement, the same hash again as `acknowledgedEnforcementHash`. The bench gives that acknowledgement for exactly the content it checked in step 3.
+
+The bench never uses `accept-defaults`, so the path it measures is the reviewed one.
+
+A refusal at any of these steps is a harness error (exit 2). The error names the step, and no plan is requested.
+
+Approving standards is project setup, like creating the users. It is written to `events.jsonl` (`standards-approved` or `standards-refused`) and to `notes` in the summary. It is **not** counted as an intervention.
+
+Rules for a `standardsProfile` file:
+
+- It must be inside the scenario directory and pass the same validator as a profile submitted through the API.
+- Its `stackTemplateId` must be the scenario's `stack`.
+- Each command in it must be exactly one of `gateCommands`, `allowedCommands` or `dryRun.planCommand`. Otherwise parsing fails and names the field, for example `standardsProfile.commands[1].run`. Approving a profile lets its commands run on every run, so this is the same rule as for plan commands.
+
+Every dry-run fixture must conform to the profile its scenario gets approved, unless the scenario exists to show a violation. A unit test runs the checker over each shipped fixture and requires zero findings, blocking or advisory, and no file left unchecked.
+
+The shipped profiles follow the checker's defaults: **MOAG blocks on the project's own tools; its own scans are advisory unless promoted.** Every shipped profile therefore carries at least one command, which is its whole blocking set, and promotes nothing; a unit test pins both. Banned phrases in the shipped profiles are truncation placeholders only; none lists "as an AI".
+
+The server refuses to approve a ship while the standards check made at the ship gate shows a blocking failure, or a blocking rule or command that was not checked (`409 standards-blocking`). The bench approver then does what a person would: rejects the ship. It is written to `events.jsonl` as `ship-refused-standards` and listed as an **unplanned** intervention of that kind; the run ends `ship-rejected`.
+
+If the plan request itself answers `409 standards-not-approved`, the version is `plan-failed` with an **unplanned** `plan-standards-not-approved`. The bench does not retry it.
+
+### The scenarios in `bench/scenarios/`
 
 **`greenfield-todo`** ($10):
 
 - A Node + TypeScript command-line todo app, built from an empty repository.
 - The bench's acceptance gate is `npm test`.
 - Also allowed in a plan: `npm run test`, `npm run build`, `npm install`, `npm ci`, `npm install && npm test`, `npm run build && npm test`.
+- Standards: its own profile, `standards.json`. It requires no directory, because the dry-run stand-in is plain JavaScript in `bin/` and `test/`, while a real engine writes TypeScript. It carries one command, `npm test`, which is its whole blocking set, and promotes no rule: every scan in it is advisory. A dry-run therefore exercises the default blocking path end to end: the command runs at the ship gate and again in verify, its row is `passed`, and each release is stamped with the standards version.
 - Versions:
   - v1 `initial`: add, list, complete, JSON persistence, tests.
   - v2 intended `patch`: Overview reworded, R-2 clarified, and a bugfix in R-3.
@@ -114,6 +148,17 @@ Put a command in `allowedCommands` only if you would approve it in any plan for 
 - One small PRD: a `formatUsd` helper and its mocha test file.
 - The bench's acceptance gates are `npm run compile` and that one mocha file (`npx mocha --require ts-node/register src/test/unit/utils/usd-format.test.ts`).
 - Also allowed in a plan: `npm run lint`, `npm test`, `npm run test`, and the same mocha command with the file path in double quotes.
+- Standards: its own profile, `standards.json` — the built-in `node-ts` profile as `brownfield`, plus the one command `npm run compile` (already an acceptance gate of the scenario), so that its blocking path is real. Its required directory is advisory, as in every built-in, and so is every scan.
+
+**`standards-violation`** ($3):
+
+- A negative scenario for the standards gate: one small PRD (a `slugify` helper) in an empty repository.
+- The bench's acceptance gate is `npm test`. Also allowed: `npm run test` and `npm run lint`.
+- Standards: its own profile, `standards.json`, which forbids commented-out code, lists truncation placeholders as banned phrases, and runs one command, `npm run lint`. It **promotes nothing**: what stops the ship is the project's own tool, by its exit code — not a scan of MOAG's.
+- Its dry-run fixture passes its own tests but leaves two violations in `src/slug.js`: line 4 is commented-out code, and line 6 is the placeholder comment `// ... rest of the code ...`. The fixture's lint script (`tools/lint.js`, run by `npm run lint`) exits 1 on the placeholder. MOAG's own scans report both lines as **advisory** findings beside it; on their own they would stop nothing.
+- Expected dry-run result: the acceptance gate (`npm test`) is green; the standards check at the ship gate shows the command row `npm run lint` **failed** (exit 1) and two advisory findings; the server refuses the ship approval (`409 standards-blocking`), the bench approver rejects the ship, and nothing is marked shipped. The version's outcome is `not-shipped` with `endState: "run-ship-rejected"`, one unplanned intervention `ship-refused-standards`, and `moagVerify: null` (verify never ran: the ship was never approved).
+- The scenario format has no expected-outcome field. Unit tests pin the two advisory findings and the exit codes of the fixture's own scripts; read the summary of a dry-run against the list above.
+- It is meant for dry-runs. A real engine would be told the standards and would normally write conforming code.
 
 ## Two gate notions: never merged
 
@@ -123,6 +168,8 @@ Put a command in `allowedCommands` only if you would approve it in any plan for 
   - brownfield: `npm run lint` and the **full** unit suite (`npm test`).
 
   These are reported as `moagVerify`.
+
+  Verify also checks the diff against the approved project standards, before the auto-detected commands, and runs the profile's commands after them. A standards failure — a failed profile command, a promoted rule with findings, or a blocking rule or command that was not checked — is reported as `moagVerify.failedGate: "standards"` with `failedCommand: null`. It is never recorded as an `environment` finding, because it names no command the machine could have failed to run.
 
 The two can disagree, and both are reported. A brownfield version that MOAG refuses to ship because its own lint or full suite failed is a valid finding, not a harness failure.
 
@@ -237,13 +284,16 @@ Run a dry-run with Git Bash. No `NODE_OPTIONS` setting is needed, on Node 20 or 
 npm run compile
 node out/headless/cli.js bench bench/scenarios/greenfield-todo/scenario.json --dry-run --out <dir>/greenfield
 node out/headless/cli.js bench bench/scenarios/brownfield-moag/scenario.json --dry-run --out <dir>/brownfield
+node out/headless/cli.js bench bench/scenarios/standards-violation/scenario.json --dry-run --out <dir>/violation
 ```
 
 Exit codes:
 
 - `0`: the harness completed, whatever the product outcome.
 - `4`: stopped for budget.
-- `2`: a harness or usage error, including Ctrl+C, and a paid run stopped by a failed environment probe.
+- `2`: a harness or usage error, including Ctrl+C, a paid run stopped by a failed environment probe, and standards that could not be proposed or approved.
+
+The `standards-violation` dry-run exits `0`: the harness completed, and the product correctly refused to ship (the ship gate could not be approved).
 
 `--out` must be empty or missing. Keep it short on Windows: `MAX_PATH` applies to the workspace and its `node_modules`.
 

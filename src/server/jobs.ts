@@ -177,6 +177,15 @@ function defaultIsPidAlive(pid: number): boolean {
 }
 
 /** Replace every occurrence of each secret in `text`. */
+/** A JSON-safe copy of `value` with {@link redactSecrets} applied to every string value. */
+function redactJsonStrings<T>(value: T, secrets: readonly string[]): T {
+  try {
+    return JSON.parse(JSON.stringify(value), (_key, v) => (typeof v === 'string' ? redactSecrets(v, secrets) : v)) as T;
+  } catch {
+    return value;
+  }
+}
+
 export function redactSecrets(text: string, secrets: readonly string[]): string {
   let out = text;
   for (const s of secrets) {
@@ -563,7 +572,9 @@ export class JobManager {
       }
       const safe: WorkerEvent = ev.event === 'task-error-tail' ? { ...ev, tail: redactSecrets(ev.tail, redact) }
         : ev.event === 'error' || ev.event === 'warning' ? { ...ev, message: redactSecrets(ev.message, redact) }
-          : ev;
+          // verify-* payloads carry command output (a standards report's command tails).
+          : ev.event === 'verify' && redact.length > 0 ? { ...ev, data: redactJsonStrings(ev.data, redact) }
+            : ev;
       try { input.onEvent?.(safe); } catch (err) { this.opts.log?.(`onEvent: ${(err as Error).message}`); }
       this.notify(a.projectId, { type: 'event', jobId: a.jobId, event: safe });
     };

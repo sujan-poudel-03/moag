@@ -32,6 +32,7 @@ describe('role matrix (ROUTES × WEB_ROLES)', function () {
     .replace(':id', p.startsWith('/api/admin/users') ? 'no-such-user' : projectId)
     .replace(':planId', 'no-such-plan')
     .replace(':runId', 'no-such-run')
+    .replace(':version', '1')
     .replace(':engine', 'anthropic');
 
   it('every server action is guarded by at least one route or a body-selected variant', () => {
@@ -81,6 +82,10 @@ describe('role matrix (ROUTES × WEB_ROLES)', function () {
       'gate.approve': ['approver'],
       'gate.reject': ['approver'],
       'gate.skip': ['admin'],
+      'standards.propose': ['admin', 'product-owner'],
+      'standards.approve': ['reviewer'],
+      'standards.reject': ['reviewer'],
+      'standards.accept-defaults': ['admin'],
       'users.manage': ['admin'],
       'audit.view': ['admin'],
       'engines.manage': ['admin'],
@@ -182,6 +187,27 @@ describe('role matrix (ROUTES × WEB_ROLES)', function () {
     assert.equal(canPerform(po, 'plan.generate-initial', { versionCount: 1, budgetExhausted: true }), false);
     assert.equal(canPerform(po, 'plan.generate', { hasDeltaScope: true, budgetExhausted: false }), true);
     assert.equal(canPerform(po, 'plan.generate-initial', { versionCount: 1, budgetExhausted: false }), true);
+  });
+
+  it('state rules: standards are decided only while pending, defaults accepted only when acceptable, and plans need an approved version', () => {
+    const rev = { id: 'r', roles: ['reviewer' as const] };
+    const admin = { id: 'a', roles: ['admin' as const] };
+    const po = { id: 'u1', roles: ['product-owner' as const] };
+    assert.equal(canPerform(rev, 'standards.approve', { standardsStatus: 'pending' }), true);
+    assert.equal(canPerform(rev, 'standards.reject', { standardsStatus: 'pending' }), true);
+    for (const status of ['approved', 'rejected', 'superseded']) {
+      assert.equal(canPerform(rev, 'standards.approve', { standardsStatus: status }), false, status);
+      assert.equal(canPerform(rev, 'standards.reject', { standardsStatus: status }), false, status);
+    }
+    assert.equal(canPerform(admin, 'standards.accept-defaults', { standardsAcceptable: true }), true);
+    assert.equal(canPerform(admin, 'standards.accept-defaults', { standardsAcceptable: false }), false);
+    assert.equal(canPerform(admin, 'standards.approve', { standardsStatus: 'pending' }), false, 'an admin never reviews');
+    assert.equal(canPerform(po, 'standards.approve', { standardsStatus: 'pending' }), false, 'the proposer role never approves');
+    assert.equal(canPerform(po, 'plan.generate', { hasDeltaScope: true, standardsApproved: false }), false);
+    assert.equal(canPerform(po, 'plan.generate-initial', { versionCount: 1, standardsApproved: false }), false);
+    assert.equal(canPerform(po, 'plan.generate', { hasDeltaScope: true, standardsApproved: true }), true);
+    assert.equal(canPerform(rev, 'run.start', { planStatus: 'approved', standardsApproved: false }), false);
+    assert.equal(canPerform(rev, 'run.start', { planStatus: 'approved', standardsApproved: true }), true);
   });
 
   it('state rules: run.start is refused once the engine changed after approval', () => {

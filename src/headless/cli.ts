@@ -6,26 +6,52 @@
  *   moag run    <plan.json> [--no-interactive] [--full-auto] [--engine <id>] [--cwd <dir>]
  *                           [--verify] [--fix] [--prd <file>] [--gate "<cmd>"] [--max-iterations <n>]
  *                           [--uat | --no-uat] [--uat-spec <path>]
+ *                           [--standards <file> | --no-standards] [--base <ref>]
  *   moag run    --prompt "<text>" [--engine <id>] [--full-auto] [--cwd <dir>]
  *   moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]
  *                           [--engine <id>] [--cwd <dir>] [--uat | --no-uat] [--uat-spec <path>]
+ *                           [--standards <file> | --no-standards] [--base <ref>]
  *   moag loop   --repo <owner/repo> [--label <l>] [--interval <sec>] [--once]
  *                                   [--full-auto] [--engine <id>] [--cwd <dir>]
  *   moag config <get-engine | set-engine <id>>
  *   moag trace  [<plan.json> | --plan <path>] [--req R-<n>]
+ *   moag standards show
+ *   moag standards check   [--base <ref>] [--no-commands]
+ *   moag standards propose [--stack <id>] [--write [--force]]
  *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
  *
  * `run`   executes a single plan file, or a one-shot prompt (`--prompt`) which is
  *          turned into a single agent task and run through the selected engine.
- * `verify` runs the deterministic PRD gates (change / command / artifact / status)
- *          and only then asks a model for a verdict; with `--fix` it generates and
+ * `verify` runs the deterministic PRD gates (status / change / standards / command /
+ *          artifact) and only then asks a model for a verdict; with `--fix` it generates and
  *          runs fix playlists until the gates pass or a halt condition trips.
+ *          The standards gate checks the diff since `--base` against `.moag/standards.json`
+ *          when the workspace has one. Without `--base` that is the commit captured when the
+ *          first run since the last passed verification started (`.moag/standards-base.json`),
+ *          so work a run committed is still checked; with none captured it is HEAD.
+ *          `--standards <file>` reads a server-written job file instead.
+ *          `--no-standards` turns project standards off for this invocation, all of it: task
+ *          prompts carry no standards block, and verification runs no standards gate — neither
+ *          the static rules nor the profile's commands. Nothing else is affected.
  *          `--uat` forces the browser UAT gate to run and pass (a missing
  *          Playwright/Cypress setup then FAILS verification); `--no-uat` disables
  *          it. Without either flag, agentTaskPlayer.prdLoop.uat.mode decides.
  * `config` reads/sets the persistent default engine in `.moag/config.json`.
  * `trace`  prints one JSONL line per PRD requirement (shipped / in-progress / not-shipped /
- *          untracked / removed) with its PRD version, release tag, tasks and gate exit codes.
+ *          untracked / removed) with its PRD version, release tag, the standards version that
+ *          release was checked against, tasks and gate exit codes.
+ * `standards` works on the workspace's own `.moag/standards.json`, with no engine and no model:
+ *          `show` prints the document and the text every task prompt carries; `check` checks
+ *          the diff since `--base` (default: the captured run base, else HEAD) and exits 0 when
+ *          no BLOCKING rule or command failed (or none is configured, which it says), 1 when
+ *          one did, 5 when no diff could be taken at all, so nothing was checked, and 6 when
+ *          a command or a promoted rule was NOT CHECKED. Advisory findings are listed and do
+ *          not change the exit code; rules it could not decide are listed as "not checked",
+ *          which is never a pass. `propose` detects the repository's conventions from the
+ *          files git tracks and prints a
+ *          proposed profile, writing it (as the next version) only with `--write`; an existing
+ *          file that differs — it may hold hand edits — is replaced only with `--force`, and
+ *          the file it replaces is kept as `.moag/standards.json.bak`.
  * `bench`  drives the hosted server end to end through one benchmark scenario
  *          (docs/benchmark.md). `--dry-run` uses a fake engine and spends nothing;
  *          a paid run requires `--max-usd`, and stops before any engine call when a
@@ -43,8 +69,19 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { installVscodeShim, FileMemento } from './install-shim';
 // Both of these are free of VS Code API imports, so they are safe to load before the shim.
-import { detectPrdFile } from '../runner/evidence';
+import { captureHeadRef, collectStandardsInput, detectPrdFile, EMPTY_TREE_REF, runGate } from '../runner/evidence';
 import { createPrdLoop, HaltReason, PrdLoopConfig, PrdLoopReport, UatSession } from '../runner/prd-loop';
+import {
+  capStandardsReport, checkStandards, commandRow, groupStandardsRules, isBlockingNotChecked, MAX_REPORT_TAIL_CHARS, NO_BLOCKING_RULES,
+  promotedScannerRules, recountTotals, ruleOutcomeLabel, SCANNER_PROMOTION_WARNING, severityOf, standardsBlocked, standardsBlockingState,
+  StandardsReport,
+} from '../standards/checker';
+import { loadLocalStandards, localStandardsPath, readStandardsJobFile, writeLocalStandards } from '../standards/local-store';
+import { profileHash, renderStandardsText, StandardsDocument } from '../standards/profile';
+import { clearStandardsBase, rememberStandardsBase, resolveStandardsBase } from '../runner/standards-base';
+import { detectedStackId, proposeProfile } from '../standards/propose';
+import { detectConventions } from '../ai-rules/project-detector';
+import { STACK_IDS, isStackId } from '../server/stacks';
 import type { Plan } from '../models/types';
 
 /** How long a freshly launched headless sandbox gets to report `running`. */
@@ -100,6 +137,23 @@ export interface Args {
   maxUsd?: number;
   /** `bench` only: let a paid run go ahead although a scenario environment probe failed. */
   allowFailedProbes?: boolean;
+  /** Verify: a server-written standards job file. Takes the place of `.moag/standards.json`. */
+  standardsPath?: string;
+  /**
+   * Turn project standards off for this invocation: no standards block in task prompts and
+   * no standards gate in verification, even when the workspace has a standards file.
+   */
+  noStandards?: boolean;
+  /** Verify: the ref the standards gate diffs against. Undefined means the captured run base, else HEAD. */
+  base?: string;
+  /** `standards propose` only: save the proposal to `.moag/standards.json`. */
+  write?: boolean;
+  /** `standards propose --write` only: replace an existing file that differs from the proposal. */
+  force?: boolean;
+  /** `standards propose` only: the stack whose built-in profile the proposal starts from ('' when the flag had no value). */
+  stack?: string;
+  /** `standards check` only: check the static rules but run none of the profile's commands. */
+  noCommands?: boolean;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -144,6 +198,17 @@ export function parseArgs(argv: string[]): Args {
     else if (arg === '--uat') { a.uatMode = 'required'; }
     else if (arg === '--no-uat') { a.uatMode = 'off'; }
     else if (arg === '--uat-spec') { const s = rest[++i]; if (s) { a.uatSpec = s; } }
+    else if (arg === '--standards') { const s = rest[++i]; if (s) { a.standardsPath = path.resolve(a.cwd, s); } }
+    else if (arg === '--no-standards') { a.noStandards = true; }
+    else if (arg === '--base') { const b = rest[++i]; if (b) { a.base = b; } }
+    else if (arg === '--write') { a.write = true; }
+    else if (arg === '--force') { a.force = true; }
+    else if (arg === '--no-commands') { a.noCommands = true; }
+    // A bare --stack becomes '' so cmdStandards reports it as a usage error.
+    else if (arg === '--stack') {
+      const v = rest[i + 1];
+      if (v === undefined || v.startsWith('--')) { a.stack = ''; } else { a.stack = v; i++; }
+    }
     else if (arg === '--since') { const v = rest[++i]; if (v) { a.since = v; } }
     else if (arg === '--merge') { a.merge = true; }
     else if (arg === '--dry-run') { a.dryRun = true; }
@@ -200,6 +265,28 @@ export interface Ctx {
   loadPlan: (p: string) => any;
 }
 
+/**
+ * Give a headless runner the two things the extension host gives its own: the AI rules
+ * store and the project standards. Headless has no global storage, so the rules store is
+ * workspace-tier only (`<cwd>/.moag/rules.json`); standards come from `<cwd>/.moag/standards.json`.
+ *
+ * Both files are trusted here because the workspace is the user's own. The hosted server's
+ * worker must NOT call this — it is handed approved standards by the server instead.
+ *
+ * With `standards: false` (`--no-standards`) the runner gets the rules store only: no
+ * standards block reaches any prompt, and no standards base is captured.
+ */
+export function wireRunnerStandards(runner: any, cwd: string, opts: { standards?: boolean } = {}): void {
+  const { AiRulesStore } = require('../ai-rules/rules-store');
+  const { createLocalStandardsProvider } = require('../standards/local-store');
+  runner.setAiRulesStore(new AiRulesStore(null));
+  if (opts.standards === false) { return; }
+  runner.setStandardsProvider(createLocalStandardsProvider(cwd));
+  // Before the run's first task: remember where the tree stood, so a later check still
+  // sees work the run committed.
+  runner.setRunStartHook(() => rememberStandardsBase(cwd, new Date(), captureHeadRef));
+}
+
 /** Shared headless bootstrap. Installs the shim, then loads vscode-dependent modules. */
 async function setup(args: Args): Promise<Ctx> {
   installVscodeShim(args.cwd);
@@ -217,6 +304,7 @@ async function setup(args: Args): Promise<Ctx> {
 
   const memento = new FileMemento(path.join(args.cwd, '.moag', 'headless-state.json'));
   const runner = new TaskRunner(new HistoryStore(memento));
+  wireRunnerStandards(runner, args.cwd, { standards: !args.noStandards });
   // No runner.dispose() here on purpose: the CLI process is short-lived and
   // owns exactly one runner, so its cost-ledger subscription dies with the
   // process. The extension host, which outlives many runners, does dispose.
@@ -322,8 +410,124 @@ function normalizeBudgetUsd(raw: unknown): number {
   return Number.isFinite(n) && n >= 0 ? n : 0;
 }
 
+/**
+ * The standards a verification is checked against.
+ *
+ * `--standards <file>` (a server-written job file, which carries its own base ref) wins;
+ * then `--no-standards`; otherwise the workspace's own `.moag/standards.json`, diffed
+ * against `--base`. The hosted worker always passes one of the two flags, so a server
+ * run never falls through to a file the repository shipped.
+ *
+ * Throws a file-naming error when a standards file exists but is invalid — a broken
+ * file must stop verification, not quietly turn the gate off.
+ *
+ * `preloaded` takes the place of every file: the hosted worker reads its job file ONCE,
+ * before the agent runs, and hands what it read to each later check. Reading the file
+ * again afterwards would mean trusting whatever the agent left in the run directory.
+ */
+export function resolveVerifyStandards(args: Args, preloaded?: NonNullable<PrdLoopConfig['standards']>): PrdLoopConfig['standards'] {
+  if (preloaded) {
+    return { profile: preloaded.profile, version: preloaded.version, baseRef: preloaded.baseRef };
+  }
+  if (args.standardsPath) {
+    const job = readStandardsJobFile(args.standardsPath);
+    return { profile: job.profile, version: job.version, baseRef: job.baseRef };
+  }
+  if (args.noStandards) { return null; }
+  const doc = loadLocalStandards(args.cwd);
+  return doc ? { profile: doc.profile, version: doc.version, baseRef: args.base ?? null } : null;
+}
+
+/**
+ * What a `verify-standards` line says the check was made against: the hash of the profile
+ * actually used and the base ref it was told to diff from (the report's own `baseRef` is
+ * the one the diff ended up using, which differs when the recorded base was lost).
+ *
+ * The hosted server compares both with what it froze on the run record. A job file
+ * rewritten after the agent ran — self-consistently, hash included — is caught there,
+ * because this is computed from the profile in hand, not copied from the file.
+ */
+function standardsAttestation(standards: NonNullable<PrdLoopConfig['standards']>): { contentHash: string; recordedBaseRef: string | null } {
+  return { contentHash: profileHash(standards.profile), recordedBaseRef: standards.baseRef };
+}
+
+// ─── standards check without a run ───────────────────────────────────────────
+
+/** How long one profile command may run when no settings are loaded to say otherwise. */
+const STANDARDS_COMMAND_TIMEOUT_MS = 600_000;
+
+/**
+ * Check the working tree against a standards profile: the static rules over the diff
+ * since `baseRef`, then the profile's commands through `runGate`. No runner, no engine,
+ * no model call.
+ *
+ * The order and the stopping rules are the PRD loop's: commands run only when no static
+ * rule failed, and stop at the first one that fails. A command that did not run is
+ * `not-checked` with the reason — never `passed`.
+ */
+export async function checkStandardsNow(
+  standards: NonNullable<PrdLoopConfig['standards']>,
+  cwd: string,
+  opts: { signal: AbortSignal; commands: boolean; timeoutMs?: number },
+): Promise<StandardsReport> {
+  const input = await collectStandardsInput(cwd, standards.baseRef, { probeDirs: standards.profile.structure.requiredDirs });
+  const report = checkStandards(standards.profile, input);
+  report.version = standards.version;
+  // Only a blocking failure stops the commands: an advisory finding is no reason not to lint.
+  let skip: string | null = !opts.commands ? 'Commands were not run'
+    : standardsBlocked(report) ? 'A standards rule failed first' : null;
+  for (const cmd of standards.profile.commands) {
+    if (!skip && opts.signal.aborted) { skip = 'The check was stopped'; }
+    if (skip) {
+      report.rules.push(commandRow({ result: 'not-checked', reason: skip, command: cmd.run }));
+      continue;
+    }
+    const result = await runGate(cmd.run, { cwd, signal: opts.signal, timeoutMs: opts.timeoutMs ?? STANDARDS_COMMAND_TIMEOUT_MS });
+    report.rules.push(commandRow({
+      result: result.passed ? 'passed' : 'failed', command: cmd.run, exitCode: result.exitCode,
+      tail: result.output.slice(-MAX_REPORT_TAIL_CHARS),
+    }));
+    if (!result.passed) { skip = 'An earlier standards command failed'; }
+  }
+  report.totals = recountTotals(report);
+  return report;
+}
+
+/**
+ * The standards gate on its own, for the moment a hosted run halts at its ship gate: the
+ * approver gets a real result to look at before deciding, without waiting for the
+ * verification pass that only runs after approval. Informational — the authoritative
+ * check is still the one in `runVerifyCore`.
+ *
+ * Emits one `verify-standards` line with `phase: 'pre-gate'` and returns the report.
+ * Returns null, emitting nothing, when the arguments name no standards or the check was
+ * stopped part-way (a half-finished report would read as a result). Throws when the
+ * standards file is unreadable or invalid; the caller decides what that means.
+ *
+ * `preloaded` is what the worker read from its job file at start: with it, nothing is read
+ * from disk here, so the profile and its commands are the ones the server approved even
+ * if the file was rewritten while the agent ran.
+ */
+export async function runStandardsCheckCore(
+  args: Args, signal: AbortSignal, preloaded?: NonNullable<PrdLoopConfig['standards']>,
+): Promise<StandardsReport | null> {
+  const standards = resolveVerifyStandards(args, preloaded);
+  if (!standards || signal.aborted) { return null; }
+  const recorded = { ...standards };
+  // A job file carries its own base ref. The workspace file names none: without --base
+  // that is the base captured at run start, or HEAD when none was.
+  if (!preloaded && !args.standardsPath && args.base === undefined) {
+    standards.baseRef = await resolveStandardsBase(args.cwd, undefined, captureHeadRef);
+  }
+  const report = await checkStandardsNow(standards, args.cwd, { signal, commands: true });
+  if (signal.aborted) { return null; }
+  const capped = capStandardsReport(report);
+  emit({ event: 'verify-standards', phase: 'pre-gate', ...capped, ...standardsAttestation(recorded) });
+  return capped;
+}
+
 /** Build the loop config from settings, with CLI flags taking precedence. */
-export function buildVerifyConfig(args: Args, ctx: Ctx): PrdLoopConfig {
+export function buildVerifyConfig(args: Args, ctx: Ctx, preloaded?: NonNullable<PrdLoopConfig['standards']>): PrdLoopConfig {
   const cfg = ctx.vscode.workspace.getConfiguration('agentTaskPlayer');
   return {
     cwd: args.cwd,
@@ -344,6 +548,7 @@ export function buildVerifyConfig(args: Args, ctx: Ctx): PrdLoopConfig {
       specPath: args.uatSpec ?? cfg.get('prdLoop.uat.specPath', ''),
       timeoutMs: cfg.get('prdLoop.uat.timeoutMs', 900_000),
     },
+    standards: resolveVerifyStandards(args, preloaded),
   };
 }
 
@@ -353,9 +558,13 @@ export function buildVerifyConfig(args: Args, ctx: Ctx): PrdLoopConfig {
  * `persist` decides what the loop's saves write: `'plan'` (moag verify) saves the whole
  * plan; `'trace'` (moag run --verify) writes only `requirementTrace` and `fixIterations`,
  * because a headless run never persists its task statuses.
+ *
+ * `opts.standards` is the hosted worker's job standards as it read them at start; see
+ * {@link resolveVerifyStandards}.
  */
 export async function runVerifyCore(
   args: Args, ctx: Ctx, plan: any, events: RunnerEventState, persist: 'plan' | 'trace',
+  opts: { standards?: NonNullable<PrdLoopConfig['standards']> } = {},
 ): Promise<number> {
   const { savePlan } = require('../models/plan');
   const { getEngine } = require('../adapters/index');
@@ -363,7 +572,21 @@ export async function runVerifyCore(
   const { SandboxManager, isPortOpen } = require('../sandbox/sandbox-manager');
   const { detectProject } = require('../sandbox/project-detector');
 
-  const cfgForUat = buildVerifyConfig(args, ctx);
+  let cfgForUat: PrdLoopConfig;
+  /** True when the standards are the workspace's own file, whose base this process manages. */
+  const localStandards = !opts.standards && !args.standardsPath;
+  try {
+    cfgForUat = buildVerifyConfig(args, ctx, opts.standards);
+    // The workspace file names no base. Without --base that is the commit captured when the
+    // run started — so work the run committed is still inside the diff — or, with none
+    // captured, HEAD as it stands now.
+    if (cfgForUat.standards && localStandards && args.base === undefined) {
+      cfgForUat.standards.baseRef = await resolveStandardsBase(args.cwd, undefined, captureHeadRef);
+    }
+  } catch (err) {
+    emit({ event: 'error', message: err instanceof Error ? err.message : String(err) });
+    return 2;
+  }
   const sandbox: { mgr: any | null } = { mgr: null };
 
   const abort = new AbortController();
@@ -506,6 +729,20 @@ export async function runVerifyCore(
       emit({ event: 'error', message: `Could not write verification report: ${err instanceof Error ? err.message : String(err)}` });
     }
 
+    // Per-rule standards results, bounded so the line stays far below the worker protocol's
+    // limit. Emitted before verify-finished, and only when a standards gate was configured.
+    if (report.standards) {
+      emit({
+        event: 'verify-standards', phase: 'verify', ...capStandardsReport(report.standards),
+        ...(cfgForUat.standards ? standardsAttestation(cfgForUat.standards) : {}),
+      });
+    }
+
+    // Verified: the work since the captured base has been judged and accepted. The next
+    // run captures a new base. A failed or halted verification keeps the old one, so
+    // nothing unverified ever drops out of the diff.
+    if (report.passed && localStandards && cfgForUat.standards) { clearStandardsBase(args.cwd); }
+
     emit({
       event: 'verify-finished',
       passed: report.passed,
@@ -554,6 +791,15 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   // Captured before the run so --pr can report what the run actually touched.
   const { captureBaseRef } = require('../runner/evidence');
   const prBaseRef = args.pr ? await captureBaseRef(args.cwd) : null;
+  // The standards gate diffs against the tree as it was BEFORE the run: the run may commit,
+  // and a base captured afterwards would hide exactly the work that needs checking. An
+  // earlier run that was never verified left its own base behind; that one still stands.
+  // A repository with no commits has no HEAD; the gate then treats every file as added.
+  let verifyArgs = args;
+  if (args.verify && args.base === undefined && !args.standardsPath && !args.noStandards) {
+    const before: string | null = await resolveStandardsBase(args.cwd, undefined, captureHeadRef);
+    if (before) { verifyArgs = { ...args, base: before }; }
+  }
   emit({ event: 'run-started', plan: plan.name, planPath, fullAuto: args.fullAuto, engine: plan.defaultEngine });
   // Headless runs do not save the plan, except for requirement trace evidence (commits,
   // release stamps) the run recorded — that is persisted only when it actually changed.
@@ -570,7 +816,7 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
 
   if (!args.verify) { return runCode; }
   // A clean task tally is not evidence — fold the PRD verdict into the exit code.
-  const verifyCode = await runVerifyCore(args, ctx, plan, events, args.prompt ? 'plan' : 'trace');
+  const verifyCode = await runVerifyCore(verifyArgs, ctx, plan, events, args.prompt ? 'plan' : 'trace');
   return runCode !== 0 ? runCode : verifyCode;
 }
 
@@ -988,8 +1234,8 @@ export function cmdTrace(args: Args): number {
     return 2;
   }
   const rows: Array<{
-    id: string; status: string; version: string | null; releaseTag: string | null; tasks: unknown; gates: unknown;
-    blockedBy?: string;
+    id: string; status: string; version: string | null; releaseTag: string | null; standardsVersion: number | null;
+    standardsCounts: unknown; tasks: unknown; gates: unknown; blockedBy?: string;
   }> = requirementStatuses(plan);
   const selected = args.req ? rows.filter((r) => r.id === args.req) : rows;
   if (args.req && selected.length === 0) {
@@ -1003,6 +1249,10 @@ export function cmdTrace(args: Args): number {
       status: row.status,
       version: row.version,
       releaseTag: row.releaseTag,
+      // The project standards version the last release was checked against; null when it had none.
+      standardsVersion: row.standardsVersion,
+      // What that check left open: advisory findings, rules and files not checked. Null when none was recorded.
+      standardsCounts: row.standardsCounts,
       tasks: row.tasks,
       gates: row.gates,
       // Present only on not-shipped rows: the Failed/Blocked/Skipped task holding it back.
@@ -1010,6 +1260,230 @@ export function cmdTrace(args: Args): number {
     });
   }
   return 0;
+}
+
+// ─── command: standards ──────────────────────────────────────────────────────
+
+/** `moag standards check`: nothing could be diffed, so nothing was checked. Distinct from 1 (a rule failed) and 2 (usage). */
+export const STANDARDS_EXIT_NOTHING_CHECKED = 5;
+/**
+ * `moag standards check`: nothing blocking failed, but a blocking rule or command was NOT
+ * CHECKED — a command that did not run (`--no-commands` included), or a promoted rule that
+ * could not read what it had to. Unevaluated blocking evidence is not a pass.
+ */
+export const STANDARDS_EXIT_BLOCKING_NOT_CHECKED = 6;
+
+const STANDARDS_USAGE =
+  'Usage: moag standards <show | check | propose> [--cwd <dir>]\n' +
+  '  moag standards show                              print .moag/standards.json and the text task prompts carry\n' +
+  '  moag standards check [--base <ref>] [--no-commands]\n' +
+  '        exit 0: nothing blocking — every command passed, or the profile has no blocking rules configured\n' +
+  '                (advisory findings and files not checked are listed, not counted)\n' +
+  '        exit 1: a command failed, or a promoted rule has findings\n' +
+  '        exit 2: usage error, no standards file, or an invalid one\n' +
+  `        exit ${STANDARDS_EXIT_NOTHING_CHECKED}: no diff could be taken, so nothing was checked\n` +
+  `        exit ${STANDARDS_EXIT_BLOCKING_NOT_CHECKED}: a command or a promoted rule was not checked (so also with --no-commands)\n` +
+  `  moag standards propose [--stack <${STACK_IDS.join('|')}>] [--write [--force]]\n` +
+  '        --write   save the proposal as the next version; refuses to replace an existing file that differs\n' +
+  '        --force   replace it anyway; the old file is kept as .moag/standards.json.bak\n';
+
+const STANDARDS_FILE_LABEL = '.moag/standards.json';
+
+/** One rule row as `moag standards check` names it. */
+function ruleLabel(row: StandardsReport['rules'][number]): string {
+  return row.rule === 'command' ? `command: ${row.command ?? ''}` : row.rule;
+}
+
+/** Most not-checked files `moag standards check` spells out; the heading carries the true count. */
+const MAX_NOT_CHECKED_FILES_SHOWN = 50;
+
+/**
+ * The human-readable result of a check, in groups that are never mixed: what is BLOCKING,
+ * what is ADVISORY, which rules were NOT CHECKED, and which changed FILES were not checked.
+ * A blocking rule or command that was not checked leads its group and is marked, because
+ * it is the one line a reader must not take for a pass. A profile with no command and no
+ * promoted rule says "no blocking rules configured" — never that anything passed.
+ *
+ * The verdict words follow the kind of row. Only a command says `passed` or `FAILED`. Every
+ * rule MOAG decides itself says `no findings` or `FINDINGS`: a scan that found nothing has
+ * not proved that nothing is there.
+ */
+export function renderStandardsCheck(report: StandardsReport): string {
+  const out: string[] = [];
+  const version = report.version === null ? 'Standards' : `Standards v${report.version}`;
+  const since = report.baseRef === EMPTY_TREE_REF ? 'the empty tree (every file counts as added)'
+    : report.baseRef ?? 'nothing (no diff could be taken)';
+  out.push(`${version} — diff since ${since}`);
+  const groups = groupStandardsRules(report);
+  const findingsOf = (severity: 'blocking' | 'advisory'): string[] =>
+    // Flush left, `file:line` first: the shape editors and terminals turn into a link.
+    report.findings.filter((f) => severityOf(f) === severity).map((f) => `${f.file}:${f.line} ${f.rule} — ${f.message}`);
+  const verdicts = (rows: StandardsReport['rules']): string[] => rows.map((row) => {
+    const detail = row.rule === 'command' && row.result === 'failed' ? ` (exit ${row.exitCode ?? '?'})` : '';
+    // A decided rule that left vendored or generated files out says which.
+    const note = row.rule !== 'command' && row.reason ? ` — ${row.reason}` : '';
+    const label = ruleOutcomeLabel(row);
+    const word = row.result === 'failed' ? label.toUpperCase() : label;
+    return `  ${word}  ${ruleLabel(row)}${detail}${note}`;
+  });
+  const stopping = (rows: StandardsReport['rules']): number => rows.filter((r) => r.result === 'failed').length;
+
+  out.push('', `Blocking (a failure or a finding here stops a release) — ${stopping(groups.blocking)} stopping:`);
+  const blockingState = standardsBlockingState(report);
+  const nothingBlocking = blockingState === 'none-configured' ? `  (${NO_BLOCKING_RULES}: MOAG blocks on your project's own tools — add a command to the profile)`
+    : '  (no blocking rule was decided)';
+  out.push(...(groups.blocking.length > 0 ? verdicts(groups.blocking) : [nothingBlocking]), ...findingsOf('blocking'));
+  const promoted = promotedScannerRules(report);
+  if (promoted.length > 0) {
+    out.push(`  !! Promoted to blocking: ${promoted.join(', ')}. ${SCANNER_PROMOTION_WARNING}`);
+  }
+
+  out.push('', `Advisory (heuristic scans: reported, never blocking) — ${stopping(groups.advisory)} with findings:`);
+  out.push(...(groups.advisory.length > 0 ? verdicts(groups.advisory) : ['  (no advisory rule was decided)']), ...findingsOf('advisory'));
+
+  if (groups.notChecked.length > 0) {
+    out.push('', 'Rules not checked (not a pass):');
+    for (const row of groups.notChecked) {
+      const mark = isBlockingNotChecked(row) ? '!! BLOCKING RULE NOT CHECKED  ' : '  ';
+      out.push(`${mark}${ruleLabel(row)} — ${row.reason ?? 'no reason given'}`);
+    }
+  }
+  const t = report.totals;
+  const files = report.notCheckedFiles ?? [];
+  if (t.notCheckedFiles > 0) {
+    out.push('', `Files not checked (${t.notCheckedFiles}) — nothing in them counts towards "no findings":`);
+    for (const f of files.slice(0, MAX_NOT_CHECKED_FILES_SHOWN)) { out.push(`  ${f.file} — not checked (${f.reason})`); }
+    const shown = Math.min(files.length, MAX_NOT_CHECKED_FILES_SHOWN);
+    if (t.notCheckedFiles > shown) { out.push(`  …and ${t.notCheckedFiles - shown} more`); }
+  }
+  out.push('', `${t.passed} passed · ${t.noFindings} no findings · ${t.failed} blocking · ` +
+    `${t.advisory} advisory with findings (${t.advisoryFindings} finding${t.advisoryFindings === 1 ? '' : 's'}) · ` +
+    `${t.notChecked} rule${t.notChecked === 1 ? '' : 's'} not checked` +
+    (t.blockingNotChecked > 0 ? ` (${t.blockingNotChecked} blocking)` : '') +
+    ` · ${t.notCheckedFiles} file${t.notCheckedFiles === 1 ? '' : 's'} not checked` +
+    ` · ${t.findings} finding${t.findings === 1 ? '' : 's'}` +
+    (blockingState === 'none-configured' ? ` · ${NO_BLOCKING_RULES}` : ''));
+  return out.join('\n') + '\n';
+}
+
+/**
+ * `moag standards <show | check | propose>` — the workspace's own standards file.
+ * Like `trace`: no setup(), no shim, no runner and no engine. `check` spawns git
+ * (and the profile's commands unless `--no-commands`); `propose` asks git which files it
+ * tracks; `show` spawns nothing.
+ *
+ * Exit codes: 0 ok / nothing blocking · 1 a command failed, or a promoted rule has findings (`check`) ·
+ * 2 usage, no profile, an invalid standards file, or a refused overwrite (`propose --write`)
+ * · 5 no diff could be taken, so nothing was checked (`check`) · 6 a blocking rule or command
+ * was not checked (`check`).
+ */
+export async function cmdStandards(args: Args): Promise<number> {
+  const verb = args.positionals[0];
+  if (verb !== 'show' && verb !== 'check' && verb !== 'propose') {
+    process.stderr.write(verb ? `Unknown standards command "${verb}".\n${STANDARDS_USAGE}` : STANDARDS_USAGE);
+    return 2;
+  }
+  if (args.stack !== undefined && (verb !== 'propose' || !isStackId(args.stack))) {
+    process.stderr.write(verb !== 'propose'
+      ? `--stack only applies to "moag standards propose".\n${STANDARDS_USAGE}`
+      : `Invalid --stack "${args.stack}" — expected one of ${STACK_IDS.join(', ')}.\n${STANDARDS_USAGE}`);
+    return 2;
+  }
+
+  // A file that exists but is wrong stops every verb: showing, checking against, or
+  // versioning on top of a document the validator refuses would all be misleading.
+  let doc: StandardsDocument | null;
+  try { doc = loadLocalStandards(args.cwd); }
+  catch (err) {
+    process.stderr.write(`${err instanceof Error ? err.message : String(err)}\n`);
+    return 2;
+  }
+
+  if (verb === 'propose') {
+    // From the files git tracks: nothing `.gitignore` names is ever proposed.
+    const detection = await detectConventions(args.cwd);
+    const stack = args.stack !== undefined && isStackId(args.stack) ? args.stack : detectedStackId(detection) ?? 'other';
+    const proposal = proposeProfile(stack, detection);
+    const next: StandardsDocument = { schemaVersion: 1, version: (doc?.version ?? 0) + 1, profile: proposal.profile, provenance: proposal.provenance };
+    process.stdout.write(JSON.stringify(next, null, 2) + '\n');
+    if (!args.write) {
+      process.stderr.write(`Proposal only — nothing was written. Re-run with --write to save it as ${STANDARDS_FILE_LABEL} (v${next.version}).\n`);
+      return 0;
+    }
+    if (doc) {
+      if (profileHash(doc.profile) === profileHash(next.profile)) {
+        process.stderr.write(`${STANDARDS_FILE_LABEL} (v${doc.version}) already holds this proposal — nothing was written.\n`);
+        return 0;
+      }
+      // The file differs from what detection proposes now. Whether a person edited it or
+      // the repository moved on cannot be told apart, so it is never replaced silently.
+      if (!args.force) {
+        process.stderr.write(
+          `${STANDARDS_FILE_LABEL} (v${doc.version}) differs from this proposal and may hold hand edits — nothing was written.\n` +
+          `Re-run with --write --force to replace it; the current file is then kept as ${STANDARDS_FILE_LABEL}.bak.\n`);
+        return 2;
+      }
+      try { fs.copyFileSync(localStandardsPath(args.cwd), `${localStandardsPath(args.cwd)}.bak`); }
+      catch (err) {
+        process.stderr.write(`Could not back up ${STANDARDS_FILE_LABEL}, so it was not replaced: ${err instanceof Error ? err.message : String(err)}\n`);
+        return 2;
+      }
+    }
+    try { writeLocalStandards(args.cwd, next); }
+    catch (err) {
+      process.stderr.write(`Could not write ${STANDARDS_FILE_LABEL}: ${err instanceof Error ? err.message : String(err)}\n`);
+      return 2;
+    }
+    process.stderr.write(`Wrote ${STANDARDS_FILE_LABEL} (v${next.version}).${doc ? ` The previous file is ${STANDARDS_FILE_LABEL}.bak.` : ''}\n`);
+    return 0;
+  }
+
+  if (!doc) {
+    process.stderr.write(`No standards found at ${path.join(args.cwd, '.moag', 'standards.json')}. Run "moag standards propose --write" to create one.\n`);
+    return 2;
+  }
+
+  if (verb === 'show') {
+    process.stdout.write(JSON.stringify(doc, null, 2) + '\n\n');
+    process.stdout.write('─── Text every task prompt carries ───\n' + renderStandardsText(doc.profile, doc.version) + '\n');
+    return 0;
+  }
+
+  // check: the diff since --base, else since the base captured at run start, else since HEAD
+  // (no commits yet: every file counts as added).
+  const abort = new AbortController();
+  const onSignal = (): void => abort.abort();
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+  try {
+    const baseRef = await resolveStandardsBase(args.cwd, args.base, captureHeadRef);
+    const report = await checkStandardsNow({ profile: doc.profile, version: doc.version, baseRef }, args.cwd, {
+      signal: abort.signal, commands: !args.noCommands,
+    });
+    if (abort.signal.aborted) {
+      process.stderr.write('Standards check stopped.\n');
+      return 2;
+    }
+    if (baseRef !== null && baseRef !== EMPTY_TREE_REF && report.baseRef === EMPTY_TREE_REF) {
+      process.stderr.write(`"${baseRef}" is not a commit in this repository, so every file was checked as if it were new.\n`);
+    }
+    process.stdout.write(renderStandardsCheck(report));
+    if (report.baseRef === null) {
+      // Not a pass: there was no diff to judge (not a git repository, or git is unavailable).
+      process.stderr.write('No diff could be taken, so nothing was checked. Run this inside a git repository.\n');
+      return STANDARDS_EXIT_NOTHING_CHECKED;
+    }
+    if (standardsBlocked(report)) { return 1; }
+    if (standardsBlockingState(report) === 'not-checked') {
+      const open = report.rules.filter(isBlockingNotChecked).length;
+      process.stderr.write(`${open} blocking rule${open === 1 ? '' : 's'} or command${open === 1 ? ' was' : 's were'} not checked — that is not a pass.\n`);
+      return STANDARDS_EXIT_BLOCKING_NOT_CHECKED;
+    }
+    return 0;
+  } finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  }
 }
 
 // ─── one-shot prompt → plan ──────────────────────────────────────────────────
@@ -1148,11 +1622,17 @@ async function main(): Promise<number> {
   if (args.command === 'trace') {
     return cmdTrace(args);
   }
+  if (args.command === 'standards') {
+    // No setup() and no shim: the standards file is read, checked and proposed without the runner.
+    return cmdStandards(args);
+  }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|bench> ...\n' +
-    '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr]\n' +
+    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench> ...\n' +
+    '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
+    '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
+    '                       no standards gate (static rules and profile commands) in verification\n' +
     '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
-    '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>]\n' +
+    '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>] [--no-standards] [--base <ref>]\n' +
     '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
     '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
     '  moag config <get-engine | set-engine <id>>\n' +
@@ -1160,6 +1640,9 @@ async function main(): Promise<number> {
     '  moag digest [--since <when>]\n' +
     '  moag land [--into <branch>] [--merge]\n' +
     '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n' +
+    '  moag standards show\n' +
+    '  moag standards check [--base <ref>] [--no-commands]     exit 0 ok · 1 blocking failure · 5 nothing checked · 6 blocking not checked\n' +
+    '  moag standards propose [--stack <id>] [--write [--force]]\n' +
     '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n',
   );
   return 2;

@@ -52,10 +52,13 @@ describe('server enums', () => {
     it('covers every audited action exactly once', () => {
       assert.equal(new Set(AUDIT_ACTIONS).size, AUDIT_ACTIONS.length);
       for (const a of ['login.success', 'login.failure', 'user.role-change', 'prd.bump-override',
-        'plan.approve', 'run.start', 'gate.approve', 'gate.skip', 'engine.key-set', 'engine.key-clear']) {
+        'plan.approve', 'run.start', 'gate.approve', 'gate.skip', 'engine.key-set', 'engine.key-clear',
+        'standards.propose', 'standards.approve', 'standards.reject', 'standards.accept-defaults']) {
         assert.equal(isAuditAction(a), true, a);
       }
       assert.equal(isAuditAction('gate.force'), false);
+      assert.equal(isAuditAction('standards.edit'), false);
+      assert.equal(AUDIT_ACTIONS.filter((a) => a.startsWith('standards.')).length, 4);
       assert.equal(isAuditAction(''), false);
     });
   });

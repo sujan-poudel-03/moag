@@ -47,6 +47,8 @@ import { extractSummary } from '../context/memory-extractor';
 import { analyzeProject } from '../context/project-analyzer';
 import { PromptLibraryStore } from '../templates/prompt-library';
 import { AiRulesStore } from '../ai-rules/rules-store';
+import { BUILT_IN_RULES } from '../ai-rules/built-in-rules';
+import { PROJECT_STANDARDS_HEADER } from '../standards/profile';
 import { TaskQueue } from './task-queue';
 import { ghSync } from '../utils/gh';
 import { fileIncidentIssue } from '../github/issue-sync';
@@ -56,6 +58,20 @@ import { trackChildProcess } from '../utils/child-tracker';
 
 const GIT_TIMEOUT_MS = 30_000;
 const VERIFY_TIMEOUT_MS = 30_000;
+
+/**
+ * Resolves the project-standards text a task's prompt must carry, or null when the host
+ * has no standards. `skipRuleNames` are built-in rules the prompt already holds in full
+ * (from the AI rules store), which the provider may list by name instead of repeating.
+ * A provider that cannot read its standards THROWS — it never returns null for a broken file.
+ */
+export type StandardsProvider = (
+  cwd: string,
+  opts: { skipRuleNames: string[] },
+) => { text: string; version: number | null } | null;
+
+/** The standards a task must carry could not be loaded. The task fails; it never runs without them. */
+class StandardsUnavailableError extends Error {}
 
 /**
  * Parse a .env-style file into a key-value map.
@@ -347,6 +363,8 @@ export class TaskRunner {
 
   private _promptLibrary: PromptLibraryStore | null = null;
   private _aiRulesStore: AiRulesStore | null = null;
+  private _standardsProvider: StandardsProvider | null = null;
+  private _runStartHook: ((cwd: string) => Promise<void> | void) | null = null;
   private _pendingScreenshots: string[] = [];
   private _sandboxUrl: string | null = null;
   /** Sink for per-engine-call usage facts (Contribution Ledger). Null = usage recording disabled. */
@@ -381,6 +399,36 @@ export class TaskRunner {
 
   setAiRulesStore(store: AiRulesStore): void {
     this._aiRulesStore = store;
+  }
+
+  /**
+   * Set where task prompts get the project standards from. The provider is called once per
+   * agent or review task and must be a pure read — playlists can build prompts concurrently.
+   */
+  setStandardsProvider(fn: StandardsProvider | null): void {
+    this._standardsProvider = fn;
+  }
+
+  /**
+   * Set what happens once when a run starts, before any of its tasks does: the host's chance
+   * to record facts about the tree as it stood (the local standards base is one). The hook
+   * is awaited, and a hook that throws never fails the run.
+   */
+  setRunStartHook(fn: ((cwd: string) => Promise<void> | void) | null): void {
+    this._runStartHook = fn;
+  }
+
+  /** Run the host's run-start hook, if any. Adds no await when none is set. */
+  private notifyRunStart(): Promise<void> | void {
+    const hook = this._runStartHook;
+    if (!hook) { return; }
+    return (async () => {
+      try {
+        await hook(this.resolveCwd());
+      } catch {
+        // Bookkeeping must never stop a run.
+      }
+    })();
   }
 
   setSandboxUrl(url: string | null): void {
@@ -581,6 +629,8 @@ export class TaskRunner {
     this.setState(RunnerState.Playing);
 
     try {
+      const runStart = this.notifyRunStart();
+      if (runStart) { await runStart; }
       await this.runLoop();
     } catch (err) {
       if (this.state !== RunnerState.Stopping) {
@@ -616,6 +666,8 @@ export class TaskRunner {
     const task = playlist.tasks[taskIndex];
 
     try {
+      const runStart = this.notifyRunStart();
+      if (runStart) { await runStart; }
       await this.executeTaskWithRetry(task, playlist, plan);
     } catch (err) {
       this.emit('error', err instanceof Error ? err : new Error(String(err)));
@@ -642,6 +694,8 @@ export class TaskRunner {
     this.setState(RunnerState.Playing);
 
     try {
+      const runStart = this.notifyRunStart();
+      if (runStart) { await runStart; }
       for (const { playlistIndex, taskIndex } of taskList) {
         if (this.state === RunnerState.Stopping) {
           break;
@@ -1291,9 +1345,31 @@ export class TaskRunner {
 
     // Gap 6: Inject failure context into prompt when retrying a failed task
     const failureContext = this._taskFailureContext.get(task.id);
-    const basePrompt = (taskType === 'agent' || taskType === 'review')
-      ? await this.buildPrompt(task, cwd, plan, playlist)
-      : this.buildTaskDescription(task);
+    let basePrompt: string;
+    try {
+      basePrompt = (taskType === 'agent' || taskType === 'review')
+        ? await this.buildPrompt(task, cwd, plan, playlist)
+        : this.buildTaskDescription(task);
+    } catch (err) {
+      if (!(err instanceof StandardsUnavailableError)) { throw err; }
+      // The project standards exist but could not be loaded. Running anyway would hand the
+      // agent a prompt that silently lacks the agreed contract, so the task fails instead.
+      const standardsResult: EngineResult = {
+        stdout: '',
+        stderr: err.message,
+        exitCode: 1,
+        durationMs: 0,
+      };
+      task.status = TaskStatus.Failed;
+      this.emit('task-output', task,
+        `[Standards Error] ${err.message}\n` +
+        `  The task was not started: its prompt must carry the project standards.\n` +
+        `  Fix or remove the standards file, then run the task again.\n`,
+        'stderr');
+      this.emit('task-failed', task, standardsResult);
+      this.applyFailurePolicy(task, standardsResult);
+      return;
+    }
     const executionDescription = failureContext
       ? `[RETRY CONTEXT — previous attempt failed]\n${failureContext}\n\n[TASK]\n${basePrompt}`
       : basePrompt;
@@ -2359,7 +2435,12 @@ export class TaskRunner {
 
       // Only the final success path stamps: a failed tag, push or gh release has already
       // returned above, so nothing is ever marked shipped by a release that did not happen.
-      const { shipped, prdVersion } = stampRelease(plan, task.releaseTag, new Date().toISOString());
+      // The standards version goes on a stamp only where the requirement's latest gates show
+      // the standards check really judged the diff — never merely because a profile exists.
+      const { shipped, prdVersion } = stampRelease(plan, task.releaseTag, new Date().toISOString(), {
+        standardsVersion: this.standardsVersionFor(cwd),
+        standardsFromGates: true,
+      });
       if (shipped.length) {
         this.emit('task-output', task, `[Release] Shipped ${shipped.join(', ')} in PRD ${prdVersion}.\n`, 'stdout');
       }
@@ -2775,8 +2856,45 @@ export class TaskRunner {
   }
 
 
+  /**
+   * The standards block for a task, or null when this host has none.
+   * Throws {@link StandardsUnavailableError} when the provider cannot read its standards.
+   */
+  private resolveStandards(cwd: string, storeRules: string): { text: string; section: string } | null {
+    if (!this._standardsProvider) { return null; }
+    // The store renders each enabled rule as `### <name>`; those bodies are already in the prompt.
+    const skipRuleNames = BUILT_IN_RULES.filter((r) => storeRules.includes(`### ${r.name}\n`)).map((r) => r.name);
+    let resolved: ReturnType<StandardsProvider>;
+    try {
+      resolved = this._standardsProvider(cwd, { skipRuleNames });
+    } catch (err) {
+      throw new StandardsUnavailableError(err instanceof Error ? err.message : String(err));
+    }
+    const text = resolved?.text.trim() ?? '';
+    return text ? { text, section: `${PROJECT_STANDARDS_HEADER}\n${text}` } : null;
+  }
+
+  /**
+   * The standards version this host's tasks carry for `cwd`, for the release stamp.
+   * Undefined when there are none — or when they cannot be read: the release has already
+   * happened by the time this is asked, so a broken file must not fail it.
+   */
+  private standardsVersionFor(cwd: string): number | undefined {
+    if (!this._standardsProvider) { return undefined; }
+    try {
+      return this._standardsProvider(cwd, { skipRuleNames: [] })?.version ?? undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private async buildPrompt(task: Task, cwd: string, plan: Plan, playlist: Playlist): Promise<string> {
     const settings = getContextSettings();
+    // Resolved before — and independently of — the context settings. Standards are the
+    // agreed contract for this project, not optional context: turning context off, or a
+    // budget too small to hold them, must never produce a prompt without them.
+    const storeRules = this._aiRulesStore?.getEnabledText(cwd) ?? '';
+    const standards = this.resolveStandards(cwd, storeRules);
     let prompt = '';
     if (settings.enabled) {
       const pendingScreenshots = this._pendingScreenshots.length > 0
@@ -2794,7 +2912,6 @@ export class TaskRunner {
           : { spans: [], usedSemantic: false };
 
       const ruleParts: string[] = [];
-      const storeRules = this._aiRulesStore?.getEnabledText(cwd) ?? '';
       if (storeRules) { ruleParts.push(storeRules); }
       if (plan.aiRules?.trim()) { ruleParts.push(`### Plan Rules\n${plan.aiRules.trim()}`); }
       if (playlist.aiRules?.trim()) { ruleParts.push(`### Playlist Rules\n${playlist.aiRules.trim()}`); }
@@ -2825,6 +2942,7 @@ export class TaskRunner {
         budgetUsage,
         pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
         roleCharter: roleCharter ?? undefined,
+        standards: standards?.text,
         aiRules: aiRules || undefined,
         // What this repo has proven about itself, gathered from real exit codes.
         knowledge: knowledgeBlockFor(cwd, fs) || undefined,
@@ -2839,6 +2957,11 @@ export class TaskRunner {
       if (ctx) {
         prompt += ctx + '\n\n';
       }
+    }
+    // Context off, or a context that came back without the section: the runner carries the
+    // standards itself, at the very top of the prompt.
+    if (standards && !prompt.includes(standards.section)) {
+      prompt = `${standards.section}\n\n${prompt}`;
     }
     // Inject execution rules before the task prompt
     const cfg = getConfig('agentTaskPlayer');
@@ -2907,8 +3030,10 @@ export class TaskRunner {
           '\n...[context trimmed to fit 80K limit]\n\n' +
           taskPart;
       } else {
-        // Task portion alone is already huge — truncate at limit
-        prompt = taskPart.slice(0, MAX_PROMPT_CHARS) + '\n...[prompt truncated at 80K chars]';
+        // Task portion alone is already huge — truncate at limit. The standards block is
+        // the one piece of the prefix that is kept: it is small, and it is the contract.
+        const kept = standards ? `${standards.section}\n\n` : '';
+        prompt = kept + taskPart.slice(0, Math.max(0, MAX_PROMPT_CHARS - kept.length)) + '\n...[prompt truncated at 80K chars]';
       }
     }
 

@@ -1,0 +1,31 @@
+{
+  "stackTemplateId": "node-ts",
+  "repoState": "greenfield",
+  "structure": {
+    "requiredDirs": ["src", "test"],
+    "allowedTopLevel": ["src", "test", "tools", ".*", "*.md", "*.json"],
+    "placement": [
+      { "id": "tests", "files": "**/*.test.js", "under": ["test"] }
+    ]
+  },
+  "frontend": { "componentKit": "", "styleSource": "", "rawPatterns": [] },
+  "backend": { "layers": [], "forbiddenImports": [], "importAliases": [] },
+  "naming": {
+    "files": [{ "globs": ["src/**/*.js", "src/**/*.ts", "test/**/*.js"], "style": "kebab-case" }],
+    "notes": "Test files end in .test.js"
+  },
+  "comments": {
+    "maxDensityPct": 30,
+    "minAddedLines": 20,
+    "forbidCommentedOutCode": true,
+    "bannedPhrases": ["// rest of the code", "// implementation goes here", "// your code here", "... rest of the code ...", "... existing code ..."]
+  },
+  "testing": {
+    "runner": "npm test",
+    "fileGlobs": ["test/**/*.test.js"],
+    "notes": "npm test must exit 0"
+  },
+  "commands": [{ "label": "Lint", "run": "npm run lint" }],
+  "builtInRuleIds": ["builtin-clean-code", "builtin-self-documenting"],
+  "freeText": ""
+}
