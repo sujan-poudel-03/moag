@@ -18,6 +18,7 @@ const TASK_STATUS = {
   failed: { glyph: '✗', label: 'Failed', badge: ['FAILED', 'error'] },
   skipped: { glyph: '→', label: 'Skipped', badge: ['SKIPPED', 'muted'] },
   blocked: { glyph: '⊘', label: 'Blocked', badge: ['BLOCKED', 'warning'] },
+  awaiting: { glyph: '⏸', label: 'Awaiting approval', badge: ['AWAITING APPROVAL', 'warning'] },
 };
 
 const RUNNER_BADGE = {
@@ -289,6 +290,16 @@ function standardsGateLine(run, stored, focusReport) {
   return h('p', null, `${name}: `, parts.map((part, i) => [i > 0 ? ' · ' : null, part]), '. ', view);
 }
 
+/**
+ * The status a task row shows. The worker halts at a ship gate by stopping the runner, which
+ * reports the gate task as failed ("Manual gate cancelled"); while the run waits for an
+ * approver, that task is awaiting approval, not failed.
+ */
+export function taskDisplayStatus(run, task, status) {
+  const halted = run && run.status === 'awaiting-approval' && run.gate && run.gate.taskId === task.id;
+  return halted && status !== 'completed' ? 'awaiting' : status;
+}
+
 /** Fold one worker event into the live view (mirrors the server's foldRunEvent). */
 export function foldEvent(view, ev) {
   switch (ev.event) {
@@ -353,7 +364,7 @@ export function render(app, params, view) {
   };
   const tasks = detail && detail.runId === run.id ? detail.tasks : [];
   const errorTails = detail && detail.runId === run.id ? { ...detail.errorTails } : {};
-  const statusOf = (t) => live.view.tasks[t.id] || t.status || 'pending';
+  const statusOf = (t) => taskDisplayStatus(run, t, live.view.tasks[t.id] || t.status || 'pending');
   const runNumber = runs.length;
 
   // ─── Header ───

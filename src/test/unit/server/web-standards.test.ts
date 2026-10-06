@@ -448,6 +448,26 @@ describe('web run screen — the standards report keeps Blocking, Advisory and N
     assert.match(source, /r\.body\.error === 'standards-blocking'\) \{\n\s+toast\(STR\.C59\(/);
   });
 
+  describe('the task row of a halted ship gate', () => {
+    const { taskDisplayStatus } = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map }, ['taskDisplayStatus']) as
+      { taskDisplayStatus: (run: unknown, task: { id: string }, status: string) => string };
+    const gate = { id: 'ship-gate-1' };
+    const waiting = { status: 'awaiting-approval', gate: { taskId: 'ship-gate-1', name: 'Ship approval' } };
+
+    it('shows awaiting approval, not failed, while the run waits at that gate', () => {
+      // The worker halts by stopping the runner, which reports the gate task as failed ("Manual gate cancelled").
+      assert.equal(taskDisplayStatus(waiting, gate, 'failed'), 'awaiting');
+      assert.equal(taskDisplayStatus(waiting, gate, 'pending'), 'awaiting');
+    });
+
+    it('leaves every other task, and the gate once the run moves on, as reported', () => {
+      assert.equal(taskDisplayStatus(waiting, { id: 'other' }, 'failed'), 'failed');
+      assert.equal(taskDisplayStatus(waiting, gate, 'completed'), 'completed');
+      assert.equal(taskDisplayStatus({ status: 'gaps' }, gate, 'failed'), 'failed');
+      assert.equal(taskDisplayStatus({ status: 'completed' }, gate, 'completed'), 'completed');
+    });
+  });
+
   describe('the card badge: green only for a command that passed', () => {
     interface Look { text: string; kind: string; card: string }
     const { standardsBadge } = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map }, ['standardsBadge']) as { standardsBadge: (t: unknown) => Look };
