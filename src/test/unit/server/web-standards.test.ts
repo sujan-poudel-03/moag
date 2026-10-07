@@ -614,3 +614,65 @@ describe('web run screen — the standards report keeps Blocking, Advisory and N
     assert.doesNotMatch(source, /advisory failed|advisory rule\$\{[^}]*\} failed/);
   });
 });
+
+describe('web run view — dependency install lines', () => {
+  type Line = { kind: string; text: string; tail: string };
+  const { dependencyLines, initialDependencyEvents } = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map },
+    ['dependencyLines', 'initialDependencyEvents']) as {
+    dependencyLines: (events: unknown[], tasks: unknown[]) => Line[];
+    initialDependencyEvents: (detail: unknown, runId: string) => Array<{ event: string }>;
+  };
+  const base = {
+    stage: 'task', taskId: 't-build', ecosystem: 'npm', dir: '.', trigger: 'install-dir-missing',
+    command: 'npm ci --no-audit --no-fund', durationMs: 12_345, exitCode: 0, timedOut: false, tail: '', note: null,
+  };
+  const tasks = [{ id: 't-build', name: 'Compile with tsc' }];
+
+  it('maps the three events to success, error and info lines, skipping everything else', () => {
+    const lines = plain(dependencyLines([
+      { event: 'state', state: 'playing' },
+      { ...base, event: 'dependencies-installed' },
+      { ...base, event: 'dependencies-install-failed', exitCode: 1, durationMs: 900, tail: 'npm ERR! ERESOLVE' },
+      { ...base, event: 'dependencies-not-installed', ecosystem: 'python', command: null, note: 'not installed: no virtualenv' },
+    ], tasks));
+    assert.deepEqual(lines, [
+      { kind: 'success', text: 'Dependencies installed · npm ci --no-audit --no-fund · 12.3s · before Compile with tsc', tail: '' },
+      { kind: 'error', text: 'Dependencies could not be installed · npm ci --no-audit --no-fund · exit 1 · before Compile with tsc', tail: 'npm ERR! ERESOLVE' },
+      { kind: 'info', text: 'Dependencies not installed · python · not installed: no virtualenv', tail: '' },
+    ]);
+  });
+
+  it('an unknown or missing taskId falls back to the stage', () => {
+    const lines = plain(dependencyLines([
+      { ...base, event: 'dependencies-installed', taskId: 'gone', stage: 'verify' },
+      { ...base, event: 'dependencies-installed', taskId: undefined, stage: 'standards' },
+    ], tasks));
+    assert.ok(lines[0].text.endsWith('before the verify step'), lines[0].text);
+    assert.ok(lines[1].text.endsWith('before the standards step'), lines[1].text);
+  });
+
+  it('a timed-out install says so instead of an exit code', () => {
+    const [line] = plain(dependencyLines([{ ...base, event: 'dependencies-install-failed', exitCode: 124, timedOut: true, durationMs: 600_000 }], tasks));
+    assert.ok(line.text.includes('timed out after 600.0s'), line.text);
+  });
+
+  it('after a reload, the card uses the server\'s whole-run list, not the recent-events window (QA M2)', () => {
+    const early = { ...base, event: 'dependencies-install-failed', exitCode: 1, tail: 'npm ERR!' };
+    // The early failure is gone from `events` (the last 200) but present in dependencyEvents.
+    const detail = { runId: 'r1', events: [{ event: 'cost', usd: 0 }], dependencyEvents: [early] };
+    const initial = plain(initialDependencyEvents(detail, 'r1'));
+    assert.deepEqual(initial, [early]);
+    const [line] = plain(dependencyLines(initial, tasks));
+    assert.equal(line.kind, 'error');
+    // An older server without the list: fall back to filtering the window.
+    assert.deepEqual(plain(initialDependencyEvents({ runId: 'r1', events: [{ event: 'cost' }, early] }, 'r1')), [early]);
+    // A different run's detail contributes nothing.
+    assert.deepEqual(plain(initialDependencyEvents(detail, 'r2')), []);
+    assert.deepEqual(plain(initialDependencyEvents(null, 'r1')), []);
+  });
+
+  it('no events means no lines', () => {
+    assert.deepEqual(plain(dependencyLines([], tasks)), []);
+    assert.deepEqual(plain(dependencyLines(undefined as unknown as unknown[], undefined as unknown as unknown[])), []);
+  });
+});

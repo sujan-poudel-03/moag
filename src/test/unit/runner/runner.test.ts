@@ -21,6 +21,10 @@ let engineRunStub: sinon.SinonStub;
 let spawnStub: sinon.SinonStub;
 /** Every process the runner asked to have killed, through the stubbed `utils/process-kill`. */
 let killProcessStub: sinon.SinonStub;
+/** The dependency installer the runner sees; ok and silent unless a test replaces it. */
+let ensureDepsStub: sinon.SinonStub;
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const realDependencyInstall = require('../../../runner/dependency-install');
 
 function createSpawnProc(options?: {
   stdoutChunks?: string[];
@@ -133,6 +137,7 @@ function buildRunner(routingOverrides?: {
   // place it spends real process-spawn time inside a test and aims a real kill at the fake
   // pid 1234. Here it only marks the fake process killed, as a real kill would.
   killProcessStub = sinon.stub().callsFake((proc: { kill?: () => void }) => { proc.kill?.(); });
+  ensureDepsStub = sinon.stub().resolves({ ok: true, aborted: false, failed: null, events: [] });
 
   let lastEngineId: string | undefined;
 
@@ -147,6 +152,10 @@ function buildRunner(routingOverrides?: {
     },
     'child_process': { spawn: spawnStub, execSync: sinon.stub() },
     '../utils/process-kill': { killProcess: killProcessStub, SPAWN_DETACHED: false },
+    './dependency-install': {
+      ...realDependencyInstall,
+      ensureDependencies: (...args: unknown[]) => ensureDepsStub(...args),
+    },
     ...(routingOverrides ?? {}),
   });
 
@@ -2257,5 +2266,173 @@ describe('TaskRunner — project standards', () => {
     assert.ok(prompts[0].startsWith(`${SECTION}\n\n`));
     assert.ok(prompts[0].includes('[prompt truncated at 80K chars]'));
     assert.ok(prompts[0].length < 80_100);
+  });
+});
+
+describe('TaskRunner — automatic dependency installs', () => {
+  afterEach(() => {
+    sinon.restore();
+    vscodeMock.clearMockConfig();
+  });
+
+  const failedEvent = {
+    event: 'dependencies-install-failed', stage: 'task', taskId: 'x', ecosystem: 'npm', dir: '.',
+    trigger: 'manifest-changed', command: 'npm ci --no-audit --no-fund', durationMs: 2500, exitCode: 1,
+    timedOut: false, tail: 'npm ERR! ERESOLVE', note: null,
+  };
+
+  function commandPlan(command = 'npm run build'): Plan {
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'command';
+    plan.playlists[0].tasks[0].command = command;
+    return plan;
+  }
+
+  const commandSpawns = (): string[] =>
+    spawnStub.getCalls().map((c) => String(c.args[0])).filter((c) => c !== 'git');
+
+  it('a failing install fails the command task without running its command', async () => {
+    const { runner } = buildRunner();
+    ensureDepsStub.callsFake(async (_cwd: string, o: { onEvent: (ev: unknown) => void }) => {
+      o.onEvent(failedEvent);
+      return { ok: false, aborted: false, failed: failedEvent, events: [failedEvent] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    const seen: unknown[] = [];
+    runner.on('dependencies-install-failed', (t: Task, ev: unknown) => seen.push([t.name, ev]));
+    const failures: EngineResult[] = [];
+    runner.on('task-failed', (_t: Task, r: EngineResult) => failures.push(r));
+
+    const plan = commandPlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    assert.deepEqual(commandSpawns(), [], 'the task command never ran');
+    assert.ok(failures[0].stderr.includes('[Dependencies] Install failed: `npm ci --no-audit --no-fund` exited 1 after 2.5s (needed by "Task 1")'));
+    assert.ok(failures[0].stderr.includes('ERESOLVE'));
+    assert.deepEqual(seen, [['Task 1', failedEvent]]);
+  });
+
+  it('a passing install runs the command and forwards the event as (task, ev)', async () => {
+    const { runner } = buildRunner();
+    const installed = { ...failedEvent, event: 'dependencies-installed', exitCode: 0, tail: 'added 1' };
+    ensureDepsStub.callsFake(async (_cwd: string, o: { onEvent: (ev: unknown) => void }) => {
+      o.onEvent(installed);
+      return { ok: true, aborted: false, failed: null, events: [installed] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    const seen: unknown[] = [];
+    runner.on('dependencies-installed', (t: Task, ev: unknown) => seen.push([t.id, ev]));
+
+    const plan = commandPlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.deepEqual(commandSpawns(), ['npm run build']);
+    assert.deepEqual(seen, [[plan.playlists[0].tasks[0].id, installed]]);
+    const [cwd, opts] = ensureDepsStub.firstCall.args;
+    assert.equal(typeof cwd, 'string');
+    assert.equal(opts.stage, 'task');
+    assert.equal(opts.taskId, plan.playlists[0].tasks[0].id);
+    assert.equal(opts.timeoutMs, 600_000);
+  });
+
+  it('an abort during the install is exit 130 with no failed event', async () => {
+    const { runner } = buildRunner();
+    ensureDepsStub.callsFake(async () => {
+      runner.stop();
+      return { ok: false, aborted: true, failed: null, events: [] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    let failedEvents = 0;
+    runner.on('dependencies-install-failed', () => { failedEvents++; });
+
+    const plan = commandPlan();
+    await runner.play(plan);
+
+    assert.equal(failedEvents, 0);
+    assert.deepEqual(commandSpawns(), []);
+    assert.notEqual(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('a verifyCommand whose install fails is a failed verification (pre-flight halts)', async () => {
+    const { runner } = buildRunner();
+    ensureDepsStub.callsFake(async (_cwd: string, o: { stage: string }) => (o.stage === 'verify'
+      ? { ok: false, aborted: false, failed: { ...failedEvent, stage: 'verify' }, events: [] }
+      : { ok: true, aborted: false, failed: null, events: [] }));
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+
+    const failures: EngineResult[] = [];
+    runner.on('task-failed', (_t: Task, r: EngineResult) => failures.push(r));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].verifyCommand = 'npm test';
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    assert.equal(engineRunStub.callCount, 0, 'the agent never ran against a baseline that could not be checked');
+    assert.deepEqual(commandSpawns(), [], 'npm test never ran');
+    assert.ok(ensureDepsStub.getCalls().some((c) => c.args[1].stage === 'verify'));
+    // QA M1: the halt keeps the real reason — marker first, command, tail — and never
+    // claims the project's tests were "already broken".
+    assert.equal(failures.length, 1);
+    const stderr = failures[0].stderr;
+    assert.ok(stderr.startsWith('[Dependencies] Install failed: `npm ci --no-audit --no-fund` exited 1 after 2.5s'), stderr);
+    assert.ok(stderr.includes('npm ERR! ERESOLVE'), 'the install tail survives');
+    assert.ok(stderr.includes('[Pre-flight] The baseline check "npm test" could not run because its dependencies could not be installed'));
+    assert.ok(!stderr.includes('Baseline already broken'), stderr);
+    assert.equal(failures[0].summary, 'Dependencies could not be installed.');
+  });
+
+  it('a pre-flight install failure with haltOnBrokenBaseline:false says so and lets the agent run', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { haltOnBrokenBaseline: false });
+    const { runner } = buildRunner();
+    let verifyCalls = 0;
+    ensureDepsStub.callsFake(async (_cwd: string, o: { stage: string }) => {
+      if (o.stage === 'verify' && verifyCalls++ === 0) {
+        return { ok: false, aborted: false, failed: { ...failedEvent, stage: 'verify' }, events: [] };
+      }
+      return { ok: true, aborted: false, failed: null, events: [] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    const output: string[] = [];
+    runner.on('task-output', (_t: Task, chunk: string) => output.push(chunk));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].verifyCommand = 'npm test';
+    await runner.play(plan);
+
+    const text = output.join('');
+    assert.ok(text.includes('[Pre-flight] Dependencies could not be installed for the baseline check'), text);
+    assert.ok(!text.includes('Baseline already broken'), text);
+    assert.equal(engineRunStub.callCount, 1, 'the agent ran');
+  });
+
+  it('agent tasks never call the installer', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 }));
+    const plan = makePlan();
+    await runner.play(plan);
+    assert.equal(engineRunStub.callCount, 2);
+    assert.equal(ensureDepsStub.callCount, 0);
+  });
+
+  it('autoInstallDependencies:false reaches the installer as enabled:false', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { autoInstallDependencies: false, 'dependencyInstall.ignoreScripts': true });
+    const { runner } = buildRunner();
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    await runner.play(commandPlan());
+    assert.equal(ensureDepsStub.callCount, 1);
+    assert.deepEqual(ensureDepsStub.firstCall.args[1].settings, { enabled: false, ignoreScripts: true, pythonVenv: null });
+  });
+
+  it('the unit-test default is off (no test may install into the repository)', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    await runner.play(commandPlan());
+    assert.equal(ensureDepsStub.firstCall.args[1].settings.enabled, false);
   });
 });

@@ -300,6 +300,43 @@ export function taskDisplayStatus(run, task, status) {
   return halted && status !== 'completed' ? 'awaiting' : status;
 }
 
+const DEPENDENCY_EVENTS = ['dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed'];
+
+/**
+ * The automatic dependency installs a run reported, one line each, in the order they
+ * happened. `kind` is success / error / info; `tail` is the install output of a failure.
+ */
+export function dependencyLines(events, tasks) {
+  const names = {};
+  for (const t of tasks || []) { names[t.id] = t.name; }
+  const lines = [];
+  for (const ev of events || []) {
+    if (!ev || DEPENDENCY_EVENTS.indexOf(ev.event) < 0) { continue; }
+    const secs = `${((Number(ev.durationMs) || 0) / 1000).toFixed(1)}s`;
+    const before = ev.taskId && names[ev.taskId] ? names[ev.taskId] : `the ${ev.stage || 'next'} step`;
+    if (ev.event === 'dependencies-installed') {
+      lines.push({ kind: 'success', text: `Dependencies installed · ${ev.command} · ${secs} · before ${before}`, tail: '' });
+    } else if (ev.event === 'dependencies-install-failed') {
+      const how = ev.timedOut ? `timed out after ${secs}` : `exit ${ev.exitCode === null || ev.exitCode === undefined ? 1 : ev.exitCode}`;
+      lines.push({ kind: 'error', text: `Dependencies could not be installed · ${ev.command} · ${how} · before ${before}`, tail: ev.tail || '' });
+    } else {
+      lines.push({ kind: 'info', text: `Dependencies not installed · ${ev.ecosystem} · ${ev.note || ''}`, tail: '' });
+    }
+  }
+  return lines;
+}
+
+/**
+ * The dependency events to show when the run view opens. The server's
+ * `dependencyEvents` covers the whole run; `events` is only the most recent window, so
+ * it is the fallback for an older server that does not send the list.
+ */
+export function initialDependencyEvents(detail, runId) {
+  if (!detail || detail.runId !== runId) { return []; }
+  if (Array.isArray(detail.dependencyEvents)) { return detail.dependencyEvents.slice(); }
+  return (detail.events || []).filter((e) => e && DEPENDENCY_EVENTS.indexOf(e.event) >= 0);
+}
+
 /** Fold one worker event into the live view (mirrors the server's foldRunEvent). */
 export function foldEvent(view, ev) {
   switch (ev.event) {
@@ -507,6 +544,24 @@ export function render(app, params, view) {
   const bannerHost = h('div');
   const renderBanner = () => mount(bannerHost, haltBanner(app, project, run, tasks, statusOf, live, runnable, base, refresh, standards));
 
+  // ─── Dependency installs ───
+  // From the server's own list, collected over the WHOLE events.jsonl: an early install
+  // (or its failure) must survive a reload on a long run, where it has left `events`
+  // (the last 200 only). Live events append to it.
+  const depEvents = initialDependencyEvents(detail, run.id);
+  const depsHost = h('div');
+  const renderDeps = () => {
+    const lines = dependencyLines(depEvents, tasks);
+    if (lines.length === 0) { clear(depsHost); return; }
+    const failed = lines.some((l) => l.kind === 'error');
+    const glyphs = { success: '✓', error: '✗', info: 'ⓘ' };
+    mount(depsHost, h('section', { class: ['card', failed ? 'card-error' : null].filter(Boolean), role: 'status' },
+      h('h2', { class: 'section-header' }, 'Dependencies'),
+      h('ul', { class: 'diff-list' }, lines.map((l) => h('li', { class: l.kind === 'error' ? 'text-error' : null },
+        glyph(glyphs[l.kind]), ' ', l.text,
+        l.tail ? h('pre', { class: 'tail' }, lastLines(l.tail, TAIL_LINES)) : null)))));
+  };
+
   const startedText = `started by ${run.startedByName || '—'} · ${fmtTime(run.startedAt)} · ${elapsed(run.startedAt, run.endedAt)}`;
   mount(view,
     h('div', { class: 'run-header' },
@@ -515,6 +570,7 @@ export function render(app, params, view) {
     progressHost,
     pdto.runsDisabledReason ? h('div', { class: ['card', 'card-error'], role: 'alert' }, glyph('✗'), ' ', STR.C18.text) : null,
     bannerHost,
+    depsHost,
     standardsHost,
     h('div', { class: 'card' }, playlistHead, tree,
       h('details', { class: 'diff-group' }, eventsSummary, eventsPre)));
@@ -522,6 +578,7 @@ export function render(app, params, view) {
   renderProgress();
   renderTree();
   renderEvents();
+  renderDeps();
   renderStandards();
   renderBanner();
   const gateHeading = bannerHost.querySelector('[data-focus="gate"]');
@@ -543,6 +600,11 @@ export function render(app, params, view) {
     if (ev.event === 'task-failed' && ev.status === 'blocked') { announce(`${ev.name} blocked.`, { assertive: true, key: 'blocked', plural: (k) => `${k} tasks blocked.` }); }
     else if (ev.event === 'task-failed') { announce(`${ev.name} failed.`, { assertive: true, key: 'failed', plural: (k) => `${k} tasks failed.` }); }
     if (ev.event === 'manual-gate') { announce(`Halted at the ship gate: ${ev.name}.`, { assertive: true }); }
+    if (DEPENDENCY_EVENTS.indexOf(ev.event) >= 0) {
+      depEvents.push(ev);
+      renderDeps();
+      if (ev.event === 'dependencies-install-failed') { announce(`Dependencies could not be installed (${ev.command}).`, { assertive: true }); }
+    }
     if (ev.event === 'verify' && ev.name === 'verify-standards') {
       const report = asStandardsReport(ev.data);
       if (report) {

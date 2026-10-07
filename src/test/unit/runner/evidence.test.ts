@@ -1636,6 +1636,47 @@ describe('evidence — runGate', () => {
     assert.equal(count(), 0, 'the abort listener must be removed on the error path');
   });
 
+  describe('processGroup', () => {
+    const spawnOptionsFor = async (processGroup: boolean | undefined): Promise<{ detached?: boolean }> => {
+      const { EventEmitter } = require('events');
+      const proc = new EventEmitter() as NodeJS.EventEmitter & {
+        stdout: NodeJS.EventEmitter; stderr: NodeJS.EventEmitter; killed: boolean; pid: number; kill: () => void;
+      };
+      proc.stdout = new EventEmitter();
+      proc.stderr = new EventEmitter();
+      proc.killed = false;
+      proc.pid = 4343;
+      proc.kill = () => { proc.killed = true; };
+      let seen: { detached?: boolean } = {};
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const pq = require('proxyquire').noCallThru();
+      const mod = pq('../../../runner/evidence', {
+        child_process: {
+          spawn: (_c: string, _a: string[], opts: { detached?: boolean }) => { seen = opts; return proc; },
+          execSync: () => Buffer.from(''),
+        },
+        // Pretend to be POSIX, where a process group exists.
+        '../utils/process-kill': { SPAWN_DETACHED: true, killProcess: () => undefined },
+      });
+      const promise = mod.runGate('anything', {
+        cwd: process.cwd(), signal: new AbortController().signal, timeoutMs: 5_000,
+        ...(processGroup === undefined ? {} : { processGroup }),
+      });
+      proc.emit('close', 0);
+      await promise;
+      return seen;
+    };
+
+    it('spawns detached (a group leader) when processGroup is true on POSIX', async () => {
+      assert.equal((await spawnOptionsFor(true)).detached, true);
+    });
+
+    it('does not detach by default', async () => {
+      assert.equal((await spawnOptionsFor(undefined)).detached, false);
+      assert.equal((await spawnOptionsFor(false)).detached, false);
+    });
+  });
+
   it('aborts promptly on an already-aborted signal without spawning', async () => {
     const controller = new AbortController();
     controller.abort();

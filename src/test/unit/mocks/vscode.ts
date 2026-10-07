@@ -70,6 +70,18 @@ export function clearMockConfig(): void {
   }
 }
 
+/**
+ * Settings whose unit-test default differs from the shipped one. Automatic dependency
+ * installs are OFF unless a test sets the key through `setMockConfig`: many tests run
+ * commands in the repository root, and none may spawn npm or write
+ * `.moag/dependencies.json` there. Kept here, not in test-setup's host, because every
+ * host a test can install (the extension's own `setHost` in activation tests included)
+ * reads this mock.
+ */
+const TEST_DEFAULTS: Record<string, Record<string, unknown>> = {
+  agentTaskPlayer: { autoInstallDependencies: false },
+};
+
 export const workspace = {
   getConfiguration(section?: string) {
     return {
@@ -78,6 +90,10 @@ export const workspace = {
         const stored = configStore[fullSection];
         if (stored && key in stored) {
           return stored[key] as T;
+        }
+        const testDefault = TEST_DEFAULTS[fullSection];
+        if (testDefault && key in testDefault) {
+          return testDefault[key] as T;
         }
         return defaultValue as T;
       },

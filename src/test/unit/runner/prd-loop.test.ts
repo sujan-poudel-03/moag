@@ -47,6 +47,8 @@ interface EvidenceStubOptions {
   standardsInputs?: StandardsCheckInput[];
   /** When given, './knowledge' is stubbed and every recorded fact's `provenBy` lands here. */
   facts?: string[];
+  /** When given, './dependency-install' is stubbed with this ensureDependencies. */
+  ensureDeps?: (cwd: string, o: { stage: string; onEvent: (ev: unknown) => void; signal: AbortSignal }) => Promise<unknown>;
 }
 
 interface LoopHarness {
@@ -130,6 +132,9 @@ function loadLoop(opts: EvidenceStubOptions = {}): LoopHarness {
       recordFact: (_cwd: string, fact: { provenBy: string }) => { facts.push(fact.provenBy); return true; },
     };
   }
+  if (opts.ensureDeps) {
+    stubs['./dependency-install'] = { ensureDependencies: opts.ensureDeps };
+  }
   const mod = proxyquire('../../../runner/prd-loop', stubs);
   return {
     createPrdLoop: mod.createPrdLoop,
@@ -153,6 +158,7 @@ function baseConfig(over: Partial<PrdLoopConfig> = {}): PrdLoopConfig {
     uat: { mode: 'off', timeoutMs: 60_000 },
     versionBudgetUsd: 0,
     standards: null,
+    dependencies: { enabled: false, ignoreScripts: false, pythonVenv: null },
     ...over,
   };
 }
@@ -194,6 +200,8 @@ interface DepsHarness {
   skipped: string[];
   /** Mutable counters — kept in an object so tests can bump them from their own fakes. */
   counters: { planRuns: number; saves: number };
+  /** Every dependency-install event the loop forwarded. */
+  dependencyEvents: unknown[];
 }
 
 /** Mark every pending task complete, the way a real successful run would. */
@@ -211,6 +219,7 @@ function makeDeps(plan: Plan, over: Partial<PrdLoopDeps> = {}): DepsHarness {
   const progress: Array<{ phase: string; detail: string }> = [];
   const skipped: string[] = [];
   const counters = { planRuns: 0, saves: 0 };
+  const dependencyEvents: unknown[] = [];
 
   const deps: PrdLoopDeps = {
     plan,
@@ -227,10 +236,11 @@ function makeDeps(plan: Plan, over: Partial<PrdLoopDeps> = {}): DepsHarness {
     onProgress: (phase: string, detail: string) => { progress.push({ phase, detail }); },
     emitReport: (r: PrdLoopReport) => { reports.push(r); },
     skipManualGate: (taskId: string) => { skipped.push(taskId); },
+    onDependencyEvent: (ev) => { dependencyEvents.push(ev); },
     signal: new AbortController().signal,
     ...over,
   };
-  return { deps, engineCalls, reports, progress, skipped, counters };
+  return { deps, engineCalls, reports, progress, skipped, counters, dependencyEvents };
 }
 
 const FAILING_GATE = (command: string): GateStub => ({
@@ -1260,6 +1270,72 @@ describe('createPrdLoop — standards gate', () => {
     // The static rules found nothing, but the profile command never ran: the blocking set was
     // not evaluated, so no row says "checked against standards v3".
     assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['npm test', 1]]);
+  });
+
+  describe('dependency installs before the gates', () => {
+    const FAILED_INSTALL = {
+      event: 'dependencies-install-failed', stage: 'verify', ecosystem: 'npm', dir: '.', trigger: 'manifest-changed',
+      command: 'npm ci --no-audit --no-fund', durationMs: 1500, exitCode: 1, timedOut: false, tail: 'npm ERR! ERESOLVE', note: null,
+    };
+
+    it('a failed install fails the command gate with no model call and no gate run', async () => {
+      const loop = loadLoop({
+        standardsInputs: [CLEAN],
+        ensureDeps: async (_cwd, o) => {
+          o.onEvent(FAILED_INSTALL);
+          return { ok: false, aborted: false, failed: FAILED_INSTALL, events: [FAILED_INSTALL] };
+        },
+      });
+      const h = makeDeps(makePlan());
+      const report = await loop.createPrdLoop(baseConfig(withStandards()), h.deps).run();
+
+      assert.equal(report.failedGate, 'command');
+      assert.equal(report.passed, false);
+      assert.equal(report.modelCallsMade, 0);
+      assert.deepEqual(loop.gateCalls(), [], 'no gate command ran without its dependencies');
+      assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode, g.passed, g.output]),
+        [['npm ci --no-audit --no-fund', 1, false, 'npm ERR! ERESOLVE']]);
+      assert.deepEqual(report.standards!.rules.filter((r) => r.rule === 'command').map((r) => [r.result, r.reason]),
+        [['not-checked', 'The command gate failed first']]);
+      assert.deepEqual(h.dependencyEvents, [FAILED_INSTALL]);
+    });
+
+    it('an abort during the install halts as aborted', async () => {
+      const loop = loadLoop({ ensureDeps: async () => ({ ok: false, aborted: true, failed: null, events: [] }) });
+      const h = makeDeps(makePlan());
+      const report = await loop.createPrdLoop(baseConfig(), h.deps).run();
+      assert.equal(report.haltReason, 'aborted');
+      assert.deepEqual(loop.gateCalls(), []);
+    });
+
+    it('a successful install forwards its events and the gates run', async () => {
+      const installed = { ...FAILED_INSTALL, event: 'dependencies-installed', exitCode: 0 };
+      const calls: Array<{ stage: string }> = [];
+      const loop = loadLoop({
+        ensureDeps: async (_cwd, o) => {
+          calls.push(o);
+          o.onEvent(installed);
+          return { ok: true, aborted: false, failed: null, events: [installed] };
+        },
+      });
+      const h = makeDeps(makePlan());
+      await loop.createPrdLoop(baseConfig(), h.deps).run();
+      assert.deepEqual(loop.gateCalls(), ['npm test']);
+      assert.equal(calls.length >= 1, true);
+      assert.equal(calls[0].stage, 'verify');
+      assert.deepEqual(h.dependencyEvents[0], installed);
+    });
+
+    it('no gates, no standards commands and UAT off means no install call', async () => {
+      let called = 0;
+      const loop = loadLoop({
+        gateCommands: [],
+        ensureDeps: async () => { called++; return { ok: true, aborted: false, failed: null, events: [] }; },
+      });
+      const h = makeDeps(makePlan());
+      await loop.createPrdLoop(baseConfig(), h.deps).run();
+      assert.equal(called, 0);
+    });
   });
 
   it('S10. a null version names the row without a version', async () => {

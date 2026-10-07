@@ -22,6 +22,7 @@ import { SecretStore } from '../../../server/secrets';
 import { referencedEngines } from '../../../server/run-env';
 import { PlanJob, RunJob } from '../../../server/worker-protocol';
 import { verifyArgv } from '../../../server/run-worker';
+import { RUN_DETAIL_EVENTS } from '../../../server/app';
 import { contentHash } from '../../../server/prd-ops';
 import { migrateStandards } from '../../../server/standards-store';
 import { readStandardsJobFile } from '../../../standards/local-store';
@@ -2757,6 +2758,52 @@ describe('server app', function () {
     assert.equal('prdLoop.gateTimeoutMs' in dcfg, false, 'no operator value: verify keeps its 600000 default');
   });
 
+  it('the plan review DTO states the dependency-install rule; the run worker config carries the operator keys', async () => {
+    const id = await (async () => {
+      const created = await h.request('POST', '/api/projects', {
+        as: 'po', body: { name: 'Acme', source: { kind: 'path', path: 'acme' }, stack: 'node-ts', defaultEngine: 'claude' },
+      });
+      return (created.body.project as { id: string }).id;
+    })();
+    await h.request('POST', `/api/projects/${id}/prd/versions`, { as: 'po', body: { text: PRD_V1, baseCreatedAt: null } });
+    h.onSpawn = planWorker({ kind: 'appended', playlist: gatedPlaylist(), rejected: [] });
+    const g = await h.request('POST', `/api/projects/${id}/plans`, { as: 'po', body: { mode: 'initial' } });
+    const planId = (g.body.plan as { id: string }).id;
+    await waitFor(() => h.state.load(id).plans[0]?.status === 'pending');
+    const view = await h.request('GET', `/api/projects/${id}`, { as: 'reviewer' });
+    const pending = (view.body.plans as Array<{ id: string; dependencyInstall: { enabled: boolean; text: string } }>).find((p) => p.id === planId)!;
+    assert.equal(pending.dependencyInstall.enabled, true);
+    assert.ok(pending.dependencyInstall.text.includes('npm ci --no-audit --no-fund'));
+    assert.ok(pending.dependencyInstall.text.includes('when a dependency manifest or lockfile changes'));
+    assert.ok(pending.dependencyInstall.text.endsWith('Lifecycle scripts run.'));
+    const hash = h.state.load(id).plans[0].contentHash;
+    await h.request('POST', `/api/projects/${id}/plans/${planId}/approve`, { as: 'reviewer', body: { contentHash: hash } });
+    h.onSpawn = () => { /* default */ };
+    await h.request('POST', `/api/projects/${id}/runs`, { as: 'reviewer', body: { planId } });
+    const rcfg = JSON.parse(fs.readFileSync(String(h.workers.at(-1)!.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
+    assert.equal(rcfg.autoInstallDependencies, true);
+    assert.equal(rcfg['dependencyInstall.ignoreScripts'], false);
+  });
+
+  it('with installs off or scripts ignored, the review card says so and the worker config follows', async () => {
+    for (const [over, phrase, enabled, ignore] of [
+      [{ autoInstallDependencies: false }, 'not installed automatically', false, false],
+      [{ installIgnoreScripts: true }, 'skipped (--ignore-scripts)', true, true],
+    ] as const) {
+      const hx = await startHarness({ config: over });
+      try {
+        const { projectId, planId } = await approvedProject(hx);
+        const view = await hx.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' });
+        const plan = (view.body.plans as Array<{ id: string; dependencyInstall: { text: string } }>).find((p) => p.id === planId)!;
+        assert.ok(plan.dependencyInstall.text.includes(phrase), plan.dependencyInstall.text);
+        await hx.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+        const rcfg = JSON.parse(fs.readFileSync(String(hx.workers.at(-1)!.spec.env.MOAG_CONFIG_PATH), 'utf-8')).agentTaskPlayer;
+        assert.equal(rcfg.autoInstallDependencies, enabled);
+        assert.equal(rcfg['dependencyInstall.ignoreScripts'], ignore);
+      } finally { await hx.close(); }
+    }
+  });
+
   // ─── Planner lockdown (no file/tool access during plan generation) ───
 
   it('a claude plan job gets no tools and no MCP servers; a run job keeps the configured claude args', async () => {
@@ -2905,6 +2952,29 @@ describe('server app', function () {
     assert.equal(detail.errorTails['t-impl'], 'Error: boom\n  at line 3');
     assert.ok(detail.events.some((e) => e.event === 'task-error-tail'));
     assert.equal(detail.tasks.find((t) => t.id === 't-impl')?.status, 'failed');
+  });
+
+  it('currentRun detail keeps an early dependency event that fell out of the recent-events window', async () => {
+    const { projectId, planId } = await approvedProject(h);
+    await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    const w = h.workers.at(-1)!;
+    const failed = {
+      event: 'dependencies-install-failed', stage: 'task', taskId: 't-impl', ecosystem: 'npm', dir: '.',
+      trigger: 'install-dir-missing', command: 'npm ci --no-audit --no-fund', durationMs: 1200, exitCode: 1,
+      timedOut: false, tail: 'npm ERR! not in sync', note: null,
+    };
+    w.line(failed);
+    for (let i = 0; i < RUN_DETAIL_EVENTS + 20; i++) { w.line({ event: 'cost', usd: 0, source: 'none' }); }
+    w.exit(1);
+    await waitFor(() => h.state.load(projectId).runs[0].status !== 'running');
+    const detail = (await projectDto(projectId, 'po')).currentRun as {
+      events: Array<{ event: string }>; dependencyEvents: Array<Record<string, unknown>>;
+    };
+    assert.ok(!detail.events.some((e) => e.event === 'dependencies-install-failed'), 'the window lost it');
+    assert.equal(detail.dependencyEvents.length, 1);
+    const { ts, ...stored } = detail.dependencyEvents[0];
+    assert.equal(typeof ts, 'string', 'the server stamps the time');
+    assert.deepEqual(stored, failed);
   });
 
   it('CI-locked server refuses plan generation and runs', async () => {

@@ -187,6 +187,28 @@ describe('JobManager', () => {
     assert.equal(redactSecrets('abc', ['']), 'abc');
   });
 
+  it('redacts injected secrets from a dependency install tail and note', () => {
+    const m = mk();
+    const secret = 'npm_SECRETTOKEN123456';
+    const seen: Array<Record<string, unknown>> = [];
+    start(m, 'p1', { redact: [secret], onEvent: (e: Record<string, unknown>) => seen.push(e), onEnd: () => undefined });
+    procs[0].line({
+      event: 'dependencies-install-failed', stage: 'task', taskId: 'a', ecosystem: 'npm', dir: '.',
+      trigger: 'manifest-changed', command: 'npm ci --no-audit --no-fund', durationMs: 10, exitCode: 1,
+      timedOut: false, tail: `401 Unauthorized //registry.npmjs.org/:_authToken=${secret}`, note: null,
+    });
+    procs[0].line({
+      event: 'dependencies-not-installed', stage: 'task', ecosystem: 'python', dir: '.', trigger: 'first-seen',
+      command: null, durationMs: 0, exitCode: null, timedOut: false, tail: '', note: `odd ${secret}`,
+    });
+    procs[0].emit('close', 0);
+    assert.equal(seen.length, 2);
+    assert.equal(seen[0].event, 'dependencies-install-failed');
+    const all = JSON.stringify(seen);
+    assert.equal(all.includes(secret), false);
+    assert.ok(all.includes('[REDACTED]'));
+  });
+
   it('records cost into the spend bucket and reports task outcomes with the engine', () => {
     const spend: Array<[string, string, number]> = [];
     const outcomes: unknown[] = [];

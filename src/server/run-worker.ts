@@ -144,6 +144,14 @@ export const NON_EVIDENCE_FAILURE_CATEGORIES: readonly string[] = ['auth', 'rate
 /** The runner's own message when a task halts on a broken pre-flight baseline (runner.ts executeTask). */
 const PREFLIGHT_HALT_MARKER = '[Pre-flight] Baseline already broken';
 
+/**
+ * The runner's stderr prefix when a step failed because its dependencies could not be
+ * installed (runner/dependency-install.ts `DEPENDENCY_INSTALL_FAILED_MARKER` — kept as a
+ * literal so this module keeps its pinned imports; a test pins the two equal). Such a
+ * step — a command task, or a pre-flight halt — never reached the engine.
+ */
+export const DEPENDENCY_FAILURE_MARKER = '[Dependencies] Install failed';
+
 const errMessage = (err: unknown): string => (err instanceof Error ? err.message : String(err));
 
 // ─── Job dispatch ───
@@ -241,11 +249,15 @@ async function runRunJob(job: RunJob, deps: WorkerDeps): Promise<number> {
   const started = new Set<string>();
   /**
    * Did the engine run this task to its own verdict? False for skipped and
-   * blocked tasks, a pre-flight baseline halt, and anything ending after a stop
-   * request — the server records stack evidence only when this is true.
+   * blocked tasks, a pre-flight baseline halt, a step that failed on its dependency
+   * install, and anything ending after a stop request — the server records stack
+   * evidence only when this is true.
    */
-  const engineRan = (t: TaskLike, result?: Partial<EngineResultLike>): boolean =>
-    started.has(t.id) && !stopRequested && !String(result?.stderr ?? '').includes(PREFLIGHT_HALT_MARKER);
+  const engineRan = (t: TaskLike, result?: Partial<EngineResultLike>): boolean => {
+    const stderr = String(result?.stderr ?? '');
+    return started.has(t.id) && !stopRequested && !stderr.includes(PREFLIGHT_HALT_MARKER)
+      && !stderr.trimStart().startsWith(DEPENDENCY_FAILURE_MARKER);
+  };
   /** A failure the environment caused (auth, rate limit, missing CLI) is no verdict on the engine. */
   const environmentFailure = (result?: Partial<EngineResultLike>): boolean => {
     if (!deps.failureCategory) { return false; }
@@ -289,6 +301,10 @@ async function runRunJob(job: RunJob, deps: WorkerDeps): Promise<number> {
     ['error', ((err: Error) => deps.emit({ event: 'error', message: errMessage(err) })) as Listener],
     ['engine-fallback', ((d: { taskId: string; toEngine: string }) =>
       deps.emit({ event: 'task-engine', id: d.taskId, engine: d.toEngine })) as Listener],
+    // Automatic dependency installs: the runner's event is already the protocol line.
+    ['dependencies-installed', ((_t: TaskLike, ev: Record<string, unknown>) => deps.emit(ev)) as Listener],
+    ['dependencies-install-failed', ((_t: TaskLike, ev: Record<string, unknown>) => deps.emit(ev)) as Listener],
+    ['dependencies-not-installed', ((_t: TaskLike, ev: Record<string, unknown>) => deps.emit(ev)) as Listener],
     ['budget-exceeded', ((d: { totalCost: number; budget: number }) => {
       budgetHit = true;
       deps.emit({ event: 'budget-exceeded', totalCost: d.totalCost, budget: d.budget });

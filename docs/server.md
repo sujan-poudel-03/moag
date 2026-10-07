@@ -56,6 +56,8 @@ Everything is configured with environment variables, validated once at boot. A b
 | `MOAG_MAX_CONCURRENT_JOBS` | no | Worker processes server-wide, 1–8, default 2. Extra requests get 429. There is no queue. |
 | `MOAG_MAX_USD_PER_ENGINE_CALL` | no | Cap in USD on any single Claude call, greater than 0 and at most 1000. Passed as `--max-budget-usd`, together with what remains of the version cap (the smaller wins). See [Cost reporting](#cost-reporting). |
 | `MOAG_GATE_TIMEOUT_MS` | no | How long, in milliseconds, verify lets one gate command (for example `npm test`) run in a run job: a whole number from 1000 to 3600000. Default 600000. A command still running then is killed and the gate fails, so nothing ships. A project cannot change it: the server never reads the repository's `.moag/config.json`. |
+| `MOAG_AUTO_INSTALL_DEPENDENCIES` | no | Install a project's dependencies automatically before a step that needs them (see [Dependency installs](#dependency-installs)). `1`/`true`/`yes` or `0`/`false`/`no`; unset means on. Any other value stops the server. |
+| `MOAG_INSTALL_IGNORE_SCRIPTS` | no | `1` to add `--ignore-scripts` to npm, pnpm and Yarn 1 installs (`--mode=skip-build` on Yarn 2+), so package lifecycle scripts do not run during automatic installs. Default off. |
 | `MOAG_RUN_ENV_PASSTHROUGH` | no | Comma-separated extra variable names passed to agents (see [below](#moag_run_env_passthrough)). |
 | `MOAG_ALLOW_SSH_CLONE` | no | `1` to allow `ssh://` clone URLs as well as `https://`. |
 
@@ -646,6 +648,46 @@ moag standards propose [--stack <id>] [--write [--force]]
 | Standards pattern denial of service | No profile-authored regular expression. Globs compile through a bounded internal translator. List and length caps apply to every field | — |
 | Standards report as an XSS or leak path | The `verify-standards` payload is shape-validated server-side, findings are capped at 200, command tails at 2,000 characters and redacted with the job's redact list, and the web app renders it with DOM text nodes only | — |
 | Planner prompt splice confusion | The `Rules:` marker line cannot occur inside the rendered standards block, because free text is blockquoted. A test covers a profile whose free text contains a `Rules:` line | — |
+
+### Dependency installs
+
+A run installs the project's dependencies itself, before the first step that needs them: a command, check, service, deploy or release task, a verify gate command, or a standards profile command. It does not rely on the agent remembering to run `npm install`. The plan review card states the rule, with the exact commands, before anyone approves.
+
+**When.** Before such a step, MOAG hashes the dependency manifests and lockfiles in the step's working directory (and the npm/pnpm workspace packages that the root `package.json` or `pnpm-workspace.yaml` lists). It installs when the hash differs from the one recorded after the last successful install in `.moag/dependencies.json`, or when `node_modules` (`obj/` for .NET) is missing while a manifest declares dependencies. For `package.json` only the dependency fields count (`dependencies`, `devDependencies`, `optionalDependencies`, `peerDependencies`, `overrides`, `resolutions`, `workspaces`, `packageManager`, `pnpm`): editing a script does not reinstall. Nothing changed means nothing runs.
+
+**What.** The commands come from a fixed table in the server code. The repository, the plan and the model never supply a command string.
+
+| Found | Command |
+|---|---|
+| `package-lock.json` / `npm-shrinkwrap.json` | `npm ci --no-audit --no-fund` |
+| `package.json` with no lockfile | `npm install --no-audit --no-fund` |
+| `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` |
+| `yarn.lock` (Yarn 1) | `yarn install --frozen-lockfile` |
+| `yarn.lock` with `.yarnrc.yml` or `packageManager: yarn@2+` | `yarn install --immutable` |
+| `requirements.txt` and a `.venv` or `venv` | `<venv>/bin/python -m pip install -r requirements.txt` |
+| `go.mod` | `go mod download` |
+| `*.sln` / `*.csproj` / `*.fsproj` / `*.vbproj` | `dotnet restore` |
+| `pom.xml`, `build.gradle(.kts)`, `Cargo.toml` | nothing: their build command resolves dependencies. A note says so |
+
+- **Lockfile refresh.** When the dependency fields of `package.json` changed since the last install but the lockfile did not (an agent added a dependency and never ran the package manager), the frozen command would refuse. MOAG runs the refresh command instead: `npm install --no-audit --no-fund`, `pnpm install --no-frozen-lockfile` or `yarn install`, which updates the lockfile. That change is part of the task's diff, is committed with it and is seen by the standards check.
+- **First sight.** When there is no record yet and `node_modules` already holds every package declared in `dependencies`, `devDependencies` and `optionalDependencies` (of `package.json` and each listed workspace package), MOAG records the current state and installs nothing: it never wipes a working tree that is already complete. An empty or partial `node_modules` (an earlier `npm install express` before `typescript` was added, a tool's `.cache`) is installed over. For dotnet, an existing `obj/` is enough. An install that was stopped or failed records nothing, so it is retried.
+- **First sight with a lockfile.** With no record, nothing says whether the lockfile still matches `package.json` — on a fresh clone an agent may already have added a dependency. For npm, MOAG compares the root (and each workspace package's) `dependencies`, `devDependencies` and `optionalDependencies` with the lockfile's `packages` entries (lockfileVersion 2 or 3); on any difference, or a lockfile it cannot read, it runs `npm install --no-audit --no-fund` instead of `npm ci`. For pnpm and Yarn it runs the frozen command and, if that fails (not on a timeout or stop), retries once with the refresh command.
+- **Python** installs only into a virtualenv the repository already has (`.venv` or `venv`), never into the system interpreter. Without one, the run shows `not installed: no virtualenv` and continues.
+- **Missing toolchain.** A table command whose tool is not on PATH (`go`, `dotnet`, `pnpm`, `yarn`) is not run: the run shows a note and continues, and the step fails later if it really needed the tool. The image ships Node 20 with npm; pnpm and Yarn need `corepack enable` in a derived image.
+- **Failure.** An install that exits non-zero or times out fails the step that needed it, with the command, its exit code and the end of its output. It is never a silent pass. A failed command task may then trigger the runner's usual auto-fix, which is an engine call.
+
+**Visibility.** Every install is a `dependencies-installed` or `dependencies-install-failed` event (a note is `dependencies-not-installed`) with the exact command, how long it took and the last 2,000 characters of its output, redacted like other tails. The run view lists them.
+
+**Trust.** An install executes what the repository's packages say, with the same trust as running its `npm test`:
+
+- npm, pnpm and Yarn run package lifecycle scripts (`preinstall`, `postinstall`) by default. That is a known supply-chain path. Set `MOAG_INSTALL_IGNORE_SCRIPTS=1` to skip them; packages that need a build step may then fail at test time.
+- The package manager still reads the repository's own `.npmrc` / `.yarnrc.yml`, so a repository can point installs at another registry. That is the same trust as running its tests.
+- A repository-shipped `.venv` interpreter is executed.
+- Installs run in the same minimal worker environment as every other command, under `MOAG_GATE_TIMEOUT_MS` (default 10 minutes; raise it for a cold install of a large repository), in their own process group, and are tree-killed when the run is stopped.
+- An agent can rewrite `.moag/dependencies.json`. That can only suppress an install, and the missing-`node_modules` check still applies, so the result is a failing step, not a silent pass.
+- Two installs in one workspace at once are serialised inside one process. Nothing locks across processes; the server's job lock already allows one job per project.
+
+Set `MOAG_AUTO_INSTALL_DEPENDENCIES=0` to turn installs off. The review card then says that a command which needs dependencies fails unless the plan installs them.
 
 ### Who can trigger agents, and how they are contained
 

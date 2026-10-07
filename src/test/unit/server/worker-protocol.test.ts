@@ -4,6 +4,7 @@ import * as path from 'path';
 import * as vm from 'vm';
 import {
   parseWorkerLine, foldRunEvent, emptyRunView, exitToRunStatus, parseJob, WorkerEvent, RunView, mergeRunViews,
+  HEADLESS_EVENTS,
 } from '../../../server/worker-protocol';
 import { TaskStatus } from '../../../models/types';
 
@@ -101,6 +102,74 @@ describe('worker-protocol', () => {
 
     it('rejects a probe row with an unknown engine', () => {
       assert.equal(parseWorkerLine(line({ event: 'probe-result', engines: [{ id: 'evil', available: true }] })), null);
+    });
+
+    describe('dependency-install events', () => {
+      const installed = {
+        event: 'dependencies-installed', stage: 'task', taskId: 't1', ecosystem: 'npm', dir: '.',
+        trigger: 'install-dir-missing', command: 'npm install --no-audit --no-fund', durationMs: 1234,
+        exitCode: 0, timedOut: false, tail: 'added 1 package', note: null,
+      };
+
+      it('parses all three events', () => {
+        assert.deepEqual(parseWorkerLine(line(installed)), installed);
+        const failed = { ...installed, event: 'dependencies-install-failed', exitCode: 1, tail: 'ERESOLVE' };
+        assert.equal(parseWorkerLine(line(failed))?.event, 'dependencies-install-failed');
+        const note = {
+          ...installed, event: 'dependencies-not-installed', ecosystem: 'python', command: null,
+          durationMs: 0, exitCode: null, tail: '', note: 'not installed: no virtualenv',
+        };
+        assert.deepEqual(parseWorkerLine(line(note)), note);
+      });
+
+      it('omits a missing taskId and rejects an empty one', () => {
+        const noTask: Record<string, unknown> = { ...installed };
+        delete noTask.taskId;
+        const parsed = parseWorkerLine(line(noTask)) as Record<string, unknown> | null;
+        assert.ok(parsed);
+        assert.equal('taskId' in parsed, false);
+        assert.equal(parseWorkerLine(line({ ...installed, taskId: '' })), null);
+      });
+
+      it('rejects malformed lines', () => {
+        const bad: Record<string, unknown>[] = [
+          { ...installed, ecosystem: 'bower' },
+          { ...installed, stage: 'deploy' },
+          { ...installed, trigger: 'because' },
+          { ...installed, command: null },
+          { ...installed, event: 'dependencies-install-failed', command: null },
+          { ...installed, durationMs: -1 },
+          { ...installed, durationMs: 'fast' },
+          { ...installed, timedOut: 'no' },
+          { ...installed, exitCode: 1.5 },
+          { ...installed, tail: 42 },
+          { ...installed, note: 7 },
+          { ...installed, dir: null },
+        ];
+        for (const b of bad) {
+          assert.equal(parseWorkerLine(line(b)), null, JSON.stringify(b));
+        }
+      });
+
+      it('cuts a long tail to its last 2000 characters', () => {
+        const tail = 'a'.repeat(3000) + 'b'.repeat(2000);
+        const parsed = parseWorkerLine(line({ ...installed, event: 'dependencies-install-failed', exitCode: 1, tail })) as { tail: string };
+        assert.equal(parsed.tail.length, 2000);
+        assert.equal(parsed.tail, 'b'.repeat(2000));
+      });
+
+      it('does not change the run view', () => {
+        const v = fold([{ event: 'state', state: 'playing' }, installed]);
+        assert.deepEqual(v, { ...emptyRunView(), runnerState: 'playing' });
+      });
+    });
+
+    it('pins HEADLESS_EVENTS', () => {
+      assert.deepEqual([...HEADLESS_EVENTS], [
+        'state', 'task-started', 'task-completed', 'task-failed', 'task-escalate',
+        'incident', 'error', 'budget-exceeded', 'manual-gate',
+        'dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed',
+      ]);
     });
   });
 

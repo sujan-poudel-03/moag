@@ -136,6 +136,7 @@ export async function startHarness(over: {
     dataDir, projectsRoot: root, publicUrl: 'http://127.0.0.1/', publicOrigin: 'http://127.0.0.1', secureCookies: false,
     host: '127.0.0.1', port: 0, trustProxy: false, bootstrapToken: null, masterKey: null, maxConcurrentJobs: 4,
     runEnvPassthrough: [], allowSshClone: false, runsDisabledReason: null, maxUsdPerEngineCall: null, gateTimeoutMs: null,
+    autoInstallDependencies: true, installIgnoreScripts: false,
     ...(over.config ?? {}),
   };
 

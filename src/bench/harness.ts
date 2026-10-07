@@ -38,6 +38,8 @@ import { StandardsProfile, profileHash } from '../standards/profile';
 import { CommandResult, PreparedWorkspace, gatesGreen, prepareWorkspace, runCommand, runGates } from './workspace';
 import { FAKE_VERSION_MARKER, FakeEngine, installFakeEngine, readFakeCalls } from './fake-engine';
 import { LaunchOptions, LaunchedServer, launchServer } from './server-launcher';
+import { ensureDependencies } from '../runner/dependency-install';
+import type { DependencyEvent } from '../models/types';
 
 /** Cap on events.jsonl. */
 export const MAX_EVENTS_BYTES = 50 * 1024 * 1024;
@@ -78,6 +80,13 @@ export interface BenchDeps {
   launchServer: (opts: LaunchOptions) => Promise<LaunchedServer>;
   prepareWorkspace: (scenario: Scenario, projectsRoot: string, name: string, env: NodeJS.ProcessEnv) => Promise<PreparedWorkspace>;
   runGates: (commands: readonly string[], cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number) => Promise<CommandResult[]>;
+  /**
+   * Install the workspace's dependencies before the acceptance gates, from the same fixed
+   * table the worker uses. Always on: not tied to any MOAG setting.
+   */
+  ensureDependencies: (
+    cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number, signal: AbortSignal,
+  ) => Promise<{ ok: boolean; aborted: boolean; events: DependencyEvent[] }>;
   checkEngine: (client: BenchClient, scenario: Scenario, server: LaunchedServer) => Promise<EngineCheck>;
   installFakeEngine: (binDir: string) => FakeEngine;
   now: () => number;
@@ -238,6 +247,7 @@ export function defaultDeps(): BenchDeps {
     launchServer,
     prepareWorkspace,
     runGates,
+    ensureDependencies: benchEnsureDependencies,
     checkEngine: defaultCheckEngine,
     installFakeEngine: (binDir) => installFakeEngine(binDir),
     now: () => Date.now(),
@@ -246,6 +256,29 @@ export function defaultDeps(): BenchDeps {
     lockRetryMs: LOCK_RETRY_MS,
     lockRetryMaxMs: LOCK_RETRY_MAX_MS,
   };
+}
+
+/**
+ * The bench's acceptance gates install dependencies exactly as a worker would, through
+ * `runCommand` so the install runs with the same env, timeout and tree-kill as the gates.
+ */
+async function benchEnsureDependencies(
+  cwd: string, env: NodeJS.ProcessEnv, timeoutMs: number, signal: AbortSignal,
+): Promise<{ ok: boolean; aborted: boolean; events: DependencyEvent[] }> {
+  const result = await ensureDependencies(cwd, {
+    settings: { enabled: true, ignoreScripts: false, pythonVenv: null },
+    stage: 'bench',
+    // Ctrl+C: no install starts after it. One already running ends at its timeout, like the gates.
+    signal,
+    timeoutMs,
+    onEvent: () => undefined,
+    exec: async (command, o) => {
+      const r = await runCommand(command, o.cwd, env, o.timeoutMs);
+      const exitCode = r.timedOut ? 124 : r.exitCode ?? 1;
+      return { command, exitCode, passed: exitCode === 0, output: r.tail, durationMs: r.durationMs, timedOut: r.timedOut };
+    },
+  });
+  return { ok: result.ok, aborted: result.aborted, events: result.events };
 }
 
 /** A strong random password that satisfies the server's policy. */
@@ -294,6 +327,8 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
   const notes: string[] = [];
   let harnessError: string | null = null;
   let aborted = false;
+  /** Aborted on Ctrl+C, so a dependency install does not start after it. */
+  const sigintAbort = new AbortController();
   let stoppedForBudget = false;
   let server: LaunchedServer | null = null;
   let disposeSse: (() => void) | null = null;
@@ -334,6 +369,7 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
   const onSigint = (): void => {
     if (aborted) { return; }
     aborted = true;
+    sigintAbort.abort();
     progress('Ctrl+C: stopping the active run through the API, then shutting the server down…');
     void stopActive('sigint');
   };
@@ -760,7 +796,21 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
             haltSeen = haltKey;
             if (gate?.name === SHIP_GATE_NAME) { required('ship-approval'); } else { unplanned('generated-manual-gate', gate?.name); }
             progress(`${v.id}: halted at "${gate?.name ?? '?'}"; running the bench acceptance gates…`);
-            const results = await deps.runGates(scenario.gateCommands, workspace!.dir, server!.serverEnv, scenario.gateTimeoutMs);
+            const installed = await deps.ensureDependencies(workspace!.dir, server!.serverEnv, scenario.gateTimeoutMs, sigintAbort.signal);
+            check();
+            log.write({ kind: 'bench-deps', version: v.id, ok: installed.ok, events: installed.events });
+            const failedInstall = installed.ok ? null : installed.events.find((e) => e.event === 'dependencies-install-failed') ?? null;
+            const results = [
+              // A failed install is a failing gate: the acceptance gates cannot be green without it.
+              ...(installed.ok ? [] : [{
+                command: failedInstall?.command ?? 'dependency install',
+                exitCode: failedInstall?.exitCode || 1,
+                timedOut: failedInstall?.timedOut ?? false,
+                durationMs: failedInstall?.durationMs ?? 0,
+                tail: failedInstall?.tail ?? '',
+              }]),
+              ...await deps.runGates(scenario.gateCommands, workspace!.dir, server!.serverEnv, scenario.gateTimeoutMs),
+            ];
             const green = gatesGreen(results);
             log.write({ kind: 'bench-gates', version: v.id, green, results: results.map((r) => ({ command: r.command, exitCode: r.exitCode, timedOut: r.timedOut, ms: r.durationMs, tail: r.tail.slice(-4000) })) });
             if (!obs.gateFirstRun) {

@@ -15,6 +15,7 @@ import {
   resolveTracePlanPath,
   persistRequirementTrace,
   cmdTrace,
+  wireEvents,
 } from '../../../headless/cli';
 import * as sinon from 'sinon';
 import { loadPlan } from '../../../models/plan';
@@ -1408,6 +1409,99 @@ describe('headless CLI: runStandardsCheckCore (pre-gate standards check)', () =>
     assert.deepEqual(line.findings.map((f) => [f.rule, f.severity]), [['comment-policy/commented-out-code', 'advisory']]);
     assert.deepEqual([line.totals.failed, line.totals.advisory], [0, 1]);
   });
+
+  describe('dependency installs before the profile commands', () => {
+    const ON = { enabled: true, ignoreScripts: false, pythonVenv: null };
+    const FAILED = {
+      event: 'dependencies-install-failed', stage: 'standards', ecosystem: 'npm', dir: '.', trigger: 'install-dir-missing',
+      command: 'npm ci --no-audit --no-fund', durationMs: 5, exitCode: 1, timedOut: false, tail: 'npm ERR! ETARGET', note: null,
+    };
+
+    function loadWithInstall(spy: Spy, ensure: (cwd: string, o: { stage: string; onEvent: (e: unknown) => void }) => Promise<unknown>) {
+      const calls: Array<{ stage: string }> = [];
+      const cli = proxyquire('../../../headless/cli', {
+        '../runner/evidence': {
+          detectPrdFile: () => null,
+          captureHeadRef: async () => 'local-head',
+          collectStandardsInput: async () => spy.input,
+          runGate: async (command: string) => {
+            spy.gates.push(command);
+            return { command, exitCode: 0, passed: true, output: 'ok', durationMs: 1, timedOut: false };
+          },
+        },
+        '../runner/dependency-install': {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          ...require('../../../runner/dependency-install'),
+          ensureDependencies: async (cwd: string, o: { stage: string; onEvent: (e: unknown) => void }) => {
+            calls.push(o);
+            return ensure(cwd, o);
+          },
+        },
+      });
+      return { cli, calls };
+    }
+
+    const standardsOf = () => {
+      const profile = sampleProfile();
+      profile.commands = [{ label: 'Lint', run: 'npm run lint' }, { label: 'Format', run: 'npm run format:check' }];
+      return { profile, version: 3, baseRef: 'abc1234' };
+    };
+
+    it('a failed install fails the first command row with its tail; the rest are not-checked; no command runs', async () => {
+      const spy = spyOf();
+      const events: unknown[] = [];
+      const { cli, calls } = loadWithInstall(spy, async (_c, o) => {
+        o.onEvent(FAILED);
+        return { ok: false, aborted: false, failed: FAILED, events: [FAILED] };
+      });
+      const report = await cli.checkStandardsNow(standardsOf(), '/repo', {
+        signal: live(), commands: true, dependencies: ON, onDependencyEvent: (e: unknown) => events.push(e),
+      });
+      const rows = report.rules.filter((r: { rule: string }) => r.rule === 'command');
+      assert.equal(rows.length, 2);
+      assert.equal(rows[0].result, 'failed');
+      assert.equal(rows[0].command, 'npm run lint');
+      assert.equal(rows[0].exitCode, 1);
+      assert.ok(String(rows[0].tail).startsWith('Dependencies could not be installed (`npm ci --no-audit --no-fund` exited 1)\n'));
+      assert.ok(String(rows[0].tail).includes('ETARGET'));
+      assert.deepEqual([rows[1].result, rows[1].reason], ['not-checked', 'Dependencies could not be installed']);
+      assert.deepEqual(spy.gates, [], 'runGate never called');
+      assert.equal(calls[0].stage, 'standards');
+      assert.deepEqual(events, [FAILED]);
+    });
+
+    it('commands:false never calls the installer', async () => {
+      const spy = spyOf();
+      const { cli, calls } = loadWithInstall(spy, async () => ({ ok: true, aborted: false, failed: null, events: [] }));
+      await cli.checkStandardsNow(standardsOf(), '/repo', {
+        signal: live(), commands: false, dependencies: ON, onDependencyEvent: () => undefined,
+      });
+      assert.equal(calls.length, 0);
+      assert.deepEqual(spy.gates, []);
+    });
+
+    it('a successful install lets the commands run', async () => {
+      const spy = spyOf();
+      const { cli, calls } = loadWithInstall(spy, async () => ({ ok: true, aborted: false, failed: null, events: [] }));
+      await cli.checkStandardsNow(standardsOf(), '/repo', {
+        signal: live(), commands: true, dependencies: ON, onDependencyEvent: () => undefined,
+      });
+      assert.equal(calls.length, 1);
+      assert.deepEqual(spy.gates, ['npm run lint', 'npm run format:check']);
+    });
+
+    it('an aborted install leaves every command not-checked as stopped', async () => {
+      const spy = spyOf();
+      const { cli } = loadWithInstall(spy, async () => ({ ok: false, aborted: true, failed: null, events: [] }));
+      const report = await cli.checkStandardsNow(standardsOf(), '/repo', {
+        signal: live(), commands: true, dependencies: ON, onDependencyEvent: () => undefined,
+      });
+      const rows = report.rules.filter((r: { rule: string }) => r.rule === 'command');
+      assert.deepEqual(rows.map((r: { result: string; reason?: string }) => [r.result, r.reason]),
+        [['not-checked', 'The check was stopped'], ['not-checked', 'The check was stopped']]);
+      assert.deepEqual(spy.gates, []);
+    });
+  });
 });
 
 // ─── moag standards show | check | propose ───
@@ -1937,5 +2031,39 @@ describe('headless CLI: moag standards', () => {
     assert.equal(await run(cli, ['propose', '--write', '--force', '--cwd', dir]), 0);
     assert.deepEqual(spawned, []);
     assert.equal(loadLocalStandards(dir)!.version, 5, 'v4 existed; the proposal was written as v5');
+  });
+});
+
+describe('headless CLI: wireEvents — dependency installs', () => {
+  it('forwards all three runner events as JSONL lines', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { EventEmitter } = require('events');
+    const runner = new EventEmitter() as NodeJS.EventEmitter & { stop: () => void };
+    runner.stop = () => undefined;
+    const lines: string[] = [];
+    const write = process.stdout.write.bind(process.stdout);
+    const stub = sinon.stub(process.stdout, 'write').callsFake((chunk: unknown) => {
+      const text = String(chunk);
+      if (text.startsWith('{')) { lines.push(text); return true; }
+      return write(text);
+    });
+    try {
+      wireEvents(runner);
+      const base = {
+        stage: 'task', taskId: 'a', ecosystem: 'npm', dir: '.', trigger: 'install-dir-missing',
+        command: 'npm install --no-audit --no-fund', durationMs: 10, exitCode: 0, timedOut: false, tail: '', note: null,
+      };
+      runner.emit('dependencies-installed', { id: 'a' }, { event: 'dependencies-installed', ...base });
+      runner.emit('dependencies-install-failed', { id: 'a' }, { event: 'dependencies-install-failed', ...base, exitCode: 1 });
+      runner.emit('dependencies-not-installed', { id: 'a' }, { event: 'dependencies-not-installed', ...base, command: null, note: 'n' });
+    } finally {
+      stub.restore();
+    }
+    const parsed = lines.map((l) => JSON.parse(l));
+    assert.deepEqual(parsed.map((p) => p.event), ['dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed']);
+    assert.equal(parsed[0].command, 'npm install --no-audit --no-fund');
+    assert.equal(parsed[1].exitCode, 1);
+    assert.equal(parsed[2].note, 'n');
+    assert.ok(typeof parsed[0].ts === 'string');
   });
 });

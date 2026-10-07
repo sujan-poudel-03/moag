@@ -1,11 +1,13 @@
 'use strict';
-// Dry-run stand-in tests for PRD v1 (R-1 to R-4). node:test, no dependencies.
+// Dry-run stand-in tests for PRD v1 (R-1 to R-4). node:test, plus the local todo-format
+// devDependency, which exists only once MOAG has installed it.
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { formatTodo } = require('todo-format');
 
 const BIN = path.join(__dirname, '..', 'bin', 'todo.js');
 
@@ -49,4 +51,8 @@ test('R-4: todos persist in TODO_FILE; a missing file is an empty list', () => {
   todo(f, 'add', 'kept');
   assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).length, 1);
   assert.equal(todo(f, 'list').out, '1 [ ] kept\n');
+});
+
+test('the installed devDependency formats a todo the way list prints it', () => {
+  assert.equal(formatTodo({ id: 2, done: true, text: 'b' }), '2 [x] b');
 });

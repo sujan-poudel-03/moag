@@ -92,6 +92,10 @@ export interface WorkerConfig {
      * `MOAG_GATE_TIMEOUT_MS`; absent, verify keeps its own default (600000).
      */
     'prdLoop.gateTimeoutMs'?: number;
+    /** Operator's `MOAG_AUTO_INSTALL_DEPENDENCIES`; always present so a repository's file cannot decide it. */
+    'autoInstallDependencies': boolean;
+    /** Operator's `MOAG_INSTALL_IGNORE_SCRIPTS`; always present. */
+    'dependencyInstall.ignoreScripts': boolean;
   };
 }
 
@@ -126,6 +130,7 @@ export function perCallBudgetUsd(capUsd: number, maxUsdPerCall: number | null): 
 export function buildWorkerConfig(
   project: Pick<ProjectRecord, 'defaultEngine' | 'versionBudgetUsd'>, remainingUsd: number, maxUsdPerCall: number | null = null,
   gateTimeoutMs: number | null = null,
+  deps: { enabled: boolean; ignoreScripts: boolean } = { enabled: true, ignoreScripts: false },
 ): WorkerConfig {
   let cap = 0;
   if (project.versionBudgetUsd > 0) {
@@ -143,6 +148,9 @@ export function buildWorkerConfig(
       'engines.claude.outputFormat': 'json',
       'engines.claude.maxBudgetUsdPerCall': perCallBudgetUsd(cap, maxUsdPerCall),
       ...(gateTimeoutMs !== null ? { 'prdLoop.gateTimeoutMs': gateTimeoutMs } : {}),
+      // pythonVenv is never sent: on the server only .venv / venv auto-detection applies.
+      'autoInstallDependencies': deps.enabled,
+      'dependencyInstall.ignoreScripts': deps.ignoreScripts,
     },
   };
 }

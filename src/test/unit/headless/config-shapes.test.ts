@@ -89,3 +89,40 @@ describe('headless config — every shape a config file is written in', () => {
     assert.strictEqual(readSetting(cfg, 'agentTaskPlayer', 'git.autoCommit', false), true);
   });
 });
+
+describe('headless config — dependency-install settings', () => {
+  const keys: [string, unknown, unknown][] = [
+    ['autoInstallDependencies', false, true],
+    ['dependencyInstall.ignoreScripts', true, false],
+    ['dependencyInstall.pythonVenv', 'envs/py', ''],
+  ];
+
+  it('resolves all three keys from the flat shape', () => {
+    const cfg = {
+      'agentTaskPlayer.autoInstallDependencies': false,
+      'agentTaskPlayer.dependencyInstall.ignoreScripts': true,
+      'agentTaskPlayer.dependencyInstall.pythonVenv': 'envs/py',
+    };
+    for (const [key, expected, fallback] of keys) {
+      assert.strictEqual(readSetting(cfg, 'agentTaskPlayer', key, fallback), expected, key);
+    }
+  });
+
+  it('resolves all three keys from the nested shape', () => {
+    const cfg = {
+      agentTaskPlayer: {
+        autoInstallDependencies: false,
+        dependencyInstall: { ignoreScripts: true, pythonVenv: 'envs/py' },
+      },
+    };
+    for (const [key, expected, fallback] of keys) {
+      assert.strictEqual(readSetting(cfg, 'agentTaskPlayer', key, fallback), expected, key);
+    }
+  });
+
+  it('falls back to the defaults when absent', () => {
+    for (const [key, , fallback] of keys) {
+      assert.strictEqual(readSetting({}, 'agentTaskPlayer', key, fallback), fallback, key);
+    }
+  });
+});

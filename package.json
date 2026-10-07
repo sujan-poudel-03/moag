@@ -1206,6 +1206,21 @@
           "default": true,
           "description": "When a task has a verifyCommand and the pre-flight baseline check fails (tests already broken before the agent runs), halt execution instead of proceeding. Prevents agents from running against a broken foundation. Set to false to proceed with a warning instead."
         },
+        "agentTaskPlayer.autoInstallDependencies": {
+          "type": "boolean",
+          "default": true,
+          "description": "Before a command task, a verify/gate command or a standards command runs, install the project's dependencies when a manifest or lockfile changed since the last install (recorded in .moag/dependencies.json) or node_modules is missing. Commands come from a fixed table: npm ci / npm install, pnpm install --frozen-lockfile, yarn install --frozen-lockfile (or --immutable), <venv> python -m pip install -r requirements.txt (only into an existing virtualenv), go mod download, dotnet restore. Maven, Gradle and Cargo resolve dependencies in their own build. A failed install fails the step that needed it."
+        },
+        "agentTaskPlayer.dependencyInstall.ignoreScripts": {
+          "type": "boolean",
+          "default": false,
+          "description": "Skip npm/pnpm/yarn lifecycle scripts during automatic dependency installs (adds --ignore-scripts; --mode=skip-build for Yarn 2+)."
+        },
+        "agentTaskPlayer.dependencyInstall.pythonVenv": {
+          "type": "string",
+          "default": "",
+          "description": "Virtualenv directory, relative to the workspace, that automatic Python installs use. Leave blank to detect .venv or venv. Python dependencies are never installed into the system interpreter."
+        },
         "agentTaskPlayer.issueRepo": {
           "type": "string",
           "default": "",

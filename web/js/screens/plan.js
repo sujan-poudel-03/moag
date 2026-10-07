@@ -39,6 +39,11 @@ function taskRows(tasks) {
       t.type === 'manual' ? [' ', badge('SHIP GATE', 'warning')] : null))));
 }
 
+/** The server's dependency-install rule, so the reviewer sees it before approving (null when the server sent none). */
+function dependencyInstallNote(p) {
+  return p.dependencyInstall ? h('p', { class: 'muted', role: 'note' }, glyph('ⓘ'), ' ', p.dependencyInstall.text) : null;
+}
+
 /** Warning shown when the repo ships engine config that an approved run would load (null when none). */
 function repoConfigWarning(entries) {
   if (!Array.isArray(entries) || entries.length === 0) { return null; }
@@ -203,6 +208,7 @@ function planCard(app, project, p, refresh) {
         standardsLines(),
         repoConfigWarning(app.project.repoEngineConfig),
         taskRows(tasks),
+        dependencyInstallNote(p),
         review.commands && review.commands.length > 0 ? h('div', null,
           h('h3', { class: 'section-header' }, `Commands and side effects (${review.commands.length})`),
           h('p', { class: 'muted' }, 'Shown exactly as written. Review them: commands run in the project workspace; health-check URLs are fetched; skip conditions and failure policies change what runs; an incident repo receives the GitHub issues a monitor task files.'),
@@ -253,6 +259,7 @@ function planCard(app, project, p, refresh) {
         standardsLines(),
         allowed.has('run.start') ? repoConfigWarning(app.project.repoEngineConfig) : null,
         taskRows(tasks),
+        dependencyInstallNote(p),
         allowed.has('run.start')
           ? h('div', { class: 'form-actions' }, h('button', { type: 'button', class: 'btn btn-primary', on: { click: start } }, 'Start run'))
           : h('p', { class: p.startBlockedReason && p.startBlockedReason !== 'job-active' ? 'text-warning' : 'muted' },

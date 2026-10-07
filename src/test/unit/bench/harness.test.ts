@@ -156,6 +156,8 @@ describe('bench harness (scripted workers behind the real app)', function () {
         const ok = over.green ? over.green() : true;
         return commands.map((command) => ({ command, exitCode: ok ? 0 : 1, timedOut: false, durationMs: 5, tail: ok ? 'ok' : 'FAIL' }));
       },
+      // Never the real installer in a unit test: nothing may reach a registry.
+      ensureDependencies: async () => ({ ok: true, aborted: false, events: [] }),
       checkEngine: async () => ({ available: true, probeVersion: null, shellVersion: '2.1.287 (Claude Code)' }),
       installFakeEngine: (binDir: string): FakeEngine => {
         fs.mkdirSync(binDir, { recursive: true });
@@ -266,6 +268,50 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.deepEqual(v.gateFirstRunPass?.results.map((x) => x.exitCode), [1]);
     assert.ok(v.interventions.unplanned.some((i) => i.kind === 'gate-rejected'));
     assert.deepEqual(v.interventions.required.map((i) => i.kind), ['plan-approval', 'ship-approval']);
+  });
+
+  it('dependencies are installed before the acceptance gates, and the install is logged as bench-deps', async () => {
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [] }, seen);
+    const order: string[] = [];
+    const installed = {
+      event: 'dependencies-installed' as const, stage: 'bench' as const, ecosystem: 'npm' as const, dir: '.', trigger: 'install-dir-missing' as const,
+      command: 'npm install --no-audit --no-fund', durationMs: 7, exitCode: 0, timedOut: false, tail: 'added 1 package', note: null,
+    };
+    const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({
+      ensureDependencies: async (cwd, _env, timeoutMs, signal) => {
+        order.push(`install:${path.basename(cwd)}:${timeoutMs}:${signal.aborted}`);
+        return { ok: true, aborted: false, events: [installed] };
+      },
+      onGates: () => { order.push('gates'); },
+    }));
+    assert.equal(r.summary!.versions[0].outcome, 'shipped');
+    assert.deepEqual(order.slice(0, 2), ['install:acme:10000:false', 'gates']);
+    const logged = fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l))
+      .filter((e) => e.kind === 'bench-deps');
+    assert.equal(logged.length >= 1, true);
+    assert.deepEqual([logged[0].version, logged[0].ok, logged[0].events[0].command], ['v1', true, 'npm install --no-audit --no-fund']);
+  });
+
+  it('a failed install makes the acceptance gates red even when the gate commands pass', async () => {
+    const seen = { plans: 0, runs: 0 };
+    scriptWorkers(h, { plans: [], costs: [] }, seen);
+    const failed = {
+      event: 'dependencies-install-failed' as const, stage: 'bench' as const, ecosystem: 'npm' as const, dir: '.', trigger: 'install-dir-missing' as const,
+      command: 'npm install --no-audit --no-fund', durationMs: 7, exitCode: 1, timedOut: false, tail: 'npm ERR! ENOTCACHED', note: null,
+    };
+    const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({
+      ensureDependencies: async () => ({ ok: false, aborted: false, events: [failed] }),
+    }));
+    const v = r.summary!.versions[0];
+    assert.equal(v.outcome, 'not-shipped');
+    assert.equal(v.gateFirstRunPass?.pass, false);
+    assert.deepEqual(v.gateFirstRunPass?.results.map((x) => [x.command, x.exitCode]),
+      [['npm install --no-audit --no-fund', 1], ['npm test', 0]]);
+    const rejected = v.interventions.unplanned.find((i) => i.kind === 'gate-rejected');
+    assert.ok(rejected && /npm install --no-audit --no-fund → exit 1/.test(rejected.detail ?? ''), JSON.stringify(v.interventions.unplanned));
+    const events = fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8');
+    assert.ok(events.includes('"kind":"bench-deps"'));
   });
 
   it('a ship the server refuses over the pre-gate standards check is rejected by the bench approver: nothing shipped, and it says why', async () => {

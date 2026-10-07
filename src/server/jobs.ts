@@ -572,6 +572,9 @@ export class JobManager {
       }
       const safe: WorkerEvent = ev.event === 'task-error-tail' ? { ...ev, tail: redactSecrets(ev.tail, redact) }
         : ev.event === 'error' || ev.event === 'warning' ? { ...ev, message: redactSecrets(ev.message, redact) }
+          // An install's output tail can echo a registry token or an env value.
+          : ev.event === 'dependencies-installed' || ev.event === 'dependencies-install-failed' || ev.event === 'dependencies-not-installed'
+            ? { ...ev, tail: redactSecrets(ev.tail, redact), note: ev.note === null ? null : redactSecrets(ev.note, redact) }
           // verify-* payloads carry command output (a standards report's command tails).
           : ev.event === 'verify' && redact.length > 0 ? { ...ev, data: redactJsonStrings(ev.data, redact) }
             : ev;

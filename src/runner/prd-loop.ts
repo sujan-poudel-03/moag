@@ -10,7 +10,8 @@
 // Dependency-injected in the style of `headless/daemon.ts` and free of VS Code API
 // imports, so the extension command and the headless CLI run the exact same loop.
 
-import { EngineResult, Plan, Playlist, Task, TaskStatus } from '../models/types';
+import { DependencyEvent, EngineResult, Plan, Playlist, Task, TaskStatus } from '../models/types';
+import { DependencyInstallSettings, ensureDependencies } from './dependency-install';
 import * as nodeFs from 'fs';
 import { recordGateResults, standardsGateCommand } from '../models/requirement-trace';
 import { commandFactId, recordFact } from './knowledge';
@@ -74,6 +75,11 @@ export interface PrdLoopConfig {
    * means "no commits yet" and makes every file count as added.
    */
   standards: { profile: StandardsProfile; version: number | null; baseRef: string | null } | null;
+  /**
+   * Automatic dependency installs before the gate commands run. Required so every host
+   * surface decides explicitly; `enabled: false` makes the install step a no-op.
+   */
+  dependencies: DependencyInstallSettings;
 }
 
 /** Why the loop stopped short of a verdict. */
@@ -138,6 +144,8 @@ export interface PrdLoopDeps {
   savePlan: () => void;
   onProgress: (phase: string, detail: string) => void;
   emitReport: (r: PrdLoopReport) => void | Promise<void>;
+  /** Every dependency-install event (installed, failed, not installed) the gates caused. */
+  onDependencyEvent: (ev: DependencyEvent) => void;
   skipManualGate?: (taskId: string) => void;
   /**
    * Bring up (or adopt) an application the UAT gate can drive, or resolve null
@@ -449,7 +457,40 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
           );
         }
         const repoResults: GateResult[] = [];
-        for (const command of commands) {
+        // Install dependencies first when a manifest changed or node_modules is missing —
+        // once per iteration, from the fixed table, never by the model. A failed install
+        // fails the command gate with that reason; it is not a gate result to learn from.
+        if (commands.length > 0 || profileCommands.length > 0 || cfg.uat.mode !== 'off') {
+          const install = await ensureDependencies(cfg.cwd, {
+            settings: cfg.dependencies,
+            signal: deps.signal,
+            timeoutMs: cfg.gateTimeoutMs,
+            stage: 'verify',
+            onEvent: deps.onDependencyEvent,
+          });
+          if (install.aborted) {
+            return makeReport({ haltReason: 'aborted' });
+          }
+          if (!install.ok) {
+            const failed = install.failed;
+            failedGate = 'command';
+            gates.push({
+              command: failed?.command ?? 'dependency install',
+              exitCode: failed?.exitCode || 1,
+              passed: false,
+              output: failed?.tail ?? '',
+              durationMs: failed?.durationMs ?? 0,
+              timedOut: failed?.timedOut ?? false,
+            });
+            failureDetail = `Dependencies could not be installed: ${failed?.command ?? 'the install'}
+`
+              + `Exit code: ${failed?.exitCode ?? 1}${failed?.timedOut ? ' (timed out)' : ''}`
+              + `
+Output tail:
+${tail(failed?.tail ?? '', 2_000)}`;
+          }
+        }
+        for (const command of failedGate ? [] : commands) {
           if (deps.signal.aborted) {
             return makeReport({ haltReason: 'aborted' });
           }

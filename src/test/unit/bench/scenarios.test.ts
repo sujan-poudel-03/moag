@@ -166,6 +166,24 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     });
   }
 
+  it('greenfield-todo: every dry-run fixture declares a local file: devDependency and an offline .npmrc', () => {
+    const s = parseScenario(path.join(SCENARIOS, 'greenfield-todo', 'scenario.json'));
+    const declared = new Set<string>();
+    for (const v of s.versions) {
+      const dir = v.dryRunFixture!;
+      const pkg = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf-8')) as { devDependencies?: Record<string, string> };
+      const deps = Object.entries(pkg.devDependencies ?? {});
+      assert.ok(deps.length > 0 && deps.every(([, spec]) => spec.startsWith('file:')), `${v.id}: ${JSON.stringify(deps)}`);
+      for (const [, spec] of deps) {
+        assert.ok(fs.existsSync(path.join(dir, spec.slice('file:'.length), 'package.json')), `${v.id}: ${spec} exists in the fixture`);
+      }
+      declared.add(JSON.stringify(pkg.devDependencies));
+      const npmrc = fs.readFileSync(path.join(dir, '.npmrc'), 'utf-8').split(/\r?\n/);
+      assert.ok(npmrc.includes('offline=true'), `${v.id}: the install can never reach the registry`);
+    }
+    assert.equal(declared.size, 1, 'the same dependency in every version, so v2 and v3 exercise "unchanged, no install"');
+  });
+
   it('every scenario directory is covered by these tests', () => {
     const shipped = fs.readdirSync(SCENARIOS, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name).sort();
     assert.deepEqual(shipped, ['brownfield-moag', 'greenfield-todo', 'standards-violation']);

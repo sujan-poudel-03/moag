@@ -19,11 +19,12 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { isDeepStrictEqual } from 'util';
 import { URL } from 'url';
-import { ENGINE_IDS, EngineId, Plan, PlanFilePlaylist, SEMVER_BUMPS, StandardsCheckCounts, TaskStatus, TaskType } from '../models/types';
+import { DEPENDENCY_EVENT_NAMES, ENGINE_IDS, EngineId, Plan, PlanFilePlaylist, SEMVER_BUMPS, StandardsCheckCounts, TaskStatus, TaskType } from '../models/types';
 import { STACK_IDS } from './stacks';
 import { WEB_ROLES } from './web-roles';
 import { dehydratePlan, hydratePlan, loadPlan } from '../models/plan';
 import { describeDeltaScope } from '../runner/prd-plan';
+import { describeInstallRule } from '../runner/dependency-install';
 import { latestRequirements, requirementStatuses } from '../models/requirement-trace';
 import { formatVersionLabel, collectReservedRequirementIds, computeLatestDiff, recommendBump } from '../models/requirements';
 import { writeFileAtomicSync } from '../utils/file-io';
@@ -158,6 +159,13 @@ export const SSE_HEARTBEAT_MS = 25_000;
 export const MAX_RUN_EVENTS_BYTES = 2 * 1024 * 1024;
 /** Most recent run events returned with the current run's detail. */
 export const RUN_DETAIL_EVENTS = 200;
+/**
+ * Most recent dependency-install events returned with the run detail, collected from the
+ * WHOLE events.jsonl — an early install (or its failure) must not fall out of the last
+ * RUN_DETAIL_EVENTS window on a long run. Each carries at most a 2000-character tail.
+ */
+export const RUN_DETAIL_DEPENDENCY_EVENTS = 50;
+const DEPENDENCY_EVENT_SET = new Set<string>(DEPENDENCY_EVENT_NAMES);
 
 // ─── Dependencies ───
 
@@ -511,7 +519,8 @@ export function createApp(deps: AppDeps): App {
     const configPath = path.join(dir, 'config.json');
     const doc = kind === 'plan'
       ? buildPlanWorkerConfig(project, remaining, config.maxUsdPerEngineCall)
-      : buildWorkerConfig(project, remaining, config.maxUsdPerEngineCall, config.gateTimeoutMs);
+      : buildWorkerConfig(project, remaining, config.maxUsdPerEngineCall, config.gateTimeoutMs,
+        { enabled: config.autoInstallDependencies, ignoreScripts: config.installIgnoreScripts });
     writeFileAtomicSync(configPath, JSON.stringify(doc, null, 2), 0o600);
     return configPath;
   };
@@ -575,6 +584,8 @@ export function createApp(deps: AppDeps): App {
       ...(pendingErrors.length > 0 ? { review: { ...(p.review ?? { commands: [] }), ok: false, errors: pendingErrors } } : {}),
       requestedByName: usernameOf(p.requestedBy),
       decidedByName: usernameOf(p.decidedBy),
+      // The rule the worker applies, from the same fixed table, so the reviewer sees it before approving.
+      dependencyInstall: describeInstallRule({ enabled: config.autoInstallDependencies, ignoreScripts: config.installIgnoreScripts }),
       ...(start && decided ? { startBlockedReason: blocked } : {}),
       ...(start && blocked === 'review-errors' ? { startBlockedErrors: start.reviewErrors } : {}),
       allowedActions: allowedActions(actorOf(u), start ? ['plan.approve', 'plan.reject', 'plan.cancel', 'run.start'] : ['plan.approve', 'plan.reject', 'plan.cancel'], {
@@ -613,6 +624,7 @@ export function createApp(deps: AppDeps): App {
     const errorTails: Record<string, string> = {};
     const ranEngines: Record<string, string> = {};
     const events: unknown[] = [];
+    let dependencyEvents: unknown[] = [];
     try {
       const lines = fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf-8').split('\n').filter(Boolean);
       for (const line of lines) {
@@ -620,8 +632,10 @@ export function createApp(deps: AppDeps): App {
           const ev = JSON.parse(line) as { event?: string; id?: string; tail?: string; engine?: string };
           if (ev.event === 'task-error-tail' && typeof ev.id === 'string' && typeof ev.tail === 'string') { errorTails[ev.id] = ev.tail.slice(-4000); }
           if (ev.event === 'task-engine' && typeof ev.id === 'string' && typeof ev.engine === 'string') { ranEngines[ev.id] = ev.engine; }
+          if (typeof ev.event === 'string' && DEPENDENCY_EVENT_SET.has(ev.event)) { dependencyEvents.push(ev); }
         } catch { /* skip a torn line */ }
       }
+      dependencyEvents = dependencyEvents.slice(-RUN_DETAIL_DEPENDENCY_EVENTS);
       for (const line of lines.slice(-RUN_DETAIL_EVENTS)) {
         try { events.push(JSON.parse(line)); } catch { /* skip */ }
       }
@@ -656,7 +670,10 @@ export function createApp(deps: AppDeps): App {
     // The standards report as the worker last sent it. Absent — not empty — for a run that
     // has none (a legacy plan, or a run that ended before any check): "no report" is not a pass.
     const standardsReport = readStandardsReport(dir);
-    return { runId: r.id, playlistName, tasks, errorTails, events, afterGate, ...(standardsReport ? { standardsReport } : {}) };
+    return {
+      runId: r.id, playlistName, tasks, errorTails, events, dependencyEvents, afterGate,
+      ...(standardsReport ? { standardsReport } : {}),
+    };
   };
 
   // ─── Project standards ───

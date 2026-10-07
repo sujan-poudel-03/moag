@@ -330,6 +330,16 @@ describe('moag verify — buildVerifyConfig', () => {
     }
   });
 
+  it('carries the dependency-install settings from the config (default on)', () => {
+    assert.deepEqual(buildVerifyConfig(parseArgs(['verify', 'p.json']), makeCtx() as never).dependencies,
+      { enabled: true, ignoreScripts: false, pythonVenv: null });
+    const ctx = makeCtx({
+      autoInstallDependencies: false, 'dependencyInstall.ignoreScripts': true, 'dependencyInstall.pythonVenv': '.env',
+    });
+    assert.deepEqual(buildVerifyConfig(parseArgs(['verify', 'p.json']), ctx as never).dependencies,
+      { enabled: false, ignoreScripts: true, pythonVenv: '.env' });
+  });
+
   it('a budget halt maps to exit code 4', () => {
     assert.equal(exitCodeForReport({ passed: false, haltReason: 'budget-exceeded' }), 4);
   });

@@ -112,6 +112,24 @@ describe('server config', () => {
     }
   });
 
+  it('MOAG_AUTO_INSTALL_DEPENDENCIES defaults on, accepts the boolean words, refuses anything else', () => {
+    assert.equal(ok(base()).autoInstallDependencies, true);
+    assert.equal(ok({ ...base(), MOAG_AUTO_INSTALL_DEPENDENCIES: '' }).autoInstallDependencies, true);
+    for (const on of ['1', 'true', 'yes', 'TRUE', ' yes ']) {
+      assert.equal(ok({ ...base(), MOAG_AUTO_INSTALL_DEPENDENCIES: on }).autoInstallDependencies, true, on);
+    }
+    for (const off of ['0', 'false', 'no', 'No']) {
+      assert.equal(ok({ ...base(), MOAG_AUTO_INSTALL_DEPENDENCIES: off }).autoInstallDependencies, false, off);
+    }
+    assert.match(err({ ...base(), MOAG_AUTO_INSTALL_DEPENDENCIES: 'maybe' }), /MOAG_AUTO_INSTALL_DEPENDENCIES/);
+  });
+
+  it('MOAG_INSTALL_IGNORE_SCRIPTS is an off-by-default flag', () => {
+    assert.equal(ok(base()).installIgnoreScripts, false);
+    assert.equal(ok({ ...base(), MOAG_INSTALL_IGNORE_SCRIPTS: '1' }).installIgnoreScripts, true);
+    assert.equal(ok({ ...base(), MOAG_INSTALL_IGNORE_SCRIPTS: '0' }).installIgnoreScripts, false);
+  });
+
   it('validates MOAG_GATE_TIMEOUT_MS to a whole number of ms in [1000, 3600000]', () => {
     assert.equal(ok(base()).gateTimeoutMs, null, 'unset: verify keeps its default');
     assert.equal(ok({ ...base(), MOAG_GATE_TIMEOUT_MS: ' ' }).gateTimeoutMs, null);

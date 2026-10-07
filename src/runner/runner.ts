@@ -19,7 +19,11 @@ import {
   TaskArtifact,
   TaskType,
   VerificationResult,
+  DependencyEvent,
 } from '../models/types';
+import {
+  DEPENDENCY_INSTALL_FAILED_MARKER, ensureDependencies, readDependencyInstallSettings,
+} from './dependency-install';
 import { generateId } from '../models/plan';
 import { recordCommit, stampRelease } from '../models/requirement-trace';
 import { commitTask, describePrepareFailure, prepareBranch, DeliveryConfig } from './git-delivery';
@@ -304,7 +308,16 @@ export interface RunnerEvents {
   'manual-gate': (task: Task) => void;
   /** Fired when a type:"monitor" task detects an incident (optionally with a filed issue URL) */
   'incident': (task: Task, summary: string, issueUrl: string | null) => void;
+  /** Dependencies were installed automatically before a step that needed them. */
+  'dependencies-installed': (task: Task, ev: DependencyEvent) => void;
+  /** An automatic dependency install failed; the step that needed it fails too. */
+  'dependencies-install-failed': (task: Task, ev: DependencyEvent) => void;
+  /** Dependencies could not be installed automatically (no virtualenv, toolchain missing, build-resolved). */
+  'dependencies-not-installed': (task: Task, ev: DependencyEvent) => void;
 }
+
+/** Task types that run a shell command which may need the project's dependencies (a subset of TaskType). */
+const DEPENDENCY_CONSUMERS: ReadonlySet<TaskType> = new Set<TaskType>(['command', 'check', 'service', 'deploy', 'release']);
 
 interface ServiceHandle {
   taskId: string;
@@ -1425,9 +1438,15 @@ export class TaskRunner {
             return getConfig('agentTaskPlayer').get<boolean>('haltOnBrokenBaseline', true);
           } catch { return true; }
         })();
+        // The baseline never ran because its dependencies could not be installed: say so,
+        // keeping the install command and tail — the project's tests are not "already broken".
+        const depsFailed = baselineVerification.output.startsWith(DEPENDENCY_INSTALL_FAILED_MARKER);
         if (haltOnBroken) {
-          const haltMsg = `[Pre-flight] Baseline already broken (exit ${baselineVerification.exitCode ?? 1}) — halting to prevent cascading failures.\n` +
-            `Fix the baseline before re-running. Disable agentTaskPlayer.haltOnBrokenBaseline to proceed anyway.\n`;
+          const haltMsg = depsFailed
+            ? `${baselineVerification.output.replace(/\n*$/, '\n')}` +
+              `[Pre-flight] The baseline check "${task.verifyCommand}" could not run because its dependencies could not be installed — halting before the agent runs.\n`
+            : `[Pre-flight] Baseline already broken (exit ${baselineVerification.exitCode ?? 1}) — halting to prevent cascading failures.\n` +
+              `Fix the baseline before re-running. Disable agentTaskPlayer.haltOnBrokenBaseline to proceed anyway.\n`;
           this.emit('task-output', task, haltMsg, 'stderr');
           task.status = TaskStatus.Failed;
           this.emit('task-failed', task, {
@@ -1435,13 +1454,16 @@ export class TaskRunner {
             stderr: haltMsg,
             exitCode: baselineVerification.exitCode ?? 1,
             durationMs: 0,
+            ...(depsFailed ? { summary: 'Dependencies could not be installed.' } : {}),
           });
           clearTimeout(timeoutId);
           this._abortController?.signal.removeEventListener('abort', onParentAbort);
           return;
         }
         this.emit('task-output', task,
-          `[Pre-flight] Baseline already broken before agent runs — task will not be blamed for this failure\n`,
+          depsFailed
+            ? `[Pre-flight] Dependencies could not be installed for the baseline check — proceeding; the install is retried before the check after the task\n`
+            : `[Pre-flight] Baseline already broken before agent runs — task will not be blamed for this failure\n`,
           'stderr');
       }
     }
@@ -1780,6 +1802,13 @@ export class TaskRunner {
     // signal never fires (a manual gate would wait forever, a command would run).
     if (signal.aborted) {
       return { stdout: '', stderr: '[Task aborted before it started]', exitCode: 130, durationMs: 0 };
+    }
+    const runsCommand = !!task.command?.trim() || (taskType === 'check' && !!task.verifyCommand?.trim());
+    if (DEPENDENCY_CONSUMERS.has(taskType) && runsCommand) {
+      const deps = await this.ensureDependenciesFor(task, cwd, signal, resolvedEnv ?? task.env, 'task');
+      if (deps) {
+        return deps.failure;
+      }
     }
     switch (taskType) {
       case 'agent':
@@ -2747,6 +2776,18 @@ export class TaskRunner {
       }
     }
 
+    // Covers both the pre-flight baseline and the post-task check.
+    const deps = await this.ensureDependenciesFor(task, cwd, parentSignal, env, 'verify');
+    if (deps) {
+      return {
+        command: effectiveCommand,
+        exitCode: deps.failure.exitCode,
+        output: [deps.failure.stdout, deps.failure.stderr].filter(Boolean).join('\n'),
+        durationMs: deps.failure.durationMs,
+        passed: false,
+      };
+    }
+
     const verifyAbort = new AbortController();
     const timer = setTimeout(() => verifyAbort.abort(), VERIFY_TIMEOUT_MS);
     const onParentAbort = () => verifyAbort.abort();
@@ -2772,6 +2813,53 @@ export class TaskRunner {
       clearTimeout(timer);
       parentSignal.removeEventListener('abort', onParentAbort);
     }
+  }
+
+  /**
+   * Install the project's dependencies first when a manifest or lockfile changed (or the
+   * install directory is missing) — deterministically, from the fixed table in
+   * `dependency-install.ts`, never by asking the model. Null when the step may proceed;
+   * otherwise the result the step must fail with (an abort is exit 130, never a failure event).
+   */
+  private async ensureDependenciesFor(
+    task: Task,
+    cwd: string,
+    signal: AbortSignal,
+    env: Record<string, string> | undefined,
+    stage: 'task' | 'verify',
+  ): Promise<{ failure: EngineResult } | null> {
+    const cfg = getConfig('agentTaskPlayer');
+    const settings = readDependencyInstallSettings(cfg);
+    const result = await ensureDependencies(cwd, {
+      settings,
+      signal,
+      timeoutMs: cfg.get<number>('prdLoop.gateTimeoutMs', 600_000),
+      stage,
+      taskId: task.id,
+      env,
+      onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),
+      onEvent: (ev) => this.emit(ev.event, task, ev),
+    });
+    if (result.aborted) {
+      return { failure: { stdout: '', stderr: '[Command aborted]', exitCode: 130, durationMs: 0 } };
+    }
+    if (result.ok) {
+      return null;
+    }
+    const failed = result.failed;
+    const seconds = failed ? (failed.durationMs / 1000).toFixed(1) : '0.0';
+    const stderr = failed
+      ? `${DEPENDENCY_INSTALL_FAILED_MARKER}: \`${failed.command}\` exited ${failed.exitCode ?? 1} after ${seconds}s (needed by "${task.name}").\n${failed.tail}`
+      : `${DEPENDENCY_INSTALL_FAILED_MARKER} (needed by "${task.name}").`;
+    return {
+      failure: {
+        stdout: '',
+        stderr,
+        exitCode: failed?.exitCode || 1,
+        durationMs: failed?.durationMs ?? 0,
+        summary: 'Dependencies could not be installed.',
+      },
+    };
   }
 
   private runLocalCommand(command: string, options: CommandRunOptions): Promise<EngineResult> {
@@ -3428,7 +3516,8 @@ export class TaskRunner {
 
     this.emit('task-output', task, `\n[Auto-Test] Running: ${testCmd}...\n`, 'stdout');
 
-    const result = await this.runLocalCommand(testCmd, {
+    const deps = await this.ensureDependenciesFor(task, cwd, signal, task.env, 'task');
+    const result = deps ? deps.failure : await this.runLocalCommand(testCmd, {
       cwd,
       signal,
       onOutput: (chunk, stream) => this.emit('task-output', task, chunk, stream),

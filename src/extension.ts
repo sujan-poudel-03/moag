@@ -61,6 +61,7 @@ import { PromptLibraryStore } from './templates/prompt-library';
 import { SandboxManager } from './sandbox/sandbox-manager';
 import { resolveBrowserRunner } from './sandbox/browser-driver';
 import { runGate } from './runner/evidence';
+import { formatDependencyEventLine, readDependencyInstallSettings } from './runner/dependency-install';
 import { clearStandardsBase, rememberStandardsBase, resolveStandardsBase } from './runner/standards-base';
 import { standardsReportSection, verificationGateRows } from './ui/standards-report-html';
 import { createLocalStandardsProvider, loadLocalStandards } from './standards/local-store';
@@ -1672,6 +1673,18 @@ export function activate(context: vscode.ExtensionContext): void {
   runner.on('task-output', (task, chunk, stream) => {
     DashboardPanel.currentPanel?.appendOutput(chunk, stream, task.id);
     promptViewProvider?.postLiveOutputChunk(task.id, chunk);
+  });
+
+  // Automatic dependency installs: one line each in the MOAG output channel. The
+  // install's own output already reaches the dashboard through task-output.
+  runner.on('dependencies-installed', (task, ev) => {
+    moagOutputChannel?.appendLine(formatDependencyEventLine(ev, task.name));
+  });
+  runner.on('dependencies-install-failed', (task, ev) => {
+    moagOutputChannel?.appendLine(formatDependencyEventLine(ev, task.name));
+  });
+  runner.on('dependencies-not-installed', (task, ev) => {
+    moagOutputChannel?.appendLine(formatDependencyEventLine(ev, task.name));
   });
 
   runner.on('engine-fallback', ({ fromEngine, toEngine }) => {
@@ -4785,6 +4798,7 @@ function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
       specPath: cfg.get<string>('prdLoop.uat.specPath', ''),
       timeoutMs: cfg.get<number>('prdLoop.uat.timeoutMs', 900_000),
     },
+    dependencies: readDependencyInstallSettings(cfg),
     standards: standardsDoc
       ? { profile: standardsDoc.profile, version: standardsDoc.version, baseRef: null }
       : null,
@@ -5225,6 +5239,7 @@ async function runPrdLoopInteractive(options: { fix: boolean; title: string }): 
             savePlan: () => saveAndRefresh(),
             onProgress: (phase: string, detail: string) => progress.report({ message: `${phase}: ${detail}` }),
             emitReport: (r: PrdLoopReport) => { holder.report = r; },
+            onDependencyEvent: (ev) => { moagOutputChannel?.appendLine(formatDependencyEventLine(ev)); },
             skipManualGate: (taskId: string) => runner.skipManualGate(taskId),
             prepareUat: (signal: AbortSignal) => prepareUatSession(cwd, signal),
             // Per-run PRD budget: the loop keeps its own baseline from these per-call costs.

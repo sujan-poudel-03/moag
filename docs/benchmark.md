@@ -266,6 +266,8 @@ This is by design and **not a regression**. It is the finding: deciding that a r
 - Everything else is real: the server, the workers, the runner, `ClaudeAdapter`, `runCli`, plan parsing, verify, and the ship stamp.
 - The fake plans one task per requirement plus the scenario's test command. It returns a passing verdict to verify. For every task, it copies the version's `dry-run/vN` fixture into the workspace.
 - The fixtures are **stand-ins** that prove the harness, offline. The greenfield fixtures are plain JavaScript with `node:test`, not the TypeScript app the PRD asks for.
+- The greenfield fixtures also exercise [automatic dependency installs](server.md#dependency-installs). Each declares one devDependency, `"todo-format": "file:test/support/todo-format"`, which its test `require`s, and ships an `.npmrc` with `offline=true`, so the install never reaches the registry. In v1 the plan's `npm test` command task finds no `node_modules`, and the worker runs `npm install --no-audit --no-fund` first: the run's `events.jsonl` has a `dependencies-installed` line. v2 and v3 declare the same dependency, so nothing changed and nothing is installed.
+- Before the acceptance gates, the bench installs dependencies the same way (always on, not tied to a setting) and logs a `bench-deps` line with the install events. A failed install is reported as a failing gate, so the gates are not green.
 
 ### Zero-spend guarantees
 

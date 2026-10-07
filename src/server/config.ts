@@ -48,6 +48,13 @@ export interface ServerConfig {
    * `.moag/config.json` is never read, so a project cannot raise it for itself.
    */
   gateTimeoutMs: number | null;
+  /**
+   * `MOAG_AUTO_INSTALL_DEPENDENCIES`: install a project's dependencies from the fixed table
+   * before a step that needs them (default true). Passed to every run worker.
+   */
+  autoInstallDependencies: boolean;
+  /** `MOAG_INSTALL_IGNORE_SCRIPTS`: add --ignore-scripts to npm/pnpm/yarn installs (default false). */
+  installIgnoreScripts: boolean;
 }
 
 export type ServerConfigResult = { ok: true; config: ServerConfig } | { ok: false; error: string };
@@ -152,6 +159,18 @@ export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfigResult {
     gateTimeoutMs = n;
   }
 
+  let autoInstallDependencies = true;
+  const autoInstallRaw = env.MOAG_AUTO_INSTALL_DEPENDENCIES?.trim().toLowerCase() ?? '';
+  if (autoInstallRaw !== '') {
+    if (['1', 'true', 'yes'].includes(autoInstallRaw)) {
+      autoInstallDependencies = true;
+    } else if (['0', 'false', 'no'].includes(autoInstallRaw)) {
+      autoInstallDependencies = false;
+    } else {
+      return fail('MOAG_AUTO_INSTALL_DEPENDENCIES must be one of 1, true, yes, 0, false, no (or unset for on).');
+    }
+  }
+
   const runEnvPassthrough: string[] = [];
   for (const name of (env.MOAG_RUN_ENV_PASSTHROUGH ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
     if (!ENV_NAME_RE.test(name)) { return fail(`MOAG_RUN_ENV_PASSTHROUGH: "${name}" is not a valid variable name.`); }
@@ -179,6 +198,8 @@ export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfigResult {
       runsDisabledReason: env.CI === 'true' ? 'ci' : null,
       maxUsdPerEngineCall,
       gateTimeoutMs,
+      autoInstallDependencies,
+      installIgnoreScripts: flag(env.MOAG_INSTALL_IGNORE_SCRIPTS),
     },
   };
 }

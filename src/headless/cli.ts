@@ -72,6 +72,11 @@ import { installVscodeShim, FileMemento } from './install-shim';
 import { captureHeadRef, collectStandardsInput, detectPrdFile, EMPTY_TREE_REF, gatesForStoredReport, runGate } from '../runner/evidence';
 import { createPrdLoop, HaltReason, PrdLoopConfig, PrdLoopReport, UatSession } from '../runner/prd-loop';
 import {
+  DependencyInstallSettings, ensureDependencies, formatDependencyEventLine, readDependencyInstallSettings,
+} from '../runner/dependency-install';
+import { getConfig } from '../core/host';
+import type { DependencyEvent } from '../models/types';
+import {
   capStandardsReport, checkStandards, commandRow, groupStandardsRules, isBlockingNotChecked, MAX_REPORT_TAIL_CHARS, NO_BLOCKING_RULES,
   promotedScannerRules, recountTotals, ruleOutcomeLabel, SCANNER_PROMOTION_WARNING, severityOf, standardsBlocked, standardsBlockingState,
   StandardsReport,
@@ -319,7 +324,7 @@ export interface RunnerEventState {
 }
 
 /** Wire runner events to JSONL output. Returns accessors for why a run halted. */
-function wireEvents(runner: any): RunnerEventState {
+export function wireEvents(runner: any): RunnerEventState {
   let manualGateHit = false;
   let manualGateTaskId: string | null = null;
   let budgetHit = false;
@@ -330,6 +335,10 @@ function wireEvents(runner: any): RunnerEventState {
   runner.on('task-escalate', (t: any, category: string) => emit({ event: 'task-escalate', id: t.id, name: t.name, category }));
   runner.on('incident', (t: any, summary: string, issueUrl: string | null) => emit({ event: 'incident', id: t.id, name: t.name, summary, issueUrl }));
   runner.on('error', (err: Error) => emit({ event: 'error', message: err.message }));
+  // Automatic dependency installs: the event already carries every field of the protocol line.
+  runner.on('dependencies-installed', (_t: any, ev: Record<string, unknown>) => emit(ev));
+  runner.on('dependencies-install-failed', (_t: any, ev: Record<string, unknown>) => emit(ev));
+  runner.on('dependencies-not-installed', (_t: any, ev: Record<string, unknown>) => emit(ev));
   // Headless has no human to answer a Continue/Stop prompt, so a breached ceiling always stops.
   runner.on('budget-exceeded', (d: any) => {
     budgetHit = true;
@@ -468,7 +477,12 @@ const STANDARDS_COMMAND_TIMEOUT_MS = 600_000;
 export async function checkStandardsNow(
   standards: NonNullable<PrdLoopConfig['standards']>,
   cwd: string,
-  opts: { signal: AbortSignal; commands: boolean; timeoutMs?: number },
+  opts: {
+    signal: AbortSignal; commands: boolean; timeoutMs?: number;
+    /** Automatic dependency installs before the profile's commands. */
+    dependencies: DependencyInstallSettings;
+    onDependencyEvent: (ev: DependencyEvent) => void;
+  },
 ): Promise<StandardsReport> {
   const input = await collectStandardsInput(cwd, standards.baseRef, { probeDirs: standards.profile.structure.requiredDirs });
   const report = checkStandards(standards.profile, input);
@@ -476,7 +490,31 @@ export async function checkStandardsNow(
   // Only a blocking failure stops the commands: an advisory finding is no reason not to lint.
   let skip: string | null = !opts.commands ? 'Commands were not run'
     : standardsBlocked(report) ? 'A standards rule failed first' : null;
-  for (const cmd of standards.profile.commands) {
+  let commands = standards.profile.commands;
+  if (!skip && commands.length > 0) {
+    // The profile's commands (lint, format) usually need the project's dependencies.
+    const install = await ensureDependencies(cwd, {
+      settings: opts.dependencies,
+      signal: opts.signal,
+      timeoutMs: opts.timeoutMs ?? STANDARDS_COMMAND_TIMEOUT_MS,
+      stage: 'standards',
+      onEvent: opts.onDependencyEvent,
+    });
+    if (install.aborted) {
+      skip = 'The check was stopped';
+    } else if (!install.ok) {
+      const failed = install.failed;
+      const [first, ...rest] = commands;
+      const reason = `Dependencies could not be installed (\`${failed?.command ?? 'install'}\` exited ${failed?.exitCode ?? 1})\n`;
+      report.rules.push(commandRow({
+        result: 'failed', command: first.run, exitCode: failed?.exitCode || 1,
+        tail: (reason + (failed?.tail ?? '')).slice(-MAX_REPORT_TAIL_CHARS),
+      }));
+      skip = 'Dependencies could not be installed';
+      commands = rest;
+    }
+  }
+  for (const cmd of commands) {
     if (!skip && opts.signal.aborted) { skip = 'The check was stopped'; }
     if (skip) {
       report.rules.push(commandRow({ result: 'not-checked', reason: skip, command: cmd.run }));
@@ -519,11 +557,29 @@ export async function runStandardsCheckCore(
   if (!preloaded && !args.standardsPath && args.base === undefined) {
     standards.baseRef = await resolveStandardsBase(args.cwd, undefined, captureHeadRef);
   }
-  const report = await checkStandardsNow(standards, args.cwd, { signal, commands: true });
+  const report = await checkStandardsNow(standards, args.cwd, {
+    signal, commands: true, dependencies: standardsDependencySettings(args.cwd), onDependencyEvent: (ev) => emit({ ...ev }),
+  });
   if (signal.aborted) { return null; }
   const capped = capStandardsReport(report);
   emit({ event: 'verify-standards', phase: 'pre-gate', ...capped, ...standardsAttestation(recorded) });
   return capped;
+}
+
+/**
+ * Dependency-install settings for a standards check. The worker (and the unit tests) have a
+ * host installed; `moag standards` deliberately runs without the shim, so there it reads
+ * `.moag/config.json` through the shim's config reader directly — every shape it accepts.
+ */
+function standardsDependencySettings(cwd: string): DependencyInstallSettings {
+  try {
+    return readDependencyInstallSettings(getConfig('agentTaskPlayer'));
+  } catch {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const shim = require('./vscode-shim');
+    shim.__setWorkspaceRoot(cwd);
+    return readDependencyInstallSettings(shim.workspace.getConfiguration('agentTaskPlayer'));
+  }
 }
 
 /** Build the loop config from settings, with CLI flags taking precedence. */
@@ -548,6 +604,7 @@ export function buildVerifyConfig(args: Args, ctx: Ctx, preloaded?: NonNullable<
       specPath: args.uatSpec ?? cfg.get('prdLoop.uat.specPath', ''),
       timeoutMs: cfg.get('prdLoop.uat.timeoutMs', 900_000),
     },
+    dependencies: readDependencyInstallSettings(cfg),
     standards: resolveVerifyStandards(args, preloaded),
   };
 }
@@ -708,6 +765,7 @@ export async function runVerifyCore(
         haltReason: r.haltReason,
         failedGate: r.failedGate,
       }),
+      onDependencyEvent: (ev) => emit({ ...ev }),
       skipManualGate: (taskId: string) => ctx.runner.skipManualGate(taskId),
       prepareUat,
       // Per-run PRD budget: lazy, so the ledger singleton loads inside the post-shim region.
@@ -1460,6 +1518,8 @@ export async function cmdStandards(args: Args): Promise<number> {
     const baseRef = await resolveStandardsBase(args.cwd, args.base, captureHeadRef);
     const report = await checkStandardsNow({ profile: doc.profile, version: doc.version, baseRef }, args.cwd, {
       signal: abort.signal, commands: !args.noCommands,
+      dependencies: standardsDependencySettings(args.cwd),
+      onDependencyEvent: (ev) => process.stderr.write(`${formatDependencyEventLine(ev)}\n`),
     });
     if (abort.signal.aborted) {
       process.stderr.write('Standards check stopped.\n');

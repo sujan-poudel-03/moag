@@ -6,7 +6,11 @@
 // dropped) and folds run events into a `RunView` with the pure `foldRunEvent`.
 // This module imports nothing that touches `vscode` or spawns processes.
 
-import { ENGINE_IDS, EngineId, RunnerState, TaskStatus } from '../models/types';
+import {
+  DEPENDENCY_ECOSYSTEMS, DEPENDENCY_STAGES, DEPENDENCY_TRIGGERS, ENGINE_IDS,
+  DependencyEcosystem, DependencyEvent, DependencyEventName, DependencyStage, DependencyTrigger,
+  EngineId, RunnerState, TaskStatus,
+} from '../models/types';
 
 // ─── Jobs ───
 
@@ -85,6 +89,7 @@ export function parseJob(raw: unknown): WorkerJob | null {
 export const HEADLESS_EVENTS = [
   'state', 'task-started', 'task-completed', 'task-failed', 'task-escalate',
   'incident', 'error', 'budget-exceeded', 'manual-gate',
+  'dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed',
 ] as const;
 
 export const WORKER_ONLY_EVENTS = [
@@ -125,7 +130,9 @@ export type WorkerEvent =
   | { event: 'warning'; message: string }
   /** A task child process (engine CLI, shell/gate command) started or ended. Server-internal: recorded in job.lock, never fanned out. */
   | { event: 'task-pid'; pid: number; alive: boolean }
-  | { event: 'verify'; name: string; data: Record<string, unknown> };
+  | { event: 'verify'; name: string; data: Record<string, unknown> }
+  /** An automatic dependency install (or the note that none was done) before a step that needed it. */
+  | ({ event: DependencyEventName } & Omit<DependencyEvent, 'event'>);
 
 /** Closed set of `cost` event sources. */
 export const COST_SOURCES = ['reported', 'estimated', 'none'] as const;
@@ -135,6 +142,37 @@ const RUNNER_STATES = new Set<string>(Object.values(RunnerState));
 const TASK_STATUSES = new Set<string>(Object.values(TaskStatus));
 const str = (v: unknown): string => (typeof v === 'string' ? v : '');
 const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+const DEPENDENCY_TAIL_CHARS = 2000;
+
+/** Validate one dependency-install event line; null unless every field has its documented shape. */
+function parseDependencyEvent(ev: DependencyEventName, o: Record<string, unknown>): WorkerEvent | null {
+  if (!(DEPENDENCY_ECOSYSTEMS as readonly unknown[]).includes(o.ecosystem)) { return null; }
+  if (!(DEPENDENCY_STAGES as readonly unknown[]).includes(o.stage)) { return null; }
+  if (!(DEPENDENCY_TRIGGERS as readonly unknown[]).includes(o.trigger)) { return null; }
+  if (typeof o.dir !== 'string') { return null; }
+  if (!(typeof o.command === 'string' || o.command === null)) { return null; }
+  if (ev !== 'dependencies-not-installed' && typeof o.command !== 'string') { return null; }
+  if (!finite(o.durationMs) || o.durationMs < 0) { return null; }
+  if (!(o.exitCode === null || (typeof o.exitCode === 'number' && Number.isInteger(o.exitCode)))) { return null; }
+  if (typeof o.timedOut !== 'boolean') { return null; }
+  if (typeof o.tail !== 'string') { return null; }
+  if (!(typeof o.note === 'string' || o.note === null)) { return null; }
+  if (o.taskId !== undefined && !isStr(o.taskId)) { return null; }
+  return {
+    event: ev,
+    stage: o.stage as DependencyStage,
+    ...(isStr(o.taskId) ? { taskId: o.taskId } : {}),
+    ecosystem: o.ecosystem as DependencyEcosystem,
+    dir: o.dir,
+    trigger: o.trigger as DependencyTrigger,
+    command: o.command as string | null,
+    durationMs: o.durationMs,
+    exitCode: o.exitCode as number | null,
+    timedOut: o.timedOut,
+    tail: o.tail.length > DEPENDENCY_TAIL_CHARS ? o.tail.slice(o.tail.length - DEPENDENCY_TAIL_CHARS) : o.tail,
+    note: o.note as string | null,
+  };
+}
 
 /**
  * Parse one stdout line from a worker. Returns null for non-JSON, for unknown
@@ -205,6 +243,10 @@ export function parseWorkerLine(line: string): WorkerEvent | null {
       return finite(o.code) ? { event: ev, code: o.code } : null;
     case 'warning':
       return { event: 'warning', message: str(o.message) };
+    case 'dependencies-installed':
+    case 'dependencies-install-failed':
+    case 'dependencies-not-installed':
+      return parseDependencyEvent(ev, o);
     case 'task-pid':
       return typeof o.pid === 'number' && Number.isInteger(o.pid) && o.pid > 0 && typeof o.alive === 'boolean'
         ? { event: ev, pid: o.pid, alive: o.alive }

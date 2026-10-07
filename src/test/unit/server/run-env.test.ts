@@ -117,6 +117,16 @@ describe('run-env', () => {
       }
     });
 
+    it('always carries the operator dependency-install keys (default on, scripts run)', () => {
+      const d = buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0).agentTaskPlayer;
+      assert.equal(d.autoInstallDependencies, true);
+      assert.equal(d['dependencyInstall.ignoreScripts'], false);
+      assert.equal('dependencyInstall.pythonVenv' in d, false, 'pythonVenv is never sent to the worker');
+      const s = buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 0 }, 0, null, null, { enabled: false, ignoreScripts: true }).agentTaskPlayer;
+      assert.equal(s.autoInstallDependencies, false);
+      assert.equal(s['dependencyInstall.ignoreScripts'], true);
+    });
+
     it('sets both ceilings to the remaining amount when a cap exists', () => {
       const c = buildWorkerConfig({ defaultEngine: 'claude', versionBudgetUsd: 10 }, 6.58);
       assert.equal(c.agentTaskPlayer.costBudgetUsd, 6.58);

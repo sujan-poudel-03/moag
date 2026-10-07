@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Automatic dependency installs
+
+- **Dependencies are installed before the step that needs them** — before a command, check, service, deploy or release task, a `verifyCommand`, a PRD-verify gate, a standards profile command or a benchmark acceptance gate, MOAG installs the project's dependencies when a manifest or lockfile changed since the last install (recorded in `.moag/dependencies.json`) or `node_modules` is missing. Commands come from a fixed table (`npm ci` / `npm install`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile` / `--immutable`, venv-only `pip install -r requirements.txt`, `go mod download`, `dotnet restore`); a failed install fails the step with the command and its output. Settings: `agentTaskPlayer.autoInstallDependencies`, `agentTaskPlayer.dependencyInstall.ignoreScripts`, `agentTaskPlayer.dependencyInstall.pythonVenv`; on the server `MOAG_AUTO_INSTALL_DEPENDENCIES` and `MOAG_INSTALL_IGNORE_SCRIPTS`. The plan review card states the rule before approval.
+
 ## [0.9.10] - 2026-05-27
 
 ### GitHub Two-Way Auto-Sync

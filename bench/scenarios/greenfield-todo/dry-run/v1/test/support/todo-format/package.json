@@ -1,0 +1,7 @@
+{
+  "name": "todo-format",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local devDependency of the dry-run fixture: proves the bench installs dependencies before a command needs them.",
+  "main": "index.js"
+}

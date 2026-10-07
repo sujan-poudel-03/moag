@@ -220,6 +220,52 @@ never asked, so it cannot override evidence — and the failure is free.
 
 Only if all of them pass does a model give a verdict.
 
+### Dependencies are installed for you
+
+An agent that adds `typescript` to `package.json` and never runs `npm install` used to leave
+the next `npm run build` failing with "'tsc' is not recognized". MOAG now installs dependencies
+itself, deterministically, before any step that runs a command: a command, check, service,
+deploy or release task, a `verifyCommand`, the gate commands of the verify loop (gate 4 above),
+and the standards profile commands (gate 5).
+
+It installs when a dependency manifest or lockfile changed since the last successful install
+(the hashes are recorded in `.moag/dependencies.json`), or when the install output is missing or
+lacks a declared package: `node_modules` for npm, pnpm and Yarn classic; `.pnp.cjs` (or `.pnp.js`)
+for Yarn Berry Plug'n'Play, which is Yarn 2+'s default when `.yarnrc.yml` sets no `nodeLinker`.
+Nothing changed means nothing runs. Only manifests and lockfiles are hashed: a change to
+`.npmrc` or `.yarnrc.yml` alone (for example a registry URL) does not trigger a reinstall.
+
+The commands come from a fixed table, never from the model or the repository:
+
+| Found | Command |
+|---|---|
+| `package-lock.json` | `npm ci --no-audit --no-fund` (`npm install --no-audit --no-fund` when `package.json` changed and the lockfile did not, or there is no lockfile) |
+| `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` (`--no-frozen-lockfile` to refresh) |
+| `yarn.lock` | `yarn install --frozen-lockfile`, or `yarn install --immutable` on Yarn 2+ (`yarn install` to refresh) |
+| `requirements.txt` | `<venv> python -m pip install -r requirements.txt`, only into `.venv`, `venv` or the configured virtualenv; never the system Python |
+| `go.mod` | `go mod download` |
+| `*.sln` / `*.csproj` | `dotnet restore` |
+| `pom.xml` / `build.gradle` / `Cargo.toml` | nothing: the build resolves them |
+
+The first time MOAG sees a project whose `node_modules` already holds every declared package,
+it records it and installs nothing; an empty or partial `node_modules` is installed over. On
+first sight an npm lockfile that does not match `package.json` is refreshed with `npm install`
+instead of `npm ci`, and a failing frozen pnpm or Yarn install is retried once with the refresh
+command. A failed install fails the step that needed it, with the command and the end
+of its output; it is never a silent pass. Each install appears in the dashboard output and as
+one line in the **MOAG** output channel; headless runs emit `dependencies-installed`,
+`dependencies-install-failed` and `dependencies-not-installed` events.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `agentTaskPlayer.autoInstallDependencies` | `true` | Turn automatic installs on or off |
+| `agentTaskPlayer.dependencyInstall.ignoreScripts` | `false` | Skip npm/pnpm/yarn lifecycle scripts (`--ignore-scripts`) |
+| `agentTaskPlayer.dependencyInstall.pythonVenv` | `""` | Virtualenv directory, relative to the workspace; blank detects `.venv` then `venv` |
+
+The headless CLI reads the same keys from `.moag/config.json`. The hosted server uses
+`MOAG_AUTO_INSTALL_DEPENDENCIES` and `MOAG_INSTALL_IGNORE_SCRIPTS` instead; see
+[server.md](server.md#dependency-installs).
+
 ## Project standards
 
 A workspace can keep one standards profile in `.moag/standards.json`: where files
@@ -449,6 +495,7 @@ and this one is injected at high priority, so it would rot every future run.
 | `daemon.json` | Daemon configuration |
 | `rules.json` | Workspace AI rules |
 | `standards.json` | The project standards profile (see Project standards) |
+| `dependencies.json` | Hashes of the dependency manifests and lockfiles at the last automatic install, and the command that ran (see Dependencies are installed for you) |
 | `queue.jsonl` | Parked work — append-only |
 | `knowledge/facts.json` | Proven facts about this repo |
 | `errors.jsonl` | Internal error log |

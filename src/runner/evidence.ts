@@ -13,7 +13,7 @@ import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { analyzeProject } from '../context/project-analyzer';
-import { killProcess } from '../utils/process-kill';
+import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 import { readImportPathScopes } from './import-paths';
 import { trackChildProcess } from '../utils/child-tracker';
 import { VENDOR_MANIFESTS } from '../standards/checker';
@@ -84,6 +84,11 @@ export interface GateOptions {
   timeoutMs: number;
   env?: Record<string, string>;
   onOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void;
+  /**
+   * Spawn the command as a process-group leader (POSIX only) so an abort or timeout
+   * kills everything it started — a package manager runs a whole tree. Default false.
+   */
+  processGroup?: boolean;
 }
 
 /** Options for {@link collectDiffEvidence}. */
@@ -247,6 +252,7 @@ export function runGate(command: string, options: GateOptions): Promise<GateResu
         env: { ...process.env, ...(options.env ?? {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
+        detached: options.processGroup ? SPAWN_DETACHED : false,
       });
       trackChildProcess(proc);
     } catch (err) {

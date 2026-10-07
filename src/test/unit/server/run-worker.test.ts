@@ -8,7 +8,9 @@ import * as path from 'path';
 import {
   heldStandards,
   runJob, WorkerDeps, RunnerLike, DeltaOutcomeLike, guardParentPipes, withRepoListing, MAX_REPO_LISTING_CHARS, NON_EVIDENCE_FAILURE_CATEGORIES, verifyArgv,
+  DEPENDENCY_FAILURE_MARKER,
 } from '../../../server/run-worker';
+import { DEPENDENCY_INSTALL_FAILED_MARKER } from '../../../runner/dependency-install';
 import * as sinon from 'sinon';
 import { parseArgs, resolveVerifyStandards } from '../../../headless/cli';
 import { readStandardsJobFile } from '../../../standards/local-store';
@@ -184,6 +186,24 @@ describe('run-worker', () => {
       await runJob(RUN_JOB, h.deps);
       assert.equal(runner.playArgs[0][1], 1);
       assert.equal(h.saves, 3, 'completed + failed + final');
+    });
+
+    it('forwards a runner dependency event as exactly that protocol line', async () => {
+      const ev = {
+        event: 'dependencies-install-failed', stage: 'task', taskId: 'a', ecosystem: 'npm', dir: '.',
+        trigger: 'manifest-changed', command: 'npm ci --no-audit --no-fund', durationMs: 900, exitCode: 1,
+        timedOut: false, tail: 'npm ERR!', note: null,
+      };
+      const runner = new FakeRunner(async (r, plan) => {
+        r.emit('dependencies-install-failed', plan.playlists[0].tasks[0], ev);
+        r.emit('dependencies-installed', plan.playlists[0].tasks[0], { ...ev, event: 'dependencies-installed', exitCode: 0 });
+        r.emit('dependencies-not-installed', plan.playlists[0].tasks[0], { ...ev, event: 'dependencies-not-installed', command: null });
+      });
+      const h = harness(runner);
+      await runJob(RUN_JOB, h.deps);
+      const deps = h.events.filter((e) => String(e.event).startsWith('dependencies-'));
+      assert.deepEqual(deps[0], ev);
+      assert.deepEqual(deps.map((e) => e.event), ['dependencies-install-failed', 'dependencies-installed', 'dependencies-not-installed']);
     });
 
     it('emits task-engine from the resolved engine and from engine-fallback', async () => {
@@ -369,6 +389,33 @@ describe('run-worker', () => {
       const h2 = harness(r2, {}, plan2 as ReturnType<typeof mkPlan>);
       await runJob(RUN_JOB, h2.deps);
       assert.equal(h2.events.find((e) => e.event === 'task-failed')?.engineRan, true);
+    });
+
+    it('a step that failed on its dependency install (command task or pre-flight) is not an engine verdict', async () => {
+      const tasks: FakeTask[] = ['cmd', 'pre', 'agent'].map((id) => ({ id, name: id, status: 'pending' }));
+      const plan = { defaultEngine: 'claude', playlists: [{ tasks }] };
+      const out: Record<string, string> = {
+        cmd: '[Dependencies] Install failed: `npm ci --no-audit --no-fund` exited 1 after 2.0s (needed by "cmd").\nERESOLVE',
+        pre: '[Dependencies] Install failed: `npm ci --no-audit --no-fund` exited 1 after 2.0s (needed by "pre").\nx\n'
+          + '[Pre-flight] The baseline check "npm test" could not run because its dependencies could not be installed — halting before the agent runs.\n',
+        // The marker mid-output (e.g. echoed by the agent's own work) is still a verdict.
+        agent: 'agent output\n[Dependencies] Install failed: quoted',
+      };
+      const runner = new FakeRunner(async (r) => {
+        for (const t of tasks) {
+          r.emit('task-started', t, plan.playlists[0]);
+          t.status = 'failed';
+          r.emit('task-failed', t, { exitCode: 1, stderr: out[t.id] });
+        }
+      });
+      const h = harness(runner, {}, plan as ReturnType<typeof mkPlan>);
+      await runJob(RUN_JOB, h.deps);
+      const ran = Object.fromEntries(h.events.filter((e) => e.event === 'task-failed').map((e) => [e.id, e.engineRan]));
+      assert.deepEqual(ran, { cmd: false, pre: false, agent: true });
+    });
+
+    it('the worker dependency marker equals the runner marker', () => {
+      assert.equal(DEPENDENCY_FAILURE_MARKER, DEPENDENCY_INSTALL_FAILED_MARKER);
     });
 
     it('the excluded categories are real runner failure categories', () => {

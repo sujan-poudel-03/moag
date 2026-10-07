@@ -210,6 +210,44 @@ export interface SandboxConfig {
 export const SEMVER_BUMPS = ['patch', 'minor', 'major'] as const;
 export type SemverBump = typeof SEMVER_BUMPS[number];
 
+// ─── Dependency installs ───
+
+/** Ecosystems MOAG recognises when deciding whether a project's dependencies need installing. */
+export const DEPENDENCY_ECOSYSTEMS = ['npm', 'pnpm', 'yarn', 'python', 'go', 'dotnet', 'maven', 'gradle', 'cargo'] as const;
+export type DependencyEcosystem = typeof DEPENDENCY_ECOSYSTEMS[number];
+
+/** The events an automatic dependency install reports. */
+export const DEPENDENCY_EVENT_NAMES = ['dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed'] as const;
+export type DependencyEventName = typeof DEPENDENCY_EVENT_NAMES[number];
+
+/** Which step needed the dependencies. */
+export const DEPENDENCY_STAGES = ['task', 'verify', 'standards', 'bench'] as const;
+export type DependencyStage = typeof DEPENDENCY_STAGES[number];
+
+/** Why an install was considered. */
+export const DEPENDENCY_TRIGGERS = ['manifest-changed', 'install-dir-missing', 'first-seen'] as const;
+export type DependencyTrigger = typeof DEPENDENCY_TRIGGERS[number];
+
+/** One automatic dependency install (or the note that it could not be done). */
+export interface DependencyEvent {
+  event: DependencyEventName;
+  stage: DependencyStage;
+  taskId?: string;
+  ecosystem: DependencyEcosystem;
+  /** '.' or a path relative to the command's working directory. */
+  dir: string;
+  trigger: DependencyTrigger;
+  /** The exact command that ran; null only for `dependencies-not-installed`. */
+  command: string | null;
+  durationMs: number;
+  exitCode: number | null;
+  timedOut: boolean;
+  /** Last 2000 characters of the install output ('' for not-installed). */
+  tail: string;
+  /** Why nothing was installed; null for the other two events. */
+  note: string | null;
+}
+
 /** A saved snapshot of a PRD at a specific version */
 export interface PrdVersion {
   version: string;
