@@ -112,6 +112,9 @@ export const STR = Object.freeze({
   C60: m('This plan no longer passes review, so it can\'t start. The review rules are applied again each time a plan is shown, approved or started. Request a new plan.'),
   C61: m('Your roles changed, so you were signed out. Sign in again.', ['route:/login']),
   C62: m('Your account changed, so you were signed out. Sign in again.', ['route:/login']),
+  /** @param {number} v the standards version approving the ship will apply */
+  C63: (v) => m(`No standards check before this gate: this run started before the project had standards. Approving applies standards v${v}, and the run is checked against them when it verifies.`),
+  C64: m('No standards check before this gate: this run started before the project had standards, and none are approved yet. A ship cannot be approved until they are.'),
   /** @param {string} rule the scanner rule being made blocking */
   C54: (rule) => m(`Heuristic rule. As a blocking rule, ${rule} can stop correct code and can miss real violations. Prefer a command (a linter, formatter or test) for anything that must stop a release.`),
 });

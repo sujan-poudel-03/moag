@@ -149,7 +149,40 @@ const NOISE_LINES = [
   /^\s*$/,
 ];
 
-export function classifyFailure(stderr: string, stdout: string): FailureClassification {
+/**
+ * Task types whose failure output comes from the AI engine CLI. Every other type
+ * runs a shell command of the project's own, so a "not found" there names a
+ * project tool, not the engine.
+ */
+const ENGINE_TASK_TYPES: ReadonlySet<TaskType> = new Set<TaskType>(['agent', 'review', 'visual-test']);
+
+/**
+ * The program a shell said it could not find, or null. Recognises the Windows
+ * (`'X' is not recognized as an internal or external command`), bash
+ * (`X: command not found`), zsh (`command not found: X`), dash
+ * (`sh: 1: X: not found`) and Node (`spawn X ENOENT`) forms; the Windows form first.
+ */
+export function missingProgramName(text: string): string | null {
+  const patterns = [
+    /'([^'\r\n]+)' is not recognized as an internal or external command/i,
+    /command not found: (\S+)/,
+    /(?:^|[\s:])([^\s:]+): command not found/m,
+    /sh: \d+: ([^\s:]+): not found/,
+    /spawn (\S+) ENOENT/,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(text);
+    if (m && m[1]) { return m[1]; }
+  }
+  return null;
+}
+
+/**
+ * Classify a failure. `ctx.taskType`, when given, says which kind of step failed:
+ * a `cli-missing` failure of a step that is not an engine step names the missing
+ * project tool instead of blaming the engine (the category stays the same).
+ */
+export function classifyFailure(stderr: string, stdout: string, ctx?: { taskType?: TaskType }): FailureClassification {
   const combined = [stderr, stdout].filter(Boolean).join('\n');
   const lines = combined.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
   const meaningful = lines.filter(l => !NOISE_LINES.some(p => p.test(l)));
@@ -177,9 +210,13 @@ export function classifyFailure(stderr: string, stdout: string): FailureClassifi
 
   // ── CLI missing ───────────────────────────────────────────────────────────
   if (/command not found|ENOENT|is not recognized as|cannot find.*command|no such file/i.test(combined)) {
+    const projectTool = ctx?.taskType !== undefined && !ENGINE_TASK_TYPES.has(ctx.taskType);
+    const name = projectTool ? missingProgramName(combined) : null;
     return {
       category: 'cli-missing',
-      reason: 'CLI not found — ensure the engine is installed and on PATH.',
+      reason: projectTool
+        ? `${name ? `'${name}'` : 'A program this step runs'} was not found. It is a project tool, not the AI engine: add it to the project's dependencies (or install it) and run the step again.`
+        : 'CLI not found — ensure the engine is installed and on PATH.',
       agentCanFix: false,
       errorLines: meaningful.slice(0, 3),
     };
@@ -1153,7 +1190,7 @@ export class TaskRunner {
     const lastEntry = entries[0];
     if (!lastEntry) { return; }
 
-    const classification = classifyFailure(lastEntry.result.stderr, lastEntry.result.stdout);
+    const classification = classifyFailure(lastEntry.result.stderr, lastEntry.result.stdout, { taskType: this.getTaskType(task) });
     const changedFiles = lastEntry.changedFiles?.join(', ') || 'none';
 
     this.emit('task-output', task, '\n\n━━━ MOAG Auto-Fix ━━━\n', 'stdout');
@@ -1657,7 +1694,7 @@ export class TaskRunner {
         this.emit('task-completed', task, result);
       } else {
         // Classify and store failure context for retry/auto-fix
-        const fc = classifyFailure(result.stderr, result.stdout);
+        const fc = classifyFailure(result.stderr, result.stdout, { taskType });
         const failureLines: string[] = [
           `Failure category: ${fc.category}`,
           `Reason: ${fc.reason}`,

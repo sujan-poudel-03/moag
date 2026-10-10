@@ -13,7 +13,10 @@
 // workspace. The worker notices the lost IPC channel, stops its runner (which
 // tree-kills the running task) and exits; the lock is reclaimed after that.
 // Workers are spawned detached on every platform (main.ts), so on Windows a
-// server crash no longer hard-kills the worker out from under its agent. A lock
+// server crash no longer hard-kills the worker out from under its agent. On
+// Windows each run/plan worker also joins a kill-on-close job object before it
+// starts anything (utils/process-job.ts), so task descendants whose parent has
+// exited, which `taskkill /T` cannot find, still die with the worker. A lock
 // may also list `taskPids` (agent processes); while any of them is alive the
 // lock is held even if the worker itself is gone.
 //
@@ -270,6 +273,20 @@ export class JobManager {
       }
     }, STOP_KILL_AFTER_MS);
     return true;
+  }
+
+  /**
+   * Hard-kill every live worker NOW (and, through `killProcess`, its tree):
+   * the last resort for a host that is about to die (`exit`, a second signal).
+   * Synchronous and never throws. Locks are left to each job's `close`
+   * handling, which releases or lingers them as usual.
+   */
+  killAll(): void {
+    for (const a of [...this.active.values()]) {
+      a.stopRequested = true;
+      try { this.opts.killProcess(a.proc); }
+      catch (err) { this.opts.log?.(`killing the worker for project ${a.projectId} failed: ${err instanceof Error ? err.message : String(err)}`); }
+    }
   }
 
   /** Stop every job (SIGTERM path). Resolves when all have ended or `timeoutMs` passes. */
@@ -655,6 +672,9 @@ function countableOutcome(
 /** Who holds a project's job lock. `taskPids`: agent processes, when the lock records them. */
 interface LockInfo { serverPid: number | null; workerPid: number | null; workerPgid: number | null; taskPids: number[]; }
 
+/** The holders a project job.lock records (exported for the bench leftover check). */
+export type JobLockInfo = LockInfo;
+
 /** Most task pids read from one lock file (a garbage lock cannot make boot probe forever). */
 const MAX_LOCK_TASK_PIDS = 64;
 
@@ -683,4 +703,12 @@ function readLock(lockPath: string): LockInfo | null | undefined {
     : [];
   const info: LockInfo = { serverPid: posInt(rec.serverPid), workerPid: posInt(rec.workerPid), workerPgid: posInt(rec.workerPgid), taskPids };
   return info.serverPid === null && info.workerPid === null && info.workerPgid === null && taskPids.length === 0 ? null : info;
+}
+
+/**
+ * Read a job.lock file: its holders, `null` when unreadable or garbage,
+ * `undefined` when there is no file. Never throws.
+ */
+export function readJobLock(lockPath: string): JobLockInfo | null | undefined {
+  return readLock(lockPath);
 }

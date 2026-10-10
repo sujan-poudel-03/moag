@@ -167,14 +167,32 @@ export function standardsBadge(t) {
 }
 
 /**
+ * What a legacy run's gate says about standards: a run that started before the
+ * project had standards carries no version and gets no check before its gate.
+ * Approving its ship applies the standards in effect then, and its verify pass is
+ * checked against them. Returns null for any other run (one with a version, one
+ * with a stored report, or one not awaiting approval); otherwise
+ * `{ kind: 'apply', version }` when a version is in effect, or `{ kind: 'none' }`.
+ */
+export function legacyGateStandards(run, stored, effectiveVersion) {
+  if (stored || run.standardsVersion || run.status !== 'awaiting-approval') { return null; }
+  return effectiveVersion ? { kind: 'apply', version: effectiveVersion } : { kind: 'none' };
+}
+
+/** The copy for {@link legacyGateStandards}' result. */
+const legacyGateText = (legacy) => (legacy.kind === 'apply' ? STR.C63(legacy.version).text : STR.C64.text);
+
+/**
  * The standards report card. `stored` is `{ phase, report }` or null. A run
  * with no report says why: "no report" is never shown as a pass.
  */
-function standardsCard(run, stored) {
+function standardsCard(run, stored, effectiveVersion) {
   const name = standardsName(run, stored);
   const heading = h('h2', { tabindex: '-1', dataset: { focus: 'standards-report' } }, name);
   if (!stored) {
-    const text = !run.standardsVersion ? STR.C39.text
+    const legacy = legacyGateStandards(run, stored, effectiveVersion);
+    const text = legacy ? legacyGateText(legacy)
+      : !run.standardsVersion ? STR.C39.text
       : run.status === 'running' ? 'Checked when the run verifies.'
         : run.status === 'awaiting-approval' ? 'Not checked yet for this run.'
           : 'Standards were not checked: the run ended first.';
@@ -262,7 +280,9 @@ function standardsCard(run, stored) {
 }
 
 /** The read-only standards line inside the ship-gate card (the full table stays in the report card). */
-function standardsGateLine(run, stored, focusReport) {
+function standardsGateLine(run, stored, focusReport, effectiveVersion) {
+  const legacy = legacyGateStandards(run, stored, effectiveVersion);
+  if (legacy) { return h('p', { class: 'muted' }, legacyGateText(legacy)); }
   if (!stored && !run.standardsVersion) {
     return h('p', { class: 'muted' }, 'Standards: none. This plan predates project standards.');
   }
@@ -537,8 +557,10 @@ export function render(app, params, view) {
       const target = standardsHost.querySelector('[data-focus="standards-report"]');
       if (target) { target.focus(); }
     },
+    /** The project's approved standards version now: what approving a legacy run's ship applies. */
+    effectiveVersion: project.standards ? project.standards.effectiveVersion : null,
   };
-  const renderStandards = () => mount(standardsHost, standardsCard(run, standards.stored));
+  const renderStandards = () => mount(standardsHost, standardsCard(run, standards.stored, standards.effectiveVersion));
 
   // ─── Banners and the gate card ───
   const bannerHost = h('div');
@@ -769,7 +791,7 @@ function gateCard(app, project, run, tasks, statusOf, live, refresh, standards) 
     h('p', null, `"${gate.name}" is waiting for an approver. Halted ${run.endedAt ? fmtAgo(run.endedAt) : 'just now'}.`),
     h('p', null, `${beforeDone}/${before.length} tasks before the gate completed.`),
     h('p', null, cost.noCap ? `Cost so far ${fmtUsd(live.spentUsd)} · no cap set` : `Cost so far ${fmtUsd(live.spentUsd)} of ${fmtUsd(cost.capUsd)}`),
-    standardsGateLine(run, standards.stored, standards.focusReport),
+    standardsGateLine(run, standards.stored, standards.focusReport, standards.effectiveVersion),
     after.length > 0 ? h('p', null, `Tasks that run after approval: ${after.join(', ')}`) : null,
     canDecide ? [note.wrap,
       h('div', { class: 'form-actions gate-actions' },

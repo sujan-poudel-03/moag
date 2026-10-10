@@ -38,6 +38,7 @@ import { StandardsProfile, profileHash } from '../standards/profile';
 import { CommandResult, PreparedWorkspace, gatesGreen, prepareWorkspace, runCommand, runGates } from './workspace';
 import { FAKE_VERSION_MARKER, FakeEngine, installFakeEngine, readFakeCalls } from './fake-engine';
 import { LaunchOptions, LaunchedServer, launchServer } from './server-launcher';
+import { describeLeftovers, defaultIsAlive, findLiveLeftovers } from './leftovers';
 import { ensureDependencies } from '../runner/dependency-install';
 import type { DependencyEvent } from '../models/types';
 
@@ -94,6 +95,14 @@ export interface BenchDeps {
   pollMs: number;
   lockRetryMs: number;
   lockRetryMaxMs: number;
+  /**
+   * Register handlers for the bench's own termination: `signal(name)` for SIGINT,
+   * SIGTERM, SIGHUP (and SIGBREAK on Windows), `exit()` for the process `exit`
+   * event. Returns a disposer that removes every handler it added.
+   */
+  onTermination: (h: { signal(name: string): void; exit(): void }) => () => void;
+  /** Is this pid alive? (the leftover-worker check on a non-empty --out). */
+  isPidAlive: (pid: number) => boolean;
 }
 
 export interface BenchResult {
@@ -255,7 +264,27 @@ export function defaultDeps(): BenchDeps {
     pollMs: 2_000,
     lockRetryMs: LOCK_RETRY_MS,
     lockRetryMaxMs: LOCK_RETRY_MAX_MS,
+    onTermination: registerTermination,
+    isPidAlive: defaultIsAlive,
   };
+}
+
+/** The signals the bench treats as "stop now". SIGBREAK (Ctrl+Break) exists only on Windows. */
+export function terminationSignals(platform: NodeJS.Platform = process.platform): NodeJS.Signals[] {
+  return platform === 'win32' ? ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK'] : ['SIGINT', 'SIGTERM', 'SIGHUP'];
+}
+
+/** Production {@link BenchDeps.onTermination}: real process signal and `exit` handlers. */
+function registerTermination(h: { signal(name: string): void; exit(): void }): () => void {
+  const added: Array<[string, (...a: unknown[]) => void]> = [];
+  for (const sig of terminationSignals()) {
+    const fn = (): void => h.signal(sig);
+    try { process.on(sig, fn); added.push([sig, fn]); } catch { /* signal not supported here */ }
+  }
+  const onExit = (): void => h.exit();
+  process.on('exit', onExit);
+  added.push(['exit', onExit]);
+  return () => { for (const [ev, fn] of added) { process.off(ev, fn); } };
 }
 
 /**
@@ -315,7 +344,13 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
   const capUsd = typeof opts.maxUsd === 'number' && opts.maxUsd > 0 ? Math.min(opts.maxUsd, scenario.budgetUsd) : scenario.budgetUsd;
   const outDir = path.resolve(opts.outDir);
   if (fs.existsSync(outDir) && fs.readdirSync(outDir).length > 0) {
-    progress(`--out ${outDir} is not empty; refusing to mix two benchmark runs. Nothing was started.`);
+    // A previous bench killed outright may have left workers (and their agents) running.
+    const leftovers = findLiveLeftovers(outDir, deps.isPidAlive);
+    if (leftovers.length > 0) {
+      progress(describeLeftovers(outDir, leftovers));
+    } else {
+      progress(`--out ${outDir} is not empty; refusing to mix two benchmark runs. Nothing was started.`);
+    }
     return { exitCode: 2, summary: null, summaryPath: null };
   }
   fs.mkdirSync(outDir, { recursive: true });
@@ -327,6 +362,8 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
   const notes: string[] = [];
   let harnessError: string | null = null;
   let aborted = false;
+  /** The signal that aborted the bench (SIGINT, SIGTERM, …). */
+  let abortSignal: string | null = null;
   /** Aborted on Ctrl+C, so a dependency install does not start after it. */
   const sigintAbort = new AbortController();
   let stoppedForBudget = false;
@@ -366,17 +403,32 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     } catch (err) { log.write({ kind: 'stop-request-failed', why, error: (err as Error).message }); }
   };
 
-  const onSigint = (): void => {
-    if (aborted) { return; }
+  /**
+   * A termination signal. The first one stops gracefully: the active run through the
+   * API, then the server. SIGHUP and SIGBREAK (Windows ends the process about 10 s
+   * later) also kill every worker at once; so does any second signal. Neither ends
+   * the bench itself: a wedged flow needs one more signal or a kill.
+   */
+  const onSignal = (name: string): void => {
+    if (aborted) {
+      progress(`second ${name}: killing every worker now`);
+      server?.killNow?.();
+      return;
+    }
     aborted = true;
+    abortSignal = name;
     sigintAbort.abort();
-    progress('Ctrl+C: stopping the active run through the API, then shutting the server down…');
-    void stopActive('sigint');
+    progress(`${name === 'SIGINT' ? 'Ctrl+C' : name}: stopping the active run through the API, then shutting the server down…`);
+    if (name === 'SIGHUP' || name === 'SIGBREAK') { server?.killNow?.(); }
+    void stopActive(name.toLowerCase());
   };
-  process.on('SIGINT', onSigint);
+  /** Process exit: best effort, synchronous. A no-op once stop() has ended every job. */
+  const onExit = (): void => { server?.killNow?.(); };
+  const disposeTermination = deps.onTermination({ signal: onSignal, exit: onExit });
+  const abortedMessage = (): string => `aborted (${abortSignal ?? 'SIGINT'})`;
 
   const check = (): void => {
-    if (aborted) { throw new BenchAbort('aborted (SIGINT)'); }
+    if (aborted) { throw new BenchAbort(abortedMessage()); }
   };
 
   /** Handle one SSE event: log it, account cost, feed the current version's observations. */
@@ -619,11 +671,11 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
       }
     }
   } catch (err) {
-    harnessError = aborted ? 'aborted (SIGINT)' : (err as Error).message;
+    harnessError = aborted ? abortedMessage() : (err as Error).message;
     log.write({ kind: 'harness-error', error: harnessError });
     progress(`harness error: ${harnessError}`);
   } finally {
-    process.off('SIGINT', onSigint);
+    try { disposeTermination(); } catch { /* best effort */ }
     try { disposeSse?.(); } catch { /* best effort */ }
     if (server) {
       progress('stopping the server…');

@@ -468,6 +468,39 @@ describe('web run screen — the standards report keeps Blocking, Advisory and N
     });
   });
 
+  describe('the gate card of a run that started before the project had standards', () => {
+    const { legacyGateStandards } = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map }, ['legacyGateStandards']) as
+      { legacyGateStandards: (run: unknown, stored: unknown, effectiveVersion: number | null) => unknown };
+    const legacy = { status: 'awaiting-approval' };
+
+    it('says approving applies the version in effect, checked at verify', () => {
+      assert.deepEqual(plain(legacyGateStandards(legacy, null, 3)), { kind: 'apply', version: 3 });
+    });
+
+    it('says nothing is approved yet when no version is in effect', () => {
+      assert.deepEqual(plain(legacyGateStandards(legacy, null, null)), { kind: 'none' });
+    });
+
+    it('is not used for a run with a version, a run with a stored report, or a run not at its gate', () => {
+      assert.equal(legacyGateStandards({ ...legacy, standardsVersion: 2 }, null, 3), null);
+      assert.equal(legacyGateStandards(legacy, { phase: 'pre-gate', report: {} }, 3), null);
+      assert.equal(legacyGateStandards({ status: 'running' }, null, 3), null);
+      assert.equal(legacyGateStandards({ status: 'completed' }, null, 3), null);
+    });
+
+    it('the copy exists, names the version, and replaces the "predates" line on the gate card', () => {
+      const { STR } = loadWebModule('strings.js', {}, ['STR']) as { STR: Record<string, { text: string } | ((...a: unknown[]) => { text: string })> };
+      const c63 = (STR.C63 as (v: number) => { text: string })(3).text;
+      assert.match(c63, /standards v3/);
+      assert.match(c63, /checked against them when it verifies/);
+      assert.match((STR.C64 as { text: string }).text, /none are approved yet/);
+      const source = fs.readFileSync(path.join(WEB, 'screens', 'run.js'), 'utf-8');
+      assert.match(source, /const legacy = legacyGateStandards\(run, stored, effectiveVersion\);\n\s+if \(legacy\) \{ return h\('p', \{ class: 'muted' \}, legacyGateText\(legacy\)\); \}/);
+      assert.match(source, /standardsGateLine\(run, standards\.stored, standards\.focusReport, standards\.effectiveVersion\)/);
+      assert.match(source, /effectiveVersion: project\.standards \? project\.standards\.effectiveVersion : null/);
+    });
+  });
+
   describe('the card badge: green only for a command that passed', () => {
     interface Look { text: string; kind: string; card: string }
     const { standardsBadge } = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map }, ['standardsBadge']) as { standardsBadge: (t: unknown) => Look };

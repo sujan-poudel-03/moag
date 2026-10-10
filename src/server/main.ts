@@ -53,6 +53,11 @@ export function bootPreconditionError(users: Pick<UserStore, 'list'>, config: Pi
  * the same workspace. Detached, the worker outlives the server, receives
  * `disconnect`, and `runner.stop()` tree-kills the running task before it exits.
  * `windowsHide` keeps the detached worker from opening a console window.
+ *
+ * `taskkill /T` alone cannot reach a task descendant whose parent already exited
+ * (it walks parent pids). So on Windows a run or plan worker also puts itself into
+ * a kill-on-close job object before it starts anything (utils/process-job.ts):
+ * such orphans die with the worker, however the worker ends.
  */
 export function workerSpawnOptions(spec: SpawnSpec): SpawnOptions {
   return {

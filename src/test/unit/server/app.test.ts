@@ -2370,6 +2370,53 @@ describe('server app', function () {
     assert.equal((h.workers.at(-1)!.job as RunJob).standardsPath, undefined);
   });
 
+  const gateAudit = (action: string, runId: string) => h.auditEntries().filter((e) => e.action === action && (e.after as { runId?: string } | undefined)?.runId === runId);
+
+  it('legacy run: the gate.approve audit entry records the standards frozen onto the run at approval', async () => {
+    const { projectId, runId } = await legacyRunAtShipGate();
+    await resumedAfterApprove(projectId, runId);
+    const run = h.state.load(projectId).runs[0];
+    const entries = gateAudit('gate.approve', runId);
+    assert.equal(entries.length, 1);
+    const after = entries[0].after as Record<string, unknown>;
+    assert.equal(after.standardsVersion, run.standardsVersion);
+    assert.equal(after.standardsHash, run.standardsHash);
+    assert.equal(typeof after.standardsHash, 'string');
+    assert.equal(after.standardsFrozenAtApproval, true);
+  });
+
+  it('a run that started under standards: the gate.approve audit carries its version and hash, and freezes nothing', async () => {
+    const { projectId, runId } = await haltAtShipGate();
+    const before = h.state.load(projectId).runs[0];
+    assert.equal(typeof before.standardsVersion, 'number');
+    await resumedAfterApprove(projectId, runId);
+    const after = gateAudit('gate.approve', runId)[0].after as Record<string, unknown>;
+    assert.deepEqual([after.standardsVersion, after.standardsHash], [before.standardsVersion, before.standardsHash]);
+    assert.equal('standardsFrozenAtApproval' in after, false);
+  });
+
+  it('legacy run: the gate.skip audit records no standards (a skip freezes nothing)', async () => {
+    const { projectId, runId } = await legacyRunAtShipGate();
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/skip`, { as: 'admin', body: { reason: 'documentation only' } })).status, 202);
+    const entries = gateAudit('gate.skip', runId);
+    assert.equal(entries.length, 1);
+    const after = entries[0].after as Record<string, unknown>;
+    assert.equal('standardsVersion' in after, false);
+    assert.equal('standardsHash' in after, false);
+    assert.equal('standardsFrozenAtApproval' in after, false);
+  });
+
+  it('legacy run: a refused approve writes no gate.approve audit entry', async () => {
+    const { projectId, runId } = await legacyRunAtShipGate();
+    const lockPath = h.app.jobs.lockPath(projectId);
+    fs.writeFileSync(lockPath, String(process.pid));
+    try {
+      const refused = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
+      assert.equal(refused.status, 409, refused.raw);
+    } finally { fs.rmSync(lockPath, { force: true }); }
+    assert.deepEqual(gateAudit('gate.approve', runId), []);
+  });
+
   it('a malformed verify-standards payload is dropped without throwing; the run carries on and a later valid report is kept', async () => {
     const { projectId, planId } = await approvedProject(h);
     assert.equal((await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } })).status, 202);

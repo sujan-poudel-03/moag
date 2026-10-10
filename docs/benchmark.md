@@ -357,7 +357,12 @@ Caveat: `--max-budget-usd` can overshoot by one turn, which is why the reserve i
 
 ### Aborting
 
-- Press **Ctrl+C once**. The bench stops the active run through the API, stops every job (`stopAll`), closes the server and writes `summary.json` with `"aborted": true`.
+- Press **Ctrl+C once**. The bench stops the active run through the API, stops every job (`stopAll`), closes the server and writes `summary.json` with `"aborted": true`. SIGTERM, SIGHUP and (on Windows) Ctrl+Break do the same; the summary's `harnessError` names the signal (`aborted (SIGTERM)`).
+- SIGHUP and Ctrl+Break also kill every worker at once, because Windows ends the process about 10 seconds after either.
+- A **second** signal kills every worker at once. It does not end the bench itself; if the graceful stop is wedged, only killing the bench process ends it.
+- When the bench process exits, it kills any worker still running, synchronously. This is best effort and does nothing once the jobs are already stopped.
+- A kill the bench cannot catch (`taskkill /F`, SIGKILL, a memory reaper) runs no cleanup at all. On Windows each worker is bound to a kill-on-close job object, so the worker still notices its server is gone and stops, and everything it started (the agent and any process the agent left behind) ends with it, within about 35 seconds. See [Windows notes in server.md](server.md#windows-notes). On POSIX, and on Windows when the binding could not be made (the run's events carry a warning), check by hand as below.
+- A re-run into a non-empty `--out` is refused. If a previous bench there left processes alive (its `server-data/projects/*/job.lock` names them), the refusal lists their pids and the command to end each (`taskkill /T /F /PID <pid>`, or `kill -TERM -<pid>; kill -TERM <pid>` on POSIX). The bench kills nothing itself: a recorded pid may since belong to another process.
 - If it hangs, list the processes and kill each one:
 
   ```powershell
@@ -365,7 +370,7 @@ Caveat: `--max-budget-usd` can overshoot by one turn, which is why the reserve i
   taskkill /T /F /PID <id>
   ```
 
-- **Always** check `Get-Process claude` afterwards. Workers are detached, and an orphaned `claude` keeps spending.
+- **Always** check `Get-Process claude` afterwards (on POSIX, `pgrep -fl claude`). Workers are detached, and an orphaned `claude` keeps spending.
 
 ## Output layout
 

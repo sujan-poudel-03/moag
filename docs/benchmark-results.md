@@ -108,6 +108,8 @@ Run 1's work appears to have continued after the bench stopped. `R1/workspaces/b
 
 Sources: `stat -c %w` / `%y` and PowerShell `CreationTimeUtc` on `R1/workspaces/bench-ws/node_modules` and `R1/workspaces/bench-ws/`.
 
+**Follow-up.** A process the agent started could outlive the worker's tree kill. On Windows every stop path is `taskkill /T`, which finds descendants by parent pid, so a descendant whose parent had already exited could not be reached, and it kept running after the worker was gone. This is fixed in commit `<hash>`: each run and plan worker is now bound to a kill-on-close job object, so everything it started ends when the worker does. See [Windows notes in server.md](server.md#windows-notes). Which process wrote `node_modules/` in run 1 is still not measured.
+
 ## The failure found in run 1
 
 **What happened:** the agents added TypeScript to `package.json` as a devDependency. Nothing ran `npm install`. The plan's command task `npm run build` then ran `tsc`, which was not installed. The task failed, `npm test` and the ship gate were blocked, and nothing shipped.

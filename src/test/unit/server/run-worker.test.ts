@@ -1039,3 +1039,79 @@ describe('armDisconnectWatchdog', () => {
     assert.deepEqual(exits, [2]);
   });
 });
+
+// ─── Process-tree binding (Windows job object) ───
+
+describe('run-worker process-tree binding', () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-bind-')); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  const warnings = (h: Harness) => h.events.filter((e) => e.event === 'warning' && /not tied to the worker/.test(String(e.message)));
+
+  it('a run job binds once, before the runner plays', async () => {
+    const order: string[] = [];
+    const runner = new FakeRunner(async () => { order.push('play'); });
+    const h = harness(runner, { bindProcessTree: () => { order.push('bind'); return { ok: true }; } });
+    await runJob(RUN_JOB, h.deps);
+    assert.deepEqual(order, ['bind', 'play']);
+    assert.deepEqual(warnings(h), []);
+  });
+
+  it('a plan job binds once, before the engine is resolved', async () => {
+    const order: string[] = [];
+    const h = harness(new FakeRunner(async () => {}), {
+      bindProcessTree: () => { order.push('bind'); return { ok: true }; },
+      getEngine: () => { order.push('engine'); return { runTask: async () => ({ stdout: '', stderr: '', exitCode: 0, durationMs: 0 }) }; },
+    });
+    const job: PlanJob = { kind: 'plan', mode: 'delta', workspace: dir, planPath: '/p', outPath: path.join(dir, 'o.json'), engine: 'claude' };
+    assert.equal(await runJob(job, h.deps), 0);
+    assert.deepEqual(order, ['bind', 'engine']);
+  });
+
+  it('a probe job is never bound', async () => {
+    let calls = 0;
+    const h = harness(new FakeRunner(async () => {}), { bindProcessTree: () => { calls++; return { ok: true }; } });
+    assert.equal(await runJob({ kind: 'probe' }, h.deps), 0);
+    assert.equal(calls, 0);
+  });
+
+  it('a failed binding warns and the run ends with its normal code', async () => {
+    const runner = new FakeRunner(async () => {});
+    const h = harness(runner, { bindProcessTree: () => ({ ok: false, reason: 'assign 5' }) });
+    assert.equal(await runJob(RUN_JOB, h.deps), 0);
+    const w = warnings(h);
+    assert.equal(w.length, 1);
+    assert.match(String(w[0].message), /assign 5/);
+    assert.equal(runner.playArgs.length, 1, 'the run still played');
+    assert.equal(h.verifyCalls, 1);
+  });
+
+  it('a throwing binder warns and the job proceeds', async () => {
+    const runner = new FakeRunner(async () => {});
+    const h = harness(runner, { bindProcessTree: () => { throw new Error('powershell gone'); } });
+    assert.equal(await runJob(RUN_JOB, h.deps), 0);
+    assert.equal(warnings(h).length, 1);
+    assert.match(String(warnings(h)[0].message), /powershell gone/);
+    assert.equal(runner.playArgs.length, 1);
+  });
+
+  it('an unsupported platform stays silent', async () => {
+    const h = harness(new FakeRunner(async () => {}), { bindProcessTree: () => ({ ok: false, reason: 'not supported on linux' }) });
+    assert.equal(await runJob(RUN_JOB, h.deps), 0);
+    assert.deepEqual(h.events.filter((e) => e.event === 'warning'), []);
+  });
+
+  it('deps without a binder behave as before', async () => {
+    const runner = new FakeRunner(async () => {});
+    const h = harness(runner);
+    assert.equal(await runJob(RUN_JOB, h.deps), 0);
+    assert.deepEqual(h.events.filter((e) => e.event === 'warning'), []);
+  });
+
+  it('main() wires the real binder lazily', () => {
+    const source = fs.readFileSync(path.join(__dirname, '../../../server/run-worker.ts'), 'utf-8');
+    const wiring = source.slice(source.indexOf('const deps: WorkerDeps = {'));
+    assert.match(wiring, /bindProcessTree: \(\) => require\('\.\.\/utils\/process-job'\)\.bindProcessTreeToLifetime\(process\.pid\)/);
+  });
+});

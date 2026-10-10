@@ -38,6 +38,12 @@ export interface LaunchedServer {
   serverEnv: NodeJS.ProcessEnv;
   /** Stop every job, then close the server. Never rejects. */
   stop(): Promise<void>;
+  /**
+   * Hard-kill every live worker NOW, synchronously (`JobManager.killAll`): for a
+   * bench that is about to die (`exit`, a second signal, SIGHUP). Never throws.
+   * Optional so test fakes need not provide it.
+   */
+  killNow?(): void;
 }
 
 /** Build the server's environment from `base` (a copy; `base` is not touched). */
@@ -94,6 +100,9 @@ export async function launchServer(opts: LaunchOptions): Promise<LaunchedServer>
     projectsRoot: env.MOAG_PROJECTS_ROOT as string,
     bootstrapToken,
     serverEnv,
+    killNow(): void {
+      try { app.jobs.killAll(); } catch { /* best effort */ }
+    },
     async stop(): Promise<void> {
       if (stopped) { return; }
       stopped = true;

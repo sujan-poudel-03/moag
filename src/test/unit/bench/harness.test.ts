@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  runBench, BenchDeps, EventLog, planApprovalProblems, scenarioAllowedCommands, standardsApprovalProblems, benchStandardsProfile,
+  runBench, BenchDeps, EventLog, terminationSignals, planApprovalProblems, scenarioAllowedCommands, standardsApprovalProblems, benchStandardsProfile,
 } from '../../../bench/harness';
 import { profileHash } from '../../../standards/profile';
 import { builtInProfile } from '../../../standards/built-in-profiles';
@@ -844,6 +844,148 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.equal(launches, 0);
   });
 
+  it('a non-empty --out whose job.lock names live processes lists them with kill commands, and starts nothing', async () => {
+    const lockDir = path.join(out(), 'server-data', 'projects', 'p1');
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, 'job.lock'), JSON.stringify({ serverPid: 111111, workerPid: 222222, taskPids: [333333, 444444] }));
+    const lines: string[] = [];
+    const r = await runBench(scenario(), { dryRun: false, maxUsd: 1, outDir: out(), progress: (l) => lines.push(l) },
+      deps({ isPidAlive: (pid) => pid === 222222 || pid === 333333 }));
+    assert.equal(r.exitCode, 2);
+    assert.equal(launches, 0);
+    const text = lines.join('\n');
+    assert.match(text, /project p1: worker 222222; task 333333/);
+    assert.doesNotMatch(text, /111111|444444/, 'dead pids are not listed');
+    assert.match(text, /may still be spending/);
+    assert.match(text, process.platform === 'win32' ? /taskkill \/T \/F \/PID 222222/ : /kill -TERM -222222/);
+  });
+
+  it('a non-empty --out whose lock holders are all dead keeps the plain refusal', async () => {
+    const lockDir = path.join(out(), 'server-data', 'projects', 'p1');
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, 'job.lock'), JSON.stringify({ serverPid: 111111, workerPid: 222222 }));
+    const lines: string[] = [];
+    const r = await runBench(scenario(), { dryRun: false, maxUsd: 1, outDir: out(), progress: (l) => lines.push(l) }, deps({ isPidAlive: () => false }));
+    assert.equal(r.exitCode, 2);
+    assert.match(lines.join('\n'), /is not empty; refusing to mix two benchmark runs/);
+  });
+
+  describe('termination signals', () => {
+    interface Term { handlers: { signal(name: string): void; exit(): void } | null; disposed: number }
+    const termDeps = (t: Term): Pick<BenchDeps, 'onTermination'> => ({
+      onTermination: (hd) => { t.handlers = hd; return () => { t.disposed++; }; },
+    });
+    /** A server whose killNow and stop are counted. */
+    const countingServer = (c: { kills: number; stops: number }): LaunchedServer => ({
+      url: h.url, projectsRoot: h.root, bootstrapToken: BOOT, serverEnv: { ...process.env },
+      stop: async () => { c.stops++; }, killNow: () => { c.kills++; },
+    });
+    /**
+     * The run worker stays running until it is told to stop. `fire` runs once the bench
+     * has started the run (its "run … started" progress line). Returns that progress sink.
+     */
+    function signalDuringRun(fire: () => void, lines: string[] = []): (l: string) => void {
+      const seen = { plans: 0, runs: 0 };
+      scriptWorkers(h, { plans: [], costs: [] }, seen);
+      const scripted = h.onSpawn;
+      h.onSpawn = (w: FakeWorker) => {
+        if (w.job.kind !== 'run') { scripted(w); return; }
+        w.send = (m: unknown): boolean => {
+          if ((m as { type?: string })?.type === 'stop') { setImmediate(() => w.exit(1)); }
+          return true;
+        };
+        w.line({ event: 'state', state: 'playing' });
+      };
+      let fired = false;
+      return (l: string) => {
+        lines.push(l);
+        if (!fired && /: run \S+ started/.test(l)) { fired = true; fire(); }
+      };
+    }
+
+    it('SIGTERM mid-run stops the run through the API, aborts with its name, stops the server and disposes the handlers', async () => {
+      const t: Term = { handlers: null, disposed: 0 };
+      const c = { kills: 0, stops: 0 };
+      const lines: string[] = [];
+      const progress = signalDuringRun(() => t.handlers!.signal('SIGTERM'), lines);
+      const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), progress },
+        deps({ ...termDeps(t), launchServer: async () => countingServer(c) }));
+      assert.equal(r.exitCode, 2);
+      assert.equal(r.summary!.harnessError, 'aborted (SIGTERM)');
+      // The stop request is fire-and-forget; its log line may land just after runBench returns.
+      const stopLogged = (): boolean => fs.readFileSync(path.join(out(), 'events.jsonl'), 'utf-8').trim().split('\n')
+        .map((l) => JSON.parse(l)).some((e) => e.kind === 'stop-request' && e.why === 'sigterm' && e.status === 202);
+      for (let i = 0; i < 100 && !stopLogged(); i++) { await new Promise((res) => setTimeout(res, 20)); }
+      assert.ok(stopLogged(), 'the run was stopped through the API');
+      assert.ok(h.auditEntries().some((e) => e.action === 'run.stop'), 'the server recorded the stop');
+      assert.ok(lines.some((l) => /^SIGTERM: stopping the active run/.test(l)));
+      assert.equal(c.stops, 1);
+      assert.equal(c.kills, 0, 'one SIGTERM stops gracefully');
+      assert.equal(t.disposed, 1);
+    });
+
+    it('a second signal kills every worker now', async () => {
+      const t: Term = { handlers: null, disposed: 0 };
+      const c = { kills: 0, stops: 0 };
+      const lines: string[] = [];
+      const progress = signalDuringRun(() => { t.handlers!.signal('SIGINT'); t.handlers!.signal('SIGINT'); }, lines);
+      const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), progress },
+        deps({ ...termDeps(t), launchServer: async () => countingServer(c) }));
+      assert.equal(r.summary!.harnessError, 'aborted (SIGINT)');
+      assert.ok(lines.some((l) => /^Ctrl\+C: stopping the active run/.test(l)));
+      assert.equal(c.kills, 1);
+      assert.ok(lines.includes('second SIGINT: killing every worker now'));
+      assert.equal(t.disposed, 1);
+    });
+
+    it('SIGHUP kills the workers at once (Windows ends the process soon after)', async () => {
+      const t: Term = { handlers: null, disposed: 0 };
+      const c = { kills: 0, stops: 0 };
+      let killsWhenFired = -1;
+      const progress = signalDuringRun(() => { t.handlers!.signal('SIGHUP'); killsWhenFired = c.kills; });
+      const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), progress },
+        deps({ ...termDeps(t), launchServer: async () => countingServer(c) }));
+      assert.equal(killsWhenFired, 1);
+      assert.equal(r.summary!.harnessError, 'aborted (SIGHUP)');
+      assert.equal(t.disposed, 1);
+    });
+
+    it('exit kills the workers synchronously and does not itself abort', async () => {
+      const t: Term = { handlers: null, disposed: 0 };
+      const c = { kills: 0, stops: 0 };
+      let killsAfterExit = -1;
+      // exit does not abort the flow; a SIGTERM afterwards ends the run so the test finishes.
+      const progress = signalDuringRun(() => { t.handlers!.exit(); killsAfterExit = c.kills; t.handlers!.signal('SIGTERM'); });
+      const r = await runBench(scenario({}, 1), { dryRun: false, maxUsd: 10, outDir: out(), progress },
+        deps({ ...termDeps(t), launchServer: async () => countingServer(c) }));
+      assert.equal(killsAfterExit, 1);
+      assert.equal(r.summary!.harnessError, 'aborted (SIGTERM)');
+      assert.equal(c.kills, 1, 'the SIGTERM after it is a first signal: graceful');
+      assert.equal(t.disposed, 1);
+    });
+
+    it('the handlers are disposed on a harness error too', async () => {
+      const t: Term = { handlers: null, disposed: 0 };
+      const r = await runBench(scenario(), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({
+        ...termDeps(t),
+        prepareWorkspace: async () => { throw new Error('setup failed'); },
+      }));
+      assert.equal(r.exitCode, 2);
+      assert.equal(t.disposed, 1);
+    });
+
+    it('the default registration adds real process handlers and removes every one', async () => {
+      const count = () => ({ int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM'), hup: process.listenerCount('SIGHUP'), exit: process.listenerCount('exit') });
+      const before = count();
+      let during = before;
+      await runBench(scenario(), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({
+        prepareWorkspace: async () => { during = count(); throw new Error('stop here'); },
+      }));
+      assert.deepEqual(during, { int: before.int + 1, term: before.term + 1, hup: before.hup + 1, exit: before.exit + 1 });
+      assert.deepEqual(count(), before);
+    });
+  });
+
   it('EventLog drops lines past its cap and says so', () => {
     const f = path.join(tmp, 'log.jsonl');
     const l = new EventLog(f, 200);
@@ -851,5 +993,12 @@ describe('bench harness (scripted workers behind the real app)', function () {
     assert.equal(l.truncated, true);
     assert.ok(l.dropped > 0);
     assert.ok(fs.statSync(f).size <= 200);
+  });
+});
+
+describe('terminationSignals', () => {
+  it('adds SIGBREAK only on Windows', () => {
+    assert.deepEqual(terminationSignals('win32'), ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGBREAK']);
+    assert.deepEqual(terminationSignals('linux'), ['SIGINT', 'SIGTERM', 'SIGHUP']);
   });
 });

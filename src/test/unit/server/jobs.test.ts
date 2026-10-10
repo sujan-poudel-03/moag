@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import * as sinon from 'sinon';
-import { JobManager, JobManagerOptions, WorkerProcess, JobEnd, redactSecrets, MAX_LINE_BYTES, STOP_KILL_AFTER_MS, HELD_LOCK_POLL_MS } from '../../../server/jobs';
+import { JobManager, JobManagerOptions, WorkerProcess, JobEnd, redactSecrets, MAX_LINE_BYTES, STOP_KILL_AFTER_MS, HELD_LOCK_POLL_MS, readJobLock } from '../../../server/jobs';
 import { ProjectStateStore, emptyProjectState, PLAN_REVIEW_STATUSES, RUN_STATUSES } from '../../../server/project-state';
 import { WorkerJob, emptyRunView } from '../../../server/worker-protocol';
 import { createEmptyPlan, createTask, dehydratePlan } from '../../../models/plan';
@@ -441,6 +441,47 @@ describe('JobManager', () => {
 
   // ─── Lock linger: task pids outliving their job ───
 
+  describe('killAll', () => {
+    it('hard-kills every active worker at once and marks each stop requested', () => {
+      const m = mk();
+      start(m, 'p1');
+      start(m, 'p2');
+      m.killAll();
+      assert.equal(kill.callCount, 2);
+      assert.deepEqual(kill.getCalls().map((c) => c.args[0]), [procs[0], procs[1]]);
+      assert.equal(m.isStopRequested('p1'), true);
+      assert.equal(m.isStopRequested('p2'), true);
+    });
+
+    it('does nothing with no jobs', () => {
+      mk().killAll();
+      assert.equal(kill.called, false);
+    });
+
+    it('a throwing kill does not stop the others, and killAll never throws', () => {
+      const logs: string[] = [];
+      const throwing = sinon.stub();
+      throwing.onFirstCall().throws(new Error('taskkill failed'));
+      const m = mk({ killProcess: throwing, log: (msg) => logs.push(msg) });
+      start(m, 'p1');
+      start(m, 'p2');
+      assert.doesNotThrow(() => m.killAll());
+      assert.equal(throwing.callCount, 2);
+      assert.ok(logs.some((l) => /p1.*taskkill failed/.test(l)));
+    });
+
+    it('leaves the lock to close handling, and a killed job ends as stopped', () => {
+      const m = mk();
+      let end: JobEnd | null = null;
+      start(m, 'p1', { onEnd: (e: JobEnd) => { end = e; } });
+      m.killAll();
+      assert.ok(fs.existsSync(m.lockPath('p1')), 'the lock is still held until the worker closes');
+      procs[0].emit('close', null);
+      assert.equal(end!.status, 'stopped');
+      assert.equal(m.isActive('p1'), false);
+    });
+  });
+
   describe('lock linger', () => {
     const POLL = 1_000;
     const MAX = 10_000;
@@ -695,5 +736,24 @@ describe('ProjectStateStore', () => {
     assert.ok(order.indexOf('other') < order.indexOf('a-end'), 'other projects are not blocked');
     assert.equal(await after, 7);
     await assert.rejects(failing);
+  });
+});
+
+describe('readJobLock', () => {
+  let dir: string;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-readlock-')); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('parses the JSON form', () => {
+    const p = path.join(dir, 'job.lock');
+    fs.writeFileSync(p, JSON.stringify({ serverPid: 1, workerPid: 2, taskPids: [3] }));
+    assert.deepEqual(readJobLock(p), { serverPid: 1, workerPid: 2, workerPgid: null, taskPids: [3] });
+  });
+
+  it('is undefined for a missing file and null for garbage', () => {
+    assert.equal(readJobLock(path.join(dir, 'nope.lock')), undefined);
+    const p = path.join(dir, 'job.lock');
+    fs.writeFileSync(p, '{not json');
+    assert.equal(readJobLock(p), null);
   });
 });

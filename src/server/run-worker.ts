@@ -130,6 +130,14 @@ export interface WorkerDeps {
    * (engine CLI, shell or gate command) starts and ends. Returns a disposer.
    */
   onChildProcess?(listener: (change: { pid: number; alive: boolean }) => void): () => void;
+  /**
+   * `bindProcessTreeToLifetime` from utils/process-job. Windows only: ties every
+   * process this job starts (including descendants whose parent already exited,
+   * which `taskkill /T` cannot find) to the worker's lifetime, through a
+   * kill-on-close job object. Called before anything is spawned. Elsewhere it
+   * reports `not supported on <platform>` and changes nothing.
+   */
+  bindProcessTree?(): { ok: boolean; reason?: string };
 }
 
 const ERROR_TAIL_CHARS = 2000;
@@ -167,6 +175,7 @@ const errMessage = (err: unknown): string => (err instanceof Error ? err.message
 export async function runJob(job: WorkerJob, deps: WorkerDeps): Promise<number> {
   let disposeChildren: (() => void) | null = null;
   try {
+    if (job.kind !== 'probe' && deps.bindProcessTree) { bindTree(job.kind, deps.bindProcessTree, deps); }
     if (job.kind !== 'probe' && deps.onChildProcess) {
       disposeChildren = deps.onChildProcess((c) => deps.emit({ event: 'task-pid', pid: c.pid, alive: c.alive }));
     }
@@ -183,6 +192,28 @@ export async function runJob(job: WorkerJob, deps: WorkerDeps): Promise<number> 
   } finally {
     disposeChildren?.();
   }
+}
+
+/**
+ * Put this worker into its process-tree binding before the job starts anything.
+ * A failed binding is never fatal: the job runs exactly as it would without it,
+ * with a warning saying what is no longer guaranteed.
+ */
+function bindTree(kind: string, bind: () => { ok: boolean; reason?: string }, deps: WorkerDeps): void {
+  let reason: string;
+  try {
+    const res = bind();
+    if (res.ok) { return; }
+    reason = res.reason ?? 'unknown reason';
+  } catch (err) {
+    reason = errMessage(err);
+  }
+  // POSIX has no job object; its group kill is the existing guarantee. Stay silent there.
+  if (reason.startsWith('not supported on')) { return; }
+  deps.emit({
+    event: 'warning',
+    message: `Processes this ${kind} starts are not tied to the worker: ${reason}. If the server and worker are killed, a task process could outlive them.`,
+  });
 }
 
 /**
@@ -661,6 +692,7 @@ export async function main(host: WorkerHost = processHost()): Promise<number> {
     dehydratePlaylist: (plan, playlist) => dehydratePlan({ ...(plan as any), playlists: [playlist] }).playlists[0],
     failureCategory: (stderr, stdout) => require('../runner/runner').classifyFailure(stderr, stdout).category,
     onChildProcess: (listener) => require('../utils/child-tracker').onChildProcess(listener),
+    bindProcessTree: () => require('../utils/process-job').bindProcessTreeToLifetime(process.pid),
   };
   return runJob(job, deps);
 }

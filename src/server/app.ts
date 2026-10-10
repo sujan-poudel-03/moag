@@ -2275,7 +2275,9 @@ export function createApp(deps: AppDeps): App {
       // run base — never HEAD now, which is past this run's own work: with neither, the base is
       // null and every file is checked. Set on the in-memory record only; it is saved below
       // after the segment starts, so a refused spawn leaves the run exactly as it was.
-      if (kind === 'approve' && run.standardsVersion === undefined) {
+      // Recorded in the audit entry below, so the approval shows what it froze.
+      const frozeNow = kind === 'approve' && run.standardsVersion === undefined;
+      if (frozeNow) {
         run.standardsVersion = effectiveStandards.version;
         run.standardsHash = effectiveStandards.contentHash;
         run.baseRef = legacyRunBaseRef(st, run.startedAt);
@@ -2298,7 +2300,16 @@ export function createApp(deps: AppDeps): App {
       delete run.exitCode;
       delete run.endedAt;
       state.save(p.id, st);
-      writeAudit(ctx, { action, projectId: p.id, target: gate.name, after: { runId: run.id, taskId: gate.taskId, ...(note ? { note } : {}) }, flags });
+      writeAudit(ctx, {
+        action, projectId: p.id, target: gate.name,
+        after: {
+          runId: run.id, taskId: gate.taskId, ...(note ? { note } : {}),
+          // The standards the resumed segment runs and verifies under.
+          ...(run.standardsVersion !== undefined ? { standardsVersion: run.standardsVersion, standardsHash: run.standardsHash } : {}),
+          ...(frozeNow ? { standardsFrozenAtApproval: true } : {}),
+        },
+        flags,
+      });
       sendJson(ctx.res, 202, { run: runDto(run, ctx.user!, p, st) });
     });
   };
