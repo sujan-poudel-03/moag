@@ -20,7 +20,7 @@ import * as net from 'net';
 import * as path from 'path';
 
 import { buildOverride, childEnv, composePolicyViolations, composeProjectName, composeVersionOk, deriveStatus, envKeyFor, isSafeBranch, parsePsOutput, servicesFromPs } from './compose';
-import { isFetchableRemote, mirrorPath, safeGitArgs, safeGitEnv } from './git-safe';
+import { mirrorPath, safeGitArgs, safeGitEnv } from './git-safe';
 import type { HostConfig } from './host-config';
 import { parseRecipe, RECIPE_FILE, type Recipe } from './recipe';
 import type { EnvRecord, ProjectsLoader, ServiceRole, ServiceSnapshot } from './types';
@@ -224,16 +224,12 @@ export class EnvironmentManager {
     if (fmt.exitCode !== 0) { throw new EnvError('That branch name is not valid.', 'rejected'); }
 
     const ref = `refs/heads/${branch}`;
-    let found = await this.git(mirror, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+    // Only the approved project's own branches. A remote run's branch is imported into the project
+    // when the run ends (MOAG's daemon), so while it is still running it is not here yet. No fallback
+    // to the project's origin: reading its URL would mean running git on the project repo's config.
+    const found = await this.git(mirror, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
     if (found.exitCode !== 0) {
-      // Not in the project: try the project's origin, over https or ssh only.
-      const origin = await this.git(mirror, ['--git-dir', path.join(projectPath, '.git'), 'config', '--get', 'remote.origin.url']);
-      const url = origin.stdout.trim();
-      if (origin.exitCode === 0 && isFetchableRemote(url)) {
-        await this.git(mirror, ['fetch', '--quiet', '--no-tags', url, `+${ref}:${ref}`]);
-        found = await this.git(mirror, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
-      }
-      if (found.exitCode !== 0) { throw new EnvError(`Branch "${branch}" was not found in the project or on origin.`, 'rejected'); }
+      throw new EnvError(`Branch "${branch}" is not in the project yet. A run's branch arrives when the run ends; try again then.`, 'rejected');
     }
 
     if (this.fs.existsSync(worktree)) {

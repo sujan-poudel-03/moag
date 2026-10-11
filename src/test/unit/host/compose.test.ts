@@ -131,7 +131,7 @@ describe('host/compose policy and git-safe', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   const { composePolicyViolations } = require('../../../host/compose');
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { isFetchableRemote, safeGitArgs, safeGitEnv } = require('../../../host/git-safe');
+  const { safeGitArgs, safeGitEnv } = require('../../../host/git-safe');
   const root = '/srv/moag/host/worktrees/shop-main-1';
 
   it('allows an ordinary stack with mounts inside the checkout', () => {
@@ -173,12 +173,5 @@ describe('host/compose policy and git-safe', () => {
     assert.deepEqual(a.slice(-2), ['fetch', 'x']);
     assert.ok(safeGitArgs([], { emptyHooksDir: '/e', allowLocal: true }).includes('protocol.file.allow=always'));
     assert.equal(safeGitEnv({ PATH: '/b' }).GIT_CONFIG_NOSYSTEM, '1');
-  });
-
-  it('fetches only from https or ssh remotes', () => {
-    for (const u of ['https://github.com/o/r.git', 'ssh://git@host/r.git', 'git@github.com:o/r.git']) { assert.ok(isFetchableRemote(u), u); }
-    for (const u of ['ext::sh -c touch% /tmp/pwned', 'file:///etc', '/home/me/repo', 'http://plain.example/r.git', '--upload-pack=x']) {
-      assert.equal(isFetchableRemote(u), false, u);
-    }
   });
 });

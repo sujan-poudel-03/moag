@@ -53,7 +53,6 @@ describe('host/environments', () => {
       if (a[0] === 'check-ref-format') { return ok(); }
       if (a[0] === 'rev-parse') { return a[3].startsWith('refs/heads/main') ? ok('abc') : failed(''); }
       if (a[0] === 'fetch') { return ok(); }
-      if (a.includes('config') && a.includes('--get')) { return ok('https://github.com/o/shop.git\n'); }
       if (a[0] === 'worktree' && a[1] === 'add') {
         const dir = a[4];
         fs.mkdirSync(dir, { recursive: true });
@@ -148,6 +147,10 @@ describe('host/environments', () => {
       const a = gitArgs(c.args);
       const local = c.args.includes('protocol.file.allow=always');
       assert.equal(local, a[0] === 'clone' || (a[0] === 'fetch' && a.includes(projectDir)), a.join(' '));
+      // The project path appears only as the source of a clone/fetch — never as --git-dir, -C or a work tree.
+      if (a[0] !== 'clone' && a[0] !== 'fetch') {
+        assert.equal(c.args.some((x) => x.includes(projectDir)), false, a.join(' '));
+      }
     }
   });
 
@@ -187,7 +190,7 @@ describe('host/environments', () => {
   });
 
   it('refuses a branch that exists nowhere', async () => {
-    await assert.rejects(manager().start('shop', 'feat/missing'), /was not found/);
+    await assert.rejects(manager().start('shop', 'feat/missing'), /not in the project yet/);
   });
 
   it('enforces the environment limit, but refreshing an existing one is always allowed', async () => {

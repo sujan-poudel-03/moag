@@ -21,6 +21,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { resolveOnosooConfig, userConfigDir } from '../headless/onosoo-config';
+import { loadApprovedProjects } from '../headless/onosoo-projects';
 import { readMoagVersion } from '../headless/onosoo-relay';
 import { execFileAsync } from '../utils/exec-file';
 
@@ -40,13 +41,6 @@ const USAGE =
 
 const out = (s: string): void => { process.stdout.write(s); };
 const err = (s: string): void => { process.stderr.write(s); };
-
-/** The approved-projects loader, owned by the relay side (src/headless/onosoo-projects.ts). */
-function defaultProjectsLoader(): ProjectsLoader {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const mod = require('../headless/onosoo-projects') as { loadApprovedProjects: ProjectsLoader };
-  return mod.loadApprovedProjects;
-}
 
 const exec: Exec = (command, args, opts) => execFileAsync(command, args, opts);
 
@@ -70,7 +64,7 @@ function cmdInit(stateDir: string): number {
   const host = path.join(stateDir, HOST_CONFIG_FILE);
   const projects = path.join(stateDir, 'projects.json');
   out(writeIfAbsent(host, HOST_CONFIG_TEMPLATE) ? `Wrote ${host}\n` : `${host} already exists; left as it is.\n`);
-  const template = JSON.stringify({ version: 1, remote_start: false, daily_budget_usd: null, projects: [] }, null, 2) + '\n';
+  const template = JSON.stringify({ version: 1, remote_start: false, daily_budget_usd: null, runner_user: null, projects: [] }, null, 2) + '\n';
   out(writeIfAbsent(projects, template) ? `Wrote ${projects}\n` : `${projects} already exists; left as it is.\n`);
   out('\nNext:\n'
     + `  1. Set "preview_domain" in ${host}.\n`
@@ -191,13 +185,9 @@ async function cmdRun(env: NodeJS.ProcessEnv, stateDir: string, loadProjects: Pr
 export async function cmdHost(argv: string[], env: NodeJS.ProcessEnv, deps: HostCliDeps = {}): Promise<number> {
   const platform = deps.platform ?? process.platform;
   const stateDir = stateDirFor(env, platform);
-  let loadProjects: ProjectsLoader;
-  try {
-    loadProjects = deps.loadProjects ?? defaultProjectsLoader();
-  } catch {
-    err('This MOAG build has no approved-projects support (src/headless/onosoo-projects.ts). Update MOAG.\n');
-    return 2;
-  }
+  // The approved-projects loader is the relay side's (src/headless/onosoo-projects.ts): one list,
+  // one set of rules, for remote runs and environments alike.
+  const loadProjects: ProjectsLoader = deps.loadProjects ?? ((dir) => loadApprovedProjects(dir, { platform }));
 
   const [sub, arg] = argv;
   switch (sub ?? 'run') {

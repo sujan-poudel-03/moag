@@ -59,8 +59,3 @@ export function safeGitEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
 export function mirrorPath(stateDir: string, projectId: string): string {
   return path.join(stateDir, 'host', 'repos', `${projectId}.git`);
 }
-
-/** Only https and ssh remotes are fetched from; anything else (ext::, file::, a path) is refused. */
-export function isFetchableRemote(url: string): boolean {
-  return /^https:\/\/[^\s]+$/i.test(url) || /^ssh:\/\/[^\s]+$/i.test(url) || /^[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:[^\s]+$/.test(url);
-}

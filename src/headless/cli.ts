@@ -19,7 +19,10 @@
  *   moag standards check   [--base <ref>] [--no-commands]
  *   moag standards propose [--stack <id>] [--write [--force]]
  *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
+ *   moag host   [run | init | draft <project> | status | stop <env> | remove <env>]
  *
+ * `host`  runs approved project branches as live environments for ONOSOO previews, behind a
+ *          gateway only workspace members get through (src/host/, docs/host-agent.md).
  * `run`   executes a single plan file, or a one-shot prompt (`--prompt`) which is
  *          turned into a single agent task and run through the selected engine.
  * `verify` runs the deterministic PRD gates (status / change / standards / command /
@@ -1921,8 +1924,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return cmdStandards(args);
   }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench|host> ...\n' +
-    '  moag host [run | init | draft <project> | status | stop <env> | remove <env>]   live environments for ONOSOO (docs/host-agent.md)\n' +
+    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench> ...\n' +
+    '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
     '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
     '                       no standards gate (static rules and profile commands) in verification\n' +
