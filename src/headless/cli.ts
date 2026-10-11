@@ -1867,6 +1867,11 @@ async function cmdConfig(args: Args): Promise<number> {
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   // Before anything else: no command handler, and nothing any of them spawns, sees the device key.
   captureRelayEnv(process.env);
+  if (argv[0] === 'host') {
+    // No setup() and no shim: the host agent runs environments and a gateway, never the runner.
+    // It reads the device key from the captured snapshot, like the relay.
+    return require('../host/cli').cmdHost(argv.slice(1), relayConfigEnv());
+  }
   const args = parseArgs(argv);
   if (args.command === 'bench') {
     // No setup() and no shim: the bench drives the hosted server over HTTP and never loads vscode.
@@ -1916,7 +1921,8 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     return cmdStandards(args);
   }
   process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench> ...\n' +
+    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench|host> ...\n' +
+    '  moag host [run | init | draft <project> | status | stop <env> | remove <env>]   live environments for ONOSOO (docs/host-agent.md)\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
     '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
     '                       no standards gate (static rules and profile commands) in verification\n' +
