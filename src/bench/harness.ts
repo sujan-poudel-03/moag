@@ -362,6 +362,8 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
   const notes: string[] = [];
   let harnessError: string | null = null;
   let aborted = false;
+  /** Set once `server.stop()` is under way; the termination handlers stay registered until it ends. */
+  let stopping = false;
   /** The signal that aborted the bench (SIGINT, SIGTERM, …). */
   let abortSignal: string | null = null;
   /** Aborted on Ctrl+C, so a dependency install does not start after it. */
@@ -410,6 +412,12 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
    * the bench itself: a wedged flow needs one more signal or a kill.
    */
   const onSignal = (name: string): void => {
+    if (stopping) {
+      // The server is already stopping: any signal now means "kill now".
+      progress(`${name} while stopping the server: killing every worker now`);
+      server?.killNow?.();
+      return;
+    }
     if (aborted) {
       progress(`second ${name}: killing every worker now`);
       server?.killNow?.();
@@ -675,11 +683,17 @@ export async function runBench(scenario: Scenario, opts: BenchOptions, depsIn: P
     log.write({ kind: 'harness-error', error: harnessError });
     progress(`harness error: ${harnessError}`);
   } finally {
-    try { disposeTermination(); } catch { /* best effort */ }
     try { disposeSse?.(); } catch { /* best effort */ }
-    if (server) {
-      progress('stopping the server…');
-      await server.stop();
+    // The termination handlers outlive server.stop(): a Ctrl+C during "stopping the
+    // server…" must still reach killNow. They are disposed whether stop() resolves or rejects.
+    try {
+      if (server) {
+        stopping = true;
+        progress('stopping the server…');
+        await server.stop();
+      }
+    } finally {
+      try { disposeTermination(); } catch { /* best effort */ }
     }
   }
 

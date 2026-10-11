@@ -9,9 +9,10 @@ import { detectProjectConventions } from '../../../ai-rules/project-detector';
 import { STACK_IDS, StackId } from '../../../server/stacks';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
 import { checkStandards } from '../../../standards/checker';
-import { PROVENANCE_FIELDS, STANDARDS_RULE_IDS, isScannerRule, ruleSeverity, validateProfile, validateProvenance } from '../../../standards/profile';
+import { PROVENANCE_FIELDS, checkDesign, STANDARDS_RULE_IDS, isScannerRule, ruleSeverity, validateProfile, validateProvenance } from '../../../standards/profile';
 import { EVIDENCE_NOTE_SEPARATOR, StandardsProposal, detectedStackId, proposeProfile } from '../../../standards/propose';
 import { makeRepo } from '../ai-rules/fixtures';
+import { ADOPTED_TOKENS_NOTE_HEADING, MAX_DESIGN_DOC_CHARS, MAX_DESIGN_TOKENS_CHARS, templateDesign, withAdoptedTokensNote } from '../../../standards/design';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const proxyquire = require('proxyquire');
@@ -97,7 +98,9 @@ function assertWellFormed(dir: string, proposal: StandardsProposal): void {
   assert.ok(profile.ok, JSON.stringify(profile));
   const provenance = validateProvenance(proposal.provenance);
   assert.ok(provenance.ok, JSON.stringify(provenance));
-  assert.deepEqual(Object.keys(proposal.provenance).sort(), [...PROVENANCE_FIELDS].sort());
+  // `design` is there exactly when the profile has a design system.
+  const expectedKeys = [...PROVENANCE_FIELDS, ...(proposal.profile.design ? ['design'] : [])];
+  assert.deepEqual(Object.keys(proposal.provenance).sort(), expectedKeys.sort());
   for (const field of PROVENANCE_FIELDS) {
     const entry = proposal.provenance[field];
     assert.ok(entry.evidence.length > 0, `${field} has evidence`);
@@ -319,7 +322,10 @@ describe('standards proposal — greenfield', () => {
       assert.equal(detection.sourceFileCount, 0);
       const proposal = proposeProfile(stack, detection);
       assertWellFormed(dir, proposal);
-      assert.deepEqual(proposal.profile, BUILT_IN_PROFILES[stack]);
+      // A static site has a user interface: its proposal also drafts the template design system.
+      const { design, ...rest } = proposal.profile;
+      assert.deepEqual(rest, BUILT_IN_PROFILES[stack]);
+      assert.equal(design !== undefined, stack === 'static-web', 'only static-web shows a UI with nothing in the repository');
       assert.equal(proposal.profile.repoState, 'greenfield');
       for (const field of PROVENANCE_FIELDS) {
         if (field === 'commands') { continue; }
@@ -629,4 +635,202 @@ describe('standards proposal — commands block, every scan advises, and only tr
       assert.deepEqual(report.findings.filter((f) => f.severity === 'blocking'), [], stack);
     }
   });
+});
+
+// ─── Design system proposals ───
+
+describe('standards proposal — design system', () => {
+  const NODE_UI = {
+    'package.json': JSON.stringify({ name: 'app', dependencies: { react: '18.0.0', '@mui/material': '5.0.0' } }),
+    'src/main.tsx': 'export const main = 1;\n',
+  };
+
+  it('greenfield static-web: the template design, assumed, identical across two calls', () => {
+    const dir = makeRepo('moag-prop-design-gf-', {});
+    const a = proposeProfile('static-web', detectTracked(dir));
+    const b = proposeProfile('static-web', detectTracked(dir));
+    assert.deepEqual(a, b);
+    assert.deepEqual(a.profile.design, templateDesign('static-web', ''));
+    assert.deepEqual(a.provenance.design, { tag: 'assumed', evidence: 'static-web default' });
+  });
+
+  it('node-ts with MUI: a design system whose DESIGN.md names MUI', () => {
+    const dir = makeRepo('moag-prop-design-mui-', NODE_UI);
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.frontend.componentKit, 'MUI');
+    assert.ok(proposal.profile.design);
+    assert.match(proposal.profile.design!.doc, /The approved component kit is MUI/);
+    assert.equal(proposal.provenance.design!.tag, 'assumed');
+  });
+
+  it('brownfield with a detected tokens file and design doc: both adopted byte-for-byte, tagged detected', () => {
+    const tokens = ':root {\n  --brand: #123456;\n  --gap: 12px;\n}\n';
+    const doc = '# Our design\n\nUse --brand for actions.\n';
+    const dir = makeRepo('moag-prop-design-adopt-', { ...NODE_UI, 'src/theme.css': tokens, 'docs/DESIGN.md': doc });
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.design!.tokensPath, 'src/theme.css');
+    assert.equal(proposal.profile.design!.tokens, tokens);
+    assert.equal(proposal.profile.design!.docPath, 'docs/DESIGN.md');
+    assert.equal(proposal.profile.design!.doc, doc);
+    assert.equal(proposal.provenance.design!.tag, 'detected');
+    assert.equal(proposal.provenance.design!.evidence, `src/theme.css, docs/DESIGN.md${EVIDENCE_NOTE_SEPARATOR}adopted, not overwritten`);
+  });
+
+  it('adopted tokens with no design doc: the template doc says which of its names the adopted file lacks and lists the ones it has', () => {
+    const tokens = ':root {\n  --brand: #123456;\n  --gap: 12px;\n}\n';
+    const dir = makeRepo('moag-prop-design-adopt-tokens-', { ...NODE_UI, 'src/theme.css': tokens });
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    const design = proposal.profile.design!;
+    assert.equal(design.tokens, tokens, 'the adopted file is byte-equal');
+    assert.equal(design.docPath, 'docs/design/DESIGN.md', 'the template doc');
+    assert.ok(design.doc.includes(ADOPTED_TOKENS_NOTE_HEADING));
+    assert.ok(design.doc.indexOf(ADOPTED_TOKENS_NOTE_HEADING) < design.doc.indexOf('## Colour palette'), 'before the first section');
+    assert.match(design.doc, /src\/theme\.css was adopted from the repository as it is/);
+    assert.match(design.doc, /are not defined in src\/theme\.css: `--color-bg`, `--color-surface`/);
+    assert.match(design.doc, /Use only the names src\/theme\.css defines — `--brand`, `--gap` —/);
+    assert.equal(design.doc.length <= MAX_DESIGN_DOC_CHARS, true);
+    assert.deepEqual(proposeProfile('node-ts', detectTracked(dir)), proposal, 'deterministic');
+  });
+
+  it('adopted tokens that define every name the template doc uses: no note', () => {
+    const dir = makeRepo('moag-prop-design-adopt-full-', { ...NODE_UI, 'src/theme.css': `/* ours */\n${templateDesign('node-ts', '')!.tokens}` });
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assert.equal(proposal.profile.design!.tokensPath, 'src/theme.css');
+    assert.equal(proposal.profile.design!.doc.includes(ADOPTED_TOKENS_NOTE_HEADING), false);
+  });
+
+  it('an adopted tokens file MOAG cannot list (tailwind config): the note says the names are unchecked', () => {
+    const adopted = withAdoptedTokensNote({ ...templateDesign('node-ts', '', 'tailwind.config.js')!, tokens: 'module.exports = { theme: {} };\n' });
+    assert.match(adopted.doc, /tailwind\.config\.js was adopted from the repository as it is \(not a CSS file\), so MOAG could not check this document's token names against it/);
+    assert.deepEqual(checkDesign(adopted), []);
+  });
+
+  it('a template paired with its own tokens is unchanged by the note helper', () => {
+    const t = templateDesign('static-web', '')!;
+    assert.equal(withAdoptedTokensNote(t), t);
+  });
+
+  it('a detected tokens file holding U+202E is not adopted: the template is used and the note says why', () => {
+    const dir = makeRepo('moag-prop-design-bidi-', { ...NODE_UI, 'src/theme.css': ':root {\n  --a: #fff‮;\n}\n' });
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.design!.tokensPath, 'src/styles/tokens.css');
+    assert.equal(proposal.provenance.design!.tag, 'assumed');
+    assert.match(proposal.provenance.design!.evidence, /^node-ts default — src\/theme\.css not adopted: profile\.design\.tokens: line 2 must not contain/);
+  });
+
+  // ── A file MOAG did not adopt is never a proposal's target ──
+
+  /** Every design path the proposal targets, with what is on disk there now (null when nothing). */
+  function targetsOnDisk(dir: string, proposal: StandardsProposal): Array<string | null> {
+    const d = proposal.profile.design!;
+    return [d.docPath, d.tokensPath].map((rel) => {
+      const full = path.join(dir, ...rel.split('/'));
+      return fs.existsSync(full) ? fs.readFileSync(full, 'utf-8') : null;
+    });
+  }
+
+  it('static-web: a tokens file under a selector list `:root, [data-theme="light"]` is adopted, not replaced', () => {
+    const tokens = ':root, [data-theme="light"] {\n  --brand: #123456;\n}\n';
+    const dir = makeRepo('moag-prop-design-sellist-', { 'index.html': '<!doctype html>\n', 'css/tokens.css': tokens });
+    const proposal = proposeProfile('static-web', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.design!.tokensPath, 'css/tokens.css');
+    assert.equal(proposal.profile.design!.tokens, tokens, 'adopted byte-for-byte');
+    assert.equal(proposal.provenance.design!.tag, 'detected');
+  });
+
+  it('static-web: a css/tokens.css MOAG cannot adopt is kept; the template goes to css/design-tokens.css and the provenance says so', () => {
+    const theirs = 'body { margin: 0; }\n';
+    const dir = makeRepo('moag-prop-design-collide-css-', { 'index.html': '<!doctype html>\n', 'css/tokens.css': theirs });
+    const proposal = proposeProfile('static-web', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.design!.tokensPath, 'css/design-tokens.css');
+    assert.equal(proposal.provenance.design!.tag, 'assumed');
+    assert.equal(proposal.provenance.design!.evidence,
+      'static-web default — css/tokens.css exists, not adopted (declares no :root custom properties): proposed css/design-tokens.css instead');
+    assert.deepEqual(targetsOnDisk(dir, proposal), [null, null], 'nothing the proposal targets exists');
+    assert.match(proposal.profile.design!.doc, /css\/design-tokens\.css/, 'the doc names the tokens file it is paired with');
+  });
+
+  it('node-ts React: an oversized src/styles/tokens.css is kept; the template goes to src/styles/design-tokens.css', () => {
+    const big = `:root {\n${Array.from({ length: 600 }, (_, i) => `  --c-${i}: #${String(i).padStart(6, '0')};`).join('\n')}\n}\n`;
+    assert.ok(big.length > MAX_DESIGN_TOKENS_CHARS);
+    const dir = makeRepo('moag-prop-design-collide-big-', { ...NODE_UI, 'src/styles/tokens.css': big });
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.design!.tokensPath, 'src/styles/design-tokens.css');
+    assert.match(proposal.provenance.design!.evidence,
+      /^node-ts default — src\/styles\/tokens\.css exists, not adopted \(larger than 8000 characters\): proposed src\/styles\/design-tokens\.css instead$/);
+    assert.deepEqual(targetsOnDisk(dir, proposal), [null, null]);
+  });
+
+  it('static-web: an oversized docs/design/DESIGN.md is kept; the template doc goes to docs/design/DESIGN-SYSTEM.md', () => {
+    const big = `# Ours\n\n${'Long design prose. '.repeat(800)}\n`;
+    assert.ok(big.length > MAX_DESIGN_DOC_CHARS);
+    const dir = makeRepo('moag-prop-design-collide-doc-', { 'index.html': '<!doctype html>\n', 'docs/design/DESIGN.md': big });
+    const proposal = proposeProfile('static-web', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.design!.docPath, 'docs/design/DESIGN-SYSTEM.md');
+    assert.equal(proposal.profile.design!.tokensPath, 'css/tokens.css');
+    assert.match(proposal.provenance.design!.evidence, /docs\/design\/DESIGN\.md exists, not adopted \(larger than 12000 characters\): proposed docs\/design\/DESIGN-SYSTEM\.md instead/);
+    assert.deepEqual(targetsOnDisk(dir, proposal), [null, null]);
+  });
+
+  it('a tokens file at the default path that fails checks moves the template off that path too', () => {
+    const dir = makeRepo('moag-prop-design-collide-bidi-', { 'index.html': '<!doctype html>\n', 'css/tokens.css': ':root {\n  --a: #fff‮;\n}\n' });
+    const proposal = proposeProfile('static-web', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal(proposal.profile.design!.tokensPath, 'css/design-tokens.css');
+    assert.match(proposal.provenance.design!.evidence, /^static-web default — css\/tokens\.css exists, not adopted \(failed checks\): proposed css\/design-tokens\.css instead — css\/tokens\.css not adopted: /);
+  });
+
+  it('an untracked file at the default path is kept unless it already holds exactly what MOAG would write', () => {
+    const template = templateDesign('static-web', '')!;
+    const dir = makeRepo('moag-prop-design-untracked-', { 'index.html': '<!doctype html>\n' });
+    fs.mkdirSync(path.join(dir, 'css'), { recursive: true });
+    const tracked = (): ConventionDetection => detectProjectConventions(dir, { tracked: { ok: true, files: ['index.html'] } });
+
+    fs.writeFileSync(path.join(dir, 'css', 'tokens.css'), ':root {\n  --mine: 1px;\n}\n');
+    const kept = proposeProfile('static-web', tracked());
+    assert.equal(kept.profile.design!.tokensPath, 'css/design-tokens.css');
+    assert.match(kept.provenance.design!.evidence, /css\/tokens\.css exists, not adopted \(not tracked by git\)/);
+
+    // MOAG's own earlier write, not committed yet (CRLF on disk): the same path, no note.
+    fs.writeFileSync(path.join(dir, 'css', 'tokens.css'), template.tokens.replace(/\n/g, '\r\n'));
+    fs.mkdirSync(path.join(dir, 'docs', 'design'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'docs', 'design', 'DESIGN.md'), template.doc);
+    const own = proposeProfile('static-web', tracked());
+    assert.deepEqual(own.profile.design, template);
+    assert.deepEqual(own.provenance.design, { tag: 'assumed', evidence: 'static-web default' });
+  });
+
+  it('with the default and every fallback path taken there is no design proposal at all', () => {
+    const dir = makeRepo('moag-prop-design-nofree-', {
+      'index.html': '<!doctype html>\n', 'css/tokens.css': 'a{}\n', 'css/design-tokens.css': 'b{}\n', 'styles/design-tokens.css': 'c{}\n',
+    });
+    const proposal = proposeProfile('static-web', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    assert.equal('design' in proposal.profile, false);
+    assert.equal('design' in proposal.provenance, false);
+  });
+
+  for (const stack of ['python', 'go', 'node-ts'] as const) {
+    it(`${stack} without a user interface gets no design: no design key in the profile or the provenance`, () => {
+      const files: Record<string, Record<string, string>> = {
+        python: { 'pyproject.toml': '[project]\nname = "x"\n', 'app/main.py': 'x = 1\n' },
+        go: { 'go.mod': 'module example.com/x\n', 'main.go': 'package main\n' },
+        'node-ts': { 'package.json': JSON.stringify({ name: 'x', dependencies: { express: '4.0.0' } }), 'src/server.ts': 'export {};\n' },
+      };
+      const dir = makeRepo(`moag-prop-design-none-${stack}-`, files[stack]);
+      const proposal = proposeProfile(stack, detectTracked(dir));
+      assertWellFormed(dir, proposal);
+      assert.equal('design' in proposal.profile, false);
+      assert.equal('design' in proposal.provenance, false);
+      assert.deepEqual(proposeProfile(stack, detectTracked(dir)), proposal);
+    });
+  }
 });

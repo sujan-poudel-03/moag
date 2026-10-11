@@ -22,6 +22,7 @@ import {
   validateProfile,
   validateProvenance,
 } from './profile';
+import { DesignSystem, renderDesignPromptText } from './design';
 
 /** Largest standards file read. A valid one is far smaller; anything bigger is not ours. */
 const MAX_STANDARDS_FILE_BYTES = 1024 * 1024;
@@ -47,6 +48,11 @@ export interface StandardsJobFile {
   promptText: string;
   /** The text the planning prompt carries, rendered by the server. */
   plannerText: string;
+  /**
+   * The design-system block every task prompt carries, DERIVED on read from the
+   * hash-verified profile — never a key of the file. Absent when the profile has no design.
+   */
+  designText?: string;
 }
 
 /** Where a workspace keeps its standards. */
@@ -154,7 +160,7 @@ export function writeLocalStandards(cwd: string, doc: StandardsDocument): void {
  */
 export function createLocalStandardsProvider(
   workspaceRoot: string | (() => string | undefined),
-): (taskCwd: string, opts?: { skipRuleNames?: string[] }) => { text: string; version: number } | null {
+): (taskCwd: string, opts?: { skipRuleNames?: string[] }) => { text: string; version: number; design?: string } | null {
   let cached: { root: string; mtimeMs: number; size: number; doc: StandardsDocument } | null = null;
   return (taskCwd, opts) => {
     const root = (typeof workspaceRoot === 'function' ? workspaceRoot() : workspaceRoot) ?? taskCwd;
@@ -173,7 +179,12 @@ export function createLocalStandardsProvider(
       if (doc && stat) { cached = { root, mtimeMs: stat.mtimeMs, size: stat.size, doc }; }
     }
     if (!doc) { return null; }
-    return { text: renderStandardsText(doc.profile, doc.version, { skipRuleNames: opts?.skipRuleNames }), version: doc.version };
+    const design = doc.profile.design;
+    return {
+      text: renderStandardsText(doc.profile, doc.version, { skipRuleNames: opts?.skipRuleNames }),
+      version: doc.version,
+      ...(design ? { design: renderDesignPromptText(design, doc.profile.frontend.componentKit, doc.version) } : {}),
+    };
   };
 }
 
@@ -227,5 +238,92 @@ export function readStandardsJobFile(filePath: string): StandardsJobFile {
     profile: profile.profile,
     promptText: obj.promptText,
     plannerText: obj.plannerText,
+    ...(profile.profile.design
+      ? { designText: renderDesignPromptText(profile.profile.design, profile.profile.frontend.componentKit, obj.version as number) }
+      : {}),
   };
+}
+
+// ─── Design system files in the workspace ───
+
+/** Text compared with line endings normalised, so a CRLF checkout is no difference. */
+function sameText(a: string, b: string): boolean {
+  const norm = (t: string): string => t.replace(/\r\n?/g, '\n');
+  return norm(a) === norm(b);
+}
+
+/** A design file exists, differs, and the caller did not allow replacing it. Nothing was written. */
+export class DesignFileConflictError extends Error {
+  constructor(readonly path: string) {
+    super(`${path} already exists and differs from the approved design system`);
+    this.name = 'DesignFileConflictError';
+  }
+}
+
+/**
+ * Write the approved design system's two files into the workspace: DESIGN.md at `docPath`
+ * and the tokens file at `tokensPath`. A file whose content already matches (line endings
+ * aside) is left alone. Refuses — throws, writing nothing more — a path that leaves the
+ * workspace or that passes through a symbolic link, at any level. Returns the paths written,
+ * and — of those — the ones that replaced an existing file with different content.
+ *
+ * With `opts.backupDir`, every file about to be replaced is first copied there under its
+ * workspace-relative path (all copies are made before any write, so a failed copy writes
+ * nothing). The caller decides where backups live; the workspace is never used for them.
+ *
+ * With `opts.mayReplace`, a file that exists and differs is replaced only when it returns
+ * true for it; otherwise {@link DesignFileConflictError} is thrown before anything is copied
+ * or written.
+ */
+export function writeDesignFiles(
+  cwd: string,
+  design: DesignSystem,
+  opts: { backupDir?: string; mayReplace?: (rel: string, current: string) => boolean } = {},
+): { written: string[]; replaced: string[] } {
+  const root = path.resolve(cwd);
+  const targets: Array<{ rel: string; full: string; content: string }> = [];
+  for (const [rel, content] of [[design.docPath, design.doc], [design.tokensPath, design.tokens]] as const) {
+    const full = path.resolve(root, ...rel.split('/'));
+    const relative = path.relative(root, full);
+    if (relative === '' || relative === '..' || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+      throw new Error(`${rel} is outside the workspace`);
+    }
+    // Every existing ancestor and the target itself: none may be a symbolic link.
+    let at = root;
+    for (const seg of relative.split(path.sep)) {
+      at = path.join(at, seg);
+      let stat: fs.Stats;
+      try { stat = fs.lstatSync(at); } catch { break; }
+      if (stat.isSymbolicLink()) {
+        throw new Error(`${rel} is a symbolic link or lies under one; refusing to write the design system through it`);
+      }
+    }
+    targets.push({ rel, full, content });
+  }
+  const pending: Array<{ rel: string; full: string; content: string; current: string | null }> = [];
+  for (const t of targets) {
+    let current: string | null = null;
+    try { current = fs.readFileSync(t.full, 'utf-8'); } catch { current = null; }
+    if (current !== null && sameText(current, t.content)) { continue; }
+    pending.push({ ...t, current });
+  }
+  if (opts.mayReplace) {
+    for (const t of pending) {
+      if (t.current !== null && !opts.mayReplace(t.rel, t.current)) { throw new DesignFileConflictError(t.rel); }
+    }
+  }
+  const replaced = pending.filter((t) => t.current !== null).map((t) => t.rel);
+  if (opts.backupDir) {
+    for (const t of pending) {
+      if (t.current === null) { continue; }
+      writeFileAtomicSync(path.join(opts.backupDir, ...t.rel.split('/')), t.current, 0o600);
+    }
+  }
+  const written: string[] = [];
+  for (const t of pending) {
+    fs.mkdirSync(path.dirname(t.full), { recursive: true });
+    writeFileAtomicSync(t.full, t.content, 0o644);
+    written.push(t.rel);
+  }
+  return { written, replaced };
 }

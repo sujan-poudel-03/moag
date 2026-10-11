@@ -12,6 +12,7 @@
 
 import { h, mount, badge, glyph, toast, announce, confirmDialog, field, skeleton, errorCard, fmtAgo, fmtTime } from '../dom.js';
 import { STR, serverMessage } from '../strings.js';
+import { designSummary, tokenTable, designDoc, tokenDiffTable, previewTokens } from './design-view.js';
 
 const LIST_CAP = 50;
 
@@ -31,6 +32,7 @@ const STATUS_WORDS = { pending: 'pending review', approved: 'approved', rejected
 const SECTIONS = [
   ['structure', 'Folder structure'],
   ['frontend', 'Frontend'],
+  ['design', 'Design system'],
   ['backend', 'Backend layering'],
   ['naming', 'Naming'],
   ['comments', 'Comment policy'],
@@ -48,6 +50,7 @@ const RULE_LABELS = {
   'structure/placement': 'Files sit where the placement rules say',
   'structure/nested-repository': 'No git repository nested inside the workspace',
   'frontend/raw-pattern': 'Raw frontend patterns',
+  'frontend/design-tokens': 'UI files use the design tokens and component kit',
   'layering/imports': 'Layers import only what they may',
   'naming/files': 'File names follow the naming style',
   'comment-policy/commented-out-code': 'No commented-out code',
@@ -180,6 +183,15 @@ function sectionRows(profile, key) {
         { label: 'Raw patterns', value: list(f.rawPatterns).map((r) => `${r.message} (${r.kind} ${r.value} in ${joined(r.globs) || 'all files'})`).join('\n'), prov: 'frontend.rawPatterns' },
       ];
     }
+    case 'design': {
+      const d = p.design || null;
+      if (!d) { return []; }
+      return [
+        { label: 'DESIGN.md', value: d.docPath || '', prov: 'design' },
+        { label: 'Tokens file', value: d.tokensPath || '', prov: 'design' },
+        { label: 'Tokens', value: String(d.tokens || ''), prov: null },
+      ];
+    }
     case 'backend': {
       const b = p.backend || {};
       return [
@@ -307,11 +319,77 @@ function enforcementNote(version) {
     set.ruleConfig.map((c) => fieldBlock(`Settings of the blocking rule ${ruleLabel(c.rule)}`, c)));
 }
 
+/**
+ * What a version changes about the design system, as the server computed it against the
+ * standards in effect (`designChanged`). `changed` errs on the side of asking: any token,
+ * section or path difference counts. An older server's DTO yields no change.
+ */
+function designChanges(version) {
+  const raw = (version && version.designChanged) || {};
+  const tokens = list(raw.tokens).filter((t) => t && typeof t.name === 'string');
+  const sections = list(raw.sections).filter((x) => x && typeof x.heading === 'string');
+  return {
+    ...raw,
+    tokens, sections,
+    comparedTo: typeof raw.comparedTo === 'number' ? raw.comparedTo : null,
+    changed: raw.changed === true || tokens.length > 0 || sections.length > 0 || !!raw.paths || !!raw.raw,
+  };
+}
+
+/** The design-system change block: un-collapsed, under the enforcement changes. */
+function designNote(version) {
+  const set = designChanges(version);
+  if (!set.changed) { return null; }
+  return h('div', { class: 'text-info', role: 'note', 'aria-label': 'Design system changes' },
+    h('p', null, glyph('~'), ' ', STR.C66(set.comparedTo).text),
+    tokenDiffTable(set));
+}
+
+/** The parts named in the acknowledgement label (C65): what this version changes. */
+function acknowledgementParts(version) {
+  const set = enforcementChanges(version);
+  return [
+    set.commands !== null ? 'commands' : null,
+    set.severity.length > 0 ? 'rule severity' : null,
+    set.requiredDirs !== null ? 'required directories' : null,
+    set.ruleConfig.length > 0 ? 'settings of a blocking rule' : null,
+    designChanges(version).changed ? 'design system' : null,
+  ].filter(Boolean).join(', ');
+}
+
+/** The design system of a version as the server describes it (`design`), or one built from the profile for an older server. */
+function designOf(version) {
+  if (version && version.design && typeof version.design === 'object') { return version.design; }
+  const d = version && version.profile && version.profile.design;
+  return d ? { docPath: d.docPath, tokensPath: d.tokensPath, doc: d.doc, tokensContent: d.tokens, tokens: [], tokensListable: false, tokensReason: 'not described by this server' } : null;
+}
+
+/** The read-only design-system section of a version. */
+function designSectionView(version, marker) {
+  const d = designOf(version);
+  const n = version.version;
+  if (!d) {
+    return h('div', null, h('h3', { class: 'section-header' }, 'Design system', marker), h('p', { class: 'muted' }, '—'));
+  }
+  const tokens = list(d.tokens);
+  return h('div', null,
+    h('h3', { class: 'section-header' }, 'Design system', marker),
+    h('p', { class: 'muted' }, STR.C68.text),
+    designSummary(d, { provenance: (f) => provenanceTag(version, f), inRun: STR.C71(d.docPath, d.tokensPath).text }),
+    d.tokensListable === false
+      ? [h('p', { class: 'muted' }, STR.C72(d.tokensPath, d.tokensReason || 'not a CSS file').text),
+        h('pre', { class: 'tail', tabindex: '0', 'aria-label': `Tokens file ${d.tokensPath}` }, String(d.tokensContent || ''))]
+      : [h('h4', { class: 'section-header' }, `Tokens  ${tokens.length}`), tokenTable(tokens, { caption: `Standards v${n} design tokens` })],
+    designDoc(d.doc, `DESIGN.md, standards v${n}`, { open: version.status === 'pending' && designChanges(version).changed }));
+}
+
 /** One read-only section of a version: heading, values with provenance, change marker. */
 function sectionView(version, key, title, baseRecord, limits) {
   const profile = version.profile || {};
   const changed = !!baseRecord && !!version.changedFrom && list(version.changedFrom.sections).includes(key);
   const marker = changed ? changeMarker(baseRecord.version) : null;
+  // The design system's own change block shows its differences in full; no second before/after.
+  if (key === 'design') { return designSectionView(version, marker); }
   const diff = changed ? beforeAfter(sectionText(baseRecord.profile, key), sectionText(profile, key)) : null;
 
   if (key === 'commands') {
@@ -359,7 +437,10 @@ function sectionView(version, key, title, baseRecord, limits) {
 /** Every section of a version, changed ones first. */
 function sectionsView(version, baseRecord, limits) {
   const changedKeys = baseRecord && version.changedFrom ? list(version.changedFrom.sections) : [];
-  const ordered = [...SECTIONS.filter(([k]) => changedKeys.includes(k)), ...SECTIONS.filter(([k]) => !changedKeys.includes(k))];
+  // The design section is left out — not shown empty — when neither this version nor its base has one.
+  const hasDesign = !!(version.profile && version.profile.design) || !!(baseRecord && baseRecord.profile && baseRecord.profile.design);
+  const shown = SECTIONS.filter(([k]) => k !== 'design' || hasDesign);
+  const ordered = [...shown.filter(([k]) => changedKeys.includes(k)), ...shown.filter(([k]) => !changedKeys.includes(k))];
   return ordered.map(([key, title]) => sectionView(version, key, title, baseRecord, limits));
 }
 
@@ -412,6 +493,11 @@ function toForm(profile) {
     builtInRuleIds: lines(p.builtInRuleIds),
     freeText: p.freeText || '',
     severity: resolvedSeverity(p),
+    designEnabled: !!p.design,
+    designDocPath: (p.design && p.design.docPath) || '',
+    designTokensPath: (p.design && p.design.tokensPath) || '',
+    designTokens: (p.design && p.design.tokens) || '',
+    designDoc: (p.design && p.design.doc) || '',
   };
 }
 
@@ -515,6 +601,15 @@ function fromForm(vals, source) {
     const chosen = (vals.severity || {})[rule] === 'advisory' ? 'advisory' : (vals.severity || {})[rule] === 'blocking' ? 'blocking' : severityDefaults[rule];
     if (sourceOverrides[rule] === chosen || chosen !== severityDefaults[rule]) { overrides[rule] = chosen; }
   }
+  // The design system goes along only while its box is ticked; unticked, the key is left out.
+  if (vals.designEnabled === true) {
+    profile.design = {
+      docPath: String(vals.designDocPath || '').trim(),
+      tokensPath: String(vals.designTokensPath || '').trim(),
+      doc: String(vals.designDoc || ''),
+      tokens: String(vals.designTokens || ''),
+    };
+  }
   if (Object.keys(severityDefaults).length === 0) {
     // The server sent no severity table (an older build): what the source says is passed through untouched.
     if (Object.keys(sourceOverrides).length > 0) { profile.severity = { ...sourceOverrides }; }
@@ -536,6 +631,10 @@ const ERROR_FIELDS = [
   ['profile.testing.runner', 'runner'], ['profile.testing.fileGlobs', 'fileGlobs'], ['profile.testing.notes', 'testingNotes'],
   ['profile.commands', 'commands'], ['profile.builtInRuleIds', 'builtInRuleIds'], ['profile.freeText', 'freeText'],
   ['profile.severity', 'severity'],
+  // Most specific first: `profile.design` alone (a planner-cap error) lands on DESIGN.md.
+  ['profile.design.docPath', 'designDocPath'], ['profile.design.tokensPath', 'designTokensPath'],
+  ['profile.design.tokens', 'designTokens'], ['profile.design.doc', 'designDoc'],
+  ['profile.design', 'designDoc'],
 ];
 
 // ─── Screen ───
@@ -577,10 +676,18 @@ export async function render(app, params, view) {
   };
 
   /** Start an edit from version `v`, or from a blank profile when the project has no version at all. */
-  const startEdit = (v) => {
+  const startEdit = (v, extra) => {
     const profile = v ? v.profile : blankProfile(state.dto.stack);
-    drafts.set(projectId, { from: v ? v.version : null, baseVersion: latestNumber(), profile, vals: toForm(profile) });
+    // `extra.design`: a suggested design system merged into the draft, so it starts dirty.
+    const start = extra && extra.design ? { ...profile, design: extra.design } : profile;
+    drafts.set(projectId, { from: v ? v.version : null, baseVersion: latestNumber(), profile, vals: toForm(start) });
     renderAll(true);
+  };
+
+  /** "…; every agent task builds against it." when the version has a design system (C73). */
+  const designConfirmText = (v) => {
+    const d = designOf(v);
+    return d ? ` ${STR.C73(v.version, list(d.tokens).length).text}` : '';
   };
 
   // ─── Decisions ───
@@ -589,7 +696,8 @@ export async function render(app, params, view) {
     if (r.status === 409 && r.body.error === 'hash-mismatch') {
       toast(STR.C37.text, 'error');
     } else if (r.status === 409 && r.body.error === 'acknowledgement-required') {
-      toast(STR.C56.text, 'error');
+      const fields = list(r.body.fields);
+      toast(fields.length === 1 && fields[0] === 'design' ? STR.C67.text : STR.C56.text, 'error');
     } else if (r.status === 409 && r.body.error === 'already-decided') {
       toast(STR.C22(r.body.status || 'decided', '', r.body.decidedAt ? fmtTime(r.body.decidedAt) : '').text, 'warning');
     } else if (r.status !== 403 && r.status !== 401) {
@@ -607,7 +715,7 @@ export async function render(app, params, view) {
     ? { contentHash: v.contentHash, acknowledgedEnforcementHash: v.contentHash } : { contentHash: v.contentHash });
 
   const approve = async (v, acknowledged) => {
-    const ok = await confirmDialog({ title: 'Approve these standards?', text: STR.C32(v.version, list(v.commands).length).text, confirmLabel: 'Approve standards' });
+    const ok = await confirmDialog({ title: 'Approve these standards?', text: STR.C32(v.version, list(v.commands).length).text + designConfirmText(v), confirmLabel: 'Approve standards' });
     if (!ok) { return; }
     const r = await app.api('POST', `${api}/versions/${encodeURIComponent(v.version)}/approve`, decisionBody(v, acknowledged));
     if (!r.ok) { await decisionRefused(r); return; }
@@ -630,7 +738,7 @@ export async function render(app, params, view) {
   };
 
   const acceptDefaults = async (v, acknowledged) => {
-    const ok = await confirmDialog({ title: 'Accept the defaults without review?', text: STR.C34(v.version, state.dto.stack).text, confirmLabel: 'Accept defaults' });
+    const ok = await confirmDialog({ title: 'Accept the defaults without review?', text: STR.C34(v.version, state.dto.stack).text + designConfirmText(v), confirmLabel: 'Accept defaults' });
     if (!ok) { return; }
     const r = await app.api('POST', `${api}/accept-defaults`, decisionBody(v, acknowledged));
     if (!r.ok) { await decisionRefused(r); return; }
@@ -691,7 +799,8 @@ export async function render(app, params, view) {
       // A version that changes enforcement is put into effect only by someone who ticked
       // that they saw the changes. Until then the buttons that do so stay disabled — and
       // the server refuses the request without the acknowledgement, whatever this screen does.
-      const mustAcknowledge = enforcementChanges(v).changed;
+      const designChanged = designChanges(v).changed;
+      const mustAcknowledge = enforcementChanges(v).changed || designChanged;
       const canEnact = allowed.has('standards.approve') || allowed.has('standards.accept-defaults');
       const ackId = `standards-ack-${v.version}`;
       const ackBox = mustAcknowledge && canEnact ? h('input', { type: 'checkbox', id: ackId }) : null;
@@ -706,7 +815,8 @@ export async function render(app, params, view) {
           if (acceptBtn) { acceptBtn.disabled = !ackBox.checked; }
         });
         footer.push(h('hr', { class: 'panel-divider' }),
-          h('p', null, ackBox, ' ', h('label', { for: ackId }, STR.C57(v.version).text)));
+          h('p', null, ackBox, ' ', h('label', { for: ackId },
+            designChanged ? STR.C65(v.version, acknowledgementParts(v)).text : STR.C57(v.version).text)));
       }
       if (canDecide) {
         const reason = field({ label: 'Rejection reason', input: h('input', { type: 'text', maxlength: 2000 }) });
@@ -726,12 +836,23 @@ export async function render(app, params, view) {
         editBtn ? h('div', { class: 'form-actions' }, editBtn) : h('p', { class: 'muted' }, 'Only a product owner can propose changes.'));
     }
 
+    // A project with a user interface whose standards have no design system: offer one.
+    const suggestion = state.dto.designSuggestion;
+    const suggest = v.inEffect && suggestion && suggestion.design && !profile.design && canPropose()
+      ? h('div', { class: ['card', 'card-info'], role: 'note' },
+        h('p', null, STR.C70(String(suggestion.evidence || 'detected')).text),
+        h('div', { class: 'form-actions' }, h('button', {
+          type: 'button', class: 'btn btn-secondary', on: { click: () => startEdit(v, { design: suggestion.design }) },
+        }, 'Propose a design system')))
+      : null;
     const kind = v.status === 'pending' ? 'card-warning' : v.inEffect ? 'card-success' : '';
     const el = h('section', { class: ['card', kind], 'aria-label': `Standards version ${v.version}` },
       h('div', { class: 'card-head' }, heading, h('span', { class: 'header-spacer' }), statusBadge(v)),
       meta,
+      suggest,
       // Un-collapsed and above every section: what approving this version changes about enforcement.
       v.status === 'pending' || v.inEffect ? enforcementNote(v) : null,
+      v.status === 'pending' || v.inEffect ? designNote(v) : null,
       sectionsView(v, baseRecord, state.dto.limits),
       footer);
     return { el, heading };
@@ -805,6 +926,7 @@ export async function render(app, params, view) {
     const submitBtn = h('button', { type: 'submit', class: 'btn btn-primary' }, 'Submit for review');
     const formErr = h('div', { class: 'form-error', role: 'alert', hidden: true });
     const noticeHost = h('div');
+    const nextNumber = (draft.baseVersion || 0) + 1;
 
     const isDirty = () => {
       const built = fromForm(vals, source.profile);
@@ -901,6 +1023,59 @@ export async function render(app, params, view) {
     freeText.addEventListener('input', () => { vals.freeText = freeText.value; syncCounter(); sync(); });
     inputs.freeText = { input: freeText, setError: (msg) => { if (msg) { counter.textContent = `✗ ${msg}`; counter.className = 'field-error'; freeText.setAttribute('aria-invalid', 'true'); } else { syncCounter(); } } };
 
+    // Design system: a box that includes it, two paths, the tokens file and DESIGN.md.
+    const designLimits = { doc: Number(limits.designDocChars) || 12000, tokens: Number(limits.designTokensChars) || 8000 };
+    const designBox = h('input', { type: 'checkbox', id: 'design-enabled' });
+    designBox.checked = vals.designEnabled === true;
+    const designDocPath = bind('designDocPath', 'DESIGN.md path', h('input', { type: 'text', maxlength: 200, class: 'mono' }), { hint: 'Relative to the repository. Written at the start of every run.' });
+    const designTokensPath = bind('designTokensPath', 'Tokens file path', h('input', { type: 'text', maxlength: 200, class: 'mono' }));
+    const previewHost = h('div');
+    const renderPreview = () => {
+      const tokens = previewTokens(vals.designTokens);
+      mount(previewHost, h('details', { class: 'diff-group' },
+        h('summary', null, `Preview  ${tokens.length} tokens`),
+        tokenTable(tokens, { caption: 'Tokens in this draft', contrast: false })));
+    };
+    const designTokens = bind('designTokens', 'Tokens', h('textarea', { rows: 10, spellcheck: 'false', class: 'mono' }),
+      { hint: 'The file\'s full content. CSS custom properties (--name: value;) are listed as tokens. Name the background token --color-bg, or contrast can\'t be shown.', after: renderPreview });
+    const docCounter = h('p', { class: 'hint' });
+    const syncDocCounter = () => {
+      const n = String(vals.designDoc || '').length;
+      const over = n > designLimits.doc;
+      docCounter.textContent = `${over ? '✗ ' : ''}${count(n)} / ${count(designLimits.doc)} characters`;
+      docCounter.className = over ? 'field-error' : 'hint';
+    };
+    const designDocArea = bind('designDoc', 'DESIGN.md', h('textarea', { class: 'prd-editor', spellcheck: 'true' }), { after: syncDocCounter });
+    const designFields = h('div', null, designDocPath, designTokensPath, designTokens, previewHost, designDocArea, docCounter);
+    const showDesign = () => { designFields.hidden = !designBox.checked; };
+    designBox.addEventListener('change', async () => {
+      if (designBox.checked) {
+        // Ticking fills an empty draft from the suggestion, else from the stack's template.
+        const fill = (state.dto.designSuggestion && state.dto.designSuggestion.design) || state.dto.designTemplate || null;
+        if (fill && !vals.designDocPath && !vals.designTokensPath && !vals.designTokens && !vals.designDoc) {
+          vals.designDocPath = fill.docPath || '';
+          vals.designTokensPath = fill.tokensPath || '';
+          vals.designTokens = fill.tokens || '';
+          vals.designDoc = fill.doc || '';
+          for (const key of ['designDocPath', 'designTokensPath', 'designTokens', 'designDoc']) { inputs[key].input.value = vals[key]; }
+        }
+        vals.designEnabled = true;
+      } else if (vals.designEnabled) {
+        const n = previewTokens(vals.designTokens).length;
+        const ok = await confirmDialog({
+          title: 'Remove the design system from this proposal?',
+          text: `The DESIGN.md text and ${n} token${n === 1 ? '' : 's'} are left out of v${nextNumber}.${state.dto.effectiveVersion ? ` v${state.dto.effectiveVersion} keeps its design system until a reviewer approves this version.` : ''} Discard changes brings them back.`,
+          confirmLabel: 'Remove design system', cancelLabel: 'Keep it', destructive: true,
+        });
+        if (!ok) { designBox.checked = true; return; }
+        vals.designEnabled = false;
+      }
+      showDesign();
+      renderPreview();
+      syncDocCounter();
+      sync();
+    });
+
     const clearErrors = () => {
       formErr.hidden = true;
       mount(formErr);
@@ -987,7 +1162,6 @@ export async function render(app, params, view) {
     };
 
     title.textContent = source.version === null ? 'Propose standards' : `Edit standards · from v${source.version}`;
-    const nextNumber = (draft.baseVersion || 0) + 1;
     const form = h('form', { on: { submit }, novalidate: true },
       h('p', null, `Submitting creates v${nextNumber} for review.${state.dto.effectiveVersion ? ` v${state.dto.effectiveVersion} stays in effect until then.` : ''}`),
       noticeHost,
@@ -1002,6 +1176,10 @@ export async function render(app, params, view) {
         bind('componentKit', 'Component kit', text(), { prov: 'frontend.componentKit' }),
         bind('styleSource', 'Style source', text(), { prov: 'frontend.styleSource' }),
         bind('rawPatterns', 'Raw patterns', area(), { hint: 'One per line: id | literal or builtin | value | globs | message', prov: 'frontend.rawPatterns' })),
+      h('fieldset', { class: 'field card' },
+        h('legend', null, 'Design system', provenanceTag(source, 'design')),
+        h('p', null, designBox, ' ', h('label', { for: 'design-enabled' }, 'This project has a user interface (include a design system)')),
+        designFields),
       group('Backend layering',
         bind('layers', 'Layers', area(), { hint: 'One per line: name: glob, glob', prov: 'backend.layers' }),
         bind('forbiddenImports', 'Forbidden imports', area(2), { hint: 'One per line: layer -> layer it must not import from' }),
@@ -1038,6 +1216,9 @@ export async function render(app, params, view) {
         submitBtn));
 
     mount(view, h('div', { class: 'form-page' }, h('div', { class: 'screen-header' }, title, status), form));
+    showDesign();
+    renderPreview();
+    syncDocCounter();
     syncCounter();
     sync();
     if (focus) { title.setAttribute('tabindex', '-1'); title.focus(); }

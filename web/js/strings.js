@@ -115,6 +115,22 @@ export const STR = Object.freeze({
   /** @param {number} v the standards version approving the ship will apply */
   C63: (v) => m(`No standards check before this gate: this run started before the project had standards. Approving applies standards v${v}, and the run is checked against them when it verifies.`),
   C64: m('No standards check before this gate: this run started before the project had standards, and none are approved yet. A ship cannot be approved until they are.'),
+  /** @param {number} n the version @param {string} parts what changed: "commands", "rule severity", "required directories", "design system" */
+  C65: (n, parts) => m(`I have read the changes in standards v${n} shown above (${parts}) and approve them as they are.`),
+  /** @param {number|null} approved the approved version it is compared with, or null */
+  C66: (approved) => m(`Design system changes: this version differs from ${approved ? `v${approved}, the approved version before it,` : 'an empty baseline (nothing was approved before it)'} in its tokens or DESIGN.md. Agents build every screen against the approved design system. Every difference is shown below.`),
+  C67: m('Nothing was approved: this version changes the design system, and the request did not confirm that you saw those changes. Tick the confirmation under the changes, then approve again.'),
+  C68: m('MOAG checks UI files against these tokens and the component kit. The check is advisory unless "What blocks a release" makes it blocking: it reports findings or no findings, never a pass.'),
+  /** @param {string} path the design-system file the run changed */
+  C69: (path) => m(`This run changed ${path}, part of the approved design system. Runs may not change it, so the change is reported as a finding. To change the design system, propose a new standards version.`, ['control:view-standards-report']),
+  /** @param {string} evidence what showed a user interface, e.g. "react and @mui/material in package.json" */
+  C70: (evidence) => m(`This project looks like it has a user interface (${evidence}), but its standards have no design system. Agents build screens without shared colours, type or spacing.`),
+  /** @param {string} doc @param {string} tokens */
+  C71: (doc, tokens) => m(`Written to ${doc} and ${tokens} at the start of every run. Edit them here, not in the repository: a run that changes them gets a finding.`),
+  /** @param {string} path @param {string} reason */
+  C72: (path, reason) => m(`MOAG can't list the tokens in ${path} (${reason}), so no swatches are shown. The file is shown as it is.`),
+  /** @param {number} n the version @param {number} tokens how many tokens it lists */
+  C73: (n, tokens) => m(`It includes a design system with ${tokens} token${tokens === 1 ? '' : 's'}; every agent task builds against it.`),
   /** @param {string} rule the scanner rule being made blocking */
   C54: (rule) => m(`Heuristic rule. As a blocking rule, ${rule} can stop correct code and can miss real violations. Prefer a command (a linter, formatter or test) for anything that must stop a release.`),
 });

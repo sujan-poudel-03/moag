@@ -7,6 +7,7 @@ import {
   StandardsCheckFile,
   StandardsCheckInput,
   StandardsReport,
+  StandardsRuleOutcome,
   capStandardsReport,
   checkStandards,
   commandRow,
@@ -14,7 +15,11 @@ import {
   skippedStandardsReport,
   standardsBlockingEvaluated,
   standardsBlockingState,
+  standardsBlocked,
+  isBlockingNotChecked,
+  ruleOutcomeLabel,
 } from '../../../standards/checker';
+import { templateDesign } from '../../../standards/design';
 import { MAX_GLOB_WILDCARDS, globToRegExp, isUnder, matchesAny } from '../../../standards/glob';
 import { RULE_RESULTS, STANDARDS_RULE_IDS, StandardsProfile, StandardsRuleId } from '../../../standards/profile';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
@@ -34,7 +39,7 @@ function input(files: StandardsCheckFile[], over: Partial<StandardsCheckInput> =
   return { baseRef: 'abc123', files, existingDirs: ['src', 'src/test'], topLevel: ['src', 'docs', 'package.json'], goModulePath: null, ...over };
 }
 
-function outcome(report: StandardsReport, rule: StandardsRuleId): { result: string; reason?: string } {
+function outcome(report: StandardsReport, rule: StandardsRuleId): { result: string; reason?: string; unconfigured?: boolean } {
   const row = report.rules.find((r) => r.rule === rule);
   assert.ok(row, `no row for ${rule}`);
   return row;
@@ -135,6 +140,8 @@ describe('standards checker — report shape', () => {
     for (const rule of STANDARDS_RULE_IDS) {
       const row = outcome(report, rule);
       assert.equal(row.result, 'not-checked', rule);
+      // The sample profile has no design system: that rule is simply not configured.
+      if (rule === 'frontend/design-tokens') { assert.equal(row.unconfigured, true); continue; }
       assert.match(row.reason ?? '', /No diff could be taken/);
     }
     assert.equal(report.baseRef, null);
@@ -158,6 +165,7 @@ describe('standards checker — report shape', () => {
       if (treeRules.includes(rule)) { continue; }
       const row = outcome(report, rule);
       assert.equal(row.result, 'not-checked', rule);
+      if (rule === 'frontend/design-tokens') { assert.equal(row.unconfigured, true); continue; }
       assert.match(row.reason ?? '', /nothing for this rule to check/, rule);
     }
     assert.deepEqual(report.totals, totalsOf({ noFindings: 2, notChecked: STANDARDS_RULE_IDS.length - 2 }));
@@ -1101,5 +1109,190 @@ describe('standards checker — skipped, capped and parsed reports', () => {
     assert.deepEqual(parsed.totals, totalsOf({ failed: 2, findings: 450 }));
     assert.deepEqual(parsed.rules.map((r) => r.severity), ['blocking', 'blocking'], 'a row with no severity is blocking');
     assert.equal(parsed.baseRef, null);
+  });
+});
+
+// ─── frontend/design-tokens ───
+
+describe('standards checker — frontend/design-tokens', () => {
+  const RULE: StandardsRuleId = 'frontend/design-tokens';
+
+  function designed(kit = ''): StandardsProfile {
+    const p = JSON.parse(JSON.stringify(BUILT_IN_PROFILES.other)) as StandardsProfile;
+    p.frontend.componentKit = kit;
+    p.design = templateDesign('node-ts', kit)!;
+    return p;
+  }
+  /** The two design files exactly as approved (CRLF on disk is no difference). */
+  function intact(p: StandardsProfile): StandardsCheckInput['designFiles'] {
+    return [{ path: p.design!.docPath, content: p.design!.doc }, { path: p.design!.tokensPath, content: p.design!.tokens.replace(/\n/g, '\r\n') }];
+  }
+  const run = (p: StandardsProfile, files: StandardsCheckFile[], over: Partial<StandardsCheckInput> = {}): StandardsReport =>
+    checkStandards(p, input(files, { designFiles: intact(p), ...over }));
+  const row = (report: StandardsReport): StandardsRuleOutcome => report.rules.find((r) => r.rule === RULE)!;
+
+  it('is not configured without a design system', () => {
+    const report = checkStandards(BUILT_IN_PROFILES.other, input([added('src/a.css', ['a { color: #fff; }'])]));
+    assert.equal(row(report).result, 'not-checked');
+    assert.equal(row(report).unconfigured, true);
+    assert.deepEqual(findingsFor(report, RULE), []);
+  });
+
+  it('a raw hex in .css and in .tsx is a finding; inside a comment it is not', () => {
+    const report = run(designed(), [
+      added('src/a.css', ['/* #ffffff is the old bg */', '.a { color: #1f2328; }', '.b { color: var(--color-fg); }']),
+      added('src/B.tsx', ['// #000 in a comment', 'export const B = () => <div style={{ color: "#ff0000" }} />;']),
+    ]);
+    assert.deepEqual(findingsFor(report, RULE), [{ file: 'src/a.css', line: 2 }, { file: 'src/B.tsx', line: 2 }]);
+    assert.equal(row(report).result, 'failed');
+    assert.ok(report.findings.filter((f) => f.rule === RULE).every((f) => f.severity === 'advisory'));
+    assert.match(report.findings.find((f) => f.rule === RULE)!.message, /Raw colour; use a design token from src\/styles\/tokens.css/);
+    assert.equal(ruleOutcomeLabel(row(report)), 'findings');
+    assert.equal(standardsBlocked(report), false, 'advisory by default');
+  });
+
+  it('a styled-components .ts file and a plain-JS .js component are scanned: raw values in their literals are findings', () => {
+    const report = run(designed(), [
+      added('src/d.ts', [
+        'import styled from "styled-components";',
+        'export const Box = styled.div`',
+        '  color: #ff0000; padding: 16px;',
+        '  margin: ${(p) => p.gap}px;',
+        '  @media (min-width: 768px) { display: flex; }',
+        '`;',
+      ]),
+      added('src/Card.js', ['export const Card = () => h("div", { style: { color: "#00ff00" } });']),
+    ]);
+    assert.deepEqual(report.findings.filter((f) => f.rule === RULE).map((f) => [f.file, f.line, f.message.split(';')[0]]), [
+      ['src/Card.js', 1, 'Raw colour'],
+      ['src/d.ts', 3, 'Raw colour'],
+      ['src/d.ts', 3, 'Raw length'],
+    ]);
+  });
+
+  it('in a .ts/.js file only literal text is read: code, comments and ${} expressions are not findings', () => {
+    const report = run(designed(), [
+      added('src/server.ts', [
+        'class A { #abc = 1; #fade = 2; }',
+        '// #ff0000 and 16px in a comment',
+        'const n = 16; const css = `a { color: ${theme.fg}; }`;',
+        'const label = "Version 2";',
+      ]),
+      added('src/b.mjs', ['export const x = 0x1f;']),
+    ]);
+    assert.deepEqual(findingsFor(report, RULE), []);
+    assert.equal(row(report).result, 'passed', 'they were read: no design findings');
+    assert.equal(ruleOutcomeLabel(row(report)), 'no findings');
+  });
+
+  it('a .ts file that cannot be lexed or read is not checked, never silently passed', () => {
+    const unread = run(designed(), [{ path: 'src/big.ts', status: 'added', addedLines: [], content: null, skipped: 'File is larger than 512 KB' }]);
+    assert.equal(row(unread).result, 'not-checked');
+    assert.match(row(unread).reason ?? '', /not checked \(File is larger than 512 KB\) \(src\/big\.ts\)/);
+    const unlexed = run(designed(), [added('src/broken.ts', ['const s = `never closed', 'color: #fff;'])]);
+    if (row(unlexed).result === 'not-checked') {
+      assert.match(row(unlexed).reason ?? '', /not checked \(.+\) \(src\/broken\.ts\)/);
+    } else {
+      // The lexer accepted it: then it was read, and the literal is a finding.
+      assert.equal(row(unlexed).result, 'failed');
+    }
+  });
+
+  it('@media lengths, 0 and 1px are not findings; 14px and rgb() are', () => {
+    const report = run(designed(), [added('src/a.css', [
+      '@media (min-width: 768px) {',
+      '  .a { margin: 0; border: 1px solid var(--color-border); }',
+      '  .b { font-size: 14px; }',
+      '  .c { background: rgb(0, 0, 0); padding: var(--space-2, 8px); }',
+      '}',
+    ])]);
+    assert.deepEqual(report.findings.filter((f) => f.rule === RULE).map((f) => [f.line, f.message.split(';')[0]]), [
+      [3, 'Raw length'],
+      [4, 'Raw colour'],
+    ]);
+  });
+
+  it('a clean UI change reads "no findings", never "passed"', () => {
+    const report = run(designed(), [added('src/a.css', ['.a { color: var(--color-fg); padding: var(--space-2); }'])]);
+    assert.equal(row(report).result, 'passed');
+    assert.equal(ruleOutcomeLabel(row(report)), 'no findings');
+  });
+
+  it('with the design files intact and no UI change, the integrity check alone is evidence', () => {
+    const report = run(designed(), []);
+    assert.equal(row(report).result, 'passed');
+    assert.equal(ruleOutcomeLabel(row(report)), 'no findings');
+  });
+
+  it('the tokens file itself is never scanned, by either rule', () => {
+    const p = designed();
+    p.frontend.rawPatterns = [{ id: 'hex', kind: 'builtin', value: 'hex-color', globs: [], message: 'No hex' }];
+    const report = run(p, [added(p.design!.tokensPath, p.design!.tokens.split('\n'))]);
+    assert.deepEqual(report.findings, []);
+  });
+
+  it('a .scss change is not checked, undecided, with the reason; it is listed among the files not checked', () => {
+    const report = run(designed(), [added('src/a.scss', ['$x: #fff;'])]);
+    assert.equal(row(report).result, 'not-checked');
+    assert.equal(row(report).undecided, true);
+    assert.match(row(report).reason ?? '', /not checked \(unsupported type \(\.scss\)\) \(src\/a\.scss\)/);
+    assert.ok((report.notCheckedFiles ?? []).some((f) => f.file === 'src/a.scss'));
+  });
+
+  it('an unread .css file is not checked', () => {
+    const report = run(designed(), [{ path: 'src/big.css', status: 'added', addedLines: [], content: null, skipped: 'File is larger than 512 KB' }]);
+    assert.equal(row(report).result, 'not-checked');
+    assert.match(row(report).reason ?? '', /not checked \(File is larger than 512 KB\) \(src\/big\.css\)/);
+  });
+
+  it('a tokens file that differs, and a DESIGN.md that is missing, are findings on line 1', () => {
+    const p = designed();
+    const report = checkStandards(p, input([], { designFiles: [
+      { path: p.design!.docPath, content: null, missing: true },
+      { path: p.design!.tokensPath, content: p.design!.tokens.replace('#ffffff', '#fafafa') },
+    ] }));
+    assert.deepEqual(findingsFor(report, RULE), [{ file: 'docs/design/DESIGN.md', line: 1 }, { file: 'src/styles/tokens.css', line: 1 }]);
+    const msgs = report.findings.map((f) => f.message).join('\n');
+    assert.match(msgs, /docs\/design\/DESIGN.md is missing; it is part of the approved design system/);
+    assert.match(msgs, /src\/styles\/tokens.css differs from the approved design system; runs may not change it/);
+  });
+
+  it('a design file that could not be read leaves the rule undecided', () => {
+    const p = designed();
+    const report = checkStandards(p, input([], { designFiles: [
+      { path: p.design!.docPath, content: p.design!.doc },
+      { path: p.design!.tokensPath, content: null, skipped: 'Not a regular file' },
+    ] }));
+    assert.equal(row(report).result, 'not-checked');
+    assert.match(row(report).reason ?? '', /Not a regular file \(src\/styles\/tokens.css\)/);
+  });
+
+  it('an import of another known kit is a finding; the approved kit and unknown packages are not', () => {
+    const report = run(designed('Chakra UI'), [added('src/App.tsx', [
+      'import { Button } from "@mui/material";',
+      'import { Box } from "@chakra-ui/react";',
+      'import x from "lodash";',
+    ])]);
+    assert.deepEqual(report.findings.filter((f) => f.rule === RULE).map((f) => [f.line, f.message]),
+      [[1, 'Imports @mui/material; the approved component kit is Chakra UI']]);
+  });
+
+  it('without the design files read, the rule is undecided', () => {
+    const report = checkStandards(designed(), input([added('src/a.css', ['.a { color: var(--color-fg); }'])]));
+    assert.equal(row(report).result, 'not-checked');
+    assert.match(row(report).reason ?? '', /The design files were not read/);
+  });
+
+  it('promoted to blocking: a finding blocks; an unread check is blocking and not checked', () => {
+    const p = promote(designed(), RULE);
+    assert.equal(standardsBlocked(run(p, [added('src/a.css', ['.a { color: #123456; }'])])), true);
+    const unread = checkStandards(p, input([]));
+    assert.equal(isBlockingNotChecked(row(unread)), true);
+    assert.equal(standardsBlockingState(unread), 'not-checked');
+  });
+
+  it('a vendored UI file is left out', () => {
+    const report = run(designed(), [added('vendor/lib/a.css', ['.a { color: #fff; }'])]);
+    assert.deepEqual(findingsFor(report, RULE), []);
   });
 });

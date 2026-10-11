@@ -53,6 +53,7 @@ import { PromptLibraryStore } from '../templates/prompt-library';
 import { AiRulesStore } from '../ai-rules/rules-store';
 import { BUILT_IN_RULES } from '../ai-rules/built-in-rules';
 import { PROJECT_STANDARDS_HEADER } from '../standards/profile';
+import { DESIGN_SYSTEM_HEADER } from '../standards/design';
 import { TaskQueue } from './task-queue';
 import { ghSync } from '../utils/gh';
 import { fileIncidentIssue } from '../github/issue-sync';
@@ -72,7 +73,7 @@ const VERIFY_TIMEOUT_MS = 30_000;
 export type StandardsProvider = (
   cwd: string,
   opts: { skipRuleNames: string[] },
-) => { text: string; version: number | null } | null;
+) => { text: string; version: number | null; design?: string } | null;
 
 /** The standards a task must carry could not be loaded. The task fails; it never runs without them. */
 class StandardsUnavailableError extends Error {}
@@ -2985,7 +2986,7 @@ export class TaskRunner {
    * The standards block for a task, or null when this host has none.
    * Throws {@link StandardsUnavailableError} when the provider cannot read its standards.
    */
-  private resolveStandards(cwd: string, storeRules: string): { text: string; section: string } | null {
+  private resolveStandards(cwd: string, storeRules: string): { text: string; section: string; design?: string; designSection?: string } | null {
     if (!this._standardsProvider) { return null; }
     // The store renders each enabled rule as `### <name>`; those bodies are already in the prompt.
     const skipRuleNames = BUILT_IN_RULES.filter((r) => storeRules.includes(`### ${r.name}\n`)).map((r) => r.name);
@@ -2996,7 +2997,13 @@ export class TaskRunner {
       throw new StandardsUnavailableError(err instanceof Error ? err.message : String(err));
     }
     const text = resolved?.text.trim() ?? '';
-    return text ? { text, section: `${PROJECT_STANDARDS_HEADER}\n${text}` } : null;
+    if (!text) { return null; }
+    const design = resolved?.design?.trim() ?? '';
+    return {
+      text,
+      section: `${PROJECT_STANDARDS_HEADER}\n${text}`,
+      ...(design ? { design, designSection: `${DESIGN_SYSTEM_HEADER}\n${design}` } : {}),
+    };
   }
 
   /**
@@ -3068,6 +3075,7 @@ export class TaskRunner {
         pendingScreenshots, retrievedSpans, retrievedSpansUsedSemantic,
         roleCharter: roleCharter ?? undefined,
         standards: standards?.text,
+        design: standards?.design,
         aiRules: aiRules || undefined,
         // What this repo has proven about itself, gathered from real exit codes.
         knowledge: knowledgeBlockFor(cwd, fs) || undefined,
@@ -3083,10 +3091,12 @@ export class TaskRunner {
         prompt += ctx + '\n\n';
       }
     }
-    // Context off, or a context that came back without the section: the runner carries the
-    // standards itself, at the very top of the prompt.
-    if (standards && !prompt.includes(standards.section)) {
-      prompt = `${standards.section}\n\n${prompt}`;
+    // Context off, or a context that came back without the sections: the runner carries the
+    // standards and the design system itself, at the very top of the prompt.
+    if (standards) {
+      const missing = [standards.section, standards.designSection]
+        .filter((s): s is string => s !== undefined && !prompt.includes(s));
+      if (missing.length > 0) { prompt = `${missing.join('\n\n')}\n\n${prompt}`; }
     }
     // Inject execution rules before the task prompt
     const cfg = getConfig('agentTaskPlayer');
@@ -3157,7 +3167,9 @@ export class TaskRunner {
       } else {
         // Task portion alone is already huge — truncate at limit. The standards block is
         // the one piece of the prefix that is kept: it is small, and it is the contract.
-        const kept = standards ? `${standards.section}\n\n` : '';
+        const kept = standards
+          ? [standards.section, standards.designSection].filter((s): s is string => s !== undefined).map((s) => `${s}\n\n`).join('')
+          : '';
         prompt = kept + taskPart.slice(0, Math.max(0, MAX_PROMPT_CHARS - kept.length)) + '\n...[prompt truncated at 80K chars]';
       }
     }

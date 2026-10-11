@@ -9,6 +9,7 @@
 import { h, mount, clear, badge, glyph, toast, announce, confirmDialog, field, fmtTime, fmtUsd, fmtAgo } from '../dom.js';
 import { STR, serverMessage } from '../strings.js';
 import { cappedList } from './version-panel.js';
+import { designSummary, tokenTable, designDoc } from './design-view.js';
 
 const TASK_STATUS = {
   pending: { glyph: '○', label: 'Pending', badge: null },
@@ -186,9 +187,10 @@ const legacyGateText = (legacy) => (legacy.kind === 'apply' ? STR.C63(legacy.ver
  * The standards report card. `stored` is `{ phase, report }` or null. A run
  * with no report says why: "no report" is never shown as a pass.
  */
-function standardsCard(run, stored, effectiveVersion) {
+function standardsCard(run, stored, effectiveVersion, designVersion) {
   const name = standardsName(run, stored);
   const heading = h('h2', { tabindex: '-1', dataset: { focus: 'standards-report' } }, name);
+  const design = designReportParts(stored, designVersion || null);
   if (!stored) {
     const legacy = legacyGateStandards(run, stored, effectiveVersion);
     const text = legacy ? legacyGateText(legacy)
@@ -196,7 +198,7 @@ function standardsCard(run, stored, effectiveVersion) {
       : run.status === 'running' ? 'Checked when the run verifies.'
         : run.status === 'awaiting-approval' ? 'Not checked yet for this run.'
           : 'Standards were not checked: the run ended first.';
-    return h('section', { class: 'card' }, h('div', { class: 'card-head' }, heading), h('p', { class: 'muted' }, text));
+    return h('section', { class: 'card' }, h('div', { class: 'card-head' }, heading), h('p', { class: 'muted' }, text), design);
   }
   const report = stored.report;
   const t = report.totals;
@@ -276,7 +278,67 @@ function standardsCard(run, stored, effectiveVersion) {
       cappedList(report.notCheckedFiles, (f) => h('li', null,
         h('span', { class: 'diff-id' }, f.file), h('span', { class: 'muted' }, ` · not checked (${f.reason})`))),
       t.notCheckedFiles > filesShown ? h('p', { class: 'muted' }, `Listing the first ${filesShown} of ${t.notCheckedFiles} files.`) : null) : null,
-    truncated ? h('p', { class: 'muted' }, `Showing the first ${report.findings.length} of ${t.findings} findings.`) : null);
+    truncated ? h('p', { class: 'muted' }, `Showing the first ${report.findings.length} of ${t.findings} findings.`) : null,
+    design);
+}
+
+const DESIGN_RULE = 'frontend/design-tokens';
+
+/**
+ * The words for the design rule at the ship gate, from the run's stored standards report and
+ * the frozen standards version (as the standards resource describes it). Null when the
+ * version has no design system. Worded like every scan MOAG makes itself — findings or no
+ * findings, never "passed".
+ */
+export function designGateText(run, stored, version) {
+  if (!version || !version.design) { return null; }
+  const v = typeof version.version === 'number' ? version.version : '?';
+  const report = stored && stored.report;
+  if (!report) { return { kind: 'muted', text: `Design system v${v}: not checked yet for this run.` }; }
+  const rules = Array.isArray(report.rules) ? report.rules : [];
+  const row = rules.find((r) => r && r.rule === DESIGN_RULE);
+  const findings = (Array.isArray(report.findings) ? report.findings : []).filter((f) => f && f.rule === DESIGN_RULE);
+  const designFiles = [version.design.docPath, version.design.tokensPath].filter(Boolean);
+  const changed = findings.some((f) => designFiles.includes(f.file)) ? ' · ⚠ design files changed by this run' : '';
+  if (!row || row.result === 'not-checked') {
+    return { kind: 'muted', text: `Design system v${v}: ○ not checked${row && row.reason ? ` (${row.reason})` : ''}.` };
+  }
+  const n = Math.max(findings.length, row.result === 'failed' ? 1 : 0);
+  if (n > 0) {
+    return row.severity === 'blocking'
+      ? { kind: 'error', text: `Design system v${v}: ✗ ${plural(n, 'design finding')} stop${n === 1 ? 's' : ''} this release${changed}.` }
+      : { kind: 'warning', text: `Design system v${v}: ⚠ ${plural(n, 'design finding')} (advisory)${changed}.` };
+  }
+  return { kind: 'muted', text: `Design system v${v}: no design findings.` };
+}
+
+/** The design line of the ship-gate card, with a link that opens the design-system disclosure. */
+function designGateLine(run, standards) {
+  const said = designGateText(run, standards.stored, standards.design);
+  if (!said) { return null; }
+  const cls = said.kind === 'error' ? 'text-error' : said.kind === 'warning' ? 'text-warning' : null;
+  return h('p', null, h('span', { class: cls }, said.text), ' ',
+    h('button', { type: 'button', class: 'btn-link', on: { click: standards.focusDesign } }, 'View design system'));
+}
+
+/**
+ * The design-system disclosure of the report card, and the C69 alert for each design file the
+ * run changed. Empty when the frozen version has no design system (or it could not be fetched).
+ */
+function designReportParts(stored, version) {
+  const d = version && version.design;
+  if (!d) { return []; }
+  const findings = stored && stored.report && Array.isArray(stored.report.findings) ? stored.report.findings : [];
+  const changed = [d.docPath, d.tokensPath].filter((path) => findings.some((f) => f && f.rule === DESIGN_RULE && f.file === path));
+  const tokens = Array.isArray(d.tokens) ? d.tokens : [];
+  return [
+    changed.map((path) => h('p', { class: 'text-warning', role: 'alert' }, glyph('⚠'), ' ', STR.C69(path).text)),
+    h('details', { class: 'diff-group', dataset: { focus: 'design-system' } },
+      h('summary', null, `Design system v${version.version}  ${tokens.length} tokens`),
+      designSummary(d),
+      tokenTable(tokens, { caption: `Standards v${version.version} design tokens` }),
+      designDoc(d.doc, `DESIGN.md, standards v${version.version}`)),
+  ];
 }
 
 /** The read-only standards line inside the ship-gate card (the full table stays in the report card). */
@@ -559,12 +621,31 @@ export function render(app, params, view) {
     },
     /** The project's approved standards version now: what approving a legacy run's ship applies. */
     effectiveVersion: project.standards ? project.standards.effectiveVersion : null,
+    /** The frozen standards version as the standards resource describes it, once fetched (for its design system). */
+    design: null,
+    focusDesign: () => {
+      const target = standardsHost.querySelector('[data-focus="design-system"]');
+      if (!target) { return; }
+      target.open = true;
+      const summary = target.querySelector('summary');
+      if (summary) { summary.focus(); }
+    },
   };
-  const renderStandards = () => mount(standardsHost, standardsCard(run, standards.stored, standards.effectiveVersion));
+  const renderStandards = () => mount(standardsHost, standardsCard(run, standards.stored, standards.effectiveVersion, standards.design));
 
   // ─── Banners and the gate card ───
   const bannerHost = h('div');
   const renderBanner = () => mount(bannerHost, haltBanner(app, project, run, tasks, statusOf, live, runnable, base, refresh, standards));
+  if (run.standardsVersion) {
+    void app.api('GET', `/api/projects/${encodeURIComponent(project.id)}/standards`, undefined, { quiet: true }).then((r) => {
+      const all = r.ok && r.body.standards && Array.isArray(r.body.standards.versions) ? r.body.standards.versions : [];
+      const v = all.find((x) => x.version === run.standardsVersion);
+      if (!v || !v.design || !standardsHost.isConnected) { return; }
+      standards.design = v;
+      renderStandards();
+      renderBanner();
+    });
+  }
 
   // ─── Dependency installs ───
   // From the server's own list, collected over the WHOLE events.jsonl: an early install
@@ -692,7 +773,12 @@ function haltBanner(app, project, run, tasks, statusOf, live, runnable, base, re
           h('button', { type: 'button', class: 'btn-link', on: { click: standards.focusReport } }, 'View report')) : null,
         // Set by the server when a run exited cleanly without proving its standards check.
         run.errorTail ? h('p', null, run.errorTail) : null,
-        failed.length > 0 ? h('ul', { class: 'diff-list' }, failed.map((t) => h('li', null, `${t.name} — ${(TASK_STATUS[statusOf(t)] || TASK_STATUS.pending).label}`))) : null);
+        failed.length > 0 ? h('ul', { class: 'diff-list' }, failed.map((t) => h('li', null, `${t.name} — ${(TASK_STATUS[statusOf(t)] || TASK_STATUS.pending).label}`))) : null,
+        // What to do next: run the plan again, or ask for a new one.
+        h('div', { class: 'inline-row' },
+          runnable ? h('a', { href: `${base}/plan`, dataset: { link: '' }, class: 'btn btn-primary' }, 'Start run') : null,
+          (app.session.user.roles || []).includes('product-owner')
+            ? h('a', { href: `${base}/prd`, dataset: { link: '' }, class: 'btn btn-secondary' }, 'Request a new plan') : null));
     }
     case 'error':
       return h('div', { class: ['card', 'card-error'], role: 'status' },
@@ -792,6 +878,7 @@ function gateCard(app, project, run, tasks, statusOf, live, refresh, standards) 
     h('p', null, `${beforeDone}/${before.length} tasks before the gate completed.`),
     h('p', null, cost.noCap ? `Cost so far ${fmtUsd(live.spentUsd)} · no cap set` : `Cost so far ${fmtUsd(live.spentUsd)} of ${fmtUsd(cost.capUsd)}`),
     standardsGateLine(run, standards.stored, standards.focusReport, standards.effectiveVersion),
+    designGateLine(run, standards),
     after.length > 0 ? h('p', null, `Tasks that run after approval: ${after.join(', ')}`) : null,
     canDecide ? [note.wrap,
       h('div', { class: 'form-actions gate-actions' },

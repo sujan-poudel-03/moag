@@ -64,14 +64,20 @@ import { createStaticServer } from './static';
 import { ServerAction, canPerform, allowedActions, Actor } from './permissions';
 import {
   StandardsStore, StandardsStoreError, StandardsVersionRecord, MAX_STANDARDS_VERSIONS, SYSTEM_ACTOR, inEffectBefore, proposeAutomatic,
-  enforcementReview, standardsChangeAudit,
+  enforcementReview, standardsChangeAudit, designReview,
 } from './standards-store';
 import {
   MAX_STANDARDS_COMMANDS, MAX_STANDARDS_COMMAND_CHARS, MAX_STANDARDS_FREE_TEXT_CHARS, PROVENANCE_FIELDS, ProvenanceField,
   DEFAULT_RULE_SEVERITY, STANDARDS_RULE_IDS, StandardsProfile, StandardsProvenance, renderPlannerStandards, renderStandardsText,
   isScannerRule, ruleSeverity, validateProfile,
 } from '../standards/profile';
+import { DesignFileConflictError, writeDesignFiles } from '../standards/local-store';
 import type { StandardsJobFile } from '../standards/local-store';
+import {
+  DesignSystem, MAX_DESIGN_DOC_CHARS, MAX_DESIGN_TOKENS_CHARS, designView, hasDesignUi, templateDesign,
+} from '../standards/design';
+import { proposeDesign } from '../standards/propose';
+import { detectDesignSources, detectUiPackages } from '../ai-rules/project-detector';
 import {
   BlockingSetState, StandardsReport, applyProfileSeverity, commandRow, parseStandardsReport, recountTotals, standardsBlockingState,
   standardsCheckCounts,
@@ -290,8 +296,13 @@ const S = {
 /** The profile sections a version is compared by for its "changed from vN" markers. */
 const STANDARDS_SECTIONS: readonly (keyof StandardsProfile)[] = [
   'stackTemplateId', 'repoState', 'structure', 'frontend', 'backend', 'naming', 'comments', 'testing',
-  'commands', 'builtInRuleIds', 'freeText', 'severity',
+  'commands', 'builtInRuleIds', 'freeText', 'severity', 'design',
 ];
+
+/** How long a computed design-system suggestion is reused for one project. */
+const DESIGN_SUGGESTION_TTL_MS = 60_000;
+/** Where, inside a run's data directory, a design file the run start replaced is kept. */
+export const DESIGN_BACKUP_DIR = 'design-replaced';
 
 /** Every rule's severity under a profile, defaults filled in: what the review screen shows. */
 const resolvedSeverity = (profile: StandardsProfile) =>
@@ -715,10 +726,41 @@ export function createApp(deps: AppDeps): App {
     return new HttpError(status, err.code, err.message, err.details);
   };
 
+  /**
+   * A design system to suggest for a project whose standards in effect have none, when its
+   * workspace shows a user interface: a cheap, bounded probe (a fixed list of `stat`s and one
+   * package.json read), cached per project for a minute because the screen polls. Null when
+   * there is nothing to suggest. Never throws.
+   */
+  const designSuggestionCache = new Map<string, { at: number; value: { evidence: string; design: DesignSystem } | null }>();
+  const designSuggestionFor = (p: ProjectRecord, kit: string): { evidence: string; design: DesignSystem } | null => {
+    const cached = designSuggestionCache.get(p.id);
+    const at = Date.now();
+    if (cached && at - cached.at < DESIGN_SUGGESTION_TTL_MS) { return cached.value; }
+    let value: { evidence: string; design: DesignSystem } | null = null;
+    try {
+      const sources = detectDesignSources(p.workspacePath);
+      const ui = p.stack === 'node-ts' ? detectUiPackages(p.workspacePath) : { framework: null, componentLibrary: null, packages: [] };
+      const signals = { stack: { value: p.stack }, framework: ui.framework, componentLibrary: ui.componentLibrary, designSources: sources };
+      if (hasDesignUi(signals)) {
+        const proposed = proposeDesign(p.stack, signals, kit || ui.componentLibrary?.value || '');
+        const evidence = ui.packages.length > 0 ? `${ui.packages.join(' and ')} in package.json`
+          : sources.ui ? sources.ui.evidence : p.stack;
+        if (proposed) { value = { evidence, design: proposed.design }; }
+      }
+    } catch {
+      value = null;
+    }
+    designSuggestionCache.set(p.id, { at, value });
+    return value;
+  };
+
   const standardsDto = (p: ProjectRecord, u: UserRecord) => {
     const view = standardsView(p.id);
     const actor = actorOf(u);
     const current = view.effective ?? view.pending;
+    const canPropose = allowedActions(actor, ['standards.propose']).includes('standards.propose');
+    const kit = current?.profile.frontend.componentKit ?? '';
     return {
       migrated: view.migrated,
       state: view.state,
@@ -738,8 +780,20 @@ export function createApp(deps: AppDeps): App {
         // one function, so the diff shown, the acknowledgement required and the audit flag
         // can never disagree.
         const review = enforcementReview(view.versions, v);
+        const design = designReview(view.versions, v);
         return {
           ...v,
+          // The design system as the web app shows it: tokens parsed, the background marked
+          // and each colour's contrast on it computed here, so the browser only renders.
+          design: v.profile.design
+            ? {
+              ...designView(v.profile.design), docPath: v.profile.design.docPath, tokensPath: v.profile.design.tokensPath,
+              doc: v.profile.design.doc, tokensContent: v.profile.design.tokens,
+            }
+            : null,
+          // Every difference from the design system in force; while `changed`, an approval must
+          // carry this version's content hash as `acknowledgedEnforcementHash`.
+          designChanged: design,
           inEffect: v.version === view.effective?.version,
           // Verbatim, exactly as a worker would run them: approving the version approves these.
           commands: v.profile.commands.map((c) => ({ label: c.label, run: c.run })),
@@ -771,7 +825,15 @@ export function createApp(deps: AppDeps): App {
       limits: {
         freeTextChars: MAX_STANDARDS_FREE_TEXT_CHARS, commands: MAX_STANDARDS_COMMANDS,
         commandChars: MAX_STANDARDS_COMMAND_CHARS, versions: MAX_STANDARDS_VERSIONS,
+        designDocChars: MAX_DESIGN_DOC_CHARS, designTokensChars: MAX_DESIGN_TOKENS_CHARS,
       },
+      // The template design system for this project's stack (null when the stack has none):
+      // what the editor fills in when a proposer ticks "This project has a user interface".
+      designTemplate: templateDesign(p.stack, kit),
+      // Only for someone who may propose, while the standards in effect have no design system.
+      designSuggestion: canPropose && view.effective && !view.effective.profile.design
+        && (p.stack === 'node-ts' || p.stack === 'static-web')
+        ? designSuggestionFor(p, kit) : null,
       // What each rule is when a profile says nothing about it.
       severityDefaults: { ...DEFAULT_RULE_SEVERITY },
       // The rules MOAG decides by scanning text itself. The editor warns before one is made
@@ -815,6 +877,29 @@ export function createApp(deps: AppDeps): App {
     const earliest = st.runs.find((r) => r.baseRef !== undefined);
     if (earliest) { return earliest.baseRef ?? null; }
     return gitHead(workspace, deps.exec);
+  };
+
+  /**
+   * Whether a run start may replace the design file at `rel`, which exists and holds
+   * `current` (different from what the approved design system would write). Only a file
+   * MOAG is answerable for:
+   * - one whose content is exactly an approved version's design file at that path — written
+   *   or adopted under that version; a newer approved version changed it, and its reviewer
+   *   acknowledged the design difference before approving;
+   * - one at a path an earlier run's approved design wrote at its start — a run's (or a
+   *   person's) edit of MOAG's own file, reverted with a backup and an audit entry.
+   * Anything else is a file MOAG never adopted — a user's — and is never replaced.
+   */
+  const designFileMayBeReplaced = (versions: readonly StandardsVersionRecord[], runs: readonly RunRecord[], rel: string, current: string): boolean => {
+    const norm = (t: string): string => t.replace(/\r\n?/g, '\n');
+    const filesOf = (v: StandardsVersionRecord): Array<[string, string]> => {
+      const d = v.profile.design;
+      return d ? [[d.docPath, d.doc], [d.tokensPath, d.tokens]] : [];
+    };
+    const approved = versions.filter((v) => v.status === 'approved');
+    if (approved.some((v) => filesOf(v).some(([p, c]) => p === rel && norm(c) === norm(current)))) { return true; }
+    const ranWith = new Set(runs.map((r) => r.standardsVersion).filter((n): n is number => typeof n === 'number'));
+    return approved.some((v) => ranWith.has(v.version) && filesOf(v).some(([p]) => p === rel));
   };
 
   /**
@@ -874,6 +959,11 @@ export function createApp(deps: AppDeps): App {
     for (const field of PROVENANCE_FIELDS) {
       const untouched = !!auto && auto.provenance?.[field] !== undefined && isDeepStrictEqual(at(profile, field), at(auto.profile, field));
       provenance[field] = untouched ? { ...auto!.provenance[field] } : { ...entered };
+    }
+    // The design system's provenance follows the same rule, and exists only with a design.
+    if (profile.design) {
+      const untouched = !!auto && auto.provenance?.design !== undefined && isDeepStrictEqual(profile.design, auto.profile.design);
+      provenance.design = untouched ? { ...auto!.provenance.design! } : { ...entered };
     }
     return provenance;
   };
@@ -2155,8 +2245,33 @@ export function createApp(deps: AppDeps): App {
       // on the run record with the base its check diffs against.
       // No job can start in this project while we wait: every start runs under this lock.
       const baseRef = await standardsBaseRef(st, workspace);
+      // The approved design system is written into the workspace before anything runs: the
+      // server copy is canonical. Never on a gate resume, so a run's own edit stays a finding.
+      // Only a file MOAG wrote or adopted is ever replaced (see designFileMayBeReplaced); one
+      // that differed is kept in the run's data directory first and named in the run.start
+      // audit, so the revert is never silent. Any other file there refuses the start.
+      const runId = randomUUID();
+      let designReplaced: string[] = [];
+      if (frozen.profile.design) {
+        const versions = standardsView(p.id).versions;
+        try {
+          designReplaced = writeDesignFiles(workspace, frozen.profile.design, {
+            backupDir: path.join(state.runDir(p.id, runId), DESIGN_BACKUP_DIR),
+            mayReplace: (rel, current) => designFileMayBeReplaced(versions, st.runs, rel, current),
+          }).replaced;
+        } catch (err) {
+          if (err instanceof DesignFileConflictError) {
+            throw new HttpError(409, 'design-file-conflict',
+              `${err.path} already exists in the workspace and is not a file MOAG wrote or adopted for an approved design system, ` +
+              'so the run can\'t start: MOAG never replaces it. Propose a new standards version that adopts it or puts the design ' +
+              'system at another path, or move the file.', { path: err.path });
+          }
+          throw new HttpError(409, 'design-files-unwritable',
+            `The approved design system could not be written to the workspace (${(err as Error).message}), so the run can't start.`);
+        }
+      }
       const run: RunRecord = {
-        id: randomUUID(), planId: review.id, status: 'running', startedBy: ctx.user!.id, startedAt: now().toISOString(),
+        id: runId, planId: review.id, status: 'running', startedBy: ctx.user!.id, startedAt: now().toISOString(),
         versionCreatedAt: review.forVersionCreatedAt, stack: p.stack, segments: 1,
         standardsVersion: frozen.version, standardsHash: frozen.contentHash, baseRef,
       };
@@ -2166,7 +2281,15 @@ export function createApp(deps: AppDeps): App {
       st.runs.push(run);
       review.status = 'ran';
       state.save(p.id, st);
-      writeAudit(ctx, { action: 'run.start', projectId: p.id, target: run.id, after: { planId: review.id, engine: p.defaultEngine } });
+      writeAudit(ctx, {
+        action: 'run.start', projectId: p.id, target: run.id,
+        after: {
+          planId: review.id, engine: p.defaultEngine,
+          ...(designReplaced.length > 0
+            ? { designFilesReplaced: designReplaced, designBackupDir: `runs/${run.id}/${DESIGN_BACKUP_DIR}` }
+            : {}),
+        },
+      });
       sendJson(ctx.res, 202, { run: runDto(run, ctx.user!, p, st) });
     });
   };

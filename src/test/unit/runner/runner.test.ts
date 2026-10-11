@@ -2194,6 +2194,38 @@ describe('TaskRunner — project standards', () => {
     assert.ok(!prompts[0].includes('## AI Rules'), 'the squeeze drops other sections, never the standards');
   });
 
+  it('carries the design system after the standards when context is disabled; without one the prompt is unchanged', async () => {
+    const DESIGN = 'Design system v3 · DESIGN.md at docs/design/DESIGN.md · tokens in css/tokens.css\nTokens:\n--color-bg: #ffffff';
+    const withDesign = build('off');
+    withDesign.runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: DESIGN }));
+    await withDesign.runner.play(plan());
+    assert.ok(withDesign.prompts[0].startsWith(`${SECTION}\n\n## Design System\n${DESIGN}\n\n`), withDesign.prompts[0].slice(0, 400));
+    const plain = build('off');
+    plain.runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+    await plain.runner.play(plan());
+    const blank = build('off');
+    blank.runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: '   ' }));
+    await blank.runner.play(plan());
+    assert.equal(blank.prompts[0], plain.prompts[0], 'a blank design adds nothing');
+    assert.ok(!plain.prompts[0].includes('## Design System'));
+  });
+
+  it('hands the design text to the context builder', async () => {
+    const { runner, contextOptions } = build('empty');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: ' Design system v3 ' }));
+    await runner.play(plan());
+    assert.equal(contextOptions[0].design, 'Design system v3');
+  });
+
+  it('with the real context builder the design system appears exactly once, after the standards', async () => {
+    const DESIGN = 'Design system v3 · tokens in css/tokens.css';
+    const { runner, prompts } = build('real');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: DESIGN }));
+    await runner.play(plan());
+    assert.equal(occurrences(prompts[0], '## Design System'), 1);
+    assert.ok(prompts[0].indexOf('## Project Standards') < prompts[0].indexOf('## Design System'));
+  });
+
   it('passes the built-in rules the store already carries as skipRuleNames', async () => {
     const { runner } = build('off');
     const seen: Array<{ cwd: string; skipRuleNames: string[] }> = [];

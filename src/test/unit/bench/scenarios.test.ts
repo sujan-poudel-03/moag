@@ -254,7 +254,7 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     assert.match(lines[3], /^\s*\/\/ const cached = cache\.get\(text\);$/);
     assert.match(lines[5], /^\s*\/\/ \.\.\. rest of the code \.\.\.$/, 'an unmistakable truncation placeholder, not a sentence');
     assert.deepEqual(report.totals, {
-      passed: 0, noFindings: 7, failed: 0, advisory: 2, notChecked: 2, blockingNotChecked: 0, findings: 2, advisoryFindings: 2, notCheckedFiles: 0,
+      passed: 0, noFindings: 7, failed: 0, advisory: 2, notChecked: 3, blockingNotChecked: 0, findings: 2, advisoryFindings: 2, notCheckedFiles: 0,
     });
     assert.equal(standardsBlocked(report), false, 'no scan blocks: on the static half alone this would ship');
     assert.deepEqual(promotedScannerRules(report), []);
@@ -263,7 +263,7 @@ describe('bench scenarios shipped in bench/scenarios', () => {
       assert.equal(report.rules.find((r) => r.rule === rule)?.result, 'passed', rule);
     }
     // Unconfigured rules say so; they are never counted as passed.
-    for (const rule of ['frontend/raw-pattern', 'layering/imports']) {
+    for (const rule of ['frontend/raw-pattern', 'frontend/design-tokens', 'layering/imports']) {
       assert.equal(report.rules.find((r) => r.rule === rule)?.result, 'not-checked', rule);
     }
   });

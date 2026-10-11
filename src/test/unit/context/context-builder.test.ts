@@ -1013,4 +1013,14 @@ describe('Context Builder — project standards', () => {
     assert.equal(budgetUsage.sectionBreakdown?.['Project Standards'], '## Project Standards'.length + 1 + STANDARDS.length + 2);
     assert.equal(budgetUsage.sectionsDropped, 0);
   });
+
+  it('emits ## Design System right after the standards; pinned, so a budget smaller than both keeps both whole', () => {
+    const design = `Design system v3 · DESIGN.md at docs/design/DESIGN.md · tokens in src/styles/tokens.css\n${'--color-x: #ffffff\n'.repeat(40)}`.trim();
+    const big = `${STANDARDS}\n${'- a rule line that takes up room\n'.repeat(60)}`.trim();
+    const ctx = build({ standards: big, design }, { maxContextChars: 300 });
+    assert.deepEqual(headers(ctx), ['## Project Standards', '## Design System'], 'every other section gave way');
+    assert.ok(ctx.includes(`## Project Standards\n${big}\n\n## Design System\n${design}`), 'both whole, standards first, never cut by the design');
+    assert.ok(!ctx.includes('[truncated]'));
+    assert.ok(!build({ standards: STANDARDS }).includes('## Design System'), 'no design, no section');
+  });
 });

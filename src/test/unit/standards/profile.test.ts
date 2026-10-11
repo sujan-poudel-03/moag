@@ -25,6 +25,9 @@ import { BUILT_IN_RULES } from '../../../ai-rules/built-in-rules';
 import { STACK_IDS } from '../../../server/stacks';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
 import { sampleProfile } from './fixtures';
+import { templateDesign } from '../../../standards/design';
+import * as fs from 'fs';
+import * as path from 'path';
 
 function errorsOf(raw: unknown): string[] {
   const result = validateProfile(raw);
@@ -649,5 +652,108 @@ describe('standards profile — enforcementChangesBetween: any difference in wha
     const result = enforcementChangesBetween(before, after);
     result.commands!.before[0].run = 'changed';
     assert.equal(before.commands[0].run, 'npm run lint');
+  });
+});
+
+// ─── Design system ───
+
+describe('standards profile — design system', () => {
+  const withDesign = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+    ({ ...sampleProfile(), design: { ...templateDesign('node-ts', 'MUI')!, ...over } });
+
+  it('profileHash is unchanged for every profile without a design (bench fixtures and built-ins, pinned at HEAD)', () => {
+    const pinnedBench: Record<string, string> = {
+      'greenfield-todo': 'f84e9d5122727ab23a2bc0bf61074c4b1f5c65297d64d8fc91541be720f90252',
+      'brownfield-moag': '84e841c8ab01578f9dd39b70cf9b2e9f4a9e05ac95dafd3a0cc89d698195b3f5',
+      'standards-violation': '736c21bc9ee446b32302129e94967e50235c23575a1506610cf8cb7d55fa1394',
+    };
+    for (const [name, hash] of Object.entries(pinnedBench)) {
+      const file = path.join(__dirname, '..', '..', '..', '..', 'bench', 'scenarios', name, 'standards.json');
+      const v = validateProfile(JSON.parse(fs.readFileSync(file, 'utf-8')));
+      assert.ok(v.ok, name);
+      assert.equal(profileHash(v.profile), hash, name);
+    }
+    const pinnedBuiltIn: Record<string, string> = {
+      'node-ts': 'd4b1faa54bb3d1f22251098f002eafcb6511749ea1520c08c20c971ad7ed7509',
+      'python': '228846807e1993b55207ba8d0d11b5ae64828f7ffbc41d070576e2186df27463',
+      'go': 'c2107939a6098b754e740dd2af9152d2f72413d8d0871d30e8d006985c697115',
+      'java': '9d7a13673b018fd1a1bd7f58dd8ab237e549126176e992c0d979e5838f670fdb',
+      'dotnet': '4a06b76249debae1d3afe418c12c2cc7d556a3e013b8eab4e5852d37eeaf0019',
+      'static-web': '8cf1c7272bec606ccbbb47d8d78d56ad01a4a0405076a5f20de5dd30050e8a76',
+      'other': '283607246295933a1eaece32a470b77d5b52f71b8f9b44cbf438cfa0ee910817',
+    };
+    for (const stack of STACK_IDS) { assert.equal(profileHash(BUILT_IN_PROFILES[stack]), pinnedBuiltIn[stack], stack); }
+  });
+
+  it('accepts a template design, keeps it verbatim, and the hash covers it', () => {
+    const r = validateProfile(withDesign());
+    assert.ok(r.ok, JSON.stringify(r));
+    assert.deepEqual(r.profile.design, templateDesign('node-ts', 'MUI'));
+    const other = validateProfile(withDesign({ tokens: ':root {\n  --color-bg: #000000;\n}\n' }));
+    assert.ok(other.ok);
+    assert.notEqual(profileHash(r.profile), profileHash(other.profile));
+  });
+
+  const refusals: Array<[string, Record<string, unknown>, RegExp]> = [
+    ['an oversized doc', { doc: 'x'.repeat(12_001) }, /profile\.design\.doc: 12001 characters; the limit is 12000/],
+    ['oversized tokens', { tokens: 'x'.repeat(8_001) }, /profile\.design\.tokens: 8001 characters; the limit is 8000/],
+    ['a credential in the doc', { doc: '# D\n\nkey sk-abcdefghijklmnopqrstuvwxyz\n' }, /profile\.design\.doc: looks like an API key/],
+    ['U+202E in a token name', { tokens: ':root {\n  --color-‮bg: #fff;\n}' }, /profile\.design\.tokens: line 2 must not contain control, zero-width or bidirectional-override characters/],
+    ['an absolute tokensPath', { tokensPath: '/etc/tokens.css' }, /profile\.design\.tokensPath: must be a path inside the repository/],
+    ['a .. segment', { docPath: 'docs/../../DESIGN.md' }, /profile\.design\.docPath: must not contain a "\.\." segment/],
+    ['a path inside .git', { tokensPath: '.git/x.css' }, /profile\.design\.tokensPath: must not be inside \.git or \.moag/],
+    ['a path inside .moag', { docPath: '.moag/DESIGN.md' }, /profile\.design\.docPath: must not be inside \.git or \.moag/],
+    ['a wrong doc extension', { docPath: 'docs/DESIGN.txt' }, /profile\.design\.docPath: must be a Markdown \(\.md\) file/],
+    ['a wrong tokens extension', { tokensPath: 'src/tokens.yaml' }, /profile\.design\.tokensPath: must end in one of/],
+    ['an unknown key', { extra: 1 }, /profile\.design: unknown key "extra"/],
+  ];
+  for (const [name, over, re] of refusals) {
+    it(`refuses ${name} with a user-safe message`, () => {
+      const errors = errorsOf(withDesign(over));
+      assert.ok(errors.some((e) => re.test(e)), errors.join('\n'));
+    });
+  }
+
+  it('refuses the same path for both files', () => {
+    const errors = errorsOf(withDesign({ docPath: 'x/tokens.md', tokensPath: 'x/tokens.md' }));
+    assert.ok(errors.some((e) => /must end in one of/.test(e)), errors.join('\n'));
+    const json = errorsOf(withDesign({ docPath: 'x/a.json.md', tokensPath: 'X/A.JSON.MD' }));
+    assert.ok(json.length > 0);
+  });
+
+  it('the planner summary is appended after the standards text, and nothing changes without a design', () => {
+    const plain = renderPlannerStandards(sampleProfile(), 2);
+    const r = validateProfile(withDesign());
+    assert.ok(r.ok);
+    const designed = renderPlannerStandards(r.profile, 2);
+    assert.ok(designed.startsWith(plain));
+    assert.match(designed, /Design system: DESIGN.md at docs\/design\/DESIGN.md; tokens in src\/styles\/tokens.css/);
+  });
+
+  it('refuses a profile whose planner text crosses the cap only because of the design', () => {
+    // Greenfield lists the directories twice, so the planner text is near its cap.
+    const p = sampleProfile();
+    p.repoState = 'greenfield';
+    p.frontend.rawPatterns = [];
+    p.structure.placement = [];
+    p.structure.allowedTopLevel = [];
+    p.freeText = '';
+    p.builtInRuleIds = [];
+    p.structure.requiredDirs = Array.from({ length: 14 }, (_, i) => `src/${'d'.repeat(160)}${i}`);
+    assert.ok(validateProfile(p).ok, 'fits without a design');
+    const errors = errorsOf({ ...p, design: templateDesign('node-ts', '') });
+    assert.ok(errors.some((e) => /the planning text renders to \d+ characters; the limit is 6000/.test(e)), errors.join('\n'));
+  });
+
+  it('provenance validates with and without design; an unknown key is still refused', () => {
+    const full = Object.fromEntries(PROVENANCE_FIELDS.map((f) => [f, { tag: 'assumed', evidence: 'node-ts default' }]));
+    const without = validateProvenance(full);
+    assert.ok(without.ok);
+    assert.equal('design' in (without.ok ? without.provenance : {}), false);
+    const withD = validateProvenance({ ...full, design: { tag: 'detected', evidence: 'src/theme.css' } });
+    assert.ok(withD.ok);
+    assert.deepEqual(withD.ok ? withD.provenance.design : null, { tag: 'detected', evidence: 'src/theme.css' });
+    assert.equal(validateProvenance({ ...full, design: { tag: 'guessed', evidence: '' } }).ok, false);
+    assert.equal(validateProvenance({ ...full, designer: { tag: 'assumed', evidence: '' } }).ok, false);
   });
 });

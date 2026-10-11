@@ -81,7 +81,8 @@ import {
   promotedScannerRules, recountTotals, ruleOutcomeLabel, SCANNER_PROMOTION_WARNING, severityOf, standardsBlocked, standardsBlockingState,
   StandardsReport,
 } from '../standards/checker';
-import { loadLocalStandards, localStandardsPath, readStandardsJobFile, writeLocalStandards } from '../standards/local-store';
+import { loadLocalStandards, localStandardsPath, readStandardsJobFile, writeDesignFiles, writeLocalStandards } from '../standards/local-store';
+import { DESIGN_SYSTEM_HEADER, DesignSystem, parseDesignTokens, renderDesignPromptText } from '../standards/design';
 import { profileHash, renderStandardsText, StandardsDocument } from '../standards/profile';
 import { clearStandardsBase, rememberStandardsBase, resolveStandardsBase } from '../runner/standards-base';
 import { detectedStackId, proposeProfile } from '../standards/propose';
@@ -484,7 +485,10 @@ export async function checkStandardsNow(
     onDependencyEvent: (ev: DependencyEvent) => void;
   },
 ): Promise<StandardsReport> {
-  const input = await collectStandardsInput(cwd, standards.baseRef, { probeDirs: standards.profile.structure.requiredDirs });
+  const input = await collectStandardsInput(cwd, standards.baseRef, {
+    probeDirs: standards.profile.structure.requiredDirs,
+    designPaths: standards.profile.design ? [standards.profile.design.docPath, standards.profile.design.tokensPath] : undefined,
+  });
   const report = checkStandards(standards.profile, input);
   report.version = standards.version;
   // Only a blocking failure stops the commands: an advisory finding is no reason not to lint.
@@ -1344,7 +1348,10 @@ const STANDARDS_USAGE =
   `        exit ${STANDARDS_EXIT_BLOCKING_NOT_CHECKED}: a command or a promoted rule was not checked (so also with --no-commands)\n` +
   `  moag standards propose [--stack <${STACK_IDS.join('|')}>] [--write [--force]]\n` +
   '        --write   save the proposal as the next version; refuses to replace an existing file that differs\n' +
-  '        --force   replace it anyway; the old file is kept as .moag/standards.json.bak\n';
+  '        --force   replace it anyway; the old file is kept as .moag/standards.json.bak\n' +
+  '        A proposal with a design system also writes DESIGN.md and the tokens file. One that\n' +
+  '        already exists and differs is never replaced without --force (then kept as <file>.bak);\n' +
+  '        such a conflict is found before anything is written, so a refusal writes nothing.\n';
 
 const STANDARDS_FILE_LABEL = '.moag/standards.json';
 
@@ -1436,6 +1443,54 @@ export function renderStandardsCheck(report: StandardsReport): string {
  * · 5 no diff could be taken, so nothing was checked (`check`) · 6 a blocking rule or command
  * was not checked (`check`).
  */
+/** The design system as `moag standards show` prints it: the two files and every listed token. */
+function renderDesignSummary(design: DesignSystem): string {
+  const parsed = parseDesignTokens(design.tokensPath, design.tokens);
+  const lines = [
+    '─── Design system ───',
+    `DESIGN.md:   ${design.docPath} (${design.doc.length} characters)`,
+    `Tokens file: ${design.tokensPath}${parsed.listable ? ` (${parsed.tokens.length} token${parsed.tokens.length === 1 ? '' : 's'})` : ` (not listable: ${parsed.reason ?? 'unknown format'})`}`,
+    ...parsed.tokens.map((t) => `  ${t.name}: ${t.value}`),
+  ];
+  return lines.join('\n') + '\n';
+}
+
+/** The design files that exist and differ (line endings aside) from what `design` would write. */
+function designFileConflicts(cwd: string, design: DesignSystem): string[] {
+  const out: string[] = [];
+  for (const [rel, content] of [[design.docPath, design.doc], [design.tokensPath, design.tokens]] as const) {
+    let current: string;
+    try { current = fs.readFileSync(path.join(cwd, ...rel.split('/')), 'utf-8'); } catch { continue; }
+    if (current.replace(/\r\n?/g, '\n') !== content.replace(/\r\n?/g, '\n')) { out.push(rel); }
+  }
+  return out;
+}
+
+/**
+ * Write the proposed design system's files: each conflicting one (only reached with --force)
+ * is kept as `<file>.bak` first. Returns the exit code.
+ */
+function writeProposedDesign(cwd: string, design: DesignSystem, conflicts: string[]): number {
+  for (const rel of conflicts) {
+    const full = path.join(cwd, ...rel.split('/'));
+    try { fs.copyFileSync(full, `${full}.bak`); }
+    catch (err) {
+      process.stderr.write(`Could not back up ${rel}, so the design system was not written: ${err instanceof Error ? err.message : String(err)}\n`);
+      return 2;
+    }
+  }
+  try {
+    const { written } = writeDesignFiles(cwd, design);
+    for (const rel of written) {
+      process.stderr.write(`Wrote ${rel}.${conflicts.includes(rel) ? ` The previous file is ${rel}.bak.` : ''}\n`);
+    }
+    return 0;
+  } catch (err) {
+    process.stderr.write(`Could not write the design system: ${err instanceof Error ? err.message : String(err)}\n`);
+    return 2;
+  }
+}
+
 export async function cmdStandards(args: Args): Promise<number> {
   const verb = args.positionals[0];
   if (verb !== 'show' && verb !== 'check' && verb !== 'propose') {
@@ -1469,10 +1524,21 @@ export async function cmdStandards(args: Args): Promise<number> {
       process.stderr.write(`Proposal only — nothing was written. Re-run with --write to save it as ${STANDARDS_FILE_LABEL} (v${next.version}).\n`);
       return 0;
     }
+    // The design files are checked before anything is written: a conflict refuses the whole write.
+    const design = next.profile.design;
+    const conflicts = design ? designFileConflicts(args.cwd, design) : [];
+    if (conflicts.length > 0 && !args.force) {
+      for (const rel of conflicts) {
+        process.stderr.write(`${rel} differs from the proposed design system and may hold hand edits — not replaced. ` +
+          `Re-run with --write --force; it is then kept as ${rel}.bak.\n`);
+      }
+      process.stderr.write('Nothing was written.\n');
+      return 2;
+    }
     if (doc) {
       if (profileHash(doc.profile) === profileHash(next.profile)) {
         process.stderr.write(`${STANDARDS_FILE_LABEL} (v${doc.version}) already holds this proposal — nothing was written.\n`);
-        return 0;
+        return design ? writeProposedDesign(args.cwd, design, conflicts) : 0;
       }
       // The file differs from what detection proposes now. Whether a person edited it or
       // the repository moved on cannot be told apart, so it is never replaced silently.
@@ -1494,7 +1560,7 @@ export async function cmdStandards(args: Args): Promise<number> {
       return 2;
     }
     process.stderr.write(`Wrote ${STANDARDS_FILE_LABEL} (v${next.version}).${doc ? ` The previous file is ${STANDARDS_FILE_LABEL}.bak.` : ''}\n`);
-    return 0;
+    return design ? writeProposedDesign(args.cwd, design, conflicts) : 0;
   }
 
   if (!doc) {
@@ -1504,7 +1570,12 @@ export async function cmdStandards(args: Args): Promise<number> {
 
   if (verb === 'show') {
     process.stdout.write(JSON.stringify(doc, null, 2) + '\n\n');
+    const design = doc.profile.design;
+    if (design) { process.stdout.write(renderDesignSummary(design) + '\n'); }
     process.stdout.write('─── Text every task prompt carries ───\n' + renderStandardsText(doc.profile, doc.version) + '\n');
+    if (design) {
+      process.stdout.write(`\n${DESIGN_SYSTEM_HEADER}\n${renderDesignPromptText(design, doc.profile.frontend.componentKit, doc.version)}\n`);
+    }
     return 0;
   }
 

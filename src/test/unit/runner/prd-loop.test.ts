@@ -10,7 +10,12 @@ import type {
   PrdLoopReport,
   UatSession,
 } from '../../../runner/prd-loop';
+import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { builtInProfile } from '../../../standards/built-in-profiles';
+import { templateDesign } from '../../../standards/design';
+import { withoutApprovedDesign } from '../../../runner/evidence';
 import type { StandardsCheckInput } from '../../../standards/checker';
 import type { StandardsProfile } from '../../../standards/profile';
 
@@ -122,6 +127,8 @@ function loadLoop(opts: EvidenceStubOptions = {}): LoopHarness {
     checkArtifacts: (_cwd: string, artifacts: string[]) =>
       artifacts.map((target) => ({ target, exists: opts.artifactsExist !== false })),
     summarizeEvidence: () => '## Deterministic evidence\n(stub)',
+    // The real filter: it only reads the two design files under cfg.cwd.
+    withoutApprovedDesign,
   };
 
   const stubs: Record<string, unknown> = { './evidence': evidenceStub };
@@ -266,6 +273,39 @@ describe('createPrdLoop — deterministic gates', () => {
     assert.equal(report.failedGate, 'change');
     assert.equal(report.modelCallsMade, 0);
     assert.equal(engineCalled, false, 'no model may be consulted when nothing changed');
+  });
+
+  it('1b. only the approved design files the server wrote at run start changed: the change gate still fails', async () => {
+    const design = templateDesign('static-web', '')!;
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-prd-design-'));
+    try {
+      fs.mkdirSync(path.join(cwd, 'docs', 'design'), { recursive: true });
+      fs.mkdirSync(path.join(cwd, 'css'), { recursive: true });
+      fs.writeFileSync(path.join(cwd, 'docs', 'design', 'DESIGN.md'), design.doc.replace(/\n/g, '\r\n'));
+      fs.writeFileSync(path.join(cwd, 'css', 'tokens.css'), design.tokens);
+      const p = builtInProfile('other');
+      p.commands = [];
+      p.design = design;
+      const cfg = baseConfig({ cwd, standards: { profile: p, version: 1, baseRef: 'head-ref' } });
+
+      const { createPrdLoop } = loadLoop({ changedFilesSequence: [[design.docPath, design.tokensPath]] });
+      const h = makeDeps(makePlan());
+      let engineCalled = false;
+      h.deps.runEngine = async () => { engineCalled = true; return engineResult('{"passed":true,"score":100,"gaps":[],"suggestion":""}'); };
+      const report = await createPrdLoop(cfg, h.deps).run();
+      assert.equal(report.passed, false);
+      assert.equal(report.failedGate, 'change', 'MOAG\'s own write is not work');
+      assert.equal(report.modelCallsMade, 0);
+      assert.equal(engineCalled, false);
+
+      // A run that did edit a design file changed something (the design rule then reports it).
+      fs.writeFileSync(path.join(cwd, 'css', 'tokens.css'), ':root { --x: 1px; }\n');
+      const edited = await loadLoop({ changedFilesSequence: [[design.docPath, design.tokensPath]] })
+        .createPrdLoop(cfg, makeDeps(makePlan()).deps).run();
+      assert.notEqual(edited.failedGate, 'change');
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
   });
 
   it('2. a gate command exiting 1 fails the command gate with zero model calls', async () => {

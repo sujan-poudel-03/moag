@@ -322,6 +322,44 @@ proves it; `go vet ./...` and `go test ./...` from `go.mod`. Java and .NET get
 no test command. Nothing is run while proposing; review each command before
 you write the proposal.
 
+**Design system.** A project with a user interface keeps a design system in
+its standards: a `DESIGN.md` (colour palette, typography, spacing, radii,
+components, page layout, empty/loading/error states, forms, accessibility,
+writing tone) and the tokens file the code must use. For a `node-ts` or
+`static-web` project that shows a UI (a static site, React, Vue, Svelte,
+Angular, Next.js, a known component library, or an `index.html`), `moag
+standards propose` drafts one from a fixed template —
+`docs/design/DESIGN.md` plus `src/styles/tokens.css` (node-ts) or
+`css/tokens.css` (static-web) — and adopts an existing tokens file or design
+document as it is instead of overwriting it. A file it cannot adopt (too
+large, unreadable, not tracked by git, or not a `:root` tokens stylesheet) is
+never overwritten either: the template goes to a fallback path such as
+`css/design-tokens.css` or `docs/design/DESIGN-SYSTEM.md`, and the proposal's
+provenance names the file it kept. An adopted tokens file paired
+with the template DESIGN.md gets a note at the top of the doc naming the
+template tokens the adopted file does not define and the names it does, so
+agents never reference an undefined token. `--write` writes both files too;
+one that already exists and differs is replaced only with `--force` (kept as
+`<file>.bak`), and that conflict is found before anything is written.
+`moag standards show` prints the design system and its tokens.
+
+When there is a design system, every task prompt also carries a
+`## Design System` block (at most 2,000 characters) right after the
+standards: where the two files are, the rules, and the tokens. The planner gets
+a short summary. Verification adds the advisory rule `frontend/design-tokens`:
+a raw colour or length on an added line of a CSS, HTML, JSX or TSX file, or
+inside a string or template literal of a JS/TS file (not the tokens file), an
+import of another known UI kit than the approved one, or
+a DESIGN.md or tokens file that no longer matches the approved one is a
+finding. Like every MOAG scan it says "findings" or "no findings", never
+"passed", and blocks only if you promote it. On the hosted server the design
+system is reviewed with the standards (a change needs the reviewer's
+acknowledgement) and written into the workspace when a run starts (a hand-edited copy it
+replaces is kept in the server's run data and named in the audit log; a file
+there that MOAG never wrote or adopted refuses the run instead of being
+replaced); see
+`docs/server.md` → The design system.
+
 **Nested repositories.** A directory that is a git repository of its own hides
 its files from git. One that no tracked `.gitmodules` declares — a gitlink, or
 an untracked directory with a `.git` — is a finding of

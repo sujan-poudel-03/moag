@@ -40,6 +40,13 @@ function escapeWinArg(arg: string): string {
 /** Maximum buffer size for stdout/stderr (10 MB) to prevent OOM on runaway output */
 const MAX_BUFFER_SIZE = 10 * 1024 * 1024;
 
+/**
+ * How long an aborted {@link runCli} waits for `close` after the tree kill. An orphan
+ * that survives the kill and still holds the stdout pipe keeps `close` from ever
+ * firing; past this grace the run gives up on it so the stop path can finish.
+ */
+export const ABORT_CLOSE_GRACE_MS = 5_000;
+
 // ─── Spawn shape shared by runs and the --version probe ───
 
 /** How an engine CLI is spawned: the arguments as passed to `spawn`, and whether a shell resolves the command. */
@@ -239,37 +246,68 @@ export function runCli(config: CliConfig, options: EngineRunOptions, onOutput?: 
       onOutput?.(text, 'stderr');
     });
 
-    // Handle abort signal — kill the child process tree
+    // `close`, `error` and the abort grace timer each end the run; only the first counts.
     let abortHandler: (() => void) | null = null;
-    if (options.signal) {
-      abortHandler = () => {
-        // The third copy of tree-kill in this codebase, and the last: a bare
-        // SIGTERM here reached only the shell, so an aborted engine CLI left its
-        // children holding the pipes and the run hung until its own timeout.
-        killProcess(proc);
-      };
-      options.signal.addEventListener('abort', abortHandler, { once: true });
-    }
-
-    proc.on('error', (err) => {
+    let settled = false;
+    let graceTimer: NodeJS.Timeout | null = null;
+    const settle = (): boolean => {
+      if (settled) { return false; }
+      settled = true;
+      if (graceTimer) { clearTimeout(graceTimer); graceTimer = null; }
       // Clean up abort listener to prevent leaks
       if (abortHandler && options.signal) {
         options.signal.removeEventListener('abort', abortHandler);
       }
-      reject(new Error(`Failed to start "${config.command}": ${err.message}`));
-    });
-
-    proc.on('close', (code) => {
-      // Clean up abort listener to prevent leaks
-      if (abortHandler && options.signal) {
-        options.signal.removeEventListener('abort', abortHandler);
-      }
+      return true;
+    };
+    const appendTruncationNotes = (): void => {
       if (stdoutTruncated) {
         stdout += '\n...[output truncated at 10MB]';
       }
       if (stderrTruncated) {
         stderr += '\n...[stderr truncated at 10MB]';
       }
+    };
+
+    // Handle abort signal — kill the child process tree
+    if (options.signal) {
+      abortHandler = () => {
+        // The third copy of tree-kill in this codebase, and the last: a bare
+        // SIGTERM here reached only the shell, so an aborted engine CLI left its
+        // children holding the pipes and the run hung until its own timeout.
+        killProcess(proc);
+        // An orphan that survived the kill can still hold the stdout pipe, so
+        // `close` may never fire. Give up on it after a grace period so the stop
+        // path still reaches its snapshot save.
+        if (settled || graceTimer) { return; }
+        graceTimer = setTimeout(() => {
+          graceTimer = null;
+          if (!settle()) { return; }
+          try { proc.stdout?.destroy(); } catch { /* already gone */ }
+          try { proc.stderr?.destroy(); } catch { /* already gone */ }
+          try { proc.stdin?.destroy(); } catch { /* already gone */ }
+          appendTruncationNotes();
+          resolve({
+            stdout,
+            stderr: stderr + (stderr ? '\n' : '') + '[Command aborted]',
+            exitCode: 130,
+            durationMs: Date.now() - startTime,
+            command: commandStr,
+          });
+        }, ABORT_CLOSE_GRACE_MS);
+        graceTimer.unref?.();
+      };
+      options.signal.addEventListener('abort', abortHandler, { once: true });
+    }
+
+    proc.on('error', (err) => {
+      if (!settle()) { return; }
+      reject(new Error(`Failed to start "${config.command}": ${err.message}`));
+    });
+
+    proc.on('close', (code) => {
+      if (!settle()) { return; }
+      appendTruncationNotes();
       resolve({
         stdout,
         stderr,

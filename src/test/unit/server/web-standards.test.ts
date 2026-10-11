@@ -14,6 +14,7 @@ import {
 } from '../../../standards/checker';
 import { DEFAULT_RULE_SEVERITY, STANDARDS_RULE_IDS, StandardsProfile, isScannerRule, validateProfile } from '../../../standards/profile';
 import { promote, sampleProfile } from '../standards/fixtures';
+import { templateDesign } from '../../../standards/design';
 import { STANDARDS_GATE_COMMAND, isStandardsGateCommand, standardsGateCommand, standardsGateWord } from '../../../models/requirement-trace';
 import { gateStatus } from '../../../ui/standards-report-html';
 
@@ -232,7 +233,8 @@ describe('web standards editor — rule severity survives an edit and can be cha
     }
 
     // Shown at the top of the card, outside every collapsed before/after.
-    assert.match(raw, /v\.status === 'pending' \|\| v\.inEffect \? enforcementNote\(v\) : null,\n\s+sectionsView\(v, baseRecord, state\.dto\.limits\),/);
+    // The design-system change block sits right under it, un-collapsed too.
+    assert.match(raw, /v\.status === 'pending' \|\| v\.inEffect \? enforcementNote\(v\) : null,\n\s+v\.status === 'pending' \|\| v\.inEffect \? designNote\(v\) : null,\n\s+sectionsView\(v, baseRecord, state\.dto\.limits\),/);
     const note = raw.slice(raw.indexOf('function enforcementNote'), raw.indexOf('/** One read-only section of a version'));
     assert.ok(note.length > 0 && !note.includes('details'), 'never inside a <details>');
     assert.match(note, /STR\.C55\(set\.comparedTo\)\.text/);
@@ -240,14 +242,15 @@ describe('web standards editor — rule severity survives an edit and can be cha
     assert.doesNotMatch(raw, /blockingSetChanged|rulesDisabled|rulesEnabled|commandChangeNote|ruleSwitchNote/, 'the reduced/extended view is gone');
 
     // The acknowledgement: a checkbox, the buttons disabled until it is ticked, and the hash sent only then.
-    assert.match(raw, /const mustAcknowledge = enforcementChanges\(v\)\.changed;/);
+    // A design-system change needs the same single tick.
+    assert.match(raw, /const mustAcknowledge = enforcementChanges\(v\)\.changed \|\| designChanged;/);
     assert.match(raw, /h\('input', \{ type: 'checkbox', id: ackId \}\)/);
-    assert.match(raw, /h\('label', \{ for: ackId \}, STR\.C57\(v\.version\)\.text\)/);
+    assert.match(raw, /h\('label', \{ for: ackId \},\n\s+designChanged \? STR\.C65\(v\.version, acknowledgementParts\(v\)\)\.text : STR\.C57\(v\.version\)\.text\)/);
     assert.match(raw, /class: 'btn btn-primary', disabled: mustAcknowledge, on: \{ click: \(\) => \{ if \(acknowledged\(\)\) \{ void approve\(v, mustAcknowledge\); \} \} \} \}, 'Approve standards'\)/);
     assert.match(raw, /class: 'btn-link', disabled: mustAcknowledge, on: \{ click: \(\) => \{ if \(acknowledged\(\)\) \{ void acceptDefaults\(v, mustAcknowledge\); \} \} \} \}/);
     assert.match(raw, /approveBtn\.disabled = !ackBox\.checked;/);
     assert.match(raw, /\? \{ contentHash: v\.contentHash, acknowledgedEnforcementHash: v\.contentHash \} : \{ contentHash: v\.contentHash \}\);/);
-    assert.match(raw, /r\.body\.error === 'acknowledgement-required'\) \{\n\s+toast\(STR\.C56\.text, 'error'\);/);
+    assert.match(raw, /r\.body\.error === 'acknowledgement-required'\) \{\n\s+const fields = list\(r\.body\.fields\);\n\s+toast\(fields\.length === 1 && fields\[0\] === 'design' \? STR\.C67\.text : STR\.C56\.text, 'error'\);/);
     const strings = fs.readFileSync(path.join(WEB, 'strings.js'), 'utf-8');
     for (const id of ['C55', 'C56', 'C57', 'C58', 'C59']) {
       assert.ok(strings.split('\n').some((l) => l.trimStart().startsWith(`${id}:`)), `${id} is defined`);
@@ -707,5 +710,111 @@ describe('web run view — dependency install lines', () => {
   it('no events means no lines', () => {
     assert.deepEqual(plain(dependencyLines([], tasks)), []);
     assert.deepEqual(plain(dependencyLines(undefined as unknown as unknown[], undefined as unknown as unknown[])), []);
+  });
+});
+
+// ─── Design system: the shared renderer's pure parts, and the editor's round trip ───
+
+describe('web design system view — pure helpers', () => {
+  interface DesignViewModule {
+    docBlocks: (text: string) => Array<{ kind: string; lines: string[] }>;
+    swatchColour: (resolved: unknown) => string | null;
+    previewTokens: (text: string) => Array<{ name: string; value: string }>;
+  }
+  const dv = loadWebModule('screens/design-view.js', { h: never, glyph: never }, ['docBlocks', 'swatchColour', 'previewTokens']) as unknown as DesignViewModule;
+
+  it('docBlocks keeps HTML as plain text in a paragraph, and nothing is interpreted inline', () => {
+    const blocks = plain(dv.docBlocks('<script>alert(1)</script>\n**bold** [link](http://x)'));
+    assert.deepEqual(blocks, [{ kind: 'p', lines: ['<script>alert(1)</script>', '**bold** [link](http://x)'] }]);
+  });
+
+  it('docBlocks: headings, lists, a fence, a | table run, a quote, and blank lines ending paragraphs', () => {
+    const text = [
+      '# Design', '## Colour', '### Detail', '- one', '* two', '1. first', '2. second', '```', 'code <b>', '```',
+      '| Token | Use |', '|---|---|', '| --a | x |', '> quoted', 'para one', 'still one', '', 'para two',
+    ].join('\n');
+    assert.deepEqual(plain(dv.docBlocks(text)), [
+      { kind: 'h4', lines: ['Design'] }, { kind: 'h4', lines: ['Colour'] }, { kind: 'h5', lines: ['Detail'] },
+      { kind: 'ul', lines: ['one', 'two'] }, { kind: 'ol', lines: ['first', 'second'] }, { kind: 'pre', lines: ['code <b>'] },
+      { kind: 'table', lines: ['| Token | Use |', '|---|---|', '| --a | x |'] }, { kind: 'quote', lines: ['quoted'] },
+      { kind: 'p', lines: ['para one', 'still one'] }, { kind: 'p', lines: ['para two'] },
+    ]);
+  });
+
+  it('swatchColour accepts only a validated #rrggbb[aa]', () => {
+    assert.equal(dv.swatchColour('#0969da'), '#0969da');
+    assert.equal(dv.swatchColour('#0969da80'), '#0969da80');
+    for (const bad of ['red', '#fff;x', 'url(javascript:x)', '#FFFFFF', '#fff', 'expression(1)', 7, null, undefined]) {
+      assert.equal(dv.swatchColour(bad), null, String(bad));
+    }
+  });
+
+  it('previewTokens lists the custom properties of a draft', () => {
+    assert.deepEqual(plain(dv.previewTokens(':root {\n  --a: #fff;\n  --b: ;\n  color: red;\n}')), [{ name: '--a', value: '#fff', kind: 'other' }]);
+  });
+
+  it('design-view never builds HTML from text and paints only through style.setProperty after swatchColour', () => {
+    const src = fs.readFileSync(path.join(WEB, 'screens', 'design-view.js'), 'utf-8');
+    assert.equal(/innerHTML|insertAdjacentHTML|outerHTML/.test(src), false);
+    const paints = src.split('\n').filter((l) => l.includes('style.setProperty') && !l.trimStart().startsWith('//'));
+    assert.equal(paints.length, 4, paints.join('\n'));
+    assert.ok(paints.some((l) => l.includes("'background-color', hex")), 'the colour comes from the validated hex');
+  });
+});
+
+describe('web standards editor — design system', () => {
+  function editor(): { toForm: (p: unknown) => Record<string, unknown>; fromForm: (v: unknown, s: unknown) => { profile: Record<string, unknown>; errors: Record<string, string> }; RULE_LABELS: Record<string, string> } {
+    const raw = fs.readFileSync(path.join(WEB, 'screens', 'standards.js'), 'utf-8');
+    const source = raw
+      .replace(/^import\s[^;]*;\s*$/gm, '')
+      .replace(/^export\s+(async\s+)?function\s/gm, '$1function ')
+      .replace(/^let severityDefaults = \{\};$/m, `let severityDefaults = ${JSON.stringify(DEFAULT_RULE_SEVERITY)};`);
+    const context: Record<string, unknown> = { ...DOM_STUBS, Map, designSummary: never, tokenTable: never, designDoc: never, tokenDiffTable: never, previewTokens: never };
+    vm.runInNewContext(`${source}\nthis.toForm = toForm; this.fromForm = fromForm; this.RULE_LABELS = RULE_LABELS;`, context);
+    return context as never;
+  }
+
+  it('RULE_LABELS names every rule the server knows', () => {
+    const labels = editor().RULE_LABELS;
+    for (const rule of STANDARDS_RULE_IDS) { assert.ok(labels[rule], rule); }
+  });
+
+  it('a profile with a design system round-trips through the form unchanged', () => {
+    const ed = editor();
+    const source = { ...sampleProfile(), design: templateDesign('node-ts', '')! };
+    const built = ed.fromForm(ed.toForm(source), source);
+    assert.deepEqual(plain(built.errors), {});
+    assert.deepEqual(plain(built.profile), plain(source));
+    assert.ok(validateProfile(plain(built.profile)).ok);
+  });
+
+  it('with the box unticked, the profile has no design key at all', () => {
+    const ed = editor();
+    const source = { ...sampleProfile(), design: templateDesign('node-ts', '')! };
+    const vals = ed.toForm(source);
+    vals.designEnabled = false;
+    assert.equal('design' in plain(ed.fromForm(vals, source).profile), false);
+    assert.equal('design' in plain(ed.fromForm(ed.toForm(sampleProfile()), sampleProfile()).profile), false, 'none added to a profile without one');
+  });
+});
+
+describe('web run screen — design gate text', () => {
+  const run = loadWebModule('screens/run.js', { ...DOM_STUBS }, ['designGateText']) as unknown as {
+    designGateText: (run: unknown, stored: unknown, version: unknown) => { kind: string; text: string } | null;
+  };
+  const version = { version: 4, design: { tokens: [] } };
+  const report = (rules: unknown[], findings: unknown[] = []) => ({ report: { rules, findings } });
+  const finding = { file: 'src/a.css', line: 1, rule: 'frontend/design-tokens', message: 'Raw colour' };
+
+  it('advisory findings, blocking findings, not checked yet, no findings, and no design', () => {
+    const adv = plain(run.designGateText({}, report([{ rule: 'frontend/design-tokens', result: 'failed', severity: 'advisory' }], [finding, finding]), version));
+    assert.deepEqual(adv, { kind: 'warning', text: 'Design system v4: ⚠ 2 design findings (advisory).' });
+    const blk = plain(run.designGateText({}, report([{ rule: 'frontend/design-tokens', result: 'failed', severity: 'blocking' }], [finding]), version));
+    assert.deepEqual(blk, { kind: 'error', text: 'Design system v4: ✗ 1 design finding stops this release.' });
+    assert.deepEqual(plain(run.designGateText({}, null, version)), { kind: 'muted', text: 'Design system v4: not checked yet for this run.' });
+    const clean = plain(run.designGateText({}, report([{ rule: 'frontend/design-tokens', result: 'passed', severity: 'advisory' }]), version));
+    assert.deepEqual(clean, { kind: 'muted', text: 'Design system v4: no design findings.' });
+    assert.equal(run.designGateText({}, report([]), { version: 4 }), null);
+    for (const res of [adv, blk, clean]) { assert.equal(/\bpassed\b/.test(res!.text), false, 'never "passed"'); }
   });
 });

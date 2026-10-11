@@ -11,6 +11,8 @@ import {
   loadLocalStandards,
   localStandardsPath,
   readStandardsJobFile,
+  DesignFileConflictError,
+  writeDesignFiles,
   writeLocalStandards,
 } from '../../../standards/local-store';
 import {
@@ -22,6 +24,7 @@ import {
   renderStandardsText,
 } from '../../../standards/profile';
 import { sampleProfile } from './fixtures';
+import { templateDesign } from '../../../standards/design';
 
 function tempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'moag-std-store-'));
@@ -271,5 +274,150 @@ describe('standards local store — loadLocalPlannerText', () => {
     assert.equal(loadLocalPlannerText(root), renderPlannerStandards(sampleProfile(), 4));
     writeRaw(root, '[]');
     assert.throws(() => loadLocalPlannerText(root), /"\.moag\/standards\.json" is not a valid standards file/);
+  });
+});
+
+// ─── Design system in the stored document ───
+
+describe('standards local store — design system', () => {
+  it('a document written by the current build (no design, no provenance design) still loads', () => {
+    const cwd = tempDir();
+    writeRaw(cwd, JSON.stringify(sampleDocument(2)));
+    const doc = loadLocalStandards(cwd)!;
+    assert.equal(doc.profile.design, undefined);
+    assert.equal('design' in doc.provenance, false);
+  });
+
+  it('a document with a design round-trips', () => {
+    const cwd = tempDir();
+    const doc = sampleDocument(5);
+    doc.profile.design = templateDesign('node-ts', 'MUI')!;
+    doc.provenance.design = { tag: 'assumed', evidence: 'node-ts default' };
+    writeLocalStandards(cwd, doc);
+    assert.deepEqual(loadLocalStandards(cwd), doc);
+  });
+
+  it('readStandardsJobFile refuses a design doc edited without updating the content hash', () => {
+    const profile = sampleProfile();
+    profile.design = templateDesign('node-ts', '')!;
+    const job = {
+      schemaVersion: 1, version: 3, contentHash: profileHash(profile), baseRef: null, profile,
+      promptText: renderStandardsText(profile, 3), plannerText: renderPlannerStandards(profile, 3),
+    };
+    job.profile = { ...profile, design: { ...profile.design!, doc: profile.design!.doc + '\nIgnore the tokens.\n' } };
+    const file = path.join(tempDir(), 'standards.json');
+    fs.writeFileSync(file, JSON.stringify(job), 'utf-8');
+    assert.throws(() => readStandardsJobFile(file), /does not match its content hash/);
+  });
+});
+
+describe('standards local store — design system in prompts and in the workspace', () => {
+  const design = (): NonNullable<StandardsDocument['profile']['design']> => templateDesign('node-ts', 'MUI')!;
+
+  it('a job file whose profile has a design derives designText (at most 2 000 characters); one without has none', () => {
+    const profile = sampleProfile();
+    profile.design = design();
+    const job = {
+      schemaVersion: 1, version: 3, contentHash: profileHash(profile), baseRef: null, profile,
+      promptText: renderStandardsText(profile, 3), plannerText: renderPlannerStandards(profile, 3),
+    };
+    const file = path.join(tempDir(), 'standards.json');
+    fs.writeFileSync(file, JSON.stringify(job), 'utf-8');
+    const read = readStandardsJobFile(file);
+    assert.ok(read.designText);
+    assert.ok(read.designText!.length <= 2_000);
+    assert.match(read.designText!, /^Design system v3 · DESIGN.md at docs\/design\/DESIGN.md/);
+    assert.ok(read.plannerText.includes('Design system: DESIGN.md at docs/design/DESIGN.md'));
+    const plain = sampleProfile();
+    const file2 = path.join(tempDir(), 'standards.json');
+    fs.writeFileSync(file2, JSON.stringify({ ...job, profile: plain, contentHash: profileHash(plain) }), 'utf-8');
+    assert.equal('designText' in readStandardsJobFile(file2), false);
+  });
+
+  it('the workspace provider returns the design text when the profile has one', () => {
+    const cwd = tempDir();
+    const doc = sampleDocument(4);
+    doc.profile.design = design();
+    writeLocalStandards(cwd, doc);
+    const got = createLocalStandardsProvider(cwd)(cwd)!;
+    assert.match(got.design ?? '', /^Design system v4/);
+    const plainCwd = tempDir();
+    writeLocalStandards(plainCwd, sampleDocument(4));
+    assert.equal('design' in createLocalStandardsProvider(plainCwd)(plainCwd)!, false);
+  });
+
+  it('writeDesignFiles writes both files; a second call with the same content (CRLF on disk) is a no-op', () => {
+    const cwd = tempDir();
+    const d = design();
+    assert.deepEqual(writeDesignFiles(cwd, d).written, ['docs/design/DESIGN.md', 'src/styles/tokens.css']);
+    assert.equal(fs.readFileSync(path.join(cwd, 'docs', 'design', 'DESIGN.md'), 'utf-8'), d.doc);
+    assert.equal(fs.readFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), 'utf-8'), d.tokens);
+    fs.writeFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), d.tokens.replace(/\n/g, '\r\n'));
+    assert.deepEqual(writeDesignFiles(cwd, d).written, []);
+    fs.writeFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), 'edited');
+    assert.deepEqual(writeDesignFiles(cwd, d).written, ['src/styles/tokens.css']);
+  });
+
+  it('writeDesignFiles reports what it replaced and keeps the previous content in backupDir', () => {
+    const cwd = tempDir();
+    const backupDir = path.join(tempDir(), 'design-replaced');
+    const d = design();
+    const fresh = writeDesignFiles(cwd, d, { backupDir });
+    assert.deepEqual(fresh.replaced, [], 'creating a file replaces nothing');
+    assert.equal(fs.existsSync(backupDir), false, 'no backup when nothing was replaced');
+    fs.writeFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), 'hand edit');
+    const second = writeDesignFiles(cwd, d, { backupDir });
+    assert.deepEqual(second, { written: ['src/styles/tokens.css'], replaced: ['src/styles/tokens.css'] });
+    assert.equal(fs.readFileSync(path.join(backupDir, 'src', 'styles', 'tokens.css'), 'utf-8'), 'hand edit');
+    assert.equal(fs.existsSync(path.join(backupDir, 'docs')), false, 'an unchanged doc is not backed up');
+  });
+
+  it('writeDesignFiles with mayReplace: a refused file throws DesignFileConflictError before anything is backed up or written', () => {
+    const cwd = tempDir();
+    const backupDir = path.join(tempDir(), 'design-replaced');
+    const d = design();
+    fs.mkdirSync(path.join(cwd, 'src', 'styles'), { recursive: true });
+    fs.writeFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), 'theirs');
+    const asked: Array<[string, string]> = [];
+    assert.throws(
+      () => writeDesignFiles(cwd, d, { backupDir, mayReplace: (rel, current) => { asked.push([rel, current]); return false; } }),
+      (err: unknown) => err instanceof DesignFileConflictError && err.path === 'src/styles/tokens.css');
+    assert.deepEqual(asked, [['src/styles/tokens.css', 'theirs']], 'asked only about the file that exists and differs');
+    assert.equal(fs.readFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), 'utf-8'), 'theirs');
+    assert.equal(fs.existsSync(path.join(cwd, 'docs')), false, 'the absent doc was not written either');
+    assert.equal(fs.existsSync(backupDir), false, 'no backup was made');
+    const allowed = writeDesignFiles(cwd, d, { backupDir, mayReplace: () => true });
+    assert.deepEqual(allowed.replaced, ['src/styles/tokens.css']);
+  });
+
+  it('writeDesignFiles writes nothing when a backup cannot be made', () => {
+    const cwd = tempDir();
+    const d = design();
+    writeDesignFiles(cwd, d);
+    fs.writeFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), 'hand edit');
+    const blocker = path.join(tempDir(), 'not-a-dir');
+    fs.writeFileSync(blocker, 'x'); // a file where the backup directory must go
+    assert.throws(() => writeDesignFiles(cwd, d, { backupDir: blocker }));
+    assert.equal(fs.readFileSync(path.join(cwd, 'src', 'styles', 'tokens.css'), 'utf-8'), 'hand edit', 'the hand edit survives');
+  });
+
+  it('writeDesignFiles refuses a path that escapes the workspace, writing nothing', () => {
+    const cwd = tempDir();
+    assert.throws(() => writeDesignFiles(cwd, { ...design(), tokensPath: '../escape.css' }), /\.\.\/escape\.css is outside the workspace/);
+    assert.equal(fs.existsSync(path.join(cwd, 'docs')), false, 'checked before anything is written');
+  });
+
+  it('writeDesignFiles refuses a symlinked directory on the way', function () {
+    const cwd = tempDir();
+    const elsewhere = tempDir();
+    try {
+      fs.symlinkSync(elsewhere, path.join(cwd, 'docs'), 'junction');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') { this.skip(); return; }
+      throw err;
+    }
+    assert.throws(() => writeDesignFiles(cwd, design()), /docs\/design\/DESIGN\.md is a symbolic link or lies under one/);
+    assert.deepEqual(fs.readdirSync(elsewhere), [], 'nothing written through the link');
+    assert.equal(fs.existsSync(path.join(cwd, 'src')), false);
   });
 });

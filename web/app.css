@@ -225,6 +225,16 @@ table.data th[scope="row"] { position: sticky; left: 0; background: var(--ds-bg)
 .diff-id { font-family: var(--ds-editor-font); margin-right: var(--ds-space-2); }
 .before-after { display: grid; grid-template-columns: 1fr 1fr; gap: var(--ds-space-2); }
 .before-after pre { margin: 0; padding: var(--ds-space-2); background: var(--ds-bg); white-space: pre-wrap; word-break: break-word; }
+/* Design system (the product's, not MOAG's): swatch fills are product values set through the CSSOM after validation; everything else is --ds-*. */
+.swatch { display: inline-block; width: 16px; height: 16px; vertical-align: middle; border: 1px solid var(--ds-border); border-radius: var(--ds-radius-sm); }
+.swatch-radius { background: transparent; border-color: var(--ds-muted); }
+.swatch-bar { display: inline-block; height: 6px; min-width: 1px; vertical-align: middle; background: var(--ds-muted); border-radius: var(--ds-radius-sm); }
+.swatch-type { display: inline-block; line-height: 1; vertical-align: middle; }
+table.data th.diff-id { word-break: break-word; }
+.design-doc { max-height: 480px; overflow: auto; padding: var(--ds-space-3); background: var(--ds-bg); border: 1px solid var(--ds-border); border-radius: var(--ds-radius-sm); }
+.design-doc h4 { font-size: 13px; font-weight: 600; margin: var(--ds-space-3) 0 var(--ds-space-1); }
+.design-doc h5 { font-size: 12px; font-weight: 600; color: var(--ds-muted); margin: var(--ds-space-2) 0 var(--ds-space-1); }
+.design-doc pre.mono { overflow-x: auto; white-space: pre; }
 .before { border-left: 2px solid var(--ds-error); }
 .after { border-left: 2px solid var(--ds-success); }
 .panel-divider { border: none; border-top: 1px solid var(--ds-border); margin: var(--ds-space-3) 0; }
@@ -288,6 +298,7 @@ progress.cost-error { accent-color: var(--ds-error); }
   .btn-icon { min-width: 36px; min-height: 36px; }
   .task-row { min-height: 48px; }
   .version-item { min-height: 36px; }
+  summary { min-height: 36px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }

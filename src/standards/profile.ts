@@ -11,6 +11,14 @@
 import { createHash } from 'crypto';
 import { BUILT_IN_RULES } from '../ai-rules/built-in-rules';
 import { STACK_IDS, StackId } from '../server/stacks';
+import {
+  DesignSystem,
+  MAX_DESIGN_DOC_CHARS,
+  MAX_DESIGN_TOKENS_CHARS,
+  designConfigFingerprint,
+  parseDesignTokens,
+  renderDesignPlannerSummary,
+} from './design';
 
 // ─── Closed sets ───
 
@@ -49,6 +57,7 @@ export const STANDARDS_RULE_IDS = [
   'structure/placement',
   'structure/nested-repository',
   'frontend/raw-pattern',
+  'frontend/design-tokens',
   'layering/imports',
   'naming/files',
   'comment-policy/commented-out-code',
@@ -93,6 +102,7 @@ export const DEFAULT_RULE_SEVERITY: Record<StandardsRuleId, RuleSeverity> = {
   'structure/placement': 'advisory',
   'structure/nested-repository': 'advisory',
   'frontend/raw-pattern': 'advisory',
+  'frontend/design-tokens': 'advisory',
   'layering/imports': 'advisory',
   'naming/files': 'advisory',
   'comment-policy/commented-out-code': 'advisory',
@@ -143,6 +153,7 @@ export function ruleConfigured(profile: StandardsProfile, rule: StandardsRuleId)
     case 'structure/top-level': return profile.structure.allowedTopLevel.length > 0;
     case 'structure/placement': return profile.structure.placement.length > 0;
     case 'frontend/raw-pattern': return profile.frontend.rawPatterns.length > 0;
+    case 'frontend/design-tokens': return profile.design !== undefined;
     case 'layering/imports': return profile.backend.layers.length > 0 && profile.backend.forbiddenImports.length > 0;
     case 'naming/files': return profile.naming.files.length > 0;
     case 'comment-policy/commented-out-code': return profile.comments.forbidCommentedOutCode;
@@ -224,6 +235,8 @@ function ruleConfigOf(profile: StandardsProfile | null, rule: StandardsRuleId): 
     case 'structure/top-level': return profile.structure.allowedTopLevel;
     case 'structure/placement': return profile.structure.placement;
     case 'frontend/raw-pattern': return profile.frontend.rawPatterns;
+    // Hashes only: no DESIGN.md prose reaches an audit log through an enforcement change.
+    case 'frontend/design-tokens': return profile.design ? designConfigFingerprint(profile.design, profile.frontend.componentKit) : null;
     case 'layering/imports': return profile.backend;
     case 'naming/files': return profile.naming.files;
     case 'comment-policy/commented-out-code': return profile.comments.forbidCommentedOutCode;
@@ -269,6 +282,13 @@ export const PROVENANCE_FIELDS = [
   'builtInRuleIds',
 ] as const;
 export type ProvenanceField = typeof PROVENANCE_FIELDS[number];
+
+/**
+ * Provenance areas present only when the profile has the matching part: `design` goes with
+ * `profile.design`. Optional, so every provenance written before them still validates.
+ */
+export const OPTIONAL_PROVENANCE_FIELDS = ['design'] as const;
+export type OptionalProvenanceField = typeof OPTIONAL_PROVENANCE_FIELDS[number];
 
 export const REPO_STATES = ['greenfield', 'brownfield'] as const;
 export type RepoState = typeof REPO_STATES[number];
@@ -334,10 +354,17 @@ export interface StandardsProfile {
    * none, so a profile written before severities existed keeps its content hash.
    */
   severity?: SeverityOverrides;
+  /**
+   * The approved design system of a project with a user interface: DESIGN.md and the tokens
+   * file, verbatim. Absent — never null or empty — when the project has none, so a profile
+   * written before design systems existed keeps its content hash.
+   */
+  design?: DesignSystem;
 }
 
 /** Per-field origin of a proposal: the tag, and the file (or default) that justified it. */
-export type StandardsProvenance = Record<ProvenanceField, { tag: ProvenanceTag; evidence: string }>;
+export type StandardsProvenance = Record<ProvenanceField, { tag: ProvenanceTag; evidence: string }>
+  & Partial<Record<OptionalProvenanceField, { tag: ProvenanceTag; evidence: string }>>;
 
 /** The stored envelope. The version lives here; the hash covers `profile` only. */
 export interface StandardsDocument {
@@ -509,7 +536,7 @@ export function validateProfile(raw: unknown): ProfileValidation {
   const root = shape(raw, 'profile', [
     'stackTemplateId', 'repoState', 'structure', 'frontend', 'backend', 'naming',
     'comments', 'testing', 'commands', 'builtInRuleIds', 'freeText',
-  ], c, ['severity']);
+  ], c, ['severity', 'design']);
   if (!root) { return { ok: false, errors: c.errors }; }
 
   const structure = shape(root.structure, 'profile.structure', ['requiredDirs', 'allowedTopLevel', 'placement'], c) ?? {};
@@ -651,6 +678,11 @@ export function validateProfile(raw: unknown): ProfileValidation {
     if (Object.keys(overrides).length > 0) { profile.severity = overrides; }
   }
 
+  if (root.design !== undefined) {
+    const design = validateDesign(root.design, c);
+    if (design) { profile.design = design; }
+  }
+
   scanCredentials(profile, 'profile', c);
 
   if (c.errors.length === 0) {
@@ -670,6 +702,79 @@ export function validateProfile(raw: unknown): ProfileValidation {
   }
 
   return c.errors.length > 0 ? { ok: false, errors: c.errors } : { ok: true, profile };
+}
+
+// ─── Design system ───
+
+/** Extensions a tokens file may have: a stylesheet, or a theme module the build reads. */
+const TOKENS_EXTENSIONS = ['.css', '.scss', '.ts', '.js', '.mjs', '.cjs', '.json'];
+
+/**
+ * A repository file a design system writes: {@link requiredDir}'s rules, and no segment that
+ * is `.moag` or starts with `.git` — MOAG writes these files into the repository.
+ */
+function repoFile(raw: unknown, at: string, c: Collector): string {
+  const p = requiredDir(raw, at, c);
+  if (p === '') { return ''; }
+  if (p.split('/').some((seg) => seg.toLowerCase() === '.moag' || seg.toLowerCase().startsWith('.git'))) {
+    c.add(`${at}: must not be inside .git or .moag`);
+    return '';
+  }
+  return p;
+}
+
+/** A multi-line text of at most `max` characters whose lines carry no invisible character. */
+function designText(raw: unknown, at: string, max: number, c: Collector): string {
+  if (typeof raw !== 'string') { c.add(`${at}: expected a string`); return ''; }
+  if (raw.length > max) { c.add(`${at}: ${raw.length} characters; the limit is ${max}`); return ''; }
+  const rows = raw.split('\n');
+  for (let i = 0; i < rows.length; i++) {
+    if (hasInvisibleChars(rows[i].replace(/[\r\t]/g, ''))) {
+      c.add(`${at}: line ${i + 1} must not contain control, zero-width or bidirectional-override characters`);
+      return '';
+    }
+  }
+  return raw;
+}
+
+/**
+ * Validate a design system: exactly `docPath`, `tokensPath`, `doc` and `tokens`. Paths are
+ * repository-relative, outside `.git` and `.moag`, distinct, with DESIGN.md a `.md` file and
+ * the tokens file a stylesheet or a theme module. Each text has its cap, and no line or listed
+ * token holds a character a reviewer cannot see. Null when anything is wrong.
+ */
+function validateDesign(raw: unknown, c: Collector): DesignSystem | null {
+  const before = c.errors.length;
+  const o = shape(raw, 'profile.design', ['docPath', 'tokensPath', 'doc', 'tokens'], c);
+  if (!o) { return null; }
+  const docPath = repoFile(o.docPath, 'profile.design.docPath', c);
+  const tokensPath = repoFile(o.tokensPath, 'profile.design.tokensPath', c);
+  if (docPath && !docPath.toLowerCase().endsWith('.md')) { c.add('profile.design.docPath: must be a Markdown (.md) file'); }
+  if (tokensPath && !TOKENS_EXTENSIONS.some((ext) => tokensPath.toLowerCase().endsWith(ext))) {
+    c.add(`profile.design.tokensPath: must end in one of ${TOKENS_EXTENSIONS.join(' ')}`);
+  }
+  if (docPath && tokensPath && docPath.toLowerCase() === tokensPath.toLowerCase()) {
+    c.add('profile.design.tokensPath: must not be the same file as profile.design.docPath');
+  }
+  const doc = designText(o.doc, 'profile.design.doc', MAX_DESIGN_DOC_CHARS, c);
+  const tokens = designText(o.tokens, 'profile.design.tokens', MAX_DESIGN_TOKENS_CHARS, c);
+  if (tokensPath && tokens) {
+    for (const t of parseDesignTokens(tokensPath, tokens).tokens) {
+      if (hasInvisibleChars(t.name) || hasInvisibleChars(t.value)) {
+        c.add(`profile.design.tokens: token ${t.name.slice(0, 60)} must not contain control, zero-width or bidirectional-override characters`);
+        break;
+      }
+    }
+  }
+  return c.errors.length > before ? null : { docPath, tokensPath, doc, tokens };
+}
+
+/** The errors a design system on its own would be refused with (credentials included); empty when valid. */
+export function checkDesign(raw: unknown): string[] {
+  const c = new Collector();
+  const design = validateDesign(raw, c);
+  if (design) { scanCredentials(design, 'profile.design', c); }
+  return c.errors;
 }
 
 /** A version number with as many digits as any store accepts; used to size rendered text. */
@@ -702,14 +807,19 @@ function validateSeverity(raw: unknown, c: Collector): SeverityOverrides {
  */
 export function validateProvenance(raw: unknown): { ok: true; provenance: StandardsProvenance } | { ok: false; errors: string[] } {
   const c = new Collector();
-  const root = shape(raw, 'provenance', PROVENANCE_FIELDS, c);
+  const root = shape(raw, 'provenance', PROVENANCE_FIELDS, c, OPTIONAL_PROVENANCE_FIELDS);
   const out = {} as StandardsProvenance;
-  for (const field of PROVENANCE_FIELDS) {
+  const entryOf = (field: ProvenanceField | OptionalProvenanceField): { tag: ProvenanceTag; evidence: string } => {
     const entry = root ? shape(root[field], `provenance.${field}`, ['tag', 'evidence'], c) ?? {} : {};
-    out[field] = {
+    return {
       tag: root ? member(entry.tag, `provenance.${field}.tag`, PROVENANCE_TAGS, c, 'assumed') : 'assumed',
       evidence: root ? line(entry.evidence, `provenance.${field}.evidence`, c, { allowEmpty: true }) : '',
     };
+  };
+  for (const field of PROVENANCE_FIELDS) { out[field] = entryOf(field); }
+  // Copied only when present: a provenance without them stays exactly as it was.
+  for (const field of OPTIONAL_PROVENANCE_FIELDS) {
+    if (root && root[field] !== undefined) { out[field] = entryOf(field); }
   }
   return c.errors.length > 0 ? { ok: false, errors: c.errors } : { ok: true, provenance: out };
 }
@@ -872,6 +982,7 @@ export function renderPlannerStandards(profile: StandardsProfile, version: numbe
     'Project standards (every task you plan must conform; cite the relevant convention in task prompts):',
     renderStandardsText(profile, version),
   ];
+  if (profile.design) { parts.push(renderDesignPlannerSummary(profile.design, profile.frontend.componentKit)); }
   if (profile.repoState === 'greenfield') {
     const dirs = profile.structure.requiredDirs;
     parts.push(

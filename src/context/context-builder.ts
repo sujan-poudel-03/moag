@@ -6,6 +6,7 @@ import * as path from 'path';
 import { Plan, Playlist, Task, TaskStatus, HistoryEntry } from '../models/types';
 import { HistoryStore } from '../history/store';
 import { PROJECT_STANDARDS_HEADER } from '../standards/profile';
+import { DESIGN_SYSTEM_HEADER } from '../standards/design';
 import { semanticSearch, formatSpans, SemanticSpan } from './semantic-provider';
 import { KnowledgeGraph, lookupSymbols, buildKG as _buildKG } from './knowledge-graph';
 import { ContextWeights, DEFAULT_WEIGHTS, loadWeights } from './weights';
@@ -98,6 +99,11 @@ export interface ContextOptions {
    * and what it uses comes out of the budget the other sections share.
    */
   standards?: string;
+  /**
+   * The approved design system, already rendered (at most 2 000 characters). Emitted as
+   * `## Design System` right after the standards and PINNED like them.
+   */
+  design?: string;
   /** Pre-formatted text from enabled AI rules — injected as the second-highest-priority context section. */
   aiRules?: string;
   /** Facts this repository has proven about itself. See runner/knowledge.ts. */
@@ -202,6 +208,9 @@ export function buildContext(options: ContextOptions): string {
   // author's own rules. Same priority, so push order is what keeps them adjacent.
   if (options.standards && options.standards.trim()) {
     sections.push({ priority: -1, header: PROJECT_STANDARDS_HEADER, body: options.standards.trim() });
+  }
+  if (options.design && options.design.trim()) {
+    sections.push({ priority: -1, header: DESIGN_SYSTEM_HEADER, body: options.design.trim() });
   }
 
   if (options.aiRules && options.aiRules.trim()) {
@@ -319,12 +328,13 @@ export function buildContext(options: ContextOptions): string {
   }
 
   const beforeTrim = sections.length;
-  // The standards section is pinned: it is kept whole, and the other sections compete for
-  // what is left. A budget smaller than the block therefore yields the block alone.
-  const pinned = sections.filter((s) => s.header === PROJECT_STANDARDS_HEADER);
+  // The standards and design-system sections are pinned: they are kept whole, and the other
+  // sections compete for what is left. A budget smaller than them therefore yields them alone.
+  const isPinned = (header: string): boolean => header === PROJECT_STANDARDS_HEADER || header === DESIGN_SYSTEM_HEADER;
+  const pinned = sections.filter((s) => isPinned(s.header));
   const pinnedChars = pinned.reduce((sum, s) => sum + s.header.length + 1 + s.body.length + 2, 0);
   const others = applyBudget(
-    sections.filter((s) => s.header !== PROJECT_STANDARDS_HEADER),
+    sections.filter((s) => !isPinned(s.header)),
     Math.max(0, settings.maxContextChars - pinnedChars),
   );
   // Stable sort: the pinned section goes in first, so it stays ahead of its priority peers.

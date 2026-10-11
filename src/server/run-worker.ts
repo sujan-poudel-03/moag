@@ -29,7 +29,7 @@ export interface RunnerLike {
   play(plan: PlanLike, playlistIndex?: number): Promise<void>;
   stop(): void;
   /** `TaskRunner.setStandardsProvider`: the block every task prompt carries. */
-  setStandardsProvider?(fn: (cwd: string) => { text: string; version: number } | null): void;
+  setStandardsProvider?(fn: (cwd: string) => { text: string; version: number; design?: string } | null): void;
 }
 
 interface EngineResultLike { stdout: string; stderr: string; exitCode: number; durationMs: number; }
@@ -48,6 +48,8 @@ export interface StandardsJobLike {
   promptText: string;
   /** The text the planning prompt carries. */
   plannerText: string;
+  /** The design-system block every task prompt carries, when the profile has a design system. */
+  designText?: string;
   /** The approved profile — its rules and its commands — as read at worker start. Opaque here. */
   profile?: unknown;
   /** The ref the standards check diffs against; null means "no commits yet". */
@@ -259,7 +261,11 @@ async function runRunJob(job: RunJob, deps: WorkerDeps): Promise<number> {
     if (!runner.setStandardsProvider) {
       throw new Error('This job names a standards file, but the runner cannot carry standards.');
     }
-    runner.setStandardsProvider(() => ({ text: standards.promptText, version: standards.version }));
+    runner.setStandardsProvider(() => ({
+      text: standards.promptText,
+      version: standards.version,
+      ...(standards.designText ? { design: standards.designText } : {}),
+    }));
     jobStandards = standards;
   }
   const defer = deps.defer ?? ((fn: () => void) => { setImmediate(fn); });

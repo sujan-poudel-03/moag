@@ -22,12 +22,13 @@ import { SecretStore } from '../../../server/secrets';
 import { referencedEngines } from '../../../server/run-env';
 import { PlanJob, RunJob } from '../../../server/worker-protocol';
 import { verifyArgv } from '../../../server/run-worker';
-import { RUN_DETAIL_EVENTS } from '../../../server/app';
+import { DESIGN_BACKUP_DIR, RUN_DETAIL_EVENTS } from '../../../server/app';
 import { contentHash } from '../../../server/prd-ops';
 import { migrateStandards } from '../../../server/standards-store';
 import { readStandardsJobFile } from '../../../standards/local-store';
 import { profileHash, renderPlannerStandards, renderStandardsText } from '../../../standards/profile';
 import { sampleProfile } from '../standards/fixtures';
+import { templateDesign } from '../../../standards/design';
 
 describe('server app', function () {
   this.timeout(20000);
@@ -3612,5 +3613,135 @@ describe('server app — standards gate', function () {
     assert.equal(legacy.status, 409, legacy.raw);
     assert.equal(legacy.body.error, 'standards-not-approved');
     assert.equal(h.workers.length, workersBefore);
+  });
+});
+
+// ─── The approved design system reaches the workspace at run start ───
+
+describe('server app — design system at run start', function () {
+  this.timeout(30000);
+  const DESIGN = templateDesign('node-ts', '')!;
+  let h: Harness;
+  afterEach(async () => { await h.close(); });
+
+  it('POST /runs writes DESIGN.md and the tokens file into the workspace before the worker spawns', async () => {
+    h = await startHarness({ profileDesign: DESIGN });
+    const { projectId, planId } = await approvedProject(h);
+    const ws = path.join(h.root, 'acme');
+    let seenAtSpawn: { doc: string | null; tokens: string | null } | null = null;
+    h.onSpawn = () => {
+      const read = (rel: string): string | null => { try { return fs.readFileSync(path.join(ws, ...rel.split('/')), 'utf-8'); } catch { return null; } };
+      seenAtSpawn = { doc: read(DESIGN.docPath), tokens: read(DESIGN.tokensPath) };
+    };
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    assert.deepEqual(seenAtSpawn, { doc: DESIGN.doc, tokens: DESIGN.tokens });
+    // The job file the worker reads carries the design text for every task prompt.
+    const w = h.workers.at(-1)!;
+    const job = readStandardsJobFile((w.job as RunJob).standardsPath!);
+    assert.match(job.designText ?? '', /^Design system v1 · DESIGN.md at docs\/design\/DESIGN.md/);
+    const start = h.auditEntries().find((e) => e.action === 'run.start')!;
+    assert.equal(JSON.stringify(start.after ?? {}).includes('designFilesReplaced'), false, 'fresh files replace nothing');
+  });
+
+  it('a file the approved design did not adopt is never replaced: 409 design-file-conflict, nothing written, nothing spawned', async () => {
+    h = await startHarness({ profileDesign: DESIGN });
+    const { projectId, planId } = await approvedProject(h);
+    const ws = path.join(h.root, 'acme');
+    const tokensFull = path.join(ws, ...DESIGN.tokensPath.split('/'));
+    const theirs = ':root, [data-theme="light"] {\n  --brand: #123456;\n}\n';
+    fs.mkdirSync(path.dirname(tokensFull), { recursive: true });
+    fs.writeFileSync(tokensFull, theirs);
+    const workers = h.workers.length;
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 409, r.raw);
+    assert.equal(r.body.error, 'design-file-conflict');
+    assert.equal(r.body.path, DESIGN.tokensPath);
+    assert.match(String(r.body.message), /^src\/styles\/tokens\.css already exists in the workspace and is not a file MOAG wrote or adopted/);
+    assert.equal(fs.readFileSync(tokensFull, 'utf-8'), theirs, 'the user\'s file is untouched');
+    assert.equal(fs.existsSync(path.join(ws, ...DESIGN.docPath.split('/'))), false, 'the other design file was not written either');
+    assert.equal(h.workers.length, workers, 'no worker was spawned');
+    assert.deepEqual(h.state.load(projectId).runs, [], 'no run was recorded');
+    assert.equal(h.auditEntries().some((e) => e.action === 'run.start'), false);
+  });
+
+  it('a hand edit of the file an earlier run wrote is replaced, kept in the run directory and named in the run.start audit', async () => {
+    h = await startHarness({ profileDesign: DESIGN });
+    const { projectId, planId } = await approvedProject(h);
+    const ws = path.join(h.root, 'acme');
+    const tokensFull = path.join(ws, ...DESIGN.tokensPath.split('/'));
+    const docFull = path.join(ws, ...DESIGN.docPath.split('/'));
+    // The first run writes both files under the approved v1, then ends.
+    const first = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(first.status, 202, first.raw);
+    const firstId = (first.body.run as { id: string }).id;
+    assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${firstId}/stop`, { as: 'reviewer', body: {} })).status, 202);
+    h.workers.at(-1)!.exit(1);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'stopped');
+
+    const handEdit = ':root { --color-primary: #123456; }\n';
+    fs.writeFileSync(tokensFull, handEdit);
+    fs.writeFileSync(docFull, DESIGN.doc.replace(/\n/g, '\r\n'), 'utf-8'); // same text, CRLF: not a replacement
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    const runId = (r.body.run as { id: string }).id;
+    assert.equal(fs.readFileSync(tokensFull, 'utf-8'), DESIGN.tokens, 'the server copy is canonical');
+    const backup = path.join(h.state.runDir(projectId, runId), DESIGN_BACKUP_DIR, ...DESIGN.tokensPath.split('/'));
+    assert.equal(fs.readFileSync(backup, 'utf-8'), handEdit, 'the hand edit is kept, outside the workspace');
+    assert.equal(fs.existsSync(path.join(h.state.runDir(projectId, runId), DESIGN_BACKUP_DIR, 'docs')), false);
+    assert.equal(fs.existsSync(`${tokensFull}.bak`), false, 'nothing extra lands in the workspace');
+    const start = h.auditEntries().filter((e) => e.action === 'run.start').at(-1)!;
+    assert.equal(start.target, runId);
+    const after = start.after as { designFilesReplaced?: string[]; designBackupDir?: string };
+    assert.deepEqual(after.designFilesReplaced, [DESIGN.tokensPath]);
+    assert.equal(after.designBackupDir, `runs/${runId}/${DESIGN_BACKUP_DIR}`);
+  });
+
+  it('a symlinked docs directory refuses the run 409 design-files-unwritable: nothing spawned, no run recorded', async function () {
+    h = await startHarness({ profileDesign: DESIGN });
+    const { projectId, planId } = await approvedProject(h);
+    const elsewhere = fs.mkdtempSync(path.join(h.root, '..', 'elsewhere-'));
+    try {
+      fs.symlinkSync(elsewhere, path.join(h.root, 'acme', 'docs'), 'junction');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EPERM') { this.skip(); return; }
+      throw err;
+    }
+    const workers = h.workers.length;
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 409, r.raw);
+    assert.equal(r.body.error, 'design-files-unwritable');
+    assert.match(String(r.body.message), /The approved design system could not be written to the workspace \(.*symbolic link.*\), so the run can't start\./);
+    assert.equal(h.workers.length, workers, 'no worker was spawned');
+    assert.deepEqual(h.state.load(projectId).runs, [], 'no run was recorded');
+    assert.deepEqual(fs.readdirSync(elsewhere), [], 'nothing was written through the link');
+  });
+
+  it('a promoted design rule with findings in the pre-gate report refuses the gate approval 409 standards-blocking', async () => {
+    h = await startHarness({ profileDesign: DESIGN, promoteRules: ['frontend/design-tokens'] });
+    const { projectId, planId } = await approvedProject(h);
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    const runId = (r.body.run as { id: string }).id;
+    const w = h.workers.at(-1)!;
+    const snapPath = (w.job as { planPath: string }).planPath;
+    const snap = JSON.parse(fs.readFileSync(snapPath, 'utf-8'));
+    const tasks = snap.playlists.at(-1).tasks as Array<{ id: string; name: string; status?: string; dependsOn?: string[] }>;
+    const shipGate = tasks.find((t) => t.name === 'Ship approval')!;
+    for (const t of tasks) { t.status = t.id === shipGate.id ? 'failed' : (t.dependsOn ?? []).includes(shipGate.id) ? 'blocked' : 'completed'; }
+    fs.writeFileSync(snapPath, JSON.stringify(snap));
+    w.line({
+      event: 'verify-standards', phase: 'pre-gate', version: 1, baseRef: FAKE_HEAD,
+      rules: [{ rule: 'frontend/design-tokens', result: 'failed' }],
+      findings: [{ file: 'src/a.css', line: 2, rule: 'frontend/design-tokens', message: 'Raw colour; use a design token from src/styles/tokens.css' }],
+    });
+    w.line({ event: 'manual-gate', id: shipGate.id, name: shipGate.name });
+    w.exit(3);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'awaiting-approval');
+    await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
+    assert.equal(h.state.load(projectId).runs[0].standardsSummary!.failed, 1);
+    const refused = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.error, 'standards-blocking');
   });
 });

@@ -307,6 +307,62 @@ describe('run-worker', () => {
       assert.equal(h.stopDisposed, 1);
     });
 
+    it('a stop whose engine child never closes (orphan holding the pipe) still reaches the snapshot save', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const proxyquire = require('proxyquire').noCallThru();
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { PassThrough } = require('stream');
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), pid: 4242,
+      });
+      const killProcess = sinon.spy();
+      const baseCli = proxyquire('../../../adapters/base-cli', {
+        'child_process': { spawn: sinon.stub().returns(child), execSync: sinon.stub() },
+        '../utils/process-kill': { killProcess, SPAWN_DETACHED: false },
+        '../utils/child-tracker': { trackChildProcess: () => undefined },
+      }) as typeof import('../../../adapters/base-cli');
+      const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      try {
+        let h!: Harness;
+        let ac!: AbortController;
+        let playSettled!: Promise<unknown>;
+        class HungRunner extends FakeRunner {
+          override stop(): void {
+            super.stop();
+            this.emit('state-changed', 'stopping');
+            ac.abort();
+            void playSettled.then(() => this.emit('state-changed', 'idle'));
+          }
+        }
+        const runner = new HungRunner(async () => {
+          ac = new AbortController();
+          playSettled = baseCli.runCli(
+            { command: 'claude', buildArgs: () => ['-p'], useStdin: true },
+            { prompt: 'p', cwd: os.tmpdir(), signal: ac.signal },
+          );
+          h.triggerStop();
+          await playSettled;
+        });
+        h = harness(runner);
+        const done = runJob(RUN_JOB, h.deps);
+        for (let i = 0; i < 5; i++) { await tick(); }
+        assert.equal(h.saves, 0, 'nothing settled yet: the child has not closed');
+        child.emit('exit', null, 'SIGTERM'); // exits, but an orphan keeps the pipe open
+        await clock.tickAsync(baseCli.ABORT_CLOSE_GRACE_MS);
+        const code = await done;
+        assert.equal(code, 1);
+        assert.equal(killProcess.callCount, 1);
+        assert.ok(h.saves >= 1, 'the stop path saved the run snapshot');
+        const seq = h.events
+          .map((e) => (e.event === 'state' ? `state:${String(e.state)}` : String(e.event)))
+          .filter((e) => e === 'state:stopping' || e === 'state:idle' || e === 'run-finished');
+        assert.deepEqual(seq, ['state:stopping', 'state:idle', 'run-finished']);
+        assert.deepEqual(h.events.at(-1), { event: 'run-finished', code: 1 });
+      } finally {
+        clock.restore();
+      }
+    });
+
     it('guardParentPipes keeps an EPIPE on a dead parent pipe from crashing the worker', () => {
       const out = new EventEmitter();
       const err = new EventEmitter();
@@ -489,6 +545,22 @@ describe('run-worker', () => {
       assert.equal(await runJob(RUN_JOB, mk().deps), 0);
       assert.equal(read.length, 1, 'no standardsPath: nothing is read');
       assert.equal(set.length, 1, 'and no provider is set');
+    });
+
+    it('the runner\'s standards provider carries the design text when the job has one, and no design key when not', async () => {
+      const seen: Array<Record<string, unknown> | null> = [];
+      for (const designText of ['Design system v2 · tokens in css/tokens.css', undefined]) {
+        const runner = new FakeRunner(async () => undefined);
+        (runner as unknown as RunnerLike).setStandardsProvider = (fn) => { seen.push(fn('/ws') as Record<string, unknown> | null); };
+        const h = harness(runner, {
+          readStandardsJobFile: () => ({ version: 2, promptText: 'Project standards v2', plannerText: 'p', ...(designText ? { designText } : {}) }),
+        });
+        await runJob({ ...RUN_JOB, standardsPath: '/run/standards.json' }, h.deps);
+      }
+      assert.deepEqual(seen, [
+        { text: 'Project standards v2', version: 2, design: 'Design system v2 · tokens in css/tokens.css' },
+        { text: 'Project standards v2', version: 2 },
+      ]);
     });
 
     it('a run whose standards file cannot be read or used never plays: exit 2, no verify', async () => {

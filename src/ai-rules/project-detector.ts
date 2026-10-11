@@ -2,6 +2,7 @@ import { execFile } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { commentOnlyLineNumbers, languageFamily, lexFile } from '../standards/lexer';
+import { MAX_DESIGN_DOC_CHARS, MAX_DESIGN_TOKENS_CHARS, allFallbackDesignPaths } from '../standards/design';
 
 export interface DetectionResult {
   /** Human-readable signals shown in the notification, e.g. ["React", "TypeScript", "FastAPI"] */
@@ -420,6 +421,11 @@ export interface ConventionDetection {
   commentDensity: { pct: number; filesSampled: number; evidence: string } | null;
   /** Built-in rule IDs from {@link detectProjectRules}. */
   suggestedRuleIds: string[];
+  /**
+   * An existing design system the repository already has: a tokens or theme file, a design
+   * document, and whether it serves pages (index.html). Absent when none of them was found.
+   */
+  designSources?: DesignSources;
 }
 
 const MAX_WALK_DEPTH = 8;
@@ -529,6 +535,133 @@ function readCapped(cwd: string, rel: string, maxBytes: number): string | null {
     return fs.readFileSync(full, 'utf8');
   } catch {
     return null;
+  }
+}
+
+// ─── Design sources ───
+
+/** What {@link detectDesignSources} found. */
+export interface DesignSources {
+  tokens: { path: string; content: string } | null;
+  doc: { path: string; content: string } | null;
+  ui: { value: string; evidence: string } | null;
+  /**
+   * Candidate and fallback design paths that exist on disk but were not adopted, each with
+   * why. A proposal never targets one of them, so nothing there is ever overwritten. Absent
+   * when there is none.
+   */
+  notAdopted?: Array<{ path: string; reason: string; content?: string }>;
+}
+
+/** Where a repository keeps its design tokens or theme, most specific first. */
+const DESIGN_TOKEN_CANDIDATES = [
+  'src/styles/tokens.css', 'src/styles/theme.css', 'src/styles/variables.css', 'src/theme.css', 'src/tokens.css',
+  'styles/tokens.css', 'css/tokens.css', 'css/variables.css', 'css/theme.css',
+  'tailwind.config.ts', 'tailwind.config.js', 'tailwind.config.cjs', 'tailwind.config.mjs',
+  'src/theme/tokens.ts', 'src/theme/index.ts', 'src/theme.ts', 'src/tokens.ts',
+];
+/** Where a repository keeps its design document. */
+const DESIGN_DOC_CANDIDATES = ['docs/design/DESIGN.md', 'DESIGN.md', 'docs/DESIGN.md', 'docs/design-system.md', 'design/DESIGN.md'];
+/**
+ * A stylesheet that declares custom properties on `:root` — alone or in a selector list such
+ * as `:root, [data-theme="light"] {` — a tokens file, not just any CSS.
+ */
+const ROOT_CUSTOM_PROPERTIES = /:root\b[^{};]*\{[^}]*--[\w-]+\s*:/;
+
+/** True when something (file, directory or link) is at `rel`, whether or not git tracks it. */
+function anythingAt(cwd: string, rel: string): boolean {
+  try { fs.lstatSync(path.join(cwd, ...rel.split('/'))); return true; } catch { return false; }
+}
+
+/** The candidate at `rel` as text within `cap`, or why it could not be read. */
+function readDesignCandidate(cwd: string, rel: string, cap: number): { content: string } | { problem: string } {
+  let stat: fs.Stats;
+  try { stat = fs.lstatSync(path.join(cwd, ...rel.split('/'))); } catch { return { problem: 'could not be read' }; }
+  if (!stat.isFile()) { return { problem: 'not a regular file' }; }
+  if (stat.size > cap) { return { problem: `larger than ${cap} characters` }; }
+  const content = readCapped(cwd, rel, cap);
+  if (content === null) { return { problem: 'could not be read' }; }
+  if (content.length > cap) { return { problem: `larger than ${cap} characters` }; }
+  return { content };
+}
+
+/**
+ * Adopt the candidate at `rel` into `found`, or list it in `notAdopted` with why — and with its
+ * content when it was readable, so a proposal can tell MOAG's own earlier write from a user's file.
+ */
+function considerDesignCandidate(
+  cwd: string, rel: string, cap: number, tracked: boolean, isTokens: boolean,
+  notAdopted: NonNullable<DesignSources['notAdopted']>,
+): { path: string; content: string } | null {
+  const read = readDesignCandidate(cwd, rel, cap);
+  const content = 'content' in read ? read.content : null;
+  const problem = 'problem' in read ? read.problem
+    : !tracked ? 'not tracked by git'
+      : isTokens && rel.endsWith('.css') && !ROOT_CUSTOM_PROPERTIES.test(read.content) ? 'declares no :root custom properties'
+        : null;
+  if (problem === null) { return { path: rel, content: content as string }; }
+  notAdopted.push({ path: rel, reason: problem, ...(content !== null ? { content } : {}) });
+  return null;
+}
+
+/**
+ * The design system a repository already has, from a fixed list of places: the first tokens
+ * or theme file (a CSS one only when it declares `:root` custom properties), the first design
+ * document, and whether it serves an `index.html`. Each file is read only when it is a regular
+ * file within the design caps. `present` decides what counts (a caller limits it to tracked
+ * files). Every candidate or fallback path that exists on disk but is not adopted is listed in
+ * `notAdopted` with why, so a proposal never targets it. Never throws.
+ */
+export function detectDesignSources(cwd: string, present: (rel: string) => boolean = (rel) => fileExists(cwd, rel)): DesignSources {
+  const out: DesignSources = { tokens: null, doc: null, ui: null };
+  const notAdopted: Array<{ path: string; reason: string }> = [];
+  try {
+    for (const rel of DESIGN_TOKEN_CANDIDATES) {
+      if (!anythingAt(cwd, rel)) { continue; }
+      if (out.tokens) { notAdopted.push({ path: rel, reason: `${out.tokens.path} was adopted instead` }); continue; }
+      out.tokens = considerDesignCandidate(cwd, rel, MAX_DESIGN_TOKENS_CHARS, present(rel), true, notAdopted);
+    }
+    for (const rel of DESIGN_DOC_CANDIDATES) {
+      if (!anythingAt(cwd, rel)) { continue; }
+      if (out.doc) { notAdopted.push({ path: rel, reason: `${out.doc.path} was adopted instead` }); continue; }
+      out.doc = considerDesignCandidate(cwd, rel, MAX_DESIGN_DOC_CHARS, present(rel), false, notAdopted);
+    }
+    for (const rel of allFallbackDesignPaths()) {
+      if (!anythingAt(cwd, rel) || notAdopted.some((n) => n.path === rel)) { continue; }
+      const read = readDesignCandidate(cwd, rel, rel.endsWith('.md') ? MAX_DESIGN_DOC_CHARS : MAX_DESIGN_TOKENS_CHARS);
+      notAdopted.push({ path: rel, reason: 'already exists', ...('content' in read ? { content: read.content } : {}) });
+    }
+    if (present('index.html')) { out.ui = { value: 'index.html', evidence: 'index.html' }; }
+  } catch {
+    return { tokens: null, doc: null, ui: null };
+  }
+  return notAdopted.length > 0 ? { ...out, notAdopted } : out;
+}
+
+/**
+ * The UI framework and component library a workspace's package.json names, from a bounded
+ * read of that one file. For a cheap "does this project have a user interface?" probe;
+ * nothing is walked and git is not asked. Never throws.
+ */
+export function detectUiPackages(cwd: string): { framework: Detected<string> | null; componentLibrary: Detected<string> | null; packages: string[] } {
+  const none = { framework: null, componentLibrary: null, packages: [] as string[] };
+  try {
+    const text = readCapped(cwd, 'package.json', MAX_MANIFEST_BYTES);
+    if (text === null) { return none; }
+    const pkg: unknown = JSON.parse(text);
+    if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) { return none; }
+    const rec = pkg as Record<string, unknown>;
+    const keys = (v: unknown): string[] => (v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v as object) : []);
+    const deps = new Set([...keys(rec.dependencies), ...keys(rec.devDependencies)]);
+    const framework = NODE_FRAMEWORKS.find(([dep]) => deps.has(dep));
+    const library = COMPONENT_LIBRARIES.find(([dep]) => deps.has(dep));
+    return {
+      framework: framework ? { value: framework[1], evidence: 'package.json' } : null,
+      componentLibrary: library ? { value: library[1], evidence: 'package.json' } : null,
+      packages: [framework?.[0], library?.[0]].filter((x): x is string => !!x),
+    };
+  } catch {
+    return none;
   }
 }
 
@@ -942,6 +1075,10 @@ export function detectProjectConventions(cwd: string, opts: ConventionDetectionO
     if (sampled > 0 && totalLines > 0 && densityProof) {
       out.commentDensity = { pct: (commentLines * 100) / totalLines, filesSampled: sampled, evidence: densityProof };
     }
+
+    // ── Design sources (only when something was found, so other detections are unchanged) ──
+    const design = detectDesignSources(cwd, present);
+    if (design.tokens || design.doc || design.ui || design.notAdopted) { out.designSources = design; }
     return out;
   } catch {
     return emptyDetection();

@@ -32,6 +32,7 @@
 
 import { commentOnlyLineNumbers, fileExtension, headerLineCount, lexFile, LexedLine, LexResult } from './lexer';
 import { globToRegExp, isUnder, matchesAny, normalizePath } from './glob';
+import { foreignKitImport, knownComponentKit } from './design';
 import type { StandardsCheckCounts } from '../models/types';
 import {
   NamingStyle,
@@ -144,6 +145,21 @@ export interface StandardsCheckInput {
    * no config declares any.
    */
   importPathScopes?: ImportPathScope[];
+  /**
+   * The approved design system's two files (DESIGN.md and the tokens file) as they stand in
+   * the workspace now: `content` null with `missing` when the file is absent, or with
+   * `skipped` when it could not be read. Absent when they were not read at all.
+   */
+  designFiles?: StandardsDesignFile[];
+}
+
+/** One design-system file as the evidence collector read it from the workspace. */
+export interface StandardsDesignFile {
+  /** Repository-relative, `/`-separated. */
+  path: string;
+  content: string | null;
+  missing?: boolean;
+  skipped?: string;
 }
 
 export interface StandardsRuleOutcome {
@@ -840,7 +856,10 @@ function checkRawPatterns(profile: StandardsProfile, files: Prepared[], log: Rul
   const rule = 'frontend/raw-pattern';
   const patterns = profile.frontend.rawPatterns;
   if (patterns.length === 0) { log.notConfigured(rule); return; }
+  const tokensPath = profile.design ? normalizePath(profile.design.tokensPath) : null;
   for (const f of files) {
+    // The tokens file is where raw values belong: never a finding.
+    if (f.path === tokensPath) { continue; }
     if (f.leftOut) { log.leftOut(f, rule); continue; }
     if (f.file.content !== null && f.file.addedLines.length > 0) { log.saw(rule); }
     for (const p of patterns) {
@@ -937,6 +956,170 @@ function importSpecifiers(ext: string, code: string): ImportRead | null {
     return { specs: m ? [m[1]] : [] };
   }
   return null;
+}
+
+// ─── Frontend design tokens ───
+
+/** UI files whose added lines are scanned for raw colours and lengths. */
+const DESIGN_SCAN_EXTENSIONS = new Set(['css', 'html', 'htm', 'jsx', 'tsx']);
+/**
+ * Script files whose string and template literals are scanned (styled-components, Emotion,
+ * style objects): only the literal text, never the code around it. JSX/TSX are scanned whole.
+ */
+const DESIGN_LITERAL_EXTENSIONS = new Set(['ts', 'mts', 'cts', 'js', 'mjs', 'cjs']);
+/** UI files no scanner here reads: a change to one leaves the rule undecided. */
+const DESIGN_UNREADABLE_EXTENSIONS = new Set(['vue', 'svelte', 'scss', 'sass', 'less']);
+/** At-rule lines whose lengths are breakpoints or conditions, not styling. */
+const DESIGN_AT_RULE = /^\s*@(?:media|container|supports)\b/;
+const DESIGN_VAR_CALL = /var\([^)]*\)/g;
+const DESIGN_RAW_LENGTH = /(?<![\w.#-])(\d*\.?\d+)(px|rem|em)\b/g;
+
+/** Text normalised for comparing a design file with its approved content. */
+function designNormalised(text: string): string {
+  return text.replace(/\r\n?/g, '\n').replace(/\n+$/, '');
+}
+
+/** Deepest nesting of template literals and `${…}` expressions followed; deeper text is skipped. */
+const MAX_LITERAL_NESTING = 32;
+
+/**
+ * The text inside string and template literals on each line of lexed (comment-free) JS/TS
+ * code — where styled-components, Emotion and inline style objects keep their CSS — with
+ * `${…}` expressions left out. A template literal is followed across lines; a quoted string
+ * ends at its line. Only the literal text is scanned in a plain `.js`/`.ts` file, so code such
+ * as a `#private` field is never read as a colour. Heuristic: a regular expression literal
+ * holding a quote can misplace one line's boundaries; the rule is advisory unless promoted.
+ */
+function literalTextByLine(lines: readonly string[]): string[] {
+  const out: string[] = [];
+  // Open template literals ('tpl') and `${` expressions (their own `{` depth) around this point.
+  const stack: Array<'tpl' | { depth: number }> = [];
+  for (const line of lines) {
+    let text = '';
+    let quote: string | null = null;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      const top = stack[stack.length - 1];
+      if (quote !== null) {
+        if (ch === '\\') { text += line.slice(i, i + 2); i++; continue; }
+        if (ch === quote) { quote = null; text += ' '; continue; }
+        text += ch;
+        continue;
+      }
+      if (top === 'tpl') {
+        if (ch === '\\') { text += line.slice(i, i + 2); i++; continue; }
+        if (ch === '`') { stack.pop(); text += ' '; continue; }
+        if (ch === '$' && line[i + 1] === '{') {
+          if (stack.length < MAX_LITERAL_NESTING) { stack.push({ depth: 0 }); }
+          text += ' ';
+          i++;
+          continue;
+        }
+        text += ch;
+        continue;
+      }
+      if (ch === '\'' || ch === '"') { quote = ch; continue; }
+      if (ch === '`') { if (stack.length < MAX_LITERAL_NESTING) { stack.push('tpl'); } continue; }
+      if (top !== undefined) {
+        if (ch === '{') { top.depth++; }
+        else if (ch === '}') { if (top.depth === 0) { stack.pop(); } else { top.depth--; } }
+      }
+    }
+    out.push(text);
+  }
+  return out;
+}
+
+/** True when `code` holds a raw length other than 0 and 1px. */
+function hasRawLength(code: string): boolean {
+  DESIGN_RAW_LENGTH.lastIndex = 0;
+  for (let m = DESIGN_RAW_LENGTH.exec(code); m; m = DESIGN_RAW_LENGTH.exec(code)) {
+    const n = Number(m[1]);
+    if (n === 0 || (n === 1 && m[2].toLowerCase() === 'px')) { continue; }
+    return true;
+  }
+  return false;
+}
+
+/**
+ * UI files use the approved design system: no raw colour or length on an added line of a UI
+ * file (the tokens file itself excepted), no import of a UI kit other than the approved one,
+ * and DESIGN.md and the tokens file exactly as approved. Advisory unless a profile promotes it.
+ */
+function checkDesignTokens(profile: StandardsProfile, input: StandardsCheckInput, files: Prepared[], log: RuleLog): void {
+  const rule = 'frontend/design-tokens';
+  const design = profile.design;
+  if (!design) { log.notConfigured(rule); return; }
+  const docPath = normalizePath(design.docPath);
+  const tokensPath = normalizePath(design.tokensPath);
+
+  // ── Integrity: the two files are exactly what was approved ──
+  if (input.designFiles === undefined) {
+    log.undecided(rule, 'The design files were not read');
+  } else {
+    for (const [p, approved] of [[docPath, design.doc], [tokensPath, design.tokens]] as const) {
+      const read = input.designFiles.find((d) => normalizePath(d.path) === p);
+      if (!read) { log.undecided(rule, `The design file was not read (${p})`); continue; }
+      if (read.missing) {
+        log.saw(rule);
+        log.find(rule, p, 1, `${p} is missing; it is part of the approved design system (write it from the approved standards)`);
+        continue;
+      }
+      if (read.content === null) { log.undecided(rule, `${read.skipped ?? 'File could not be read'} (${p})`); continue; }
+      log.saw(rule);
+      if (designNormalised(read.content) !== designNormalised(approved)) {
+        log.find(rule, p, 1, `${p} differs from the approved design system; runs may not change it — propose a new standards version instead`);
+      }
+    }
+  }
+
+  const kit = knownComponentKit(profile.frontend.componentKit);
+  for (const f of files) {
+    if (f.path === tokensPath || f.path === docPath) { continue; }
+    const inScope = f.file.content === null || f.file.status !== 'modified' || f.file.addedLines.length > 0;
+    if (!inScope) { continue; }
+    const literalOnly = DESIGN_LITERAL_EXTENSIONS.has(f.ext);
+    const isUi = DESIGN_SCAN_EXTENSIONS.has(f.ext) || DESIGN_UNREADABLE_EXTENSIONS.has(f.ext) || literalOnly;
+    if (f.leftOut) { if (isUi || JS_EXTENSIONS.has(f.ext)) { log.leftOut(f, rule); } continue; }
+    // A script file whose literals could not be told from its code is not checked either:
+    // "no design findings" must never cover a file nobody read.
+    if (DESIGN_UNREADABLE_EXTENSIONS.has(f.ext) || (isUi && f.file.content === null) || (literalOnly && !f.lex.ok)) {
+      const reason = unsupportedType(f) ?? (f.lex.ok ? 'File could not be read' : f.lex.reason);
+      log.undecided(rule, `not checked (${reason}) (${f.path})`);
+      continue;
+    }
+    if (f.file.content === null || f.file.addedLines.length === 0) { continue; }
+
+    // ── Raw colours and lengths ──
+    if (DESIGN_SCAN_EXTENSIONS.has(f.ext) || literalOnly) {
+      log.saw(rule);
+      const literals = literalOnly && f.lex.ok ? literalTextByLine(f.lex.lines.map((l) => l.code)) : null;
+      for (const n of f.file.addedLines) {
+        const text = literals ? literals[n - 1] : f.lex.ok ? f.lex.lines[n - 1]?.code : f.raw[n - 1];
+        if (text === undefined || DESIGN_AT_RULE.test(text)) { continue; }
+        const code = text.replace(DESIGN_VAR_CALL, '');
+        if (BUILTIN_PATTERNS['hex-color'].test(code) || BUILTIN_PATTERNS['css-color-function'].test(code)) {
+          log.findIn(rule, f, n, `Raw colour; use a design token from ${tokensPath}`);
+        }
+        if (hasRawLength(code)) {
+          log.findIn(rule, f, n, `Raw length; use a spacing, radius or type token from ${tokensPath}`);
+        }
+      }
+    }
+
+    // ── Component kit ──
+    if (kit && JS_EXTENSIONS.has(f.ext) && f.lex.ok) {
+      log.saw(rule);
+      for (const n of f.file.addedLines) {
+        const code = f.lex.lines[n - 1]?.code;
+        if (code === undefined) { continue; }
+        for (const spec of importSpecifiers(f.ext, code)?.specs ?? []) {
+          const foreign = foreignKitImport(spec, kit);
+          if (foreign) { log.findIn(rule, f, n, `Imports ${foreign.pkg}; the approved component kit is ${kit.label}`); }
+        }
+      }
+    }
+  }
 }
 
 /** What the importing file is, for telling the project's own code apart from a package. */
@@ -1704,6 +1887,7 @@ export function checkStandards(profile: StandardsProfile, input: StandardsCheckI
   checkPlacement(profile, files, log);
   checkNestedRepos(input, log);
   checkRawPatterns(profile, files, log);
+  checkDesignTokens(profile, input, files, log);
   checkLayering(profile, input, files, log);
   checkNaming(profile, files, log);
   checkComments(profile, files, log);

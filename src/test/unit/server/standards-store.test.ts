@@ -6,8 +6,9 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   MAX_STANDARDS_VERSIONS, ProposeInput, StandardsStore, StandardsStoreError, StandardsVersionRecord, enforcementReview, inEffectBefore, severityReview,
-  standardsChangeAudit,
+  standardsChangeAudit, designReview,
 } from '../../../server/standards-store';
+import { templateDesign } from '../../../standards/design';
 import { AuditLog } from '../../../server/audit';
 import { enforcementChangesBetween, enforcementFieldsChanged, profileHash, severityChangesBetween } from '../../../standards/profile';
 import { sampleProfile, sampleProvenance } from '../standards/fixtures';
@@ -564,5 +565,128 @@ describe('server standards store — enforcement-changed: any difference, measur
       actorUserId: 'u', actorUsername: 'u', action: 'standards.propose', projectId: P, target: 'standards v2',
       after: audited(v2).after, flags: audited(v2).flags,
     }));
+  });
+});
+
+// ─── Design system changes: acknowledged and audited like enforcement, never logging prose ───
+
+describe('server standards store — design-changed', () => {
+  let dir: string;
+  let store: StandardsStore;
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-stdstore-design-'));
+    store = new StandardsStore(dir);
+  });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  type Profile = ReturnType<typeof sampleProfile>;
+  const DOC_SECRET_PROSE = 'Use the brand gradient only on the landing hero.';
+  const withDesign = (over: (p: Profile) => void = () => undefined): Profile => {
+    const p = sampleProfile();
+    p.design = { ...templateDesign('node-ts', '')!, doc: `# Design\n\n${DOC_SECRET_PROSE}\n` };
+    over(p);
+    return p;
+  };
+  const propose = (profile: Profile, baseVersion: number | null): StandardsVersionRecord =>
+    store.propose(P, proposal({ profile, baseVersion }), AT);
+  const approveAck = (v: StandardsVersionRecord): StandardsVersionRecord =>
+    store.approve(P, v.version, { contentHash: v.contentHash, by: 'u-rev', acknowledgedEnforcementHash: v.contentHash }, AT);
+  const approveBare = (v: StandardsVersionRecord): StandardsVersionRecord =>
+    store.approve(P, v.version, { contentHash: v.contentHash, by: 'u-rev' }, AT);
+
+  it('a pending version whose design differs from the one in effect needs the acknowledgement, with fields ["design"]', () => {
+    approveAck(propose(withDesign(), null));
+    const v2 = propose(withDesign((p) => { p.design!.tokens = p.design!.tokens.replace('#0969da', '#8250df'); }), 1);
+    const err = refusal(() => approveBare(v2));
+    assert.equal(err.code, 'acknowledgement-required');
+    assert.deepEqual(err.details, { fields: ['design'], comparedTo: 1 });
+    assert.match(err.message, /^Standards v2 changes the design system\. Review the changes/);
+    assert.equal(store.effective(P)?.version, 1);
+    assert.equal(approveAck(v2).status, 'approved');
+  });
+
+  it('removing the design needs the acknowledgement too', () => {
+    approveAck(propose(withDesign(), null));
+    const v2 = propose(withDesign((p) => { delete p.design; }), 1);
+    const r = designReview(store.load(P).versions, v2);
+    assert.equal(r.changed, true);
+    assert.ok(r.tokens.every((t) => t.after === null));
+    assert.equal(refusal(() => approveBare(v2)).code, 'acknowledgement-required');
+  });
+
+  it('an unchanged design and unchanged enforcement need no acknowledgement', () => {
+    approveAck(propose(withDesign(), null));
+    const v2 = propose(withDesign((p) => { p.freeText = 'Prefer smaller modules.'; }), 1);
+    assert.equal(designReview(store.load(P).versions, v2).changed, false);
+    assert.deepEqual(standardsChangeAudit(store, P, v2), { after: {}, flags: [] });
+    assert.equal(approveBare(v2).status, 'approved');
+  });
+
+  it('accepting the defaults of a migrated project with a design needs the acknowledgement', () => {
+    const bare = withDesign((p) => { p.commands = []; p.structure.requiredDirs = []; });
+    const auto = store.propose(P, proposal({ profile: bare, origin: 'auto', proposedBy: 'system', migrated: true }), AT);
+    assert.equal(enforcementReview(store.load(P).versions, auto).changed, false, 'nothing enforceable: only the design changes');
+    const err = refusal(() => store.acceptDefaults(P, { contentHash: auto.contentHash, by: 'u-admin' }, AT));
+    assert.deepEqual(err.details, { fields: ['design'], comparedTo: null });
+    assert.equal(store.acceptDefaults(P, { contentHash: auto.contentHash, by: 'u-admin', acknowledgedEnforcementHash: auto.contentHash }, AT).status, 'approved');
+  });
+
+  it('the audit carries design-changed and the token diff, never the DESIGN.md text', () => {
+    approveAck(propose(withDesign(), null));
+    const v2 = propose(withDesign((p) => {
+      p.design!.tokensPath = 'src/theme.css';
+      p.design!.tokens = p.design!.tokens.replace('#0969da', '#8250df');
+      p.design!.doc = `# Design\n\n${DOC_SECRET_PROSE} Also on the pricing page.\n`;
+    }), 1);
+    const audit = standardsChangeAudit(store, P, v2);
+    assert.deepEqual(audit.flags, ['design-changed']);
+    assert.equal(audit.after.enforcementChanged, undefined, 'an advisory design rule is not an enforcement change');
+    assert.deepEqual(audit.after.designChanged?.values, [{ name: '--color-primary', before: '#0969da', after: '#8250df' }]);
+    assert.equal(audit.after.designChanged?.docChanged, true);
+    assert.equal(audit.after.designChanged?.docSectionsChanged, 1);
+    assert.deepEqual(audit.after.designChanged?.files, {
+      before: { doc: 'docs/design/DESIGN.md', values: 'src/styles/tokens.css' }, after: { doc: 'docs/design/DESIGN.md', values: 'src/theme.css' },
+    });
+    assert.equal(JSON.stringify(audit.after).includes(DOC_SECRET_PROSE), false, 'no DESIGN.md prose in the audit log');
+    assert.doesNotThrow(() => new AuditLog(dir).append({
+      actorUserId: 'u', actorUsername: 'u', action: 'standards.propose', projectId: P, target: 'standards v2', after: audit.after, flags: audit.flags,
+    }));
+  });
+
+  it('enforcement-changed appears for a design change only while the design rule is blocking on either side', () => {
+    approveAck(propose(withDesign((p) => { p.severity = { 'frontend/design-tokens': 'blocking' }; }), null));
+    const v2 = propose(withDesign((p) => {
+      p.severity = { 'frontend/design-tokens': 'blocking' };
+      p.design!.tokens = p.design!.tokens.replace('#0969da', '#8250df');
+    }), 1);
+    const audit = standardsChangeAudit(store, P, v2);
+    assert.deepEqual(audit.flags, ['enforcement-changed', 'design-changed']);
+    const ruleConfig = audit.after.enforcementChanged?.ruleConfig ?? [];
+    assert.deepEqual(ruleConfig.map((c) => c.rule), ['frontend/design-tokens']);
+    assert.equal(JSON.stringify(ruleConfig).includes(DOC_SECRET_PROSE), false, 'hashes only');
+    assert.deepEqual(refusal(() => approveBare(v2)).details, { fields: ['ruleConfig', 'design'], comparedTo: 1 });
+    // The audit log's own secret-key filter accepts the entry: the fingerprint has no token-shaped key.
+    assert.doesNotThrow(() => new AuditLog(dir).append({
+      actorUserId: 'u', actorUsername: 'u', action: 'standards.propose', projectId: P, target: 'standards v2', after: audit.after, flags: audit.flags,
+    }));
+  });
+
+  it('fails closed with the design measured against nothing', () => {
+    approveAck(propose(withDesign(), null));
+    const v2 = propose(withDesign((p) => { p.freeText = 'x'; }), 1);
+    fs.writeFileSync(store.filePath(P), '{ not json');
+    const audit = standardsChangeAudit(store, P, v2);
+    assert.ok(audit.flags.includes('enforcement-reference-unreadable'));
+    assert.ok(audit.flags.includes('design-changed'));
+    assert.equal(audit.after.designChanged?.comparedTo, null);
+  });
+
+  it('a store file written by the current build (no design, no provenance design) loads', () => {
+    const v1 = propose(sampleProfile(), null);
+    const raw = JSON.parse(fs.readFileSync(store.filePath(P), 'utf-8')) as { versions: Array<{ profile: Record<string, unknown>; provenance: Record<string, unknown> }> };
+    assert.equal('design' in raw.versions[0].profile, false);
+    assert.equal('design' in raw.versions[0].provenance, false);
+    const reread = new StandardsStore(dir);
+    assert.equal(reread.get(P, 1)?.contentHash, v1.contentHash);
   });
 });

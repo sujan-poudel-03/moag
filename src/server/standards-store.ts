@@ -25,6 +25,7 @@ import { writeFileAtomicSync } from '../utils/file-io';
 import { ConventionDetection, detectConventions } from '../ai-rules/project-detector';
 import { builtInProfile } from '../standards/built-in-profiles';
 import { StandardsProposal, proposeProfile } from '../standards/propose';
+import { DesignChanges, designChangesBetween } from '../standards/design';
 import { StackId } from './stacks';
 import type { AuditInput } from './audit';
 import {
@@ -161,6 +162,25 @@ export function enforcementReview(versions: readonly StandardsVersionRecord[], v
   return { comparedTo: reference ? reference.version : null, ...changes, fields, changed: fields.length > 0 };
 }
 
+/** What a version changes about the design system, and what that was measured against. */
+export type DesignReview = DesignChanges & {
+  /** The approved version the changes are measured against; null when nothing was in effect. */
+  comparedTo: number | null;
+};
+
+/**
+ * What `v` changes about the design system (DESIGN.md, the tokens, their paths), measured
+ * against the same version {@link enforcementReview} uses. The one comparison the review
+ * screen, the acknowledgement and the audit log all use. Any difference is a change.
+ */
+export function designReview(versions: readonly StandardsVersionRecord[], v: StandardsVersionRecord): DesignReview {
+  const reference = inEffectBefore(versions, v);
+  return {
+    comparedTo: reference ? reference.version : null,
+    ...designChangesBetween(reference?.profile.design ?? null, v.profile.design ?? null),
+  };
+}
+
 /** The severity part of {@link enforcementReview}. */
 export function severityReview(versions: readonly StandardsVersionRecord[], v: StandardsVersionRecord): SeverityReview {
   const review = enforcementReview(versions, v);
@@ -184,6 +204,14 @@ export const ENFORCEMENT_CHANGED_FLAG = 'enforcement-changed';
 export const SEVERITY_CHANGED_FLAG = 'severity-changed';
 /** Audit flag, beside {@link ENFORCEMENT_CHANGED_FLAG}: the command list is among the differences. */
 export const COMMANDS_CHANGED_FLAG = 'commands-changed';
+/**
+ * Audit flag: the version's design system differs from the one in force. Not an enforcement
+ * change by itself — the design rule is advisory unless promoted, and a promoted rule's
+ * configuration change shows up as `enforcement-changed` through `ruleConfig`.
+ */
+export const DESIGN_CHANGED_FLAG = 'design-changed';
+/** Most token rows an audit entry records for a design change. */
+const MAX_AUDIT_DESIGN_TOKENS = 100;
 /** Audit flag: the approved version to compare with could not be read, so the change is recorded as unverified. */
 export const ENFORCEMENT_UNVERIFIED_FLAG = 'enforcement-reference-unreadable';
 
@@ -197,30 +225,67 @@ export interface EnforcementAudit {
   ruleConfig?: EnforcementChanges['ruleConfig'];
 }
 
+/**
+ * The design-system change an audit entry holds: the two file paths and each token's value
+ * before and after, and how much of DESIGN.md changed. Never any DESIGN.md text.
+ *
+ * Keys avoid `token` and `key`: the audit log refuses such keys as secret-shaped. `files`
+ * holds `{ doc, values }` (DESIGN.md and the tokens file), `values` the token rows.
+ */
+export interface DesignAudit {
+  comparedTo: number | null;
+  files?: { before: { doc: string; values: string } | null; after: { doc: string; values: string } | null };
+  values: Array<{ name: string; before: string | null; after: string | null }>;
+  /** How many more token rows changed than are listed. */
+  valuesTruncated?: number;
+  docChanged: boolean;
+  docSectionsChanged: number;
+}
+
 /** What {@link standardsChangeAudit} adds to an audit entry. */
 export interface StandardsChangeAudit {
-  /** Merged into the entry's `after`: `enforcementChanged`, only when a field differs. */
-  after: { enforcementChanged?: EnforcementAudit };
+  /**
+   * Merged into the entry's `after`: `enforcementChanged`, only when an enforcement field
+   * differs, and `designChanged`, only when the design system differs.
+   */
+  after: { enforcementChanged?: EnforcementAudit; designChanged?: DesignAudit };
   flags: string[];
 }
 
-function auditOf(review: EnforcementReview): StandardsChangeAudit {
-  if (!review.changed) { return { after: {}, flags: [] }; }
-  const flags = [ENFORCEMENT_CHANGED_FLAG];
-  if (review.severity.length > 0) { flags.push(SEVERITY_CHANGED_FLAG); }
-  if (review.commands !== null) { flags.push(COMMANDS_CHANGED_FLAG); }
+function designAuditOf(design: DesignReview): DesignAudit {
+  const rows = design.tokens.map((t) => ({ name: t.name, before: t.before, after: t.after }));
+  const filesOf = (x: { docPath: string; tokensPath: string } | null): { doc: string; values: string } | null =>
+    (x ? { doc: x.docPath, values: x.tokensPath } : null);
   return {
-    after: {
-      enforcementChanged: {
-        comparedTo: review.comparedTo,
-        ...(review.commands !== null ? { commands: review.commands } : {}),
-        ...(review.severity.length > 0 ? { severity: review.severity } : {}),
-        ...(review.requiredDirs !== null ? { requiredDirs: review.requiredDirs } : {}),
-        ...(review.ruleConfig.length > 0 ? { ruleConfig: review.ruleConfig } : {}),
-      },
-    },
-    flags,
+    comparedTo: design.comparedTo,
+    ...(design.paths ? { files: { before: filesOf(design.paths.before), after: filesOf(design.paths.after) } } : {}),
+    values: rows.slice(0, MAX_AUDIT_DESIGN_TOKENS),
+    ...(rows.length > MAX_AUDIT_DESIGN_TOKENS ? { valuesTruncated: rows.length - MAX_AUDIT_DESIGN_TOKENS } : {}),
+    docChanged: design.docChanged,
+    docSectionsChanged: design.sections.length,
   };
+}
+
+function auditOf(review: EnforcementReview, design: DesignReview): StandardsChangeAudit {
+  const after: StandardsChangeAudit['after'] = {};
+  const flags: string[] = [];
+  if (review.changed) {
+    flags.push(ENFORCEMENT_CHANGED_FLAG);
+    if (review.severity.length > 0) { flags.push(SEVERITY_CHANGED_FLAG); }
+    if (review.commands !== null) { flags.push(COMMANDS_CHANGED_FLAG); }
+    after.enforcementChanged = {
+      comparedTo: review.comparedTo,
+      ...(review.commands !== null ? { commands: review.commands } : {}),
+      ...(review.severity.length > 0 ? { severity: review.severity } : {}),
+      ...(review.requiredDirs !== null ? { requiredDirs: review.requiredDirs } : {}),
+      ...(review.ruleConfig.length > 0 ? { ruleConfig: review.ruleConfig } : {}),
+    };
+  }
+  if (design.changed) {
+    flags.push(DESIGN_CHANGED_FLAG);
+    after.designChanged = designAuditOf(design);
+  }
+  return { after, flags };
 }
 
 /**
@@ -237,12 +302,16 @@ export function standardsChangeAudit(
   store: Pick<StandardsStore, 'load'>, projectId: string, v: StandardsVersionRecord,
 ): StandardsChangeAudit {
   try {
-    return auditOf(enforcementReview(store.load(projectId).versions, v));
+    const versions = store.load(projectId).versions;
+    return auditOf(enforcementReview(versions, v), designReview(versions, v));
   } catch {
-    const assumed = auditOf(enforcementReview([], v));
+    const assumed = auditOf(enforcementReview([], v), designReview([], v));
     const flags = [ENFORCEMENT_CHANGED_FLAG, ENFORCEMENT_UNVERIFIED_FLAG];
     return {
-      after: { enforcementChanged: assumed.after.enforcementChanged ?? { comparedTo: null } },
+      after: {
+        enforcementChanged: assumed.after.enforcementChanged ?? { comparedTo: null },
+        ...(assumed.after.designChanged ? { designChanged: assumed.after.designChanged } : {}),
+      },
       flags: [...flags, ...assumed.flags.filter((flag) => !flags.includes(flag))],
     };
   }
@@ -339,11 +408,15 @@ function requireAcknowledgement(
   versions: readonly StandardsVersionRecord[], v: StandardsVersionRecord, acknowledged: string | undefined,
 ): void {
   const review = enforcementReview(versions, v);
-  if (!review.changed || acknowledged === v.contentHash) { return; }
+  const design = designReview(versions, v);
+  if ((!review.changed && !design.changed) || acknowledged === v.contentHash) { return; }
+  const fields: string[] = [...review.fields, ...(design.changed ? ['design'] : [])];
+  const message = review.changed
+    ? `Standards v${v.version} changes what can stop a release (${review.fields.join(', ')}${design.changed ? ', and the design system' : ''}). `
+    : `Standards v${v.version} changes the design system. `;
   throw new StandardsStoreError('acknowledgement-required',
-    `Standards v${v.version} changes what can stop a release (${review.fields.join(', ')}). ` +
-    'Review the changes and confirm you have seen them before approving.',
-    { fields: review.fields, comparedTo: review.comparedTo });
+    message + 'Review the changes and confirm you have seen them before approving.',
+    { fields, comparedTo: review.comparedTo });
 }
 
 function clone<T>(v: T): T { return JSON.parse(JSON.stringify(v)) as T; }

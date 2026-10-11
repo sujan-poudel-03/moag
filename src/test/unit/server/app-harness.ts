@@ -26,6 +26,7 @@ import { SecretStore } from '../../../server/secrets';
 import { ProposeInput, StandardsStore, StandardsVersionRecord } from '../../../server/standards-store';
 import { readStandardsJobFile } from '../../../standards/local-store';
 import type { StandardsProfile, StandardsRuleId } from '../../../standards/profile';
+import type { DesignSystem } from '../../../standards/design';
 
 export const PASSWORD = 'Correct-Horse-Battery-9';
 /** The commit the stubbed git reports as HEAD of every fixture workspace. */
@@ -122,6 +123,8 @@ export async function startHarness(over: {
    * blocking set of a project whose standards run a tool. Ignored with `standards: 'manual'`.
    */
   profileCommands?: Array<{ label: string; run: string }>;
+  /** A design system every automatic proposal carries (and the stand-in reviewer approves). Ignored with `standards: 'manual'`. */
+  profileDesign?: DesignSystem;
   /** What `git rev-parse HEAD` answers for a workspace (default: {@link FAKE_HEAD}); null = no commits. */
   gitHead?: () => string | null;
 } = {}): Promise<Harness> {
@@ -146,7 +149,7 @@ export async function startHarness(over: {
   const projects = new ProjectStore(dataDir);
   const state = new ProjectStateStore(dataDir);
   const standards = over.standards === 'manual' ? new StandardsStore(dataDir)
-    : new AutoApprovingStandardsStore(dataDir, over.promoteRules ?? [], over.profileCommands ?? []);
+    : new AutoApprovingStandardsStore(dataDir, over.promoteRules ?? [], over.profileCommands ?? [], over.profileDesign);
   let verifyCount = 0;
   const workers: FakeWorker[] = [];
 
@@ -261,16 +264,18 @@ export class AutoApprovingStandardsStore extends StandardsStore {
   constructor(
     dataDir: string, private readonly promoteRules: StandardsRuleId[] = [],
     private readonly commands: StandardsProfile['commands'] = [],
+    private readonly design?: DesignSystem,
   ) { super(dataDir); }
 
   propose(projectId: string, input: ProposeInput, now?: Date): StandardsVersionRecord {
-    const auto = input.origin === 'auto' && (this.promoteRules.length > 0 || this.commands.length > 0);
+    const auto = input.origin === 'auto' && (this.promoteRules.length > 0 || this.commands.length > 0 || this.design !== undefined);
     const profile = input.profile as StandardsProfile;
     const promoted: ProposeInput = !auto ? input : {
       ...input,
       profile: {
         ...profile,
         ...(this.commands.length > 0 ? { commands: this.commands.map((c) => ({ ...c })) } : {}),
+        ...(this.design ? { design: { ...this.design } } : {}),
         ...(this.promoteRules.length > 0
           ? { severity: { ...(profile.severity ?? {}), ...Object.fromEntries(this.promoteRules.map((rule) => [rule, 'blocking'])) } } : {}),
       },

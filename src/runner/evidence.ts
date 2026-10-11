@@ -17,7 +17,7 @@ import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 import { readImportPathScopes } from './import-paths';
 import { trackChildProcess } from '../utils/child-tracker';
 import { VENDOR_MANIFESTS } from '../standards/checker';
-import type { StandardsCheckFile, StandardsCheckInput, WorkspacePackage } from '../standards/checker';
+import type { StandardsCheckFile, StandardsCheckInput, StandardsDesignFile, WorkspacePackage } from '../standards/checker';
 import type { StandardsCheckCounts } from '../models/types';
 import { StandardsGateWord, isStandardsGateCommand, standardsGateWord, standardsOpenText } from '../models/requirement-trace';
 
@@ -670,6 +670,12 @@ export interface StandardsInputOptions {
    * case-insensitive one `SRC` "exists" where only `src` does.
    */
   probeDirs?: string[];
+  /**
+   * The approved design system's files (DESIGN.md, the tokens file), repository-relative.
+   * Each is read as it stands now and handed to the checker as `designFiles`, which compares
+   * it with the approved content. Absent: the checker is told nothing about them.
+   */
+  designPaths?: string[];
 }
 
 /**
@@ -1097,6 +1103,64 @@ export async function collectStandardsInput(
   cwd: string,
   baseRef: string | null,
   opts: StandardsInputOptions = {},
+): Promise<StandardsCheckInput> {
+  const input = await collectDiffInput(cwd, baseRef, opts);
+  // Read whether or not a diff could be taken: the design files are facts about the tree.
+  return opts.designPaths ? { ...input, designFiles: readDesignFiles(cwd, opts.designPaths) } : input;
+}
+
+/**
+ * Each design-system file as it stands in the workspace: its content, `missing` when it is
+ * not there, or the reason it was not read. Never throws.
+ */
+export function readDesignFiles(cwd: string, paths: string[]): StandardsDesignFile[] {
+  return paths.map((rel) => {
+    const file = rel.replace(/\\/g, '/');
+    const full = path.resolve(cwd, file);
+    const root = path.resolve(cwd);
+    if (full !== root && !full.startsWith(root + path.sep)) { return { path: file, content: null, skipped: 'Path is outside the workspace' }; }
+    try {
+      fs.lstatSync(full);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') { return { path: file, content: null, missing: true }; }
+    }
+    const read = readForStandards(cwd, file);
+    return read.content === null ? { path: file, content: null, skipped: read.skipped } : { path: file, content: read.content };
+  });
+}
+
+/**
+ * The changed files that count as work for the change gate: `changedFiles` without the
+ * approved design system's two files while each holds exactly its approved content (line
+ * endings and trailing newlines aside). The server writes those at run start, so on their
+ * own they are MOAG's output — like `.moag/` — and must never make "something changed" true
+ * in a run whose agents changed nothing. A design file a run did edit still counts. Never throws.
+ */
+export function withoutApprovedDesign(
+  cwd: string,
+  changedFiles: string[],
+  design: { docPath: string; tokensPath: string; doc: string; tokens: string } | undefined,
+): string[] {
+  if (!design) { return changedFiles; }
+  const norm = (t: string): string => t.replace(/\r\n?/g, '\n').replace(/\n+$/, '');
+  const approved = new Map([[design.docPath, design.doc], [design.tokensPath, design.tokens]]);
+  const own = new Set<string>();
+  try {
+    for (const f of readDesignFiles(cwd, [...approved.keys()])) {
+      const want = approved.get(f.path);
+      if (f.content !== null && want !== undefined && norm(f.content) === norm(want)) { own.add(f.path); }
+    }
+  } catch {
+    return changedFiles;
+  }
+  return changedFiles.filter((f) => !own.has(f.replace(/\\/g, '/')));
+}
+
+/** {@link collectStandardsInput} without the design files. */
+async function collectDiffInput(
+  cwd: string,
+  baseRef: string | null,
+  opts: StandardsInputOptions,
 ): Promise<StandardsCheckInput> {
   let goModulePath: string | null = null;
   try {

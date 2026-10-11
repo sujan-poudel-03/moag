@@ -9,10 +9,19 @@
 // are filtered to plain path segments and fixed labels before they reach the
 // profile, and the finished proposal must pass the same validator as user input.
 
-import type { ConventionDetection } from '../ai-rules/project-detector';
+import type { ConventionDetection, DesignSources } from '../ai-rules/project-detector';
 import { BUILT_IN_RULES } from '../ai-rules/built-in-rules';
 import { StackId, isStackId } from '../server/stacks';
 import { builtInProfile } from './built-in-profiles';
+import {
+  DEFAULT_DESIGN_PATHS,
+  DesignSystem,
+  DesignUiSignals,
+  FALLBACK_DESIGN_PATHS,
+  hasDesignUi,
+  templateDesign,
+  withAdoptedTokensNote,
+} from './design';
 import { NAMING_PATTERNS } from './checker';
 import { matchesAny } from './glob';
 import {
@@ -22,6 +31,7 @@ import {
   NAMING_STYLES,
   NamingStyle,
   PROVENANCE_FIELDS,
+  checkDesign,
   ProvenanceField,
   StandardsProfile,
   StandardsProvenance,
@@ -233,7 +243,7 @@ export function proposeProfile(stack: StackId, detection: ConventionDetection): 
   if (detection.sourceFileCount === 0) {
     const assumed = allAssumed(defaults);
     assumed.commands = assumedTag(noCommandsNote(stack));
-    return { profile, provenance: assumed };
+    return withDesign({ profile, provenance: assumed }, stack, detection);
   }
 
   profile.repoState = 'brownfield';
@@ -364,9 +374,103 @@ export function proposeProfile(stack: StackId, detection: ConventionDetection): 
 
   const checked = validateProfile(profile);
   if (!checked.ok) {
+    // The design is dropped here too: the fallback is the plain built-in profile.
     const fallback = builtInProfile(stack);
     fallback.repoState = 'brownfield';
     return { profile: fallback, provenance: allAssumed(defaults) };
   }
-  return { profile: checked.profile, provenance };
+  return withDesign({ profile: checked.profile, provenance }, stack, detection);
+}
+
+// ─── Design system ───
+
+/**
+ * A design system for `stack`, or null when the stack has no template or the project shows
+ * no user interface. Starts from the stack's template; a tokens file or a design document the
+ * repository already has is ADOPTED (proposed as it is, never overwritten) when it passes the
+ * same checks as user input — otherwise the template part stays and the provenance says why.
+ * A template part never targets a path where a file MOAG did not adopt already exists (too
+ * large, unreadable, untracked, failed checks): it moves to the stack's first free fallback
+ * path and the provenance names the file kept — or, with no free path, there is no proposal.
+ */
+export function proposeDesign(
+  stack: StackId,
+  detection: DesignUiSignals & { designSources?: DesignSources | null },
+  componentKit: string,
+): { design: DesignSystem; provenance: { tag: 'detected' | 'assumed'; evidence: string } } | null {
+  if (stack !== 'static-web' && !hasDesignUi(detection)) { return null; }
+  const defaults = DEFAULT_DESIGN_PATHS[stack];
+  const fallbacks = FALLBACK_DESIGN_PATHS[stack];
+  if (!defaults || !fallbacks || !templateDesign(stack, componentKit)) { return null; }
+  const found = detection.designSources;
+  const notes: string[] = [];
+  /** Why a path moved off its default: first in the evidence, so the length clip never drops it. */
+  const pathNotes: string[] = [];
+  const adopted: string[] = [];
+  // Paths holding a file MOAG did not adopt. A proposal never targets one: approving it
+  // would replace the user's file with the template at run start.
+  // A file there that already holds exactly what MOAG would write (its own earlier, still
+  // untracked write) is no collision: writing it again changes nothing.
+  const taken = new Map<string, { reason: string; content?: string }>(
+    (found?.notAdopted ?? []).map((n) => [n.path, { reason: n.reason, ...(n.content !== undefined ? { content: n.content } : {}) }]));
+  const sameText = (a: string, b: string): boolean => a.replace(/\r\n?/g, '\n') === b.replace(/\r\n?/g, '\n');
+  const isFree = (rel: string, content: string): boolean => {
+    const t = taken.get(rel);
+    return t === undefined || (t.content !== undefined && sameText(t.content, content));
+  };
+  const freePath = (preferred: string, alternatives: readonly string[], content: string): string | null => {
+    if (isFree(preferred, content)) { return preferred; }
+    const alt = alternatives.find((a) => isFree(a, content)) ?? null;
+    const why = taken.get(preferred)!.reason;
+    pathNotes.push(alt
+      ? `${preferred} exists, not adopted (${why}): proposed ${alt} instead`
+      : `${preferred} exists, not adopted (${why}) and no free path remains`);
+    return alt;
+  };
+
+  // ── Tokens: adopt the detected file, or the template at a free path ──
+  const templateTokens = templateDesign(stack, componentKit)!.tokens;
+  let tokensPath: string | null = null;
+  let tokens: string | null = null;
+  if (found?.tokens) {
+    const errors = checkDesign({ ...templateDesign(stack, componentKit, found.tokens.path)!, tokens: found.tokens.content });
+    if (errors.length === 0) { tokensPath = found.tokens.path; tokens = found.tokens.content; adopted.push(found.tokens.path); }
+    else { notes.push(`${found.tokens.path} not adopted: ${errors[0]}`); taken.set(found.tokens.path, { reason: 'failed checks' }); }
+  }
+  if (tokensPath === null) { tokensPath = freePath(defaults.tokensPath, fallbacks.tokensPath, templateTokens); }
+  if (tokensPath === null) { return null; }
+
+  // ── DESIGN.md: adopt the detected document, or the template at a free path ──
+  let design: DesignSystem = { ...templateDesign(stack, componentKit, tokensPath)!, ...(tokens !== null ? { tokens } : {}) };
+  let docAdopted = false;
+  if (found?.doc) {
+    const candidate: DesignSystem = { ...design, docPath: found.doc.path, doc: found.doc.content };
+    const errors = checkDesign(candidate);
+    if (errors.length === 0) { design = candidate; adopted.push(found.doc.path); docAdopted = true; }
+    else { notes.push(`${found.doc.path} not adopted: ${errors[0]}`); taken.set(found.doc.path, { reason: 'failed checks' }); }
+  }
+  if (!docAdopted) {
+    // The template doc over an adopted tokens file names the template's tokens: say which of
+    // them the adopted file lacks and what it defines instead.
+    if (adopted.length > 0) {
+      const noted = withAdoptedTokensNote(design);
+      if (noted !== design && checkDesign(noted).length === 0) { design = noted; }
+    }
+    const docPath = freePath(defaults.docPath, fallbacks.docPath, design.doc);
+    if (docPath === null) { return null; }
+    design = { ...design, docPath };
+  }
+  const provenance = adopted.length > 0
+    ? detectedTag(adopted.join(', '), ['adopted, not overwritten', ...pathNotes, ...notes].join('; '))
+    : assumedTag([`${stack} default`, ...pathNotes, ...notes].join(EVIDENCE_NOTE_SEPARATOR));
+  return { design, provenance };
+}
+
+/** `proposal` with the proposed design system, when there is one and the whole still validates. */
+function withDesign(proposal: StandardsProposal, stack: StackId, detection: ConventionDetection): StandardsProposal {
+  const proposed = proposeDesign(stack, detection, proposal.profile.frontend.componentKit);
+  if (!proposed) { return proposal; }
+  const checked = validateProfile({ ...proposal.profile, design: proposed.design });
+  if (!checked.ok) { return proposal; }
+  return { profile: checked.profile, provenance: { ...proposal.provenance, design: proposed.provenance } };
 }

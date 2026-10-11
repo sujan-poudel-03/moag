@@ -10,6 +10,9 @@ import {
   DEFAULT_RULE_SEVERITY, MAX_STANDARDS_FREE_TEXT_CHARS, STANDARDS_RULE_IDS, profileHash, severityChangesBetween,
 } from '../../../standards/profile';
 import { sampleProfile } from '../standards/fixtures';
+import { templateDesign } from '../../../standards/design';
+import * as fs from 'fs';
+import * as path from 'path';
 
 interface VersionDto {
   version: number; status: string; origin: string; inEffect: boolean; contentHash: string; baseVersion: number | null;
@@ -759,5 +762,101 @@ describe('standards API', function () {
     assert.deepEqual(await migrateStandards(h.projects, h.standards, h.audit, () => undefined), []);
     assert.equal(((await h.request('GET', url, { as: 'admin' })).body.standards as StandardsDto).versions.length, 1);
     assert.equal((await get()).migrated, false, 'a project created with standards is never marked migrated');
+  });
+});
+
+// ─── Design system over HTTP ───
+
+describe('standards API — design system', function () {
+  this.timeout(30000);
+  let h: Harness;
+  let projectId: string;
+
+  beforeEach(async () => {
+    h = await startHarness({ standards: 'manual' });
+    const r = await h.request('POST', '/api/projects', {
+      as: 'po', body: { name: 'Acme', source: { kind: 'path', path: 'acme' }, stack: 'node-ts', defaultEngine: 'claude' },
+    });
+    assert.equal(r.status, 201, r.raw);
+    projectId = (r.body.project as { id: string }).id;
+  });
+  afterEach(async () => { await h.close(); });
+
+  const base = () => `/api/projects/${projectId}/standards`;
+  const get = async (as = 'reviewer'): Promise<Record<string, unknown>> => {
+    const r = await h.request('GET', base(), { as });
+    assert.equal(r.status, 200, r.raw);
+    return r.body.standards as Record<string, unknown>;
+  };
+  const versions = (s: Record<string, unknown>) => s.versions as Array<Record<string, unknown> & { version: number; contentHash: string; profile: ReturnType<typeof sampleProfile> }>;
+  const approve = (version: number, contentHash: string, acknowledge = true): Promise<Resp> =>
+    h.request('POST', `${base()}/versions/${version}/approve`, {
+      as: 'reviewer', body: acknowledge ? { contentHash, acknowledgedEnforcementHash: contentHash } : { contentHash },
+    });
+  /** v1 approved, then v2: v1's blocking set and severities exactly, plus `design`. */
+  const proposeWithDesign = async (): Promise<{ version: number; contentHash: string }> => {
+    const v1 = versions(await get())[0];
+    assert.equal((await approve(1, v1.contentHash)).status, 200);
+    const profile = { ...v1.profile, design: templateDesign('node-ts', '')! };
+    const created = await h.request('POST', `${base()}/versions`, { as: 'po', body: { profile, baseVersion: 1 } });
+    assert.equal(created.status, 201, created.raw);
+    const v2 = versions(await get()).find((v) => v.version === 2)!;
+    return { version: 2, contentHash: v2.contentHash };
+  };
+
+  it('a version that adds a design system is refused without the acknowledgement: 409 with fields ["design"]', async () => {
+    const v2 = await proposeWithDesign();
+    const refused = await approve(2, v2.contentHash, false);
+    assert.equal(refused.status, 409, refused.raw);
+    assert.equal(refused.body.code ?? refused.body.error, 'acknowledgement-required', refused.raw);
+    assert.deepEqual((refused.raw.match(/"fields":\[[^\]]*\]/) ?? [])[0], '"fields":["design"]');
+    assert.equal((await approve(2, v2.contentHash)).status, 200);
+    const audit = h.auditEntries().filter((e) => e.action === 'standards.approve').at(-1)!;
+    assert.ok((audit.flags ?? []).includes('design-changed'));
+  });
+
+  it('the DTO carries the parsed tokens with resolved values and contrast, the change, and the template', async () => {
+    await proposeWithDesign();
+    const s = await get();
+    const v2 = versions(s).find((v) => v.version === 2)!;
+    const design = v2.design as { tokens: Array<{ name: string; resolved?: string | number; contrast?: number; role?: string }>; docPath: string; tokensContent: string; background: string };
+    assert.equal(design.docPath, 'docs/design/DESIGN.md');
+    assert.equal(design.background, '#ffffff');
+    const fg = design.tokens.find((t) => t.name === '--color-fg')!;
+    assert.equal(fg.resolved, '#1f2328');
+    assert.equal(fg.contrast, 15.8);
+    assert.equal(design.tokens.find((t) => t.name === '--color-bg')!.role, 'background');
+    assert.equal(design.tokensContent, templateDesign('node-ts', '')!.tokens);
+    const changed = v2.designChanged as { changed: boolean; comparedTo: number | null; tokens: unknown[] };
+    assert.equal(changed.changed, true);
+    assert.equal(changed.comparedTo, 1);
+    assert.ok(changed.tokens.length > 10);
+    assert.equal((versions(s)[0].designChanged as { changed: boolean }).changed, false, 'v1 has no design and replaced nothing that had one');
+    assert.ok(s.designTemplate, 'node-ts has a template');
+    assert.deepEqual((s.limits as Record<string, number>).designDocChars, 12_000);
+    assert.ok((v2.changedFrom as { sections: string[] }).sections.includes('design'));
+  });
+
+  it('designTemplate is null for a stack without a template', async () => {
+    fs.mkdirSync(path.join(h.root, 'py'), { recursive: true });
+    const r = await h.request('POST', '/api/projects', {
+      as: 'po', body: { name: 'Py', source: { kind: 'path', path: 'py' }, stack: 'python', defaultEngine: 'claude' },
+    });
+    assert.equal(r.status, 201, r.raw);
+    const id = (r.body.project as { id: string }).id;
+    const got = await h.request('GET', `/api/projects/${id}/standards`, { as: 'po' });
+    assert.equal((got.body.standards as Record<string, unknown>).designTemplate, null);
+  });
+
+  it('designSuggestion appears only for a proposer, once the standards in effect have no design and the workspace shows a UI', async () => {
+    const v1 = versions(await get())[0];
+    assert.equal((await approve(1, v1.contentHash)).status, 200);
+    fs.writeFileSync(path.join(h.root, 'acme', 'index.html'), '<!doctype html><title>x</title>\n');
+    const asPo = await get('po');
+    const suggestion = asPo.designSuggestion as { evidence: string; design: { tokensPath: string } } | null;
+    assert.ok(suggestion, 'the po may propose, so is offered one');
+    assert.equal(suggestion!.evidence, 'index.html');
+    assert.equal(suggestion!.design.tokensPath, 'src/styles/tokens.css');
+    assert.equal((await get('reviewer')).designSuggestion, null, 'a reviewer cannot propose');
   });
 });

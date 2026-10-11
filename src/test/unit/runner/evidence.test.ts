@@ -18,6 +18,7 @@ import {
   GateResult,
   gatesForStoredReport,
   HIDDEN_FROM_GIT,
+  readDesignFiles,
   readWorkspacePackages,
   resolveGateCommands,
   resolveUatGate,
@@ -192,6 +193,39 @@ describe('evidence — standards input', () => {
     // `src` is on disk, but with no listing from git no directory is known to exist: the
     // checker then reports the required-directories rule as not checked, not as a finding.
     assert.deepEqual(input, { baseRef: null, files: [], existingDirs: [], topLevel: [], goModulePath: null });
+  });
+
+  it('designPaths: reads each design file, marks a missing one, skips an oversized one — even with no diff', async function () {
+    this.timeout(15_000);
+    const dir = makeTempDir('moag-std-design-');
+    fs.mkdirSync(path.join(dir, 'docs', 'design'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'css'));
+    fs.writeFileSync(path.join(dir, 'docs', 'design', 'DESIGN.md'), '# Design\r\n');
+    fs.writeFileSync(path.join(dir, 'css', 'big.css'), 'x'.repeat(600 * 1024));
+    let input: StandardsCheckInput;
+    try {
+      input = await collectStandardsInput(dir, null, { designPaths: ['docs/design/DESIGN.md', 'css/tokens.css', 'css/big.css'] });
+    } catch (err) {
+      if (isSpawnEperm(err)) { this.skip(); return; }
+      throw err;
+    }
+    assert.equal(input.baseRef, null);
+    assert.deepEqual(input.designFiles, [
+      { path: 'docs/design/DESIGN.md', content: '# Design\r\n' },
+      { path: 'css/tokens.css', content: null, missing: true },
+      { path: 'css/big.css', content: null, skipped: 'File is larger than 512 KB' },
+    ]);
+    // Without designPaths nothing about them is said.
+    assert.equal('designFiles' in (await collectStandardsInput(dir, null)), false);
+  });
+
+  it('readDesignFiles refuses a path outside the workspace and a directory', () => {
+    const dir = makeTempDir('moag-std-design2-');
+    fs.mkdirSync(path.join(dir, 'tokens.css'));
+    assert.deepEqual(readDesignFiles(dir, ['../outside.css', 'tokens.css']).map((f) => [f.content, f.skipped ?? (f.missing ? 'missing' : '')]), [
+      [null, 'Path is outside the workspace'],
+      [null, 'Not a regular file'],
+    ]);
   });
 
   // The case a stash base misses: `git stash create` snapshots the working tree, so a

@@ -169,3 +169,95 @@ describe('runCli with an already-aborted signal', () => {
     assert.equal(chunks.length, 0, 'no command header for a run that never started');
   });
 });
+
+// ─── Abort when the child never closes ───
+
+describe('runCli abort when close never fires', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const proxyquire = require('proxyquire').noCallThru();
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const sinon = require('sinon');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { EventEmitter } = require('events');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { PassThrough } = require('stream');
+
+  type FakeChild = NodeJS.EventEmitter & { stdout: NodeJS.ReadWriteStream; stderr: NodeJS.ReadWriteStream; stdin: NodeJS.ReadWriteStream; pid: number };
+
+  function load(): { run: typeof runCli; grace: number; child: FakeChild; killProcess: { callCount: number } } {
+    const child = new EventEmitter() as FakeChild;
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.stdin = new PassThrough();
+    child.pid = 4242;
+    const killProcess = sinon.spy();
+    const mod = proxyquire('../../../adapters/base-cli', {
+      'child_process': { spawn: sinon.stub().returns(child), execSync: sinon.stub() },
+      '../utils/process-kill': { killProcess, SPAWN_DETACHED: false },
+      '../utils/child-tracker': { trackChildProcess: () => undefined },
+    }) as { runCli: typeof runCli; ABORT_CLOSE_GRACE_MS: number };
+    return { run: mod.runCli, grace: mod.ABORT_CLOSE_GRACE_MS, child, killProcess };
+  }
+
+  let clock: { tick(ms: number): void; tickAsync(ms: number): Promise<void>; restore(): void };
+  beforeEach(() => { clock = sinon.useFakeTimers(); });
+  afterEach(() => { clock.restore(); });
+
+  it('resolves an aborted result after the grace period, removes the listener and ignores a late close', async () => {
+    const { run, grace, child, killProcess } = load();
+    const ac = new AbortController();
+    const removeSpy = sinon.spy(ac.signal, 'removeEventListener');
+    let settledCount = 0;
+    const pending = run(
+      { command: 'claude', buildArgs: () => ['-p'], useStdin: true },
+      { prompt: 'p', cwd: process.cwd(), signal: ac.signal },
+    ).then((r) => { settledCount++; return r; });
+    child.stdout.write('partial');
+    ac.abort();
+    child.emit('exit', null, 'SIGTERM'); // an orphan keeps the pipe: no 'close'
+    await clock.tickAsync(grace - 1);
+    assert.equal(settledCount, 0, 'still waiting inside the grace period');
+    await clock.tickAsync(1);
+    const result = await pending;
+    assert.equal(result.exitCode, 130);
+    assert.match(result.stderr, /\[Command aborted\]$/);
+    assert.equal(result.stdout, 'partial');
+    assert.equal(killProcess.callCount, 1);
+    assert.equal(removeSpy.callCount, 1, 'the abort listener is removed');
+    // A late close neither resolves twice nor throws.
+    child.emit('close', 0);
+    await clock.tickAsync(grace);
+    assert.equal(settledCount, 1);
+  });
+
+  it('a close inside the grace period resolves with the real code; the timer then does nothing', async () => {
+    const { run, grace, child, killProcess } = load();
+    const ac = new AbortController();
+    let settledCount = 0;
+    const pending = run(
+      { command: 'claude', buildArgs: () => ['-p'], useStdin: true },
+      { prompt: 'p', cwd: process.cwd(), signal: ac.signal },
+    ).then((r) => { settledCount++; return r; });
+    ac.abort();
+    child.emit('close', 143);
+    const result = await pending;
+    assert.equal(result.exitCode, 143);
+    assert.doesNotMatch(result.stderr, /Command aborted/);
+    await clock.tickAsync(grace * 2);
+    assert.equal(settledCount, 1);
+    assert.equal(killProcess.callCount, 1);
+  });
+
+  it('an error after the abort rejects once and cancels the grace timer', async () => {
+    const { run, grace, child } = load();
+    const ac = new AbortController();
+    const pending = run(
+      { command: 'claude', buildArgs: () => ['-p'], useStdin: true },
+      { prompt: 'p', cwd: process.cwd(), signal: ac.signal },
+    );
+    ac.abort();
+    child.emit('error', new Error('boom'));
+    await assert.rejects(pending, /Failed to start "claude": boom/);
+    await clock.tickAsync(grace * 2); // no resolve-after-reject, no throw
+  });
+});

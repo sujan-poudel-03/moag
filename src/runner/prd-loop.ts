@@ -26,6 +26,7 @@ import {
   resolveUatGate,
   runGate,
   summarizeEvidence,
+  withoutApprovedDesign,
 } from './evidence';
 import {
   checkStandards, commandRow, groupStandardsRules, isBlockingNotChecked, isUnreadBlocking, NO_BLOCKING_RULES, promotedScannerRules,
@@ -339,12 +340,18 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
           broken.map((t) => `- ${t.name} (${t.status})`).join('\n');
       }
 
-      // c. G1 — something must have actually changed
-      if (!failedGate && changedFiles.length === 0) {
+      // c. G1 — something must have actually changed. The approved design files the server
+      //    wrote at run start are MOAG's output, not work, while they hold the approved content.
+      const workFiles = cfg.standards?.profile.design
+        ? withoutApprovedDesign(cfg.cwd, changedFiles, cfg.standards.profile.design)
+        : changedFiles;
+      if (!failedGate && workFiles.length === 0) {
         failedGate = 'change';
-        failureDetail = baseRef
-          ? `No files changed since ${baseRef}. The work was not performed.`
-          : 'No changed files could be detected (git unavailable).';
+        failureDetail = changedFiles.length > 0
+          ? `Only the approved design-system files MOAG writes itself changed (${changedFiles.join(', ')}). The work was not performed.`
+          : baseRef
+            ? `No files changed since ${baseRef}. The work was not performed.`
+            : 'No changed files could be detected (git unavailable).';
       }
 
       // c2. Standards, static half — free, so it runs before any command: a diff that breaks
@@ -365,7 +372,10 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
           }
           deps.onProgress('standards', `Checking the diff against ${standardsGateName(std.version)}`);
           const startedAt = Date.now();
-          const input = await collectStandardsInput(cfg.cwd, std.baseRef, { probeDirs: std.profile.structure.requiredDirs });
+          const input = await collectStandardsInput(cfg.cwd, std.baseRef, {
+            probeDirs: std.profile.structure.requiredDirs,
+            designPaths: std.profile.design ? [std.profile.design.docPath, std.profile.design.tokensPath] : undefined,
+          });
           const checked = checkStandards(std.profile, input);
           checked.version = std.version;
           // "No base recorded" (null: a repository with no commits) is not the same as "a base

@@ -1725,7 +1725,8 @@ describe('headless CLI: moag standards', () => {
     assert.equal(await run(checkCli(clean, quiet), ['check', '--no-commands', '--cwd', workspace()]), 6);
     assert.deepEqual(quiet.gates, []);
     assert.match(out, /Rules not checked \(not a pass\):\n(.*\n)*?!! BLOCKING RULE NOT CHECKED {2}command: npm run lint — Commands were not run/);
-    assert.match(out, /^0 passed · .* · 1 rule not checked \(1 blocking\) · /m);
+    // Two: the command, and the unconfigured design-system row (this profile has no design).
+    assert.match(out, /^0 passed · .* · 2 rules not checked \(1 blocking\) · /m);
     assert.match(err, /^1 blocking rule or command was not checked — that is not a pass\.$/m);
   });
 
@@ -2065,5 +2066,134 @@ describe('headless CLI: wireEvents — dependency installs', () => {
     assert.equal(parsed[1].exitCode, 1);
     assert.equal(parsed[2].note, 'n');
     assert.ok(typeof parsed[0].ts === 'string');
+  });
+});
+
+// ─── moag standards: the design system ───
+
+describe('headless CLI: moag standards — design system', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const proxyquire = require('proxyquire').noCallThru();
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const realCli = require('../../../headless/cli');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { templateDesign } = require('../../../standards/design') as typeof import('../../../standards/design');
+  const dirs: string[] = [];
+  let out: string;
+  let err: string;
+  let stdout: sinon.SinonStub;
+  let stderr: sinon.SinonStub;
+  beforeEach(() => {
+    out = '';
+    err = '';
+    stdout = sinon.stub(process.stdout, 'write').callsFake((chunk: unknown) => { out += String(chunk); return true; });
+    stderr = sinon.stub(process.stderr, 'write').callsFake((chunk: unknown) => { err += String(chunk); return true; });
+  });
+  afterEach(() => { stdout.restore(); stderr.restore(); });
+  after(() => { for (const d of dirs) { fs.rmSync(d, { recursive: true, force: true }); } });
+
+  async function run(cli: { cmdStandards: (a: unknown) => Promise<number>; parseArgs: (a: string[]) => unknown }, argv: string[]): Promise<number> {
+    return cli.cmdStandards(cli.parseArgs(['standards', ...argv]));
+  }
+  const DESIGN = templateDesign('static-web', '')!;
+  function designedWorkspace(promoted = false): string {
+    const dir = tmpDir();
+    dirs.push(dir);
+    const base = { ...sampleProfile(), design: DESIGN };
+    const profile = promoted ? promote(base, 'frontend/design-tokens') : base;
+    writeLocalStandards(dir, { schemaVersion: 1, version: 2, profile, provenance: { ...sampleProvenance(), design: { tag: 'assumed', evidence: 'static-web default' } } });
+    return dir;
+  }
+  /** The CLI with the diff stubbed to `files`, and the design files read as approved. */
+  function checkCli(files: unknown[]) {
+    return proxyquire('../../../headless/cli', {
+      '../runner/evidence': {
+        detectPrdFile: () => null,
+        captureHeadRef: async () => 'head-sha',
+        collectStandardsInput: async (_cwd: string, baseRef: string | null, opts: { designPaths?: string[] }) => ({
+          baseRef, files, existingDirs: ['src', 'src/test'], topLevel: ['src'], goModulePath: null,
+          ...(opts.designPaths ? { designFiles: [{ path: DESIGN.docPath, content: DESIGN.doc }, { path: DESIGN.tokensPath, content: DESIGN.tokens }] } : {}),
+        }),
+        runGate: async (command: string) => ({ command, exitCode: 0, passed: true, output: '', durationMs: 1, timedOut: false }),
+      },
+    });
+  }
+  const RAW_HEX = [{ path: 'src/site.css', status: 'added', addedLines: [1], content: '.a { color: #ff0000; }\n' }];
+
+  it('show prints the design system and the text every task prompt carries', async () => {
+    const dir = designedWorkspace();
+    assert.equal(await run(realCli, ['show', '--cwd', dir]), 0);
+    assert.match(out, /─── Design system ───\nDESIGN\.md: {3}docs\/design\/DESIGN\.md \(\d+ characters\)\nTokens file: css\/tokens\.css \(35 tokens\)\n {2}--color-bg: #ffffff/);
+    assert.match(out, /## Design System\nDesign system v2 · DESIGN\.md at docs\/design\/DESIGN\.md · tokens in css\/tokens\.css/);
+  });
+
+  it('propose --write on a static-web repository writes standards.json, DESIGN.md and the tokens file', async () => {
+    const dir = tmpDir();
+    dirs.push(dir);
+    assert.equal(await run(realCli, ['propose', '--stack', 'static-web', '--write', '--cwd', dir]), 0, err);
+    assert.equal(fs.readFileSync(path.join(dir, 'docs', 'design', 'DESIGN.md'), 'utf-8'), DESIGN.doc);
+    assert.equal(fs.readFileSync(path.join(dir, 'css', 'tokens.css'), 'utf-8'), DESIGN.tokens);
+    assert.ok(fs.existsSync(path.join(dir, '.moag', 'standards.json')));
+    assert.match(err, /Wrote docs\/design\/DESIGN\.md\./);
+  });
+
+  it('a tokens file MOAG cannot adopt is never a target: the proposal uses css/design-tokens.css and the file is untouched', async () => {
+    const dir = tmpDir();
+    dirs.push(dir);
+    fs.mkdirSync(path.join(dir, 'css'));
+    fs.writeFileSync(path.join(dir, 'css', 'tokens.css'), 'body { margin: 0; }\n');
+    assert.equal(await run(realCli, ['propose', '--stack', 'static-web', '--write', '--cwd', dir]), 0, err);
+    assert.equal(fs.readFileSync(path.join(dir, 'css', 'tokens.css'), 'utf-8'), 'body { margin: 0; }\n');
+    assert.equal(fs.readFileSync(path.join(dir, 'css', 'design-tokens.css'), 'utf-8'), DESIGN.tokens);
+    const written = JSON.parse(fs.readFileSync(path.join(dir, '.moag', 'standards.json'), 'utf-8'));
+    assert.equal(written.profile.design.tokensPath, 'css/design-tokens.css');
+    assert.match(written.provenance.design.evidence, /css\/tokens\.css exists, not adopted \(declares no :root custom properties\): proposed css\/design-tokens\.css instead/);
+  });
+
+  it('a differing design file the proposal still targets is never replaced without --force: exit 2, nothing written; with --force it is kept as .bak', async () => {
+    // Detection now steers every proposal off such a file; this is the write path's own guard.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const realPropose = require('../../../standards/propose');
+    const forcedCli = proxyquire('../../../headless/cli', {
+      '../standards/propose': {
+        ...realPropose,
+        proposeProfile: (stack: string, detection: unknown) => {
+          const p = realPropose.proposeProfile(stack, detection);
+          return { ...p, profile: { ...p.profile, design: DESIGN } };
+        },
+      },
+    });
+    const dir = tmpDir();
+    dirs.push(dir);
+    fs.mkdirSync(path.join(dir, 'css'));
+    fs.writeFileSync(path.join(dir, 'css', 'tokens.css'), 'body { margin: 0; }\n');
+    assert.equal(await run(forcedCli, ['propose', '--stack', 'static-web', '--write', '--cwd', dir]), 2);
+    assert.match(err, /css\/tokens\.css differs from the proposed design system and may hold hand edits — not replaced\. Re-run with --write --force; it is then kept as css\/tokens\.css\.bak\./);
+    assert.match(err, /Nothing was written\./);
+    assert.equal(fs.existsSync(path.join(dir, '.moag', 'standards.json')), false, 'the standards file was not written either');
+    assert.equal(fs.existsSync(path.join(dir, 'docs')), false);
+    assert.equal(fs.readFileSync(path.join(dir, 'css', 'tokens.css'), 'utf-8'), 'body { margin: 0; }\n');
+
+    err = '';
+    assert.equal(await run(forcedCli, ['propose', '--stack', 'static-web', '--write', '--force', '--cwd', dir]), 0, err);
+    assert.equal(fs.readFileSync(path.join(dir, 'css', 'tokens.css.bak'), 'utf-8'), 'body { margin: 0; }\n');
+    assert.equal(fs.readFileSync(path.join(dir, 'css', 'tokens.css'), 'utf-8'), DESIGN.tokens);
+    assert.match(err, /Wrote css\/tokens\.css\. The previous file is css\/tokens\.css\.bak\./);
+  });
+
+  it('check: a raw hex in an added .css file is an advisory finding — exit 0, printed as FINDINGS', async () => {
+    const dir = designedWorkspace();
+    assert.equal(await run(checkCli(RAW_HEX), ['check', '--no-commands', '--cwd', dir]), 6, 'the sample profile has a command, which --no-commands leaves unchecked');
+    assert.match(out, /^ {2}FINDINGS {2}frontend\/design-tokens$/m);
+    out = '';
+    err = '';
+    assert.equal(await run(checkCli(RAW_HEX), ['check', '--cwd', dir]), 0, err);
+    assert.match(out, /^ {2}FINDINGS {2}frontend\/design-tokens$/m);
+    assert.match(out, /src\/site\.css:1 .*Raw colour; use a design token from css\/tokens\.css/);
+  });
+
+  it('check: with the design rule promoted, the same finding exits 1', async () => {
+    const dir = designedWorkspace(true);
+    assert.equal(await run(checkCli(RAW_HEX), ['check', '--cwd', dir]), 1);
   });
 });

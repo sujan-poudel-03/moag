@@ -9,6 +9,7 @@
 import { h, mount, badge, glyph, toast, announce, confirmDialog, fmtTime, fmtUsd, field } from '../dom.js';
 import { STR, serverMessage } from '../strings.js';
 import { standardsBlockedCard } from './version-panel.js';
+import { tokenTable, designDoc } from './design-view.js';
 
 const STATUS_BADGE = {
   generating: ['GENERATING', 'info'],
@@ -132,6 +133,8 @@ function planCard(app, project, p, refresh) {
       return h('p', { class: 'muted' }, 'Standards: none. This plan was generated before the project had standards.');
     }
     const who = h('span');
+    // The version's design system, shown inline (the router has no deep link into a version).
+    const designHost = h('div');
     // Who approved it is on the standards resource; fill it in when it arrives.
     void app.api('GET', `/api/projects/${encodeURIComponent(project.id)}/standards`, undefined, { quiet: true }).then((r) => {
       const all = r.ok && r.body.standards && Array.isArray(r.body.standards.versions) ? r.body.standards.versions : [];
@@ -139,10 +142,22 @@ function planCard(app, project, p, refresh) {
       if (v && v.status === 'approved') {
         who.textContent = ` · ${v.decision === 'accepted-defaults' ? 'defaults accepted' : 'approved'} by ${v.decidedByName || '—'} · ${fmtTime(v.decidedAt)}`;
       }
+      // The card may have been replaced while the request ran: fill only a placeholder still on screen.
+      const d = v && v.design;
+      if (!d || !designHost.isConnected) { return; }
+      const tokens = Array.isArray(d.tokens) ? d.tokens : [];
+      const kit = v.profile && v.profile.frontend && v.profile.frontend.componentKit;
+      mount(designHost,
+        h('p', null, `Design system: ${tokens.length} token${tokens.length === 1 ? '' : 's'} · `, h('span', { class: 'mono' }, d.tokensPath || '—'), kit ? ` · kit ${kit}` : ''),
+        h('details', { class: 'diff-group' },
+          h('summary', null, 'Show design system'),
+          tokenTable(tokens, { caption: `Standards v${v.version} design tokens` }),
+          designDoc(d.doc, `DESIGN.md, standards v${v.version}`)));
     });
     const now = project.standards ? project.standards.effectiveVersion : null;
     return [
       h('p', null, `Standards v${p.standardsVersion}`, who, ' ', link),
+      designHost,
       now && now !== p.standardsVersion
         ? h('p', { class: 'text-warning' }, glyph('⚠'), ' ', STR.C38(p.standardsVersion, now).text) : null,
     ];

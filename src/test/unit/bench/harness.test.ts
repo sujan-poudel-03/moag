@@ -974,6 +974,43 @@ describe('bench harness (scripted workers behind the real app)', function () {
       assert.equal(t.disposed, 1);
     });
 
+    it('a signal while the server is stopping still kills every worker; the handlers are disposed only after stop()', async () => {
+      const t: Term = { handlers: null, disposed: 0 };
+      let kills = 0;
+      let disposedAtSignal = -1;
+      const lines: string[] = [];
+      const server: LaunchedServer = {
+        url: h.url, projectsRoot: h.root, bootstrapToken: BOOT, serverEnv: { ...process.env },
+        stop: async () => { disposedAtSignal = t.disposed; t.handlers!.signal('SIGINT'); },
+        killNow: () => { kills++; },
+      };
+      const r = await runBench(scenario(), { dryRun: false, maxUsd: 10, outDir: out(), progress: (l) => lines.push(l) }, deps({
+        ...termDeps(t),
+        launchServer: async () => server,
+        prepareWorkspace: async () => { throw new Error('setup failed'); },
+      }));
+      assert.equal(r.exitCode, 2);
+      assert.equal(disposedAtSignal, 0, 'the handlers were still registered while the server stopped');
+      assert.equal(kills, 1, 'the signal during stop() reached killNow');
+      assert.ok(lines.includes('SIGINT while stopping the server: killing every worker now'));
+      assert.equal(t.disposed, 1);
+    });
+
+    it('a rejecting server.stop() still disposes the handlers, and the rejection propagates', async () => {
+      const t: Term = { handlers: null, disposed: 0 };
+      const server: LaunchedServer = {
+        url: h.url, projectsRoot: h.root, bootstrapToken: BOOT, serverEnv: { ...process.env },
+        stop: async () => { throw new Error('stop failed'); },
+        killNow: () => undefined,
+      };
+      await assert.rejects(runBench(scenario(), { dryRun: false, maxUsd: 10, outDir: out(), ...quiet }, deps({
+        ...termDeps(t),
+        launchServer: async () => server,
+        prepareWorkspace: async () => { throw new Error('setup failed'); },
+      })), /stop failed/);
+      assert.equal(t.disposed, 1);
+    });
+
     it('the default registration adds real process handlers and removes every one', async () => {
       const count = () => ({ int: process.listenerCount('SIGINT'), term: process.listenerCount('SIGTERM'), hup: process.listenerCount('SIGHUP'), exit: process.listenerCount('exit') });
       const before = count();

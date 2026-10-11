@@ -6,7 +6,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  detectConventions, detectProjectConventions, detectProjectRules, minimalGitEnv, readTrackedFiles,
+  detectConventions, detectDesignSources, detectProjectConventions, detectProjectRules, minimalGitEnv, readTrackedFiles,
 } from '../../../ai-rules/project-detector';
 import { ruleSeverity } from '../../../standards/profile';
 import { proposeProfile } from '../../../standards/propose';
@@ -516,5 +516,75 @@ describe('project detector — git is asked asynchronously, and a refusal is sai
     const d = detector.detectProjectConventions(makeRepo('moag-conv-nospawn-', { 'package.json': '{}', 'src/a.ts': 'export const a = 1;\n' }));
     assert.equal(d.sourceFileCount, 1);
     assert.equal(calls.length, 0);
+  });
+});
+
+describe('project detector — detectDesignSources', () => {
+  it('adopts a CSS file that declares :root custom properties, and a design document', () => {
+    const dir = makeRepo('moag-design-src-', { 'src/theme.css': ':root{--x:1px}', 'docs/DESIGN.md': '# D\n', 'index.html': '<!doctype html>' });
+    assert.deepEqual(detectDesignSources(dir), {
+      tokens: { path: 'src/theme.css', content: ':root{--x:1px}' },
+      doc: { path: 'docs/DESIGN.md', content: '# D\n' },
+      ui: { value: 'index.html', evidence: 'index.html' },
+    });
+  });
+
+  it('ignores a CSS candidate without :root variables and moves on to the next one', () => {
+    const dir = makeRepo('moag-design-src2-', { 'src/styles/tokens.css': 'body { margin: 0; }', 'css/tokens.css': ':root {\n  --a: #fff;\n}' });
+    assert.equal(detectDesignSources(dir).tokens?.path, 'css/tokens.css');
+    assert.deepEqual(detectDesignSources(dir).notAdopted, [{ path: 'src/styles/tokens.css', reason: 'declares no :root custom properties', content: 'body { margin: 0; }' }]);
+    assert.deepEqual(detectDesignSources(makeRepo('moag-design-src3-', { 'src/theme.css': 'a{}' })), {
+      tokens: null, doc: null, ui: null,
+      notAdopted: [{ path: 'src/theme.css', reason: 'declares no :root custom properties', content: 'a{}' }],
+    });
+  });
+
+  it('accepts :root in a selector list as a tokens file', () => {
+    for (const head of [':root, [data-theme="light"] {', '[data-theme="dark"], :root {', 'html:root {']) {
+      const dir = makeRepo('moag-design-sellist-', { 'css/tokens.css': `${head}\n  --a: #fff;\n}\n` });
+      assert.equal(detectDesignSources(dir).tokens?.path, 'css/tokens.css', head);
+    }
+    const notRoot = makeRepo('moag-design-sellist-no-', { 'css/tokens.css': '.root { --a: #fff; }\n' });
+    assert.equal(detectDesignSources(notRoot).tokens, null);
+  });
+
+  it('lists every candidate or fallback path that exists but was not adopted, so a proposal never targets it', () => {
+    const dir = makeRepo('moag-design-taken-', {
+      'src/theme.css': ':root{--x:1px}', 'css/tokens.css': 'a{}', 'css/design-tokens.css': 'b{}', 'docs/design/DESIGN.md': 'x'.repeat(13_000),
+    });
+    const found = detectDesignSources(dir);
+    assert.equal(found.tokens?.path, 'src/theme.css');
+    assert.deepEqual(found.notAdopted, [
+      { path: 'css/tokens.css', reason: 'src/theme.css was adopted instead' },
+      { path: 'docs/design/DESIGN.md', reason: 'larger than 12000 characters' },
+      { path: 'css/design-tokens.css', reason: 'already exists', content: 'b{}' },
+    ]);
+  });
+
+  it('ignores an untracked candidate when the tracked listing is given', () => {
+    const dir = makeRepo('moag-design-src4-', { 'src/theme.css': ':root{--x:1px}', 'src/a.ts': 'export {};\n' });
+    const detection = detectProjectConventions(dir, { tracked: { ok: true, files: ['src/a.ts'] } });
+    assert.equal(detection.designSources?.tokens, null, 'an untracked candidate is never adopted');
+    assert.deepEqual(detection.designSources?.notAdopted, [{ path: 'src/theme.css', reason: 'not tracked by git', content: ':root{--x:1px}' }],
+      'but it is listed, so a proposal never writes over it');
+    const none = detectProjectConventions(makeRepo('moag-design-src4b-', { 'src/a.ts': 'export {};\n' }), { tracked: { ok: true, files: ['src/a.ts'] } });
+    assert.equal(none.designSources, undefined, 'nothing on disk, no key at all');
+    const tracked = detectProjectConventions(dir, { tracked: { ok: true, files: ['src/a.ts', 'src/theme.css'] } });
+    assert.equal(tracked.designSources?.tokens?.path, 'src/theme.css');
+  });
+
+  it('skips an oversized file', () => {
+    const dir = makeRepo('moag-design-src5-', { 'src/theme.css': ':root{--x:1px}' + ' '.repeat(9_000), 'DESIGN.md': 'x'.repeat(13_000) });
+    const found = detectDesignSources(dir);
+    assert.equal(found.tokens, null);
+    assert.equal(found.doc, null);
+    assert.deepEqual(found.notAdopted, [
+      { path: 'src/theme.css', reason: 'larger than 8000 characters' },
+      { path: 'DESIGN.md', reason: 'larger than 12000 characters' },
+    ]);
+  });
+
+  it('never throws, even when present() throws', () => {
+    assert.deepEqual(detectDesignSources('/nope', () => { throw new Error('boom'); }), { tokens: null, doc: null, ui: null });
   });
 });
