@@ -42,7 +42,8 @@ export interface CommitRequest {
 }
 
 export type CommitOutcome =
-  | { committed: true; sha: string }
+  /** `sha` is the short sha for display; `fullSha` the 40/64-hex sha, null when it could not be read. */
+  | { committed: true; sha: string; fullSha: string | null }
   | { committed: false; reason: 'nothing-to-commit' | 'commit-failed'; detail: string };
 
 const MAX_SLUG = 32;
@@ -208,7 +209,9 @@ export async function commitTask(req: CommitRequest, git: GitRunner): Promise<Co
   }
 
   const sha = await git(['rev-parse', '--short', 'HEAD'], req.cwd);
-  return { committed: true, sha: (sha ?? '').trim() };
+  const full = ((await git(['rev-parse', 'HEAD'], req.cwd)) ?? '').trim();
+  const fullSha = /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(full) ? full : null;
+  return { committed: true, sha: (sha ?? '').trim(), fullSha };
 }
 
 /** One human-readable line per prepare failure. */

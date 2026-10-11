@@ -2301,6 +2301,207 @@ describe('TaskRunner — project standards', () => {
   });
 });
 
+// ─── Task-settled hook (headless task-changes) ───
+
+describe('TaskRunner — task-settled hook', () => {
+  const HEAD = 'c'.repeat(40);
+  type SettledInfo = {
+    taskId: string; status: TaskStatus; cwd: string; snapshotRef: string | null; headRef: string | null;
+    untrackedAtStart: string[] | null; commit: { sha: string; branch: string } | null;
+  };
+
+  /** A runner whose git answers the three start-fact commands; `extra` adds proxyquire stubs. */
+  function build(extra: Record<string, unknown> = {}) {
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    spawnStub = sinon.stub().callsFake((cmd: string, args: string[] = []) => {
+      if (cmd === 'git' && args[0] === 'stash' && args[1] === 'create') { return createSpawnProc({ stdoutChunks: ['stashsha'] }); }
+      if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === '--verify') { return createSpawnProc({ stdoutChunks: [HEAD] }); }
+      if (cmd === 'git' && args[0] === 'ls-files') { return createSpawnProc({ stdoutChunks: ['old.txt\0'] }); }
+      return createSpawnProc();
+    });
+    const mod = proxyquire('../../../runner/runner', {
+      'vscode': vscodeMock,
+      '../adapters/index': { getEngine: () => mockEngine },
+      '../context/context-builder': { buildContext: () => '', getContextSettings: () => ({ enabled: false }) },
+      'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+      '../utils/process-kill': { killProcess: sinon.stub(), SPAWN_DETACHED: false },
+      ...extra,
+    });
+    return { TaskRunner: mod.TaskRunner, runner: new mod.TaskRunner(historyStore) };
+  }
+
+  const spawnedLsFiles = (): boolean => spawnStub.getCalls().some((c) => c.args[0] === 'git' && (c.args[1] as string[])[0] === 'ls-files');
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  it('is called once for a completed task, before task-completed, with the start facts', async () => {
+    const { runner } = build();
+    const order: string[] = [];
+    const infos: SettledInfo[] = [];
+    runner.setTaskSettledHook(async (info: SettledInfo) => { order.push('hook'); infos.push(info); });
+    runner.on('task-completed', () => order.push('completed'));
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+    await runner.play(plan);
+
+    assert.deepEqual(order, ['hook', 'completed']);
+    assert.equal(infos.length, 1);
+    assert.equal(infos[0].taskId, plan.playlists[0].tasks[0].id);
+    assert.equal(infos[0].status, TaskStatus.Completed);
+    assert.equal(infos[0].snapshotRef, 'stashsha');
+    assert.equal(infos[0].headRef, HEAD);
+    assert.deepEqual(infos[0].untrackedAtStart, ['old.txt']);
+    assert.equal(infos[0].commit, null);
+    assert.equal(typeof infos[0].cwd, 'string');
+  });
+
+  it('is called for a failed task, before task-failed', async () => {
+    const { runner } = build();
+    engineRunStub.resolves({ ...mockEngineResult, exitCode: 1 });
+    const order: string[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { order.push(`hook:${info.status}`); });
+    runner.on('task-failed', () => order.push('failed'));
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+    await runner.play(plan);
+
+    assert.deepEqual(order, ['hook:failed', 'failed']);
+  });
+
+  it('is not called for a dependency-blocked task', async () => {
+    const { runner } = build();
+    engineRunStub.resolves({ ...mockEngineResult, exitCode: 1 });
+    const ids: string[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { ids.push(info.taskId); });
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].id = 'dep-task';
+    plan.playlists[0].tasks[1].dependsOn = ['dep-task'];
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Blocked);
+    assert.deepEqual(ids, ['dep-task']);
+  });
+
+  it('is not called for a skipped task', async () => {
+    const { runner } = build();
+    const ids: string[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { ids.push(info.taskId); });
+    const plan = makePlan();
+    const [first, second] = plan.playlists[0].tasks;
+    second.skipIf = { taskId: first.id, status: TaskStatus.Completed };
+
+    await runner.play(plan);
+
+    assert.equal(second.status, TaskStatus.Skipped);
+    assert.deepEqual(ids, [first.id]);
+  });
+
+  it('a throwing hook never changes the outcome', async () => {
+    for (const hook of [() => { throw new Error('sync boom'); }, async () => { throw new Error('async boom'); }]) {
+      const { runner } = build();
+      const completed: string[] = [];
+      runner.on('task-completed', (t: Task) => completed.push(t.id));
+      runner.setTaskSettledHook(hook);
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+      await runner.play(plan);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+      assert.deepEqual(completed, [plan.playlists[0].tasks[0].id]);
+    }
+  });
+
+  describe('bounded', () => {
+    let restore: (() => void) | null = null;
+    afterEach(() => { restore?.(); restore = null; });
+
+    it('a never-resolving hook is abandoned after TASK_SETTLED_HOOK_MS and its signal aborts', async () => {
+      const { runner, TaskRunner } = build();
+      const original = TaskRunner.TASK_SETTLED_HOOK_MS;
+      TaskRunner.TASK_SETTLED_HOOK_MS = 30;
+      restore = () => { TaskRunner.TASK_SETTLED_HOOK_MS = original; };
+      let seen: AbortSignal | null = null;
+      runner.setTaskSettledHook((_info: SettledInfo, signal: AbortSignal) => { seen = signal; return new Promise<void>(() => undefined); });
+      const completed: string[] = [];
+      runner.on('task-completed', (t: Task) => completed.push(t.id));
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+      await runner.play(plan);
+
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+      assert.equal(completed.length, 1);
+      assert.ok(seen);
+      assert.equal((seen as AbortSignal).aborted, true);
+    });
+  });
+
+  it('with no hook, no start facts are captured (no ls-files spawn)', async () => {
+    const { runner } = build();
+    const plan = makePlan();
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.equal(spawnedLsFiles(), false);
+  });
+
+  it('a cleared hook is not called and captures nothing', async () => {
+    const { runner } = build();
+    let calls = 0;
+    runner.setTaskSettledHook(() => { calls++; });
+    runner.setTaskSettledHook(null);
+    await runner.play(makePlan());
+    assert.equal(calls, 0);
+    assert.equal(spawnedLsFiles(), false);
+  });
+
+  it('carries the full commit sha and the delivery branch when delivery committed the task', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const realDelivery = require('../../../runner/git-delivery');
+    const { runner } = build({
+      './git-delivery': {
+        ...realDelivery,
+        prepareBranch: async () => ({ ok: true, branch: 'moag/p', created: true }),
+        commitTask: async () => ({ committed: true, sha: 'abc1234', fullSha: 'f'.repeat(40) }),
+      },
+    });
+    const infos: SettledInfo[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { infos.push(info); });
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+    await runner.play(plan);
+
+    assert.equal(infos.length, 1);
+    assert.deepEqual(infos[0].commit, { sha: 'f'.repeat(40), branch: 'moag/p' });
+  });
+
+  it('a commit without a readable full sha reports commit null', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const realDelivery = require('../../../runner/git-delivery');
+    const { runner } = build({
+      './git-delivery': {
+        ...realDelivery,
+        prepareBranch: async () => ({ ok: true, branch: 'moag/p', created: true }),
+        commitTask: async () => ({ committed: true, sha: 'abc1234', fullSha: null }),
+      },
+    });
+    const infos: SettledInfo[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { infos.push(info); });
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    await runner.play(plan);
+    assert.equal(infos[0].commit, null);
+  });
+});
+
 describe('TaskRunner — automatic dependency installs', () => {
   afterEach(() => {
     sinon.restore();

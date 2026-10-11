@@ -59,6 +59,7 @@ import { ghSync } from '../utils/gh';
 import { fileIncidentIssue } from '../github/issue-sync';
 // Type-only — zero runtime dependency, keeps the runner headless-safe.
 import type { EngineCallUsage } from '../utils/usage-log';
+import type { TaskSettledHook, TaskSettledInfo } from './task-changes';
 import { trackChildProcess } from '../utils/child-tracker';
 
 const GIT_TIMEOUT_MS = 30_000;
@@ -416,6 +417,12 @@ export class TaskRunner {
   private _aiRulesStore: AiRulesStore | null = null;
   private _standardsProvider: StandardsProvider | null = null;
   private _runStartHook: ((cwd: string) => Promise<void> | void) | null = null;
+  /** Host hook told about every task that settles after task-started; null = none (the default). */
+  private _taskSettledHook: TaskSettledHook | null = null;
+  /** taskId -> git facts captured at task start, only while a settled hook is set. */
+  private _taskStartFacts = new Map<string, { headRef: string | null; untrackedAtStart: string[] | null }>();
+  /** Bound on one settled-hook call; under STOP_WATCHDOG_MS so a stop can still finish. */
+  private static readonly TASK_SETTLED_HOOK_MS = 20_000;
   private _pendingScreenshots: string[] = [];
   private _sandboxUrl: string | null = null;
   /** Sink for per-engine-call usage facts (Contribution Ledger). Null = usage recording disabled. */
@@ -480,6 +487,56 @@ export class TaskRunner {
         // Bookkeeping must never stop a run.
       }
     })();
+  }
+
+  /**
+   * Set what happens when a task that reached task-started settles Completed or Failed:
+   * the host's chance to record what the task changed (the headless CLI's `task-changes`).
+   * Called immediately before task-completed/task-failed, awaited, bounded by
+   * TASK_SETTLED_HOOK_MS (the signal aborts on timeout). A hook that throws or hangs never
+   * changes the task's outcome. With no hook, nothing extra runs at task start or end.
+   */
+  setTaskSettledHook(fn: TaskSettledHook | null): void {
+    this._taskSettledHook = fn;
+  }
+
+  /** Run the settled hook for `task`, bounded; never throws. No-op when no hook is set. */
+  private async notifyTaskSettled(
+    task: Task,
+    cwd: string,
+    snapshotRef: string | null,
+    commit: { sha: string; branch: string } | null,
+  ): Promise<void> {
+    const hook = this._taskSettledHook;
+    if (!hook) { return; }
+    const facts = this._taskStartFacts.get(task.id);
+    const info: TaskSettledInfo = {
+      taskId: task.id,
+      status: task.status,
+      cwd,
+      snapshotRef,
+      headRef: facts?.headRef ?? null,
+      untrackedAtStart: facts?.untrackedAtStart ?? null,
+      commit,
+    };
+    const ac = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      await Promise.race([
+        Promise.resolve().then(() => hook(info, ac.signal)),
+        new Promise<void>((resolve) => {
+          timer = setTimeout(() => {
+            ac.abort();
+            resolve();
+          }, TaskRunner.TASK_SETTLED_HOOK_MS);
+        }),
+      ]);
+    } catch {
+      // Reporting must never change a task's outcome.
+    } finally {
+      if (timer) { clearTimeout(timer); }
+      this._taskStartFacts.delete(task.id);
+    }
   }
 
   setSandboxUrl(url: string | null): void {
@@ -1434,6 +1491,16 @@ export class TaskRunner {
     if (gitRef) {
       this._taskGitRefs.set(task.id, { ref: gitRef, cwd });
     }
+    if (this._taskSettledHook) {
+      const headRef = await this.runGitCommand(['rev-parse', '--verify', '--quiet', 'HEAD'], cwd);
+      const untracked = await this.runGitCommand(['ls-files', '--others', '--exclude-standard', '-z', '--', '.', ':(exclude).moag'], cwd);
+      this._taskStartFacts.set(task.id, {
+        headRef: headRef || null,
+        untrackedAtStart: untracked === null ? null : untracked.split('\0').filter((p) => p.length > 0),
+      });
+    } else {
+      this._taskStartFacts.delete(task.id);
+    }
 
     const taskAbort = new AbortController();
     const settingOverrideMs = (() => {
@@ -1487,6 +1554,7 @@ export class TaskRunner {
               `Fix the baseline before re-running. Disable agentTaskPlayer.haltOnBrokenBaseline to proceed anyway.\n`;
           this.emit('task-output', task, haltMsg, 'stderr');
           task.status = TaskStatus.Failed;
+          await this.notifyTaskSettled(task, cwd, gitRef, null);
           this.emit('task-failed', task, {
             stdout: '',
             stderr: haltMsg,
@@ -1691,7 +1759,8 @@ export class TaskRunner {
       if (task.status === TaskStatus.Completed) {
         // Gap 6: Clear failure context on success
         this._taskFailureContext.delete(task.id);
-        await this.commitCompletedTask(task, playlist, cwd, changedFiles, result);
+        const commit = await this.commitCompletedTask(task, playlist, cwd, changedFiles, result);
+        await this.notifyTaskSettled(task, cwd, gitRef, commit);
         this.emit('task-completed', task, result);
       } else {
         // Classify and store failure context for retry/auto-fix
@@ -1709,6 +1778,7 @@ export class TaskRunner {
           failureLines.push('Verification failed:\n' + verification.output.slice(-1000));
         }
         this._taskFailureContext.set(task.id, failureLines.join('\n\n'));
+        await this.notifyTaskSettled(task, cwd, gitRef, null);
         this.emit('task-failed', task, result);
         // Fix 3: Hint when autoFix is off so users know why MOAG won't self-repair
         const autoFixOn = !this.isFailSafeMode() && getConfig('agentTaskPlayer').get<boolean>('autoFix', true);
@@ -1756,6 +1826,7 @@ export class TaskRunner {
         runId: this._currentRunId || undefined,
       });
 
+      await this.notifyTaskSettled(task, cwd, gitRef, null);
       this.emit('task-failed', task, errorResult);
       // Fix 3: Hint when autoFix is off so users know why MOAG won't self-repair
       const autoFixOnCatch = !this.isFailSafeMode() && getConfig('agentTaskPlayer').get<boolean>('autoFix', true);
@@ -3338,15 +3409,18 @@ export class TaskRunner {
     this._deliveryBranch = outcome.branch;
   }
 
-  /** Commit a task that just passed, when delivery is armed. */
+  /**
+   * Commit a task that just passed, when delivery is armed. Resolves the full sha and
+   * delivery branch when a commit was made and its full sha could be read, else null.
+   */
   private async commitCompletedTask(
     task: Task,
     playlist: Playlist,
     cwd: string,
     changedFiles: string[],
     result: EngineResult,
-  ): Promise<void> {
-    if (!this._deliveryBranch) { return; }
+  ): Promise<{ sha: string; branch: string } | null> {
+    if (!this._deliveryBranch) { return null; }
 
     const outcome = await commitTask(
       {
@@ -3364,11 +3438,13 @@ export class TaskRunner {
       this.emit('task-output', task,
         `[MOAG] Committed ${outcome.sha} on ${this._deliveryBranch}\n`, 'stdout');
       if (this._plan) { recordCommit(this._plan, task, outcome.sha); }
+      return outcome.fullSha && this._deliveryBranch ? { sha: outcome.fullSha, branch: this._deliveryBranch } : null;
     } else if (outcome.reason === 'commit-failed') {
       // Surface it, but never fail a task that already passed its gates.
       this.emit('task-output', task,
         `[MOAG] Auto-commit failed: ${outcome.detail}\n`, 'stderr');
     }
+    return null;
   }
 
   private getDeliveryConfig(): DeliveryConfig {

@@ -569,6 +569,29 @@ describe('headless CLI: cmdRun persists only requirement trace', () => {
     assert.ok(lines.some((l) => l.includes('"manual-gate"')));
   });
 
+  it('a failed task adds a redacted task-error-tail; the other event names are unchanged', async () => {
+    const { dir, planFile } = writePlanFile();
+    const secret = 'sk-ant-api03-' + 'S'.repeat(40);
+    const { EventEmitter } = require('events');
+    const runner = new EventEmitter();
+    runner.stop = () => undefined;
+    runner.play = async (plan: Plan) => {
+      const t = plan.playlists[0].tasks[0];
+      runner.emit('task-started', t);
+      t.status = TaskStatus.Failed;
+      runner.emit('task-failed', t, { stdout: '', stderr: `auth failed for ${secret}` });
+    };
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]), { ...fakeCtx(), runner, relayDeps: { env: {} } });
+    assert.equal(code, 1);
+    const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    assert.deepEqual(events.map((e) => e.event), ['run-started', 'task-started', 'task-failed', 'task-error-tail', 'run-finished']);
+    const tail = events.find((e) => e.event === 'task-error-tail')!;
+    assert.equal(tail.id, 't-1');
+    assert.ok(String(tail.tail).includes('[REDACTED]'));
+    assert.ok(!lines.join('').includes(secret));
+    assert.equal(runner.listenerCount('task-failed'), 1, 'reporting listeners are removed when the run ends');
+  });
+
   it('a run that recorded no trace does not touch the plan file', async () => {
     const { dir, planFile } = writePlanFile();
     const before = fs.readFileSync(planFile, 'utf-8');
@@ -596,6 +619,293 @@ describe('headless CLI: cmdRun persists only requirement trace', () => {
     assert.deepEqual(raw.requirementTrace[0].gates.map((g: { exitCode: number }) => g.exitCode), [0]);
     assert.equal(raw.prdSource, undefined, 'run --verify persists the trace only');
     assert.deepEqual(fs.readdirSync(dir).filter((f) => f.endsWith('.tmp')), [], 'no temp file left behind');
+  });
+});
+
+// ─── cmdRun — the ONOSOO relay ───
+
+describe('headless CLI: cmdRun ONOSOO relay', function () {
+  this.timeout(20_000);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const proxyquire = require('proxyquire').noCallThru();
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { EventEmitter } = require('events');
+  const KEY = 'onosoo_live_' + 'R'.repeat(43);
+  const BASE = 'http://127.0.0.1:54321';
+  const ENDPOINT = `${BASE}/functions/v1/builds/events`;
+  const PROMPT = 'Implement the secret-prompt-text feature';
+  const SECRET = 'sk-ant-api03-' + 'L'.repeat(40);
+  const HEADLESS_TODAY = new Set(['run-started', 'task-started', 'task-completed', 'task-failed', 'manual-gate', 'run-finished']);
+  let stdout: sinon.SinonStub;
+  let lines: string[];
+
+  type Body = { protocol: number; device_id: string; moag_version: string; events: Array<{ run_id: string; seq: number; type: string; at: string; data: Record<string, unknown> }> };
+  type Call = { url: string; body: Body; raw: string };
+
+  beforeEach(() => {
+    lines = [];
+    const write = process.stdout.write.bind(process.stdout);
+    stdout = sinon.stub(process.stdout, 'write').callsFake((chunk: unknown) => {
+      const text = String(chunk);
+      if (text.startsWith('{')) { lines.push(text); return true; }
+      return write(text);
+    });
+  });
+  afterEach(() => { stdout.restore(); });
+
+  function loadCli() {
+    return proxyquire('../../../headless/cli', {
+      '../runner/prd-loop': {
+        createPrdLoop: () => ({
+          run: async () => ({
+            passed: true, score: 100, haltReason: null, failedGate: null, iterations: 1, modelCallsMade: 1,
+            gateCommandsEmpty: false, uatRan: false, uatSkipReason: null, changedFiles: [],
+          }),
+          noteManualGate: () => undefined,
+          noteBudgetExceeded: () => undefined,
+        }),
+      },
+      '../runner/evidence': { detectPrdFile: () => null, captureBaseRef: async () => null, captureHeadRef: async () => null },
+      '../adapters/index': { getEngine: () => ({ runTask: async () => { throw new Error('no engine in tests'); } }) },
+      '../sandbox/sandbox-manager': { SandboxManager: class {}, isPortOpen: async () => false },
+      '../sandbox/project-detector': { detectProject: () => null },
+    });
+  }
+
+  /** A plan dir and a separate user config dir (never inside the plan dir). */
+  function workspace(): { dir: string; planFile: string; configDir: string } {
+    const dir = fs.realpathSync(tmpDir());
+    const configDir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'moag-cli-cfg-')));
+    const planFile = path.join(dir, 'plan.json');
+    fs.writeFileSync(planFile, JSON.stringify({
+      version: '1.0', name: 'Relay plan',
+      playlists: [{ id: 'pl', name: 'Build', tasks: [
+        { id: 't-1', name: 'First', prompt: PROMPT },
+        { id: 't-2', name: 'Second', prompt: PROMPT },
+      ] }],
+    }, null, 2));
+    return { dir, planFile, configDir };
+  }
+
+  type Outcome = 'ok' | 'fail' | 'gate';
+
+  /** An EventEmitter runner whose play() drives the tasks to `outcome`. */
+  function fakeRunner(outcome: Outcome) {
+    const runner = new EventEmitter();
+    runner.stop = () => undefined;
+    runner.play = async (plan: Plan) => {
+      const [a, b] = plan.playlists[0].tasks;
+      runner.emit('task-started', a);
+      if (outcome === 'gate') { runner.emit('manual-gate', b); return; }
+      if (outcome === 'fail') {
+        a.status = TaskStatus.Failed;
+        runner.emit('task-failed', a, { stdout: '', stderr: `request failed with key ${SECRET}` });
+      } else {
+        a.status = TaskStatus.Completed;
+        runner.emit('task-completed', a, { stdout: 'ok', stderr: '' });
+      }
+      b.status = TaskStatus.Completed;
+      runner.emit('task-started', b);
+      runner.emit('task-completed', b, { stdout: 'ok', stderr: '' });
+    };
+    return runner;
+  }
+
+  function recorder(respond?: (body: Body) => Promise<{ status: number; body: string }> | { status: number; body: string }) {
+    const calls: Call[] = [];
+    const http = async (req: { url: string; body: string }) => {
+      const body = JSON.parse(req.body) as Body;
+      calls.push({ url: req.url, body, raw: req.body });
+      if (respond) { return respond(body); }
+      const acked: Record<string, number> = {};
+      for (const e of body.events) { acked[e.run_id] = Math.max(acked[e.run_id] ?? 0, e.seq); }
+      return { status: 200, body: JSON.stringify({ acked }) };
+    };
+    return { calls, http };
+  }
+
+  function ctxFor(outcome: Outcome, relayDeps: Record<string, unknown>) {
+    return {
+      runner: fakeRunner(outcome),
+      vscode: { workspace: { getConfiguration: () => ({ get: <T>(_k: string, d: T) => d }) } },
+      TaskStatus,
+      loadPlan,
+      relayDeps,
+    };
+  }
+
+  const envWithKey = (configDir: string): NodeJS.ProcessEnv =>
+    ({ APPDATA: configDir, XDG_CONFIG_HOME: configDir, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: BASE });
+
+  function walkText(dir: string): string {
+    let out = '';
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      out += e.isDirectory() ? walkText(p) : fs.readFileSync(p, 'utf-8');
+    }
+    return out;
+  }
+
+  const stdoutEvents = (): Array<Record<string, unknown>> => lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+
+  it('no key: zero requests, no spool, and only the events of today plus the new reporting lines (AC2)', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const { calls, http } = recorder();
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]),
+      ctxFor('fail', { env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir }, http, closeDeadlineMs: 50 }));
+    assert.equal(code, 1);
+    assert.equal(calls.length, 0);
+    assert.deepEqual(fs.readdirSync(configDir), [], 'nothing written to the user config dir');
+    const names = stdoutEvents().map((e) => String(e.event));
+    assert.ok(names.every((n) => HEADLESS_TODAY.has(n) || n === 'task-changes' || n === 'task-error-tail'), names.join(','));
+    assert.ok(names.includes('task-error-tail'));
+  });
+
+  it('seq runs 1, 2, 3 … from run-meta through run-finished and verify-*; run-meta is relay-only (AC4)', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const { calls, http } = recorder();
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir, '--verify']),
+      ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000 }));
+    assert.equal(code, 0);
+    assert.ok(calls.length >= 1);
+    for (const c of calls) { assert.equal(c.url, ENDPOINT); }
+    const sent = calls.flatMap((c) => c.body.events);
+    const runId = sent[0].run_id;
+    assert.ok(sent.every((e) => e.run_id === runId));
+    assert.deepEqual(sent.map((e) => e.seq), sent.map((_e, i) => i + 1), 'contiguous, no gaps, no resends');
+    assert.equal(sent[0].type, 'run-meta');
+    const types = sent.map((e) => e.type);
+    const finished = types.indexOf('run-finished');
+    assert.ok(finished > 0);
+    assert.ok(types.slice(finished + 1).some((t) => t.startsWith('verify-')), types.join(','));
+    // Every stdout line was relayed, in order, with its own ts.
+    const out = stdoutEvents();
+    assert.deepEqual(types.slice(1), out.map((e) => e.event));
+    assert.deepEqual(sent.slice(1).map((e) => e.at), out.map((e) => e.ts));
+    assert.ok(!out.some((e) => e.event === 'run-meta'), 'run-meta never reaches stdout');
+    // run-meta: names only, never a path or a prompt.
+    const meta = sent[0].data as { plan_name: string; project: string; tasks: Array<{ id: string; name: string }> };
+    assert.equal(meta.plan_name, 'Relay plan');
+    assert.equal(meta.project, path.basename(dir));
+    assert.deepEqual(meta.tasks, [{ id: 't-1', name: 'First' }, { id: 't-2', name: 'Second' }]);
+    for (const c of calls) { assert.ok(!c.raw.includes(PROMPT), 'no prompt text in any request'); }
+    // No request carries the absolute workspace path, in any spelling JSON gives it.
+    for (const c of calls) {
+      assert.ok(!c.raw.includes(JSON.stringify(dir).slice(1, -1)), 'no absolute tmp dir path in any request');
+      assert.ok(!c.raw.includes(dir.replace(/\\/g, '/')), 'no absolute tmp dir path (forward slashes) in any request');
+    }
+    const started = sent.find((e) => e.type === 'run-started')!;
+    assert.equal(started.data.planPath, 'plan.json', 'the relay copy is cwd-relative');
+    assert.equal(out.find((e) => e.event === 'run-started')!.planPath, planFile, 'stdout keeps the absolute path');
+  });
+
+  const failing: Array<[string, () => (req: unknown) => Promise<{ status: number; body: string }>]> = [
+    ['throwing', () => async () => { throw new Error('ECONNREFUSED'); }],
+    ['hanging', () => () => new Promise(() => undefined)],
+    ['401', () => async () => ({ status: 401, body: '' })],
+  ];
+  for (const [label, make] of failing) {
+    it(`a ${label} client changes no exit code, adds no JSONL line, and close is bounded (AC9)`, async () => {
+      for (const [outcome, expected] of [['ok', 0], ['fail', 1], ['gate', 3]] as Array<[Outcome, number]>) {
+        lines = [];
+        const { dir, planFile, configDir } = workspace();
+        const stderr: string[] = [];
+        const t0 = Date.now();
+        const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]),
+          ctxFor(outcome, { env: envWithKey(configDir), http: make(), closeDeadlineMs: 50, stderr: (s: string) => stderr.push(s) }));
+        assert.equal(code, expected, `${label}/${outcome}`);
+        assert.ok(Date.now() - t0 < 5000, `took ${Date.now() - t0} ms`);
+        const names = stdoutEvents().map((e) => String(e.event));
+        assert.ok(!names.includes('error'), 'relay trouble never becomes a JSONL error line');
+        assert.ok(names.every((n) => HEADLESS_TODAY.has(n) || n === 'task-changes' || n === 'task-error-tail'), names.join(','));
+        assert.ok(stderr.length <= 2, stderr.join(''));
+      }
+    });
+  }
+
+  it('an injected env object is never modified (only process.env loses the relay variables)', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const { http } = recorder();
+    const env = envWithKey(configDir);
+    const before = { ...env };
+    await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]), ctxFor('ok', { env, http, closeDeadlineMs: 2000 }));
+    assert.deepEqual(env, before);
+  });
+
+  it('main() takes the relay variables out of process.env before any handler runs; cmdRun still gets them', async () => {
+    const saved = { ...process.env };
+    try {
+      const { dir, planFile, configDir } = workspace();
+      process.env.MOAG_ONOSOO_KEY = KEY;
+      process.env.MOAG_ONOSOO_URL = BASE;
+      process.env.APPDATA = configDir;
+      process.env.XDG_CONFIG_HOME = configDir;
+      const seenByHandler: Array<string | undefined> = [];
+      const cli = proxyquire('../../../headless/cli', {
+        '../bench/harness': { cmdBench: async () => { seenByHandler.push(process.env.MOAG_ONOSOO_KEY, process.env.MOAG_ONOSOO_URL); return 0; } },
+        '../runner/evidence': { detectPrdFile: () => null, captureBaseRef: async () => null, captureHeadRef: async () => null },
+      });
+      assert.equal(await cli.main(['bench', 'scenario.json', '--dry-run']), 0);
+      assert.deepEqual(seenByHandler, [undefined, undefined], 'the handler never sees the key');
+      assert.equal(process.env.MOAG_ONOSOO_KEY, undefined);
+      assert.equal(process.env.MOAG_ONOSOO_URL, undefined);
+
+      // The same module's cmdRun (no injected env) still relays, through the snapshot.
+      const { calls, http } = recorder();
+      const code = await cli.cmdRun(parseArgs(['run', planFile, '--cwd', dir]), ctxFor('ok', { http, closeDeadlineMs: 2000 }));
+      assert.equal(code, 0);
+      assert.ok(calls.length >= 1, 'the relay was configured from the snapshot');
+      assert.equal(calls[0].url, ENDPOINT);
+      assert.equal(process.env.MOAG_ONOSOO_KEY, undefined);
+    } finally {
+      for (const k of Object.keys(process.env)) { if (!(k in saved)) { delete process.env[k]; } }
+      Object.assign(process.env, saved);
+    }
+  });
+
+  it('forgetRelayEnv deletes the key and URL from the env it is given, and nothing else', () => {
+    const { forgetRelayEnv } = loadCli();
+    const env: NodeJS.ProcessEnv = { MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: BASE, PATH: '/bin' };
+    forgetRelayEnv(env);
+    assert.deepEqual(env, { PATH: '/bin' });
+  });
+
+  it('the key and device id never land under the workspace (AC11)', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const { http } = recorder();
+    await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]), ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000 }));
+    const deviceId = JSON.parse(fs.readFileSync(path.join(configDir, 'moag', 'onosoo.json'), 'utf-8')).device_id as string;
+    assert.match(deviceId, /^[0-9a-f-]{36}$/);
+    const text = walkText(dir);
+    assert.ok(!text.includes(KEY));
+    assert.ok(!text.includes(deviceId));
+  });
+
+  it('a planted secret in a failed task\'s output reaches neither stdout, the spool, nor a request (AC15)', async () => {
+    const { dir, planFile, configDir } = workspace();
+    // 500s keep everything in the spool, so the spool is checked too.
+    const { calls, http } = recorder(() => ({ status: 500, body: '' }));
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]),
+      ctxFor('fail', { env: envWithKey(configDir), http, closeDeadlineMs: 50, stderr: () => undefined }));
+    assert.equal(code, 1);
+    assert.ok(lines.some((l) => l.includes('task-error-tail')));
+    assert.ok(!lines.join('').includes(SECRET));
+    assert.ok(calls.length >= 1);
+    for (const c of calls) { assert.ok(!c.raw.includes(SECRET)); assert.ok(!c.raw.includes(KEY)); }
+    const spoolText = walkText(path.join(configDir, 'moag'));
+    assert.ok(spoolText.includes('task-error-tail'), 'the tail was spooled');
+    assert.ok(!spoolText.includes(SECRET));
+  });
+
+  it('buildRunMeta: package.json name, else the folder name; tasks flattened in plan order', () => {
+    const { buildRunMeta } = loadCli();
+    const dir = fs.realpathSync(tmpDir());
+    const plan = { name: 'P', playlists: [{ tasks: [{ id: 'a', name: 'A', prompt: 'x' }] }, { tasks: [{ id: 'b' }] }] };
+    assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A' }, { id: 'b', name: '' }] });
+    fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@acme/app' }));
+    assert.equal(buildRunMeta(plan, dir).project, '@acme/app');
+    fs.writeFileSync(path.join(dir, 'package.json'), '{broken');
+    assert.equal(buildRunMeta(plan, dir).project, path.basename(dir));
   });
 });
 

@@ -187,6 +187,24 @@ describe('JobManager', () => {
     assert.equal(redactSecrets('abc', ['']), 'abc');
   });
 
+  it('redacts injected secrets from a task-changes diff, keeping diff.truncated', () => {
+    const m = mk();
+    const secret = 'sk-ant-SECRET-123456';
+    const seen: Array<Record<string, unknown>> = [];
+    start(m, 'p1', { redact: [secret], onEvent: (e: Record<string, unknown>) => seen.push(e), onEnd: () => undefined });
+    procs[0].line({
+      event: 'task-changes', task_id: 'a', status: 'completed', source: 'worktree', base_sha: 'b'.repeat(40),
+      commit_sha: null, branch: null, files: [{ path: 'x.env', status: 'added', binary: false, added: 1, removed: 0 }],
+      diff: { text: `+KEY=${secret}\n`, truncated: true, bytes: 99, redactions: 0 },
+    });
+    procs[0].emit('close', 0);
+    const ev = seen.find((e) => e.event === 'task-changes') as { diff: { text: string; truncated: boolean } } | undefined;
+    assert.ok(ev);
+    assert.equal(ev.diff.text.includes(secret), false);
+    assert.ok(ev.diff.text.includes('[REDACTED]'));
+    assert.equal(ev.diff.truncated, true);
+  });
+
   it('redacts injected secrets from a dependency install tail and note', () => {
     const m = mk();
     const secret = 'npm_SECRETTOKEN123456';

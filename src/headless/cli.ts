@@ -63,6 +63,21 @@
  * Exit codes: 0 ok · 1 task(s) failed or PRD gaps remain · 2 error/usage ·
  *             3 halted at ship gate · 4 halted on cost ceiling.
  * Progress is JSONL on stdout; human notices on stderr.
+ *
+ * `run` also reports, after each task's own line, `task-changes` (files changed, and a
+ *          redacted diff capped at 64 KB) for tasks that started and ended Completed or
+ *          Failed in a git work tree, and a redacted `task-error-tail` for a failed task.
+ *
+ * ONOSOO relay (`run` only): with a device key configured, every JSONL line except
+ *          task-pid/task-output is also mirrored to ONOSOO, redacted, spooled to disk first
+ *          and resent until acknowledged. Sources, and only these:
+ *            MOAG_ONOSOO_KEY   the device key   (else "key" in the user file)
+ *            MOAG_ONOSOO_URL   the base URL     (else "url" in the user file; https, or
+ *                                                http to localhost only)
+ *          User file: <configDir>/moag/onosoo.json — <configDir> is %APPDATA% on Windows,
+ *          else $XDG_CONFIG_HOME, else ~/.config. It also keeps the generated device_id; the
+ *          spool lives beside it. Nothing relay-related is ever written under the workspace.
+ *          No key: no request, no spool, no timer. Relay trouble never changes an exit code.
  */
 
 import * as fs from 'fs';
@@ -89,6 +104,11 @@ import { detectedStackId, proposeProfile } from '../standards/propose';
 import { detectConventions } from '../ai-rules/project-detector';
 import { STACK_IDS, isStackId } from '../server/stacks';
 import type { Plan } from '../models/types';
+import { reportingSecretValues, wireTaskReporting } from './task-reporting';
+import { createRedactor, Redactor } from '../utils/redact';
+import { resolveOnosooConfig } from './onosoo-config';
+import { OnosooSpool } from './onosoo-spool';
+import { OnosooRelay, RelayHttpClient, RunMeta } from './onosoo-relay';
 
 /** How long a freshly launched headless sandbox gets to report `running`. */
 const UAT_SANDBOX_READY_TIMEOUT_MS = 120_000;
@@ -255,8 +275,16 @@ export function parseArgs(argv: string[]): Args {
   return a;
 }
 
+/**
+ * Sees every emitted line after it is written to stdout — the ONOSOO relay while a
+ * relay-enabled `moag run` is live, null otherwise. Module-level: one cmdRun per process.
+ */
+let emitTap: ((line: Record<string, unknown>) => void) | null = null;
+
 function emit(obj: Record<string, unknown>): void {
-  process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n');
+  const line = { ts: new Date().toISOString(), ...obj };
+  process.stdout.write(JSON.stringify(line) + '\n');
+  try { emitTap?.(line); } catch { /* the relay never disturbs the run */ }
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -269,6 +297,19 @@ export interface Ctx {
   vscode: any;
   TaskStatus: any;
   loadPlan: (p: string) => any;
+  /** Test seams for `moag run`'s task reporting and ONOSOO relay. Absent in production. */
+  relayDeps?: RelayDeps;
+}
+
+/** Injected dependencies of `moag run`'s reporting and relay; every field defaults to the real thing. */
+export interface RelayDeps {
+  env?: NodeJS.ProcessEnv;
+  http?: RelayHttpClient;
+  /** Builds the reporting redactor; `extra` holds the relay's device key when one is configured. */
+  makeRedactor?: (extra: string[]) => Redactor;
+  stderr?: (s: string) => void;
+  isPidAlive?: (pid: number) => boolean;
+  closeDeadlineMs?: number;
 }
 
 /**
@@ -851,6 +892,119 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   }
 
   const events = wireEvents(ctx.runner);
+  // After wireEvents, so task-changes / task-error-tail follow the task's own line.
+  // Injected in tests; otherwise process.env plus the relay variables main() took out of it.
+  const env = ctx.relayDeps?.env ?? relayConfigEnv();
+  const redactorExtra: string[] = [];
+  const buildRedactor = ctx.relayDeps?.makeRedactor
+    ?? ((extra: string[]): Redactor => createRedactor(reportingSecretValues(args.cwd, env, extra)));
+  const unwireReporting = wireTaskReporting(ctx.runner, {
+    cwd: args.cwd,
+    emit,
+    makeRedactor: () => buildRedactor(redactorExtra),
+  });
+  let relay: OnosooRelay | null = null;
+  try {
+    const started = startRelay(args, ctx, plan, env, buildRedactor);
+    // main() already did this; a caller that bypassed main() still must not leak the key to children.
+    if (!ctx.relayDeps?.env) { forgetRelayEnv(process.env); }
+    if (started) {
+      relay = started.relay;
+      // The device key is a secret of its own: it never appears in a reported diff or tail.
+      redactorExtra.push(started.key);
+      emitTap = (line) => started.relay.record(line);
+    }
+    return await runAfterWiring(args, ctx, plan, planPath, events);
+  } finally {
+    emitTap = null;
+    if (relay) { await relay.close(); }
+    unwireReporting();
+  }
+}
+
+/** Remove the ONOSOO relay variables from `env` (the device key must not reach child processes). */
+export function forgetRelayEnv(env: NodeJS.ProcessEnv): void {
+  delete env.MOAG_ONOSOO_KEY;
+  delete env.MOAG_ONOSOO_URL;
+}
+
+/** The relay variables as main() found them, before it removed them from process.env. */
+let relayEnvSnapshot: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string } | null = null;
+
+/**
+ * Take the ONOSOO relay variables out of `env` (process.env in main()), keeping a private
+ * copy for `moag run`'s relay. Called first thing, so no command — and no agent or tool any
+ * command spawns — ever inherits the device key.
+ */
+export function captureRelayEnv(env: NodeJS.ProcessEnv = process.env): void {
+  relayEnvSnapshot = {
+    ...(env.MOAG_ONOSOO_KEY !== undefined ? { MOAG_ONOSOO_KEY: env.MOAG_ONOSOO_KEY } : {}),
+    ...(env.MOAG_ONOSOO_URL !== undefined ? { MOAG_ONOSOO_URL: env.MOAG_ONOSOO_URL } : {}),
+  };
+  forgetRelayEnv(env);
+}
+
+/** The env the relay configuration reads: process.env with main()'s captured relay variables over it. */
+function relayConfigEnv(): NodeJS.ProcessEnv {
+  return relayEnvSnapshot ? { ...process.env, ...relayEnvSnapshot } : process.env;
+}
+
+/**
+ * Start the ONOSOO relay when a device key is configured (env MOAG_ONOSOO_KEY or the
+ * user-level onosoo.json); null otherwise — then nothing is spooled, sent or timed.
+ * Never throws: a relay that cannot start leaves the run exactly as it was.
+ */
+function startRelay(
+  args: Args,
+  ctx: Ctx,
+  plan: any,
+  env: NodeJS.ProcessEnv,
+  buildRedactor: (extra: string[]) => Redactor,
+): { relay: OnosooRelay; key: string } | null {
+  const deps = ctx.relayDeps;
+  const stderr = deps?.stderr ?? ((s: string): void => { process.stderr.write(s); });
+  try {
+    const cfg = resolveOnosooConfig({ env, cwd: args.cwd, stderr });
+    if (!cfg) { return null; }
+    let redactor: Redactor;
+    try {
+      redactor = buildRedactor([cfg.key]);
+    } catch {
+      // Every relayed event then carries { redaction_failed: true } instead of its data.
+      redactor = { redact: (): never => { throw new Error('redactor unavailable'); } };
+    }
+    const spool = new OnosooSpool(cfg.stateDir, args.cwd, { isPidAlive: deps?.isPidAlive });
+    const relay = new OnosooRelay({
+      config: cfg, spool, http: deps?.http, redactor, stderr, closeDeadlineMs: deps?.closeDeadlineMs, cwd: args.cwd,
+    });
+    relay.start(buildRunMeta(plan, args.cwd));
+    return { relay, key: cfg.key };
+  } catch (err) {
+    stderr(`ONOSOO relay could not start: ${err instanceof Error ? err.message : String(err)}\n`);
+    return null;
+  }
+}
+
+/**
+ * The relay-only `run-meta` facts for a plan: its name, the project's package.json
+ * name (else the folder's base name — never a path), and each task's id and name in
+ * plan order. Caps and redaction are the relay's.
+ */
+export function buildRunMeta(plan: any, cwd: string): RunMeta {
+  let project = '';
+  try {
+    const pkg: unknown = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf-8'));
+    const name = (pkg as { name?: unknown } | null)?.name;
+    if (typeof name === 'string' && name.trim().length > 0) { project = name; }
+  } catch { /* no package.json */ }
+  if (!project) { project = path.basename(path.resolve(cwd)); }
+  const tasks = (plan?.playlists ?? []).flatMap((pl: any) => pl?.tasks ?? [])
+    .map((t: any) => ({ id: String(t?.id), name: String(t?.name ?? '') }));
+  return { plan_name: String(plan?.name ?? ''), project, tasks };
+}
+
+/** The body of {@link cmdRun} once events and task reporting are wired. */
+async function runAfterWiring(args: Args, ctx: Ctx, plan: any, planPath: string, events: RunnerEventState): Promise<number> {
   // Captured before the run so --pr can report what the run actually touched.
   const { captureBaseRef } = require('../runner/evidence');
   const prBaseRef = args.pr ? await captureBaseRef(args.cwd) : null;
@@ -1709,8 +1863,11 @@ async function cmdConfig(args: Args): Promise<number> {
 
 // ─── entry ───────────────────────────────────────────────────────────────────
 
-async function main(): Promise<number> {
-  const args = parseArgs(process.argv.slice(2));
+/** The CLI entry point. Exported so a test can drive dispatch. */
+export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
+  // Before anything else: no command handler, and nothing any of them spawns, sees the device key.
+  captureRelayEnv(process.env);
+  const args = parseArgs(argv);
   if (args.command === 'bench') {
     // No setup() and no shim: the bench drives the hosted server over HTTP and never loads vscode.
     if (args.out === '' || (args.maxUsd !== undefined && Number.isNaN(args.maxUsd))) {

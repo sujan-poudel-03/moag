@@ -168,3 +168,38 @@ describe('bench modules never load vscode', () => {
     assert.deepEqual(offenders, []);
   });
 });
+
+// ─── The ONOSOO relay and task reporting run in `moag run` before/without any shim: never vscode ───
+
+const RELAY_MODULES = [
+  'utils/redact.ts',
+  'runner/task-changes.ts',
+  'headless/task-reporting.ts',
+  'headless/onosoo-config.ts',
+  'headless/onosoo-spool.ts',
+  'headless/onosoo-relay.ts',
+];
+
+describe('ONOSOO relay modules never load vscode', function () {
+  this.timeout(20000);
+
+  it('finds all six modules (non-vacuous)', () => {
+    for (const rel of RELAY_MODULES) {
+      assert.ok(fs.existsSync(path.join(SRC, rel)), rel);
+    }
+  });
+
+  for (const rel of RELAY_MODULES) {
+    it(`${rel} reaches no vscode import at load time`, () => {
+      const offenders = [...reachable(path.join(SRC, rel))].filter((f) => importsVscode(fs.readFileSync(f, 'utf-8')));
+      assert.deepEqual(offenders.map((f) => path.relative(SRC, f)), []);
+    });
+  }
+
+  it("'run-meta' is relay-only: in neither HEADLESS_EVENTS nor WORKER_ONLY_EVENTS", () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { HEADLESS_EVENTS, WORKER_ONLY_EVENTS } = require('../../../server/worker-protocol');
+    assert.equal((HEADLESS_EVENTS as readonly string[]).includes('run-meta'), false);
+    assert.equal((WORKER_ONLY_EVENTS as readonly string[]).includes('run-meta'), false);
+  });
+});

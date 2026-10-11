@@ -4,8 +4,9 @@ import * as path from 'path';
 import * as vm from 'vm';
 import {
   parseWorkerLine, foldRunEvent, emptyRunView, exitToRunStatus, parseJob, WorkerEvent, RunView, mergeRunViews,
-  HEADLESS_EVENTS,
+  HEADLESS_EVENTS, WORKER_ONLY_EVENTS,
 } from '../../../server/worker-protocol';
+import { MAX_LINE_BYTES } from '../../../server/jobs';
 import { TaskStatus } from '../../../models/types';
 
 const line = (o: Record<string, unknown>) => JSON.stringify({ ts: '2026-10-04T00:00:00.000Z', ...o });
@@ -170,6 +171,95 @@ describe('worker-protocol', () => {
         'incident', 'error', 'budget-exceeded', 'manual-gate',
         'dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed',
       ]);
+    });
+  });
+
+  describe('task-changes', () => {
+    const good = (): Record<string, unknown> => ({
+      event: 'task-changes', task_id: 't1', status: 'completed', source: 'worktree',
+      base_sha: 'a'.repeat(40), commit_sha: null, branch: 'main',
+      files: [
+        { path: 'a.ts', status: 'modified', binary: false, added: 2, removed: 1 },
+        { path: 'b.ts', status: 'renamed', old_path: 'old.ts', binary: false, added: 0, removed: 0 },
+        { path: 'img.png', status: 'added', binary: true, added: null, removed: null },
+      ],
+      diff: { text: 'diff --git a/a.ts b/a.ts\n', truncated: true, bytes: 70000, redactions: 2 },
+    });
+
+    it('pins WORKER_ONLY_EVENTS', () => {
+      assert.deepEqual([...WORKER_ONLY_EVENTS], [
+        'cost', 'task-engine', 'task-error-tail', 'plan-outcome', 'probe-result', 'run-finished', 'warning', 'task-pid',
+        'task-changes',
+      ]);
+    });
+
+    it('parses a well-formed line, keeps diff.truncated and drops ts and unknown keys', () => {
+      const parsed = parseWorkerLine(line({ ...good(), extra: 'x' }));
+      assert.ok(parsed && parsed.event === 'task-changes');
+      assert.equal(parsed.diff?.truncated, true);
+      assert.ok(!('ts' in parsed));
+      assert.deepEqual(parsed, good());
+    });
+
+    it('accepts a stray top-level truncated and drops it', () => {
+      const parsed = parseWorkerLine(line({ ...good(), truncated: true }));
+      assert.ok(parsed);
+      assert.ok(!('truncated' in parsed));
+    });
+
+    it('accepts diff null with a diff_error', () => {
+      const parsed = parseWorkerLine(line({ ...good(), diff: null, diff_error: 'redaction failed' }));
+      assert.ok(parsed && parsed.event === 'task-changes');
+      assert.equal(parsed.diff, null);
+      assert.equal(parsed.diff_error, 'redaction failed');
+    });
+
+    const bad: Array<[string, (o: Record<string, unknown>) => void]> = [
+      ['missing task_id', (o) => { delete o.task_id; }],
+      ['bad status', (o) => { o.status = 'skipped'; }],
+      ['bad source', (o) => { o.source = 'stash'; }],
+      ['base_sha not a string', (o) => { o.base_sha = 1; }],
+      ['commit_sha a number', (o) => { o.commit_sha = 5; }],
+      ["file status 'copied'", (o) => { (o.files as Array<Record<string, unknown>>)[0].status = 'copied'; }],
+      ["binary 'yes'", (o) => { (o.files as Array<Record<string, unknown>>)[0].binary = 'yes'; }],
+      ['negative added', (o) => { (o.files as Array<Record<string, unknown>>)[0].added = -1; }],
+      ['fractional removed', (o) => { (o.files as Array<Record<string, unknown>>)[0].removed = 1.5; }],
+      ['old_path not a string', (o) => { (o.files as Array<Record<string, unknown>>)[1].old_path = 3; }],
+      ['files not an array', (o) => { o.files = {}; }],
+      ['a file that is null', (o) => { o.files = [null]; }],
+      ['diff.bytes negative', (o) => { (o.diff as Record<string, unknown>).bytes = -1; }],
+      ['diff missing truncated', (o) => { delete (o.diff as Record<string, unknown>).truncated; }],
+      ["diff.truncated 'no'", (o) => { (o.diff as Record<string, unknown>).truncated = 'no'; }],
+      ['diff.redactions fractional', (o) => { (o.diff as Record<string, unknown>).redactions = 0.5; }],
+      ['diff a string', (o) => { o.diff = 'x'; }],
+      ['diff missing', (o) => { delete o.diff; }],
+      ['diff_error a number', (o) => { o.diff_error = 1; }],
+    ];
+    for (const [label, mutate] of bad) {
+      it(`returns null (never throws) for ${label}`, () => {
+        const o = good();
+        mutate(o);
+        assert.equal(parseWorkerLine(line(o)), null);
+      });
+    }
+
+    it('does not change the run view', () => {
+      const parsed = parseWorkerLine(line(good()));
+      assert.ok(parsed);
+      const v = { ...emptyRunView(), runnerState: 'playing' };
+      assert.deepEqual(foldRunEvent(v, parsed), v);
+    });
+
+    it('a maximal line (64 KB of control chars + 500 files) stays under MAX_LINE_BYTES', () => {
+      const files = Array.from({ length: 500 }, (_, i) => ({
+        path: `src/some/deeply/nested/directory/structure/file-${String(i).padStart(4, '0')}.tsx`,
+        status: 'renamed', old_path: `src/old/deeply/nested/directory/structure/file-${String(i).padStart(4, '0')}.tsx`,
+        binary: false, added: 99999, removed: 99999,
+      }));
+      const o = { ...good(), files, diff: { text: '\u0001'.repeat(65_536), truncated: true, bytes: 10_000_000, redactions: 0 } };
+      const l = line(o);
+      assert.ok(Buffer.byteLength(l) < MAX_LINE_BYTES, `${Buffer.byteLength(l)} bytes`);
+      assert.ok(parseWorkerLine(l));
     });
   });
 

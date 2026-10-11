@@ -94,7 +94,34 @@ export const HEADLESS_EVENTS = [
 
 export const WORKER_ONLY_EVENTS = [
   'cost', 'task-engine', 'task-error-tail', 'plan-outcome', 'probe-result', 'run-finished', 'warning', 'task-pid',
+  'task-changes',
 ] as const;
+
+/** One file a task changed, as the `task-changes` line reports it. */
+export interface TaskChangesFileLine {
+  path: string;
+  status: 'added' | 'modified' | 'deleted' | 'renamed';
+  old_path?: string;
+  binary: boolean;
+  added: number | null;
+  removed: number | null;
+}
+
+/**
+ * The `task-changes` line (headless `moag run` only; the run worker does not emit it).
+ * Defined here rather than imported so the protocol never depends on `runner/`.
+ */
+export interface TaskChangesLine {
+  task_id: string;
+  status: 'completed' | 'failed';
+  source: 'commit' | 'worktree';
+  base_sha: string;
+  commit_sha: string | null;
+  branch: string | null;
+  files: TaskChangesFileLine[];
+  diff: { text: string; truncated: boolean; bytes: number; redactions: number } | null;
+  diff_error?: string;
+}
 
 export const DELTA_OUTCOME_KINDS = ['no-delta', 'engine-failed', 'parse-failed', 'all-rejected', 'appended'] as const;
 export type DeltaOutcomeKind = typeof DELTA_OUTCOME_KINDS[number];
@@ -130,6 +157,8 @@ export type WorkerEvent =
   | { event: 'warning'; message: string }
   /** A task child process (engine CLI, shell/gate command) started or ended. Server-internal: recorded in job.lock, never fanned out. */
   | { event: 'task-pid'; pid: number; alive: boolean }
+  /** What one task changed in the repository (see {@link TaskChangesLine}). */
+  | ({ event: 'task-changes' } & TaskChangesLine)
   | { event: 'verify'; name: string; data: Record<string, unknown> }
   /** An automatic dependency install (or the note that none was done) before a step that needed it. */
   | ({ event: DependencyEventName } & Omit<DependencyEvent, 'event'>);
@@ -171,6 +200,57 @@ function parseDependencyEvent(ev: DependencyEventName, o: Record<string, unknown
     timedOut: o.timedOut,
     tail: o.tail.length > DEPENDENCY_TAIL_CHARS ? o.tail.slice(o.tail.length - DEPENDENCY_TAIL_CHARS) : o.tail,
     note: o.note as string | null,
+  };
+}
+
+const FILE_STATUSES = new Set(['added', 'modified', 'deleted', 'renamed']);
+const countOrNull = (v: unknown): v is number | null => v === null || (typeof v === 'number' && Number.isInteger(v) && v >= 0);
+const strOrNull = (v: unknown): v is string | null => v === null || typeof v === 'string';
+
+/** Validate a `task-changes` line and rebuild it from known keys only; null when malformed. */
+function parseTaskChanges(o: Record<string, unknown>): WorkerEvent | null {
+  if (!isStr(o.task_id)) { return null; }
+  if (o.status !== 'completed' && o.status !== 'failed') { return null; }
+  if (o.source !== 'commit' && o.source !== 'worktree') { return null; }
+  if (typeof o.base_sha !== 'string' || !strOrNull(o.commit_sha) || !strOrNull(o.branch)) { return null; }
+  if (!Array.isArray(o.files)) { return null; }
+  const files: TaskChangesFileLine[] = [];
+  for (const f of o.files as unknown[]) {
+    if (!f || typeof f !== 'object' || Array.isArray(f)) { return null; }
+    const x = f as Record<string, unknown>;
+    if (typeof x.path !== 'string' || !FILE_STATUSES.has(str(x.status)) || typeof x.binary !== 'boolean') { return null; }
+    if (!countOrNull(x.added) || !countOrNull(x.removed)) { return null; }
+    if (x.old_path !== undefined && typeof x.old_path !== 'string') { return null; }
+    files.push({
+      path: x.path,
+      status: x.status as TaskChangesFileLine['status'],
+      ...(typeof x.old_path === 'string' ? { old_path: x.old_path } : {}),
+      binary: x.binary,
+      added: x.added,
+      removed: x.removed,
+    });
+  }
+  let diff: TaskChangesLine['diff'] = null;
+  if (o.diff !== null) {
+    if (!o.diff || typeof o.diff !== 'object' || Array.isArray(o.diff)) { return null; }
+    const d = o.diff as Record<string, unknown>;
+    if (typeof d.text !== 'string' || typeof d.truncated !== 'boolean') { return null; }
+    if (!finite(d.bytes) || d.bytes < 0) { return null; }
+    if (typeof d.redactions !== 'number' || !Number.isInteger(d.redactions) || d.redactions < 0) { return null; }
+    diff = { text: d.text, truncated: d.truncated, bytes: d.bytes, redactions: d.redactions };
+  }
+  if (o.diff_error !== undefined && typeof o.diff_error !== 'string') { return null; }
+  return {
+    event: 'task-changes',
+    task_id: o.task_id,
+    status: o.status,
+    source: o.source,
+    base_sha: o.base_sha,
+    commit_sha: o.commit_sha,
+    branch: o.branch,
+    files,
+    diff,
+    ...(typeof o.diff_error === 'string' ? { diff_error: o.diff_error } : {}),
   };
 }
 
@@ -251,6 +331,8 @@ export function parseWorkerLine(line: string): WorkerEvent | null {
       return typeof o.pid === 'number' && Number.isInteger(o.pid) && o.pid > 0 && typeof o.alive === 'boolean'
         ? { event: ev, pid: o.pid, alive: o.alive }
         : null;
+    case 'task-changes':
+      return parseTaskChanges(o);
     default:
       if (/^verify-[a-z-]{1,32}$/.test(ev)) {
         // eslint-disable-next-line @typescript-eslint/no-unused-vars

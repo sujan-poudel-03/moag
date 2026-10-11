@@ -594,7 +594,9 @@ export class JobManager {
             ? { ...ev, tail: redactSecrets(ev.tail, redact), note: ev.note === null ? null : redactSecrets(ev.note, redact) }
           // verify-* payloads carry command output (a standards report's command tails).
           : ev.event === 'verify' && redact.length > 0 ? { ...ev, data: redactJsonStrings(ev.data, redact) }
-            : ev;
+            // A task's diff can carry any file content the agent touched.
+            : ev.event === 'task-changes' && ev.diff ? { ...ev, diff: { ...ev.diff, text: redactSecrets(ev.diff.text, redact) } }
+              : ev;
       try { input.onEvent?.(safe); } catch (err) { this.opts.log?.(`onEvent: ${(err as Error).message}`); }
       this.notify(a.projectId, { type: 'event', jobId: a.jobId, event: safe });
     };
