@@ -109,7 +109,7 @@ WantedBy=multi-user.target
 | A branch's compose file asks for the host | Before **every** `up` (start, restart from stopped, database reset) the configuration is resolved again and checked against an **allow-list** (`compose-policy.ts`): any key it does not know is refused — at every depth: each nested object it lets through (`build`, `deploy` and its `resources`, `healthcheck`, `logging`, mounts, network attachments, env-file, port, `depends_on`, secret and config entries, top-level volumes, networks, secrets and configs) has its own field allow-list. Refused in detail: privileged mode, capabilities, devices, host or `container:` namespaces, runtimes, sysctls, security profiles other than no-new-privileges, lifecycle hooks (`post_start`, `pre_stop`), `develop`, `annotations`, `group_add`, `ulimits`, the Docker socket, bind mounts, env files, secrets and configs from outside the branch checkout (symlinks resolved), bind propagation other than private, top-level volumes with driver options or external, external or non-bridge networks, network `ipam`, any volume or network `name` that does not start with the environment's own `moag-<env>_` (so a branch cannot attach another environment's or your own), unsafe `build:` options (contexts or Dockerfiles outside the checkout, additional contexts, `cache_from`, build secrets, SSH forwarding, host build network, entitlements), device reservations, an unbounded or over-1024 `pids_limit`, a negative `oom_score_adj`, more than one replica (`scale`, `deploy.replicas`), and any published port other than the web service's own `127.0.0.1:<allocated>`. |
 | A container rewrites the compose file in its checkout | Docker always runs from the host-owned copy that was checked (`<configDir>/moag/host/compose/<env>/resolved.json`), never from the checkout; a rewrite only matters at the next start, which checks it again. |
 | A running container swaps a checked path for a link during a refresh | Starting an environment that runs refreshes it — and its containers are **stopped first**, before the checkout is updated, checked and brought back up. Nothing but the host touches the checkout between the check and `up`, when Docker resolves bind sources, env files and build contexts again. |
-| A branch pulls private images with your registry logins | Every docker and compose call runs with `DOCKER_CONFIG` set to a host-owned folder whose `config.json` has no `auths`, `credsStore` or `credHelpers` — see [Images: public registries only](#images-public-registries-only). |
+| A branch pulls private images with your registry logins | Every docker and compose call runs with `DOCKER_CONFIG` set to a host-owned folder whose `config.json` holds no credentials (no `credsStore` or `credHelpers`, and only an empty placeholder in `auths`, which also stops Docker from auto-detecting a credential helper) — see [Images: public registries only](#images-public-registries-only). |
 | The branch's compose file reads the main user's secrets | Docker and git get an **allow-listed** environment only (PATH, HOME, locale, Docker connection settings), and every compose call gets an empty `--env-file`, so `${ANTHROPIC_API_KEY}`, `${GITHUB_TOKEN}`, `SSH_AUTH_SOCK`, the branch's `.env` and the machine key are not available for interpolation. |
 | Environments fight over ports or reach the internet directly | Every service's published ports are reset; only the web service is published, on `127.0.0.1`, for the gateway — and the check above refuses anything else. |
 | One environment starves the machine | CPU, memory and process-count (`pids_limit: 512`) limits on every service, one container per service; a cap on running environments (every start, refresh and restart in flight counts against it) and on environments kept (50); idle ones stop. |
@@ -124,8 +124,8 @@ WantedBy=multi-user.target
 A branch's compose file names the images it pulls, so `moag host` never lets Docker use your
 registry logins. Every docker and compose child runs with `DOCKER_CONFIG` pointing at
 `<configDir>/moag/host/docker-config/` (mode 700), rewritten each time `moag host` starts. Its
-`config.json` has **no `auths`, no `credsStore` and no `credHelpers`**, so **only public images can
-be pulled**; a private image fails to pull and the environment fails to start. `docker login` as
+`config.json` has **no credentials**: no `credsStore`, no `credHelpers`, and `auths` holds only one
+empty placeholder entry for `moag.invalid` (see below). So **only public images can be pulled**; a private image fails to pull and the environment fails to start. `docker login` as
 the main user changes nothing here. With `DOCKER_CONFIG` set, Docker does not read `~/.docker` at
 all, and because a `config.json` is always written there, it never falls back to defaults either.
 
@@ -142,11 +142,13 @@ Carried over from your own configuration (`$DOCKER_CONFIG`, else `~/.docker`), a
 
 Context changes take effect the next time `moag host` starts.
 
-**Credential helpers on the `PATH`.** When a configuration has no credentials at all, the Docker
-CLI looks for a platform default helper on the `PATH` — on Linux `docker-credential-pass` (when
-`pass` is installed) or `docker-credential-secretservice` — and uses it. If either is installed for
-the main user and holds registry logins, Docker can still use them. On the build machine, do not
-install those helpers for the user that runs `moag host`, or keep no registry logins in them.
+**Why the placeholder `auths` entry.** When a configuration has no auth settings at all, the Docker
+CLI (`cli/config/config.go`, `LoadDefaultConfigFile`) looks for a platform default credential
+helper on the `PATH` — on Linux `docker-credential-pass` (when `pass` is installed) or
+`docker-credential-secretservice` — and would use the main user's keyring logins through it. An
+`auths` map with one entry counts as "has auth", so that lookup never happens; the entry is for a
+registry that cannot exist (`moag.invalid`) and holds no credentials, so every pull is anonymous.
+Credential helpers installed on the machine are therefore never used by `moag host`.
 
 ### Accepted risks
 

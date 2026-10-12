@@ -13,11 +13,33 @@ import {
   dockerChildEnv,
   hostDockerConfigDir,
   hostDockerConfigJson,
+  PLACEHOLDER_REGISTRY,
   prepareHostDockerConfig,
   userDockerConfigDir,
 } from '../../../host/docker-config';
 
 const HASH = 'a'.repeat(64);
+/** Every host config.json carries exactly this, and no other auth data. */
+const AUTHS = { auths: { 'moag.invalid': {} } };
+
+/**
+ * docker/cli's own decision, mirrored from the file's content: LoadDefaultConfigFile
+ * (cli/config/config.go) runs credentials.DetectDefaultStore — which picks up
+ * docker-credential-pass / -secretservice from the PATH — only when ContainsAuth() is false, and
+ * ContainsAuth (cli/config/configfile/file.go) is credsStore != "" || credHelpers non-empty ||
+ * auths non-empty.
+ */
+function dockerWouldDetectHelper(cfg: Record<string, unknown>): boolean {
+  const count = (v: unknown): number => (v && typeof v === 'object' ? Object.keys(v).length : 0);
+  const containsAuth = (typeof cfg.credsStore === 'string' && cfg.credsStore !== '') || count(cfg.credHelpers) > 0 || count(cfg.auths) > 0;
+  return !containsAuth;
+}
+
+/** The registry credentials a config.json would hand Docker, for any registry. */
+function credentialsIn(cfg: Record<string, unknown>): unknown[] {
+  const auths = (cfg.auths ?? {}) as Record<string, Record<string, unknown>>;
+  return Object.values(auths).flatMap((a) => Object.entries(a).filter(([k]) => ['auth', 'username', 'password', 'identitytoken', 'registrytoken'].includes(k.toLowerCase())));
+}
 
 describe('host/docker-config', () => {
   let root: string;
@@ -56,15 +78,15 @@ describe('host/docker-config', () => {
       proxies: { default: { httpProxy: 'http://u:p@proxy' } },
       HttpHeaders: { Authorization: 'secret' },
     }), null);
-    assert.deepEqual(json, { currentContext: 'build-box' });
+    assert.deepEqual(json, { ...AUTHS, currentContext: 'build-box' });
   });
 
   it('carries nothing over from an unreadable configuration, an odd or default context name', () => {
-    assert.deepEqual(hostDockerConfigJson('{not json', null), {});
-    assert.deepEqual(hostDockerConfigJson(JSON.stringify({ currentContext: '../../etc' }), null), {});
-    assert.deepEqual(hostDockerConfigJson(JSON.stringify({ currentContext: 'default' }), null), {});
-    assert.deepEqual(hostDockerConfigJson(JSON.stringify([1]), null), {});
-    assert.deepEqual(hostDockerConfigJson(null, '/home/me/.docker/cli-plugins'), { cliPluginsExtraDirs: ['/home/me/.docker/cli-plugins'] });
+    assert.deepEqual(hostDockerConfigJson('{not json', null), AUTHS);
+    assert.deepEqual(hostDockerConfigJson(JSON.stringify({ currentContext: '../../etc' }), null), AUTHS);
+    assert.deepEqual(hostDockerConfigJson(JSON.stringify({ currentContext: 'default' }), null), AUTHS);
+    assert.deepEqual(hostDockerConfigJson(JSON.stringify([1]), null), AUTHS);
+    assert.deepEqual(hostDockerConfigJson(null, '/home/me/.docker/cli-plugins'), { ...AUTHS, cliPluginsExtraDirs: ['/home/me/.docker/cli-plugins'] });
   });
 
   it('writes a credential-free config.json, copies context metadata only, and never TLS keys', () => {
@@ -83,7 +105,9 @@ describe('host/docker-config', () => {
     assert.equal(dir, hostDockerConfigDir(stateDir));
 
     const cfg = hostConfig();
-    for (const k of ['auths', 'credsStore', 'credHelpers']) { assert.equal(k in cfg, false, `${k} reached the host configuration`); }
+    assert.deepEqual(cfg.auths, { [PLACEHOLDER_REGISTRY]: {} }, 'exactly the one empty placeholder entry');
+    for (const k of ['credsStore', 'credHelpers']) { assert.equal(k in cfg, false, `${k} reached the host configuration`); }
+    assert.deepEqual(credentialsIn(cfg), []);
     assert.equal(cfg.currentContext, 'build-box');
     assert.deepEqual(cfg.cliPluginsExtraDirs, [path.join(userDir, 'cli-plugins')]);
 
@@ -101,7 +125,7 @@ describe('host/docker-config', () => {
 
   it('writes a config.json even when the user has none, so Docker never falls back to defaults from HOME', () => {
     const dir = prepareHostDockerConfig(stateDir, { HOME: path.join(root, 'nobody') });
-    assert.deepEqual(hostConfig(), {});
+    assert.deepEqual(hostConfig(), AUTHS);
     assert.ok(fs.existsSync(path.join(dir, 'config.json')));
   });
 
@@ -111,7 +135,7 @@ describe('host/docker-config', () => {
     fs.writeFileSync(path.join(dir, 'contexts', 'meta', HASH, 'meta.json'), '{}');
     fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify({ auths: { 'ghcr.io': { auth: 'x' } } }));
     prepareHostDockerConfig(stateDir, { HOME: path.join(root, 'nobody') });
-    assert.deepEqual(hostConfig(), {});
+    assert.deepEqual(hostConfig(), AUTHS);
     assert.equal(fs.existsSync(path.join(dir, 'contexts')), false);
   });
 
@@ -134,6 +158,22 @@ describe('host/docker-config', () => {
     fs.mkdirSync(path.join(stateDir, 'host'), { recursive: true });
     fs.writeFileSync(hostDockerConfigDir(stateDir), 'a file where the folder should be');
     assert.throws(() => prepareHostDockerConfig(stateDir, { HOME: path.join(root, 'nobody') }));
+  });
+
+  it('makes Docker skip credential-helper detection: the written file has auth (one empty entry), so no helper is looked up', () => {
+    // The trap the placeholder closes: a config with no auth at all makes Docker go looking.
+    assert.equal(dockerWouldDetectHelper({}), true);
+    assert.equal(dockerWouldDetectHelper({ auths: {} }), true, 'an empty auths map is not enough');
+    for (const userConfig of [null, '{}', JSON.stringify({ auths: {}, credsStore: '' }), JSON.stringify({ credsStore: 'pass', credHelpers: { 'gcr.io': 'gcloud' } })]) {
+      if (userConfig === null) { fs.rmSync(userDir, { recursive: true, force: true }); } else { writeUserConfig(userConfig); }
+      prepareHostDockerConfig(stateDir, { DOCKER_CONFIG: userDir });
+      const cfg = hostConfig();
+      assert.equal(dockerWouldDetectHelper(cfg), false, `helper detection would run for user config ${String(userConfig)}`);
+      assert.equal('credsStore' in cfg, false);
+      assert.equal('credHelpers' in cfg, false);
+      assert.deepEqual(Object.keys(cfg.auths as object), [PLACEHOLDER_REGISTRY]);
+      assert.deepEqual(credentialsIn(cfg), [], 'and the file store has nothing for any registry');
+    }
   });
 
   it('dockerChildEnv sets DOCKER_CONFIG over whatever the base had', () => {

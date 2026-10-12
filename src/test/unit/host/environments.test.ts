@@ -446,7 +446,8 @@ describe('host/environments', () => {
     for (const c of docker) { assert.equal(c.env?.DOCKER_CONFIG, hostDocker, `${c.args.join(' ')} ran with DOCKER_CONFIG=${String(c.env?.DOCKER_CONFIG)}`); }
     for (const c of calls.filter((x) => x.command === 'git')) { assert.equal(c.env?.DOCKER_CONFIG, undefined, 'git does not get the Docker configuration'); }
     const cfg = JSON.parse(fs.readFileSync(path.join(hostDocker, 'config.json'), 'utf-8')) as Record<string, unknown>;
-    for (const k of ['auths', 'credsStore', 'credHelpers']) { assert.equal(k in cfg, false, `${k} in the host Docker configuration`); }
+    assert.deepEqual(cfg.auths, { 'moag.invalid': {} }, 'only the empty placeholder: no credentials, and no helper detection');
+    for (const k of ['credsStore', 'credHelpers']) { assert.equal(k in cfg, false, `${k} in the host Docker configuration`); }
   });
 
   it('runs no docker at all when the host Docker configuration cannot be written', async () => {

@@ -7,10 +7,12 @@
 // `moag host` therefore runs with DOCKER_CONFIG pointing at a host-owned folder,
 //
 //   <configDir>/moag/host/docker-config/      (0700)
-//     config.json                              (0600) no auths, no credsStore, no credHelpers
+//     config.json                              (0600) one placeholder `auths` entry with no
+//                                              credentials; no credsStore, no credHelpers
 //     contexts/meta/<sha256>/meta.json         copied context metadata (endpoints, no keys)
 //
-// so only public images can be pulled. With DOCKER_CONFIG set the Docker CLI never reads
+// so only public images can be pulled. The placeholder is what makes that true: see
+// PLACEHOLDER_AUTHS below. With DOCKER_CONFIG set the Docker CLI never reads
 // ~/.docker (cli/config: Dir() uses HOME only when DOCKER_CONFIG is empty, and a missing
 // config.json falls back to defaults, not to HOME) — and config.json is always written here.
 //
@@ -40,6 +42,27 @@ const CONTEXT_NAME_RE = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,127}$/;
 const META_DIR_RE = /^[0-9a-f]{64}$/;
 const MAX_META_BYTES = 64 * 1024;
 
+/** A registry name that can never resolve (RFC 6761 `.invalid`). */
+export const PLACEHOLDER_REGISTRY = 'moag.invalid';
+
+/**
+ * The host config's only `auths` entry: one registry that cannot exist, with no credentials.
+ *
+ * An EMPTY configuration is not enough. docker/cli `cli/config/config.go` LoadDefaultConfigFile does
+ *
+ *   if !configFile.ContainsAuth() {
+ *     configFile.CredentialsStore = credentials.DetectDefaultStore(configFile.CredentialsStore)
+ *   }
+ *
+ * and ContainsAuth (`configfile/file.go`) is `CredentialsStore != "" || len(CredentialHelpers) > 0
+ * || len(AuthConfigs) > 0`. With no auth at all, DetectDefaultStore picks the platform helper — on
+ * Linux `docker-credential-pass` (when `pass` is installed) or `docker-credential-secretservice` —
+ * whenever it is on the PATH, and Docker would then use the main user's keyring logins. One
+ * non-empty `auths` entry makes ContainsAuth true, so no helper is detected; with no credsStore the
+ * file store is used, it has nothing for any real registry, and every pull is anonymous.
+ */
+export const PLACEHOLDER_AUTHS: Readonly<Record<string, Record<string, never>>> = Object.freeze({ [PLACEHOLDER_REGISTRY]: {} });
+
 /** <stateDir>/host/docker-config, where stateDir is <configDir>/moag. */
 export function hostDockerConfigDir(stateDir: string): string {
   return path.join(stateDir, 'host', 'docker-config');
@@ -55,9 +78,10 @@ export function userDockerConfigDir(env: NodeJS.ProcessEnv, homedir: () => strin
 /**
  * The host-owned config.json for the user's config.json text (null when there is none). Pure.
  * Only `currentContext` is kept from the user's file; `pluginsDir` becomes `cliPluginsExtraDirs`.
+ * `auths` is always exactly PLACEHOLDER_AUTHS — never anything from the user's file.
  */
 export function hostDockerConfigJson(userConfigText: string | null, pluginsDir: string | null): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
+  const out: Record<string, unknown> = { auths: { [PLACEHOLDER_REGISTRY]: {} } };
   if (userConfigText) {
     try {
       const raw: unknown = JSON.parse(userConfigText);
