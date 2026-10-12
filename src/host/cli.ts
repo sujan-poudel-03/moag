@@ -132,7 +132,13 @@ function cmdStatus(stateDir: string, loadProjects: ProjectsLoader): number {
   return 0;
 }
 
-async function cmdRun(env: NodeJS.ProcessEnv, stateDir: string, loadProjects: ProjectsLoader): Promise<number> {
+async function cmdRun(env: NodeJS.ProcessEnv, stateDir: string, loadProjects: ProjectsLoader, platform: NodeJS.Platform): Promise<number> {
+  if (platform === 'win32') {
+    // Paths, permissions and the Docker socket all behave differently on native Windows, and none of
+    // the hardening here was designed or tested for it.
+    err('moag host runs on Linux. On Windows, install it inside WSL2 Ubuntu and run it there (docs/host-agent.md).\n');
+    return 2;
+  }
   const onosoo = resolveOnosooConfig({ env, cwd: process.cwd(), stderr: err });
   if (!onosoo) {
     err('No ONOSOO device key. Pair this machine in ONOSOO (Builds → Pair machine) and set MOAG_ONOSOO_KEY and MOAG_ONOSOO_URL, or put them in onosoo.json.\n');
@@ -143,8 +149,8 @@ async function cmdRun(env: NodeJS.ProcessEnv, stateDir: string, loadProjects: Pr
   const config = hc.config;
 
   const manager = new EnvironmentManager({ exec, config, stateDir: onosoo.stateDir, loadProjects });
-  const dockerProblem = await manager.checkDocker();
-  if (dockerProblem) { err(`${dockerProblem}\n`); return 2; }
+  const prereqProblem = await manager.checkPrerequisites();
+  if (prereqProblem) { err(`${prereqProblem}\n`); return 2; }
 
   const call = createOnosooClient(onosoo);
   let agent: HostAgent | null = null;
@@ -191,7 +197,7 @@ export async function cmdHost(argv: string[], env: NodeJS.ProcessEnv, deps: Host
 
   const [sub, arg] = argv;
   switch (sub ?? 'run') {
-    case 'run': return cmdRun(env, stateDir, loadProjects);
+    case 'run': return cmdRun(env, stateDir, loadProjects, platform);
     case 'init': return cmdInit(stateDir);
     case 'draft': return cmdDraft(stateDir, arg, loadProjects);
     case 'status': return cmdStatus(stateDir, loadProjects);

@@ -11,6 +11,7 @@ import * as net from 'net';
 import {
   envKeyFromHost,
   forwardHeaders,
+  hostOnlySetCookie,
   Gateway,
   parseCookies,
   safeNext,
@@ -72,9 +73,23 @@ describe('host/gateway helpers', () => {
     assert.equal(parseCookies(`x=1; ${SESSION_COOKIE}=abc`).get(SESSION_COOKIE), 'abc');
   });
 
-  it('only redirects to a path on the same host', () => {
-    assert.equal(safeNext('/dash?x=1'), '/dash?x=1');
-    for (const n of ['//evil.com', 'https://evil.com', '/\\evil.com', '', null]) { assert.equal(safeNext(n), '/'); }
+  it('only redirects to a path on the same host — including tricks browsers normalise', () => {
+    assert.equal(safeNext('/dash?x=1#top'), '/dash?x=1#top');
+    for (const n of ['//evil.com', 'https://evil.com', '/\\evil.com', '/\t/evil.com', '/\n/evil.com', '/\r\n/evil.com', '', null]) {
+      assert.equal(safeNext(n), '/', JSON.stringify(n));
+    }
+  });
+
+  it('first cookie of a name wins, and the session cookie is a __Host- cookie', () => {
+    assert.equal(parseCookies(`${SESSION_COOKIE}=first; ${SESSION_COOKIE}=tossed`).get(SESSION_COOKIE), 'first');
+    assert.ok(SESSION_COOKIE.startsWith('__Host-'));
+  });
+
+  it('makes an app\'s cookies host-only and drops any that use the session name', () => {
+    assert.equal(hostOnlySetCookie('theme=dark; Domain=.preview.test; Path=/; HttpOnly'), 'theme=dark; Path=/; HttpOnly');
+    assert.equal(hostOnlySetCookie('theme=dark; domain=preview.test'), 'theme=dark');
+    assert.equal(hostOnlySetCookie(`${SESSION_COOKIE}=hijack; Path=/`), null);
+    assert.equal(hostOnlySetCookie('plain=1'), 'plain=1');
   });
 
   it('forwards without the session, the authorization header or spoofed X-Forwarded-*', () => {
@@ -152,7 +167,7 @@ describe('host/gateway server', () => {
     appPort = await freePort();
     app = http.createServer((req, res) => {
       lastAppRequest = req;
-      res.setHeader('Set-Cookie', [`${SESSION_COOKIE}=hijack`, 'app=1']);
+      res.setHeader('Set-Cookie', [`${SESSION_COOKIE}=hijack`, 'app=1', 'shared=1; Domain=.preview.test']);
       res.end(`app:${req.url}`);
     });
     app.on('upgrade', (_req, socket) => {
@@ -228,7 +243,8 @@ describe('host/gateway server', () => {
     assert.equal(lastAppRequest?.headers.cookie, 'theme=dark');
     assert.equal(lastAppRequest?.headers.host, `localhost:${appPort}`);
     assert.equal(lastAppRequest?.headers['x-forwarded-host'], 'shop-1.preview.test');
-    assert.deepEqual(r.headers['set-cookie'], ['app=1']);
+    // The hijack attempt is gone and the Domain cookie became host-only: no planting on siblings.
+    assert.deepEqual(r.headers['set-cookie'], ['app=1', 'shared=1']);
   });
 
   it('does not honour one environment\'s session on another', async () => {
@@ -237,8 +253,12 @@ describe('host/gateway server', () => {
     assert.equal(r.status, 401);
   });
 
-  it('serves logs to members, refuses guests, and allows only the ONOSOO origin', async () => {
-    const member = await login('obt_m');
+  it('serves logs only with a logs session: not to a preview session, not to guests; only the ONOSOO origin', async () => {
+    const preview = await login('obt_pv');
+    assert.equal((await get(gwPort, 'shop-1.preview.test', '/__onosoo/logs?service=api', { cookie: preview })).status, 403, 'a preview session cannot read logs');
+
+    const lr = await get(gwPort, 'shop-1.preview.test', `/__onosoo/auth?ticket=${ticket('obt_m', { scope: 'logs' })}`);
+    const member = String(lr.headers['set-cookie']?.[0]).split(';')[0];
     const ok = await get(gwPort, 'shop-1.preview.test', '/__onosoo/logs?service=api', { cookie: member, origin: 'https://app.example.com' });
     assert.equal(ok.status, 200);
     assert.equal(ok.body, 'line1\nline2');
@@ -280,18 +300,48 @@ describe('host/gateway server', () => {
     assert.equal(lastAppRequest, null);
   });
 
-  it('proxies a WebSocket upgrade only with a session', async () => {
+  it('proxies a WebSocket upgrade only with a session, and only from the environment\'s own pages', async () => {
     const cookie = await login('obt_ws');
-    const upgrade = (withCookie: boolean): Promise<string> => new Promise((resolve) => {
+    const upgrade = (withCookie: boolean, origin: string | null): Promise<string> => new Promise((resolve) => {
       const s = net.connect(gwPort, '127.0.0.1', () => {
-        s.write(`GET /hmr HTTP/1.1\r\nHost: shop-1.preview.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n${withCookie ? `Cookie: ${cookie}\r\n` : ''}\r\n`);
+        s.write(`GET /hmr HTTP/1.1\r\nHost: shop-1.preview.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n`
+          + `${withCookie ? `Cookie: ${cookie}\r\n` : ''}${origin ? `Origin: ${origin}\r\n` : ''}\r\n`);
       });
       let data = '';
       s.on('data', (c) => { data += c.toString(); });
       s.on('close', () => resolve(data));
       s.on('error', () => resolve(data));
     });
-    assert.match(await upgrade(true), /101 Switching Protocols[\s\S]*hello/);
-    assert.match(await upgrade(false), /401/);
+    assert.match(await upgrade(true, 'https://shop-1.preview.test'), /101 Switching Protocols[\s\S]*hello/);
+    assert.match(await upgrade(false, 'https://shop-1.preview.test'), /401/);
+    assert.match(await upgrade(true, 'https://shop-2.preview.test'), /403/, 'a sibling environment cannot open it');
+    assert.match(await upgrade(true, null), /403/);
+  });
+
+  it('re-checks more than 200 people in batches without logging out anyone in another batch', async () => {
+    const store = gw.sessions;
+    const ids = Array.from({ length: 450 }, (_, i) => `bulk-${i}`);
+    for (const id of ids) { store.create({ userId: id, userName: '', role: 'member', scope: 'preview', envKey: 'shop-1', expiresAt: Date.now() + 60_000 }); }
+    members = Object.fromEntries(ids.map((id) => [id, 'member']));
+    members['user-1'] = 'member';
+    members[ids[3]] = null; // one person removed, in the first batch
+    const batches = calls.length;
+    await gw.recheck();
+    assert.equal(calls.slice(batches).filter((c) => c.route === 'previews/check').length >= 3, true, 'checked in batches');
+    for (const id of ids) {
+      const still = [...(store as unknown as { sessions: Map<string, { userId: string }> }).sessions.values()].some((s) => s.userId === id);
+      assert.equal(still, id !== ids[3], id);
+    }
+  });
+
+  it('changes nothing when one membership batch fails to answer', async () => {
+    const before = gw.sessions.size();
+    const failing = new Gateway({
+      previewDomain: DOMAIN, appUrl: 'https://app.example.com', appOrigins: [], log: () => undefined,
+      call: async () => ({ status: 500, json: null }), environment: () => undefined, status: () => null, logs: async () => '', touch: () => undefined,
+      sessions: gw.sessions,
+    });
+    await failing.recheck();
+    assert.equal(gw.sessions.size(), before);
   });
 });

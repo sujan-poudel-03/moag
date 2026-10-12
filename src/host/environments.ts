@@ -1,26 +1,33 @@
 // ─── Environments: a project branch as a running Docker stack ───
 //
-// One environment per (project, branch). Starting one:
+// One environment per (project, branch). Everything a branch contains is treated as written by an
+// adversary — the compose file, its .env, and anything its containers later write into the checkout
+// — because an AI wrote it and its containers run with a bind mount of it. So:
 //
-//   1. resolve the project id to its approved folder (projects.json — never a path from ONOSOO);
-//   2. read and validate the recipe from THAT folder (recipe.ts);
-//   3. check the branch name, then create (or refresh) a detached git worktree of the branch under
-//      <stateDir>/host/worktrees/<key> — detached, so the branch itself stays free for MOAG runs;
-//   4. list the compose services, write the override (compose.ts), and `up -d --build`.
+//   resolve   the project id → its approved folder (projects.json, never a path from ONOSOO); the
+//             recipe from THAT folder (recipe.ts); the branch from the host's own mirror (git-safe.ts)
+//   checkout  a detached worktree of the branch; git is always given the worktree's gitdir
+//             explicitly (--git-dir/--work-tree), never discovering it from the checkout's `.git`
+//             file, which a container could repoint at a gitdir whose config runs commands
+//   prepare   before EVERY `up`: write the override, resolve the configuration with no inherited
+//             environment and an empty env file, check it (compose-policy.ts), and save the checked
+//             result to a host-owned file outside the checkout
+//   run       Docker always runs from that saved, checked file — so a container rewriting the compose
+//             file in the checkout changes nothing until the next prepare, which checks it again
 //
-// Starting an environment that exists refreshes it to the branch's latest commit. Stopping keeps
-// the worktree and volumes; the agent never restarts what a person stopped, and stops what nobody
-// has opened for `idle_stop_minutes`.
+// Starting an environment that exists refreshes it to the branch's latest commit. Stopping keeps the
+// worktree and volumes; the agent never restarts what a person stopped, and stops what nobody has
+// opened for `idle_stop_minutes`.
 //
-// Every command goes through the injected `exec` with childEnv(): no shell, no machine key.
 // Imports node built-ins and sibling host modules only; never vscode.
 
 import * as fs from 'fs';
 import * as net from 'net';
 import * as path from 'path';
 
-import { buildOverride, childEnv, composePolicyViolations, composeProjectName, composeVersionOk, deriveStatus, envKeyFor, isSafeBranch, parsePsOutput, servicesFromPs } from './compose';
-import { mirrorPath, safeGitArgs, safeGitEnv } from './git-safe';
+import { buildOverride, childEnv, composeProjectName, composeVersionOk, deriveStatus, envKeyFor, isSafeBranch, parsePsOutput, servicesFromPs } from './compose';
+import { composePolicyViolations } from './compose-policy';
+import { gitVersionOk, mirrorPath, safeGitArgs, safeGitEnv } from './git-safe';
 import type { HostConfig } from './host-config';
 import { parseRecipe, RECIPE_FILE, type Recipe } from './recipe';
 import type { EnvRecord, ProjectsLoader, ServiceRole, ServiceSnapshot } from './types';
@@ -32,7 +39,11 @@ export interface ExecResult {
   timedOut: boolean;
 }
 
-export type Exec = (command: string, args: string[], opts: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number }) => Promise<ExecResult>;
+export type Exec = (
+  command: string,
+  args: string[],
+  opts: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number; maxBuffer?: number },
+) => Promise<ExecResult>;
 
 export interface EnvironmentDeps {
   exec: Exec;
@@ -43,14 +54,20 @@ export interface EnvironmentDeps {
   now?: () => number;
   /** True when nothing listens on 127.0.0.1:port. */
   portFree?: (port: number) => Promise<boolean>;
-  fs?: Pick<typeof fs, 'readFileSync' | 'writeFileSync' | 'mkdirSync' | 'existsSync' | 'renameSync'>;
+  fs?: Pick<typeof fs, 'readFileSync' | 'writeFileSync' | 'mkdirSync' | 'existsSync' | 'renameSync' | 'rmSync'>;
+  /** Resolve symlinks for the compose policy; injectable for tests. */
+  realpath?: (p: string) => string;
   log?: (line: string) => void;
 }
 
 const PORT_MIN = 41000;
 const PORT_MAX = 41999;
+/** PROTOCOL §3: a snapshot carries at most 50 environments, stopped ones included. */
+export const MAX_RECORDS = 50;
 const BUILD_TIMEOUT_MS = 30 * 60 * 1000;
 const CMD_TIMEOUT_MS = 2 * 60 * 1000;
+/** Builds are chatty; the default 10 MB would leave a long build "starting" forever. */
+const BIG_BUFFER = 256 * 1024 * 1024;
 const MAX_LOG_LINES = 2000;
 
 export class EnvError extends Error {
@@ -78,6 +95,11 @@ export class EnvironmentManager {
   private records = new Map<string, EnvRecord>();
   /** Keys with an operation in flight: one at a time per environment. */
   private busy = new Set<string>();
+  /** Starts admitted but not yet recorded, and the ports they hold: the limit counts them. */
+  private pendingStarts = new Set<string>();
+  private reservedPorts = new Set<number>();
+  /** Serialises admission (limit check + port allocation) across all environments. */
+  private admission: Promise<unknown> = Promise.resolve();
   private readonly exec: Exec;
   private readonly fs: NonNullable<EnvironmentDeps['fs']>;
   private readonly now: () => number;
@@ -140,35 +162,83 @@ export class EnvironmentManager {
     }
   }
 
-  // ─── Commands ───
+  /** Run `fn` with no other admission in progress. */
+  private admit<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.admission.then(fn, fn);
+    this.admission = next.catch(() => undefined);
+    return next;
+  }
 
-  private compose(r: Pick<EnvRecord, 'key' | 'worktree' | 'composeFile'>, args: string[], timeoutMs = CMD_TIMEOUT_MS): Promise<ExecResult> {
-    return this.exec('docker', [
+  // ─── Host-owned files ───
+
+  /** <stateDir>/host/compose/<key>: the override, the checked config, the empty env file. Never mounted. */
+  private hostDir(key: string): string {
+    return path.join(this.deps.stateDir, 'host', 'compose', key);
+  }
+
+  private hostFile(key: string, name: 'override.yml' | 'resolved.json' | 'empty.env'): string {
+    return path.join(this.hostDir(key), name);
+  }
+
+  // ─── Processes ───
+
+  /** exec that never rejects: a spawn failure or an overflowing buffer is a failed result. */
+  private async run(command: string, args: string[], opts: Parameters<Exec>[2]): Promise<ExecResult> {
+    try {
+      return await this.exec(command, args, opts);
+    } catch (err) {
+      return { exitCode: null, stdout: '', stderr: err instanceof Error ? err.message : String(err), timedOut: false };
+    }
+  }
+
+  /**
+   * Compose on the BRANCH's file plus the override — used only to list and resolve the configuration
+   * before it is checked. No inherited environment beyond the allow-list, and an empty env file so
+   * the branch's .env is not read for interpolation either.
+   */
+  private composeSource(r: Pick<EnvRecord, 'key' | 'worktree' | 'composeFile'>, args: string[]): Promise<ExecResult> {
+    return this.run('docker', [
       'compose', '-p', composeProjectName(r.key),
       '--project-directory', r.worktree,
-      '-f', r.composeFile, '-f', this.overridePath(r.key),
+      '--env-file', this.hostFile(r.key, 'empty.env'),
+      '-f', r.composeFile, '-f', this.hostFile(r.key, 'override.yml'),
       ...args,
-    ], { cwd: r.worktree, env: this.env, timeoutMs });
+    ], { cwd: this.hostDir(r.key), env: this.env, timeoutMs: CMD_TIMEOUT_MS, maxBuffer: BIG_BUFFER });
   }
 
-  private overridePath(key: string): string {
-    return path.join(this.deps.config.worktreesDir, `${key}.override.yml`);
+  /** Compose on the checked, host-owned configuration. Every command that runs anything uses this. */
+  private compose(r: Pick<EnvRecord, 'key'>, args: string[], timeoutMs = CMD_TIMEOUT_MS): Promise<ExecResult> {
+    return this.run('docker', [
+      'compose', '-p', composeProjectName(r.key),
+      '--env-file', this.hostFile(r.key, 'empty.env'),
+      '-f', this.hostFile(r.key, 'resolved.json'),
+      '--progress', 'quiet',
+      ...args,
+    ], { cwd: this.hostDir(r.key), env: this.env, timeoutMs, maxBuffer: BIG_BUFFER });
   }
 
-  /** Every host git call: hardened options, no system/global config, no prompts (git-safe.ts). */
-  private git(cwd: string, args: string[], allowLocal = false): Promise<ExecResult> {
+  /** Every host git call: hardened options, explicit repository, never discovered from a checkout. */
+  private git(gitArgs: string[], opts: { gitDir: string; workTree?: string; allowLocal?: boolean }): Promise<ExecResult> {
     const emptyHooksDir = path.join(this.deps.stateDir, 'host', 'no-hooks');
     this.fs.mkdirSync(emptyHooksDir, { recursive: true });
-    return this.exec('git', safeGitArgs(args, { emptyHooksDir, allowLocal }), { cwd, env: safeGitEnv(this.env), timeoutMs: CMD_TIMEOUT_MS });
+    const repo = ['--git-dir', opts.gitDir, ...(opts.workTree ? ['--work-tree', opts.workTree] : [])];
+    return this.run('git', safeGitArgs([...repo, ...gitArgs], { emptyHooksDir, allowLocal: opts.allowLocal }), {
+      cwd: path.dirname(opts.gitDir), env: safeGitEnv(this.env), timeoutMs: CMD_TIMEOUT_MS,
+    });
   }
 
-  /** Docker and Compose are present and new enough. */
-  async checkDocker(): Promise<string | null> {
-    const v = await this.exec('docker', ['compose', 'version', '--short'], { env: this.env, timeoutMs: 20_000 }).catch(() => null);
-    if (!v || v.exitCode !== 0) { return 'Docker with the Compose plugin is not available on this machine.'; }
+  /** Docker, Compose and git are present and new enough. Null when all is well. */
+  async checkPrerequisites(): Promise<string | null> {
+    const v = await this.run('docker', ['compose', 'version', '--short'], { env: this.env, timeoutMs: 20_000 });
+    if (v.exitCode !== 0) { return 'Docker with the Compose plugin is not available on this machine.'; }
     if (!composeVersionOk(v.stdout)) { return `Docker Compose ${v.stdout.trim()} is too old; 2.24.4 or newer is needed.`; }
+    const g = await this.run('git', ['--version'], { env: safeGitEnv(this.env), timeoutMs: 20_000 });
+    if (g.exitCode !== 0) { return 'git is not available on this machine.'; }
+    if (!gitVersionOk(g.stdout)) { return `${g.stdout.trim()} is too old; git 2.45.1 or newer is needed (it hardens local clones).`; }
     return null;
   }
+
+  // ─── Lookups ───
 
   private project(projectId: string): { id: string; name: string; path: string } {
     const found = this.deps.loadProjects(this.deps.stateDir).projects.find((p) => p.id === projectId);
@@ -192,140 +262,191 @@ export class EnvironmentManager {
   }
 
   private async allocatePort(): Promise<number> {
-    const used = new Set(this.list().map((r) => r.port));
+    const used = new Set([...this.list().map((r) => r.port), ...this.reservedPorts]);
     for (let p = PORT_MIN; p <= PORT_MAX; p++) {
       if (!used.has(p) && await this.portFree(p)) { return p; }
     }
     throw new EnvError('No free local port for the preview.', 'failed');
   }
 
+  private runningCount(except: string): number {
+    const running = this.list().filter((r) => r.desired === 'running' && r.key !== except).length;
+    return running + [...this.pendingStarts].filter((k) => k !== except && !this.records.has(k)).length;
+  }
+
+  // ─── Git ───
+
   /**
    * Bring the host's mirror of a project up to date with the project's branches. The project is
-   * read as a remote — git uses none of its config, hooks or attributes drivers to do that — and
-   * the mirror's own config is the host's alone (git-safe.ts).
+   * read as a remote — git uses none of its config, hooks or attribute drivers to do that.
    */
   private async refreshMirror(projectId: string, projectPath: string): Promise<string> {
     const mirror = mirrorPath(this.deps.stateDir, projectId);
     if (!this.fs.existsSync(mirror)) {
       this.fs.mkdirSync(path.dirname(mirror), { recursive: true });
-      const clone = await this.git(path.dirname(mirror), ['clone', '--bare', '--no-local', '--no-hardlinks', '--quiet', projectPath, mirror], true);
+      const emptyHooksDir = path.join(this.deps.stateDir, 'host', 'no-hooks');
+      this.fs.mkdirSync(emptyHooksDir, { recursive: true });
+      const clone = await this.run('git', safeGitArgs(['clone', '--bare', '--no-local', '--no-hardlinks', '--quiet', projectPath, mirror], { emptyHooksDir, allowLocal: true }), {
+        cwd: path.dirname(mirror), env: safeGitEnv(this.env), timeoutMs: CMD_TIMEOUT_MS,
+      });
       if (clone.exitCode !== 0) { throw new EnvError(`Could not read the project's repository: ${tail(clone.stderr)}`); }
     }
-    const fetch = await this.git(mirror, ['fetch', '--quiet', '--prune', '--no-tags', projectPath, '+refs/heads/*:refs/heads/*'], true);
+    const fetch = await this.git(['fetch', '--quiet', '--prune', '--no-tags', projectPath, '+refs/heads/*:refs/heads/*'], { gitDir: mirror, allowLocal: true });
     if (fetch.exitCode !== 0) { throw new EnvError(`Could not read the project's branches: ${tail(fetch.stderr)}`); }
     return mirror;
   }
 
+  /** The worktree's own gitdir inside the mirror: host-owned, unlike the checkout's `.git` file. */
+  private worktreeGitDir(mirror: string, key: string): string {
+    return path.join(mirror, 'worktrees', key);
+  }
+
   /** Make `worktree` a detached checkout of `branch`'s latest commit, from the host's mirror. */
-  private async checkout(projectId: string, projectPath: string, worktree: string, branch: string): Promise<void> {
+  private async checkout(projectId: string, projectPath: string, key: string, worktree: string, branch: string): Promise<void> {
     if (!isSafeBranch(branch)) { throw new EnvError('That branch name is not valid.', 'rejected'); }
     const mirror = await this.refreshMirror(projectId, projectPath);
-    const fmt = await this.git(mirror, ['check-ref-format', '--branch', branch]);
+    const fmt = await this.git(['check-ref-format', '--branch', branch], { gitDir: mirror });
     if (fmt.exitCode !== 0) { throw new EnvError('That branch name is not valid.', 'rejected'); }
 
     const ref = `refs/heads/${branch}`;
     // Only the approved project's own branches. A remote run's branch is imported into the project
-    // when the run ends (MOAG's daemon), so while it is still running it is not here yet. No fallback
-    // to the project's origin: reading its URL would mean running git on the project repo's config.
-    const found = await this.git(mirror, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]);
+    // when the run ends (MOAG's daemon), so while it is still running it is not here yet.
+    const found = await this.git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { gitDir: mirror });
     if (found.exitCode !== 0) {
       throw new EnvError(`Branch "${branch}" is not in the project yet. A run's branch arrives when the run ends; try again then.`, 'rejected');
     }
 
-    if (this.fs.existsSync(worktree)) {
-      const r = await this.git(worktree, ['checkout', '--quiet', '--force', '--detach', ref]);
+    const gitDir = this.worktreeGitDir(mirror, key);
+    if (this.fs.existsSync(worktree) && this.fs.existsSync(gitDir)) {
+      // Explicit gitdir and work tree: the checkout's `.git` file is never read.
+      const r = await this.git(['checkout', '--quiet', '--force', '--detach', ref], { gitDir, workTree: worktree });
       if (r.exitCode !== 0) { throw new EnvError(`Could not update the checkout: ${tail(r.stderr)}`); }
       return;
     }
     this.fs.mkdirSync(path.dirname(worktree), { recursive: true });
-    await this.git(mirror, ['worktree', 'prune']);
-    const add = await this.git(mirror, ['worktree', 'add', '--force', '--detach', worktree, ref]);
+    await this.git(['worktree', 'prune'], { gitDir: mirror });
+    const add = await this.git(['worktree', 'add', '--force', '--detach', worktree, ref], { gitDir: mirror });
     if (add.exitCode !== 0) { throw new EnvError(`Could not check out the branch: ${tail(add.stderr)}`); }
+    if (!this.fs.existsSync(gitDir)) { throw new EnvError('The checkout was created under an unexpected name; remove the environment and start it again.'); }
   }
 
-  /** Start (or refresh) the environment for a project branch. Returns its key. */
+  // ─── Prepare: resolve, check, save — before every up ───
+
+  /**
+   * Resolve the branch's compose configuration with the override, check it, and save the checked
+   * result where only the host can write. Returns the services. Throws a "rejected" EnvError with the
+   * reasons when the policy refuses it, so nothing starts.
+   */
+  private async prepare(r: EnvRecord, recipe: Recipe): Promise<string[]> {
+    this.fs.mkdirSync(this.hostDir(r.key), { recursive: true });
+    this.fs.writeFileSync(this.hostFile(r.key, 'empty.env'), '');
+    this.fs.writeFileSync(this.hostFile(r.key, 'override.yml'), 'services: {}\n');
+
+    if (!this.fs.existsSync(r.composeFile)) {
+      throw new EnvError(`The compose file ${recipe.composeFile} is not in ${recipe.composeFromProject ? 'the project folder' : 'this branch'}.`, 'rejected');
+    }
+    const listed = await this.composeSource(r, ['config', '--services']);
+    if (listed.exitCode !== 0) { throw new EnvError(`The compose file could not be read: ${tail(listed.stderr)}`, 'rejected'); }
+    const services = listed.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+    if (recipe.web && !services.includes(recipe.web.service)) {
+      throw new EnvError(`The recipe's web service "${recipe.web.service}" is not in the compose file.`, 'rejected');
+    }
+    r.roles = { ...recipe.roles };
+    for (const s of services) { if (!r.roles[s]) { r.roles[s] = 'other'; } }
+    r.web = recipe.web;
+
+    this.fs.writeFileSync(this.hostFile(r.key, 'override.yml'), buildOverride({
+      envKey: r.key, services, web: recipe.web, hostPort: r.port, cpus: this.deps.config.cpus, memoryMb: this.deps.config.memoryMb,
+    }));
+
+    const resolved = await this.composeSource(r, ['config', '--format', 'json']);
+    if (resolved.exitCode !== 0) { throw new EnvError(`The compose file could not be read: ${tail(resolved.stderr)}`, 'rejected'); }
+    let configJson: unknown;
+    try {
+      configJson = JSON.parse(resolved.stdout);
+    } catch {
+      throw new EnvError('The compose configuration could not be read as JSON.', 'rejected');
+    }
+    const violations = composePolicyViolations(configJson, {
+      roots: [r.worktree], web: recipe.web, hostPort: r.port, realpath: this.deps.realpath,
+    });
+    if (violations.length > 0) {
+      throw new EnvError(`This branch's compose file asks for more than an environment may have: ${violations.slice(0, 6).join('; ')}.`, 'rejected');
+    }
+    // What Docker will run from now on: exactly what was checked.
+    this.fs.writeFileSync(this.hostFile(r.key, 'resolved.json'), JSON.stringify(configJson), { mode: 0o600 });
+    return services;
+  }
+
+  // ─── Commands ───
+
+  /** Start (or refresh) the environment for a project branch. */
   async start(projectId: string, branch: string, runKey: string | null = null): Promise<EnvRecord> {
     const project = this.project(projectId);
     const recipe = this.recipeFor(project.path);
     const key = envKeyFor(projectId, branch);
-    const existing = this.records.get(key);
-    const running = this.list().filter((r) => r.desired === 'running' && r.key !== key).length;
-    if (!existing && running >= this.deps.config.maxEnvironments) {
-      throw new EnvError(`This machine already runs ${running} environments (its limit). Stop one first.`, 'rejected');
-    }
 
-    return this.withLock(key, async () => {
-      const worktree = path.join(this.deps.config.worktreesDir, key);
-      await this.checkout(projectId, project.path, worktree, branch);
-
-      const composeFile = recipe.composeFromProject ? path.join(project.path, recipe.composeFile) : path.join(worktree, recipe.composeFile);
-      if (!this.fs.existsSync(composeFile)) {
-        throw new EnvError(`The compose file ${recipe.composeFile} is not in ${recipe.composeFromProject ? 'the project folder' : 'this branch'}.`, 'rejected');
+    const port = await this.admit(async () => {
+      const existing = this.records.get(key);
+      if (!existing && this.records.size + this.pendingStarts.size >= MAX_RECORDS) {
+        throw new EnvError(`This machine already keeps ${MAX_RECORDS} environments. Remove a stopped one on the machine first.`, 'rejected');
       }
-
-      const port = existing?.port ?? await this.allocatePort();
-      const record: EnvRecord = {
-        key,
-        projectId,
-        projectName: project.name,
-        branch,
-        runKey: runKey ?? existing?.runKey ?? null,
-        port,
-        worktree,
-        composeFile,
-        roles: { ...recipe.roles },
-        web: recipe.web,
-        desired: 'running',
-        status: 'starting',
-        message: null,
-        createdAt: existing?.createdAt ?? new Date(this.now()).toISOString(),
-        startedAt: null,
-        lastAccessAt: new Date(this.now()).toISOString(),
-      };
-
-      // The services the compose file actually defines: the override must reset every one's ports.
-      this.fs.writeFileSync(this.overridePath(key), 'services: {}\n');
-      const listed = await this.compose(record, ['config', '--services']);
-      if (listed.exitCode !== 0) { throw new EnvError(`The compose file could not be read: ${tail(listed.stderr)}`, 'rejected'); }
-      const services = listed.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
-      if (recipe.web && !services.includes(recipe.web.service)) {
-        throw new EnvError(`The recipe's web service "${recipe.web.service}" is not in the compose file.`, 'rejected');
+      const running = this.runningCount(key);
+      if ((!existing || existing.desired !== 'running') && running >= this.deps.config.maxEnvironments) {
+        throw new EnvError(`This machine already runs ${running} environments (its limit). Stop one first.`, 'rejected');
       }
-      for (const s of services) { if (!record.roles[s]) { record.roles[s] = 'other'; } }
-
-      this.fs.writeFileSync(this.overridePath(key), buildOverride({
-        envKey: key, services, web: recipe.web, hostPort: port, cpus: this.deps.config.cpus, memoryMb: this.deps.config.memoryMb,
-      }));
-
-      // The compose file is the branch's: check what it asks Docker for before anything starts.
-      const resolved = await this.compose(record, ['config', '--format', 'json']);
-      if (resolved.exitCode !== 0) { throw new EnvError(`The compose file could not be read: ${tail(resolved.stderr)}`, 'rejected'); }
-      let configJson: unknown;
-      try {
-        configJson = JSON.parse(resolved.stdout);
-      } catch {
-        throw new EnvError('The compose configuration could not be read as JSON.', 'rejected');
-      }
-      const violations = composePolicyViolations(configJson, [worktree]);
-      if (violations.length > 0) {
-        throw new EnvError(`This branch's compose file asks for more than an environment may have: ${violations.slice(0, 5).join('; ')}.`, 'rejected');
-      }
-
-      this.records.set(key, record);
-      this.save();
-
-      const up = await this.compose(record, ['up', '-d', '--build', '--remove-orphans'], BUILD_TIMEOUT_MS);
-      if (up.exitCode !== 0) {
-        record.status = 'failed';
-        record.message = up.timedOut ? 'Starting took longer than 30 minutes and was stopped.' : `Starting failed: ${tail(up.stderr)}`;
-        this.save();
-        throw new EnvError(record.message);
-      }
-      record.startedAt = new Date(this.now()).toISOString();
-      record.message = null;
-      this.save();
-      return record;
+      const p = existing?.port ?? await this.allocatePort();
+      this.reservedPorts.add(p);
+      this.pendingStarts.add(key);
+      return p;
     });
+
+    try {
+      return await this.withLock(key, async () => {
+        const existing = this.records.get(key);
+        const worktree = path.join(this.deps.config.worktreesDir, key);
+        await this.checkout(projectId, project.path, key, worktree, branch);
+
+        const record: EnvRecord = {
+          key,
+          projectId,
+          projectName: project.name,
+          branch,
+          runKey: runKey ?? existing?.runKey ?? null,
+          port,
+          worktree,
+          composeFile: recipe.composeFromProject ? path.join(project.path, recipe.composeFile) : path.join(worktree, recipe.composeFile),
+          roles: { ...recipe.roles },
+          web: recipe.web,
+          desired: 'running',
+          status: 'starting',
+          message: null,
+          createdAt: existing?.createdAt ?? new Date(this.now()).toISOString(),
+          startedAt: null,
+          lastAccessAt: new Date(this.now()).toISOString(),
+        };
+
+        await this.prepare(record, recipe);
+        this.records.set(key, record);
+        this.save();
+
+        // --force-recreate: containers pick up the freshly checked config and checkout.
+        const up = await this.compose(record, ['up', '-d', '--build', '--remove-orphans', '--force-recreate'], BUILD_TIMEOUT_MS);
+        if (up.exitCode !== 0) {
+          record.status = 'failed';
+          record.message = up.timedOut ? 'Starting took longer than 30 minutes and was stopped.' : `Starting failed: ${tail(up.stderr)}`;
+          this.save();
+          throw new EnvError(record.message);
+        }
+        record.startedAt = new Date(this.now()).toISOString();
+        record.message = null;
+        this.save();
+        return record;
+      });
+    } finally {
+      this.pendingStarts.delete(key);
+      this.reservedPorts.delete(port);
+    }
   }
 
   private need(key: string): EnvRecord {
@@ -334,9 +455,16 @@ export class EnvironmentManager {
     return r;
   }
 
+  private needResolved(r: EnvRecord): void {
+    if (!this.fs.existsSync(this.hostFile(r.key, 'resolved.json'))) {
+      throw new EnvError('This environment needs to be started again before it can be used.', 'rejected');
+    }
+  }
+
   async stop(key: string, reason: string | null = null): Promise<void> {
     const r = this.need(key);
     await this.withLock(key, async () => {
+      this.needResolved(r);
       const res = await this.compose(r, ['stop']);
       if (res.exitCode !== 0) { throw new EnvError(`Stopping failed: ${tail(res.stderr)}`); }
       r.desired = 'stopped';
@@ -349,16 +477,44 @@ export class EnvironmentManager {
   async restart(key: string, service: string | null): Promise<void> {
     const r = this.need(key);
     if (service && !r.roles[service]) { throw new EnvError(`There is no service "${service}" in this environment.`, 'rejected'); }
-    await this.withLock(key, async () => {
-      // A stopped environment is started again; a running one restarted.
-      const args = r.desired === 'stopped' ? ['up', '-d'] : ['restart', ...(service ? [service] : [])];
-      const res = await this.compose(r, args, r.desired === 'stopped' ? BUILD_TIMEOUT_MS : CMD_TIMEOUT_MS);
-      if (res.exitCode !== 0) { throw new EnvError(`Restarting failed: ${tail(res.stderr)}`); }
-      r.desired = 'running';
-      r.message = null;
-      r.lastAccessAt = new Date(this.now()).toISOString();
-      this.save();
+
+    if (r.desired !== 'stopped') {
+      await this.withLock(key, async () => {
+        this.needResolved(r);
+        const res = await this.compose(r, ['restart', ...(service ? [service] : [])]);
+        if (res.exitCode !== 0) { throw new EnvError(`Restarting failed: ${tail(res.stderr)}`); }
+        r.message = null;
+        r.lastAccessAt = new Date(this.now()).toISOString();
+        this.save();
+      });
+      return;
+    }
+
+    // Starting a stopped environment again is a start: the project must still be approved, the
+    // limit applies, and the configuration is resolved and checked again before anything runs.
+    const project = this.project(r.projectId);
+    const recipe = this.recipeFor(project.path);
+    await this.admit(async () => {
+      const running = this.runningCount(key);
+      if (running >= this.deps.config.maxEnvironments) {
+        throw new EnvError(`This machine already runs ${running} environments (its limit). Stop one first.`, 'rejected');
+      }
+      this.pendingStarts.add(key);
     });
+    try {
+      await this.withLock(key, async () => {
+        r.composeFile = recipe.composeFromProject ? path.join(project.path, recipe.composeFile) : path.join(r.worktree, recipe.composeFile);
+        await this.prepare(r, recipe);
+        const res = await this.compose(r, ['up', '-d', '--force-recreate'], BUILD_TIMEOUT_MS);
+        if (res.exitCode !== 0) { throw new EnvError(`Starting again failed: ${tail(res.stderr)}`); }
+        r.desired = 'running';
+        r.message = null;
+        r.lastAccessAt = new Date(this.now()).toISOString();
+        this.save();
+      });
+    } finally {
+      this.pendingStarts.delete(key);
+    }
   }
 
   async resetDb(key: string): Promise<void> {
@@ -367,26 +523,37 @@ export class EnvironmentManager {
     const recipe = this.recipeFor(project.path);
     await this.withLock(key, async () => {
       if (recipe.resetDb) {
+        this.needResolved(r);
         const res = await this.compose(r, ['exec', '-T', recipe.resetDb.service, ...recipe.resetDb.command], BUILD_TIMEOUT_MS);
         if (res.exitCode !== 0) { throw new EnvError(`The reset command failed: ${tail(res.stderr || res.stdout)}`); }
         return;
       }
-      // No reset command: recreate the stack with fresh volumes. Everything stateful starts empty.
-      const down = await this.compose(r, ['down', '--volumes', '--remove-orphans']);
-      if (down.exitCode !== 0) { throw new EnvError(`Resetting failed: ${tail(down.stderr)}`); }
-      const up = await this.compose(r, ['up', '-d'], BUILD_TIMEOUT_MS);
+      // No reset command: recreate the stack with fresh volumes — after checking the configuration
+      // again, since `up` is about to run it.
+      r.composeFile = recipe.composeFromProject ? path.join(project.path, recipe.composeFile) : path.join(r.worktree, recipe.composeFile);
+      if (this.fs.existsSync(this.hostFile(r.key, 'resolved.json'))) {
+        const down = await this.compose(r, ['down', '--volumes', '--remove-orphans']);
+        if (down.exitCode !== 0) { throw new EnvError(`Resetting failed: ${tail(down.stderr)}`); }
+      }
+      await this.prepare(r, recipe);
+      const up = await this.compose(r, ['up', '-d', '--force-recreate'], BUILD_TIMEOUT_MS);
       if (up.exitCode !== 0) { throw new EnvError(`Starting again after the reset failed: ${tail(up.stderr)}`); }
       r.desired = 'running';
       this.save();
     });
   }
 
-  /** Remove an environment entirely: containers, volumes, worktree, record. Not exposed to ONOSOO. */
+  /** Remove an environment entirely: containers, volumes, worktree, host files, record. Machine only. */
   async remove(key: string): Promise<void> {
     const r = this.need(key);
     await this.withLock(key, async () => {
-      await this.compose(r, ['down', '--volumes', '--remove-orphans']);
-      await this.git(mirrorPath(this.deps.stateDir, r.projectId), ['worktree', 'remove', '--force', r.worktree]);
+      if (this.fs.existsSync(this.hostFile(r.key, 'resolved.json'))) { await this.compose(r, ['down', '--volumes', '--remove-orphans']); }
+      // Deleted as files, not with `git worktree remove`, which would read the checkout's `.git`.
+      try { this.fs.rmSync(r.worktree, { recursive: true, force: true }); } catch (err) {
+        this.log(`moag host: could not delete ${r.worktree} (files written by a container as root?): ${err instanceof Error ? err.message : String(err)}`);
+      }
+      await this.git(['worktree', 'prune'], { gitDir: mirrorPath(this.deps.stateDir, r.projectId) });
+      try { this.fs.rmSync(this.hostDir(r.key), { recursive: true, force: true }); } catch { /* best effort */ }
       this.records.delete(key);
       this.save();
     });
@@ -396,6 +563,7 @@ export class EnvironmentManager {
   async logs(key: string, service: string, lines: number): Promise<string> {
     const r = this.need(key);
     if (!r.roles[service]) { throw new EnvError(`There is no service "${service}" in this environment.`, 'rejected'); }
+    this.needResolved(r);
     const n = Math.max(1, Math.min(MAX_LOG_LINES, Math.trunc(lines) || 500));
     const res = await this.compose(r, ['logs', '--no-color', '--timestamps', '--tail', String(n), service]);
     if (res.exitCode !== 0) { throw new EnvError(`Could not read the logs: ${tail(res.stderr)}`); }
@@ -406,9 +574,9 @@ export class EnvironmentManager {
   /** Refresh every environment's services and status from Docker. */
   async refresh(): Promise<void> {
     for (const r of this.list()) {
-      if (this.busy.has(r.key)) { continue; }
-      const ps = await this.compose(r, ['ps', '-a', '--format', 'json']).catch(() => null);
-      if (!ps || ps.exitCode !== 0) { continue; }
+      if (this.busy.has(r.key) || !this.fs.existsSync(this.hostFile(r.key, 'resolved.json'))) { continue; }
+      const ps = await this.compose(r, ['ps', '-a', '--format', 'json']);
+      if (ps.exitCode !== 0) { continue; }
       const services = servicesFromPs(parsePsOutput(ps.stdout), r.roles);
       const next = deriveStatus(services, r.desired, r.web?.service ?? null);
       // A start that failed stays failed until it is started again; ps alone cannot clear that.

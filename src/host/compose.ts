@@ -178,70 +178,23 @@ export function deriveStatus(services: ServiceSnapshot[], desired: 'running' | '
   return 'running';
 }
 
-// ─── Compose policy ───
-//
-// The compose file comes from the branch, which an AI may have written. Containers are the sandbox,
-// so anything that lets a container out of it is refused before `up`: privileged mode, added
-// capabilities, devices, the host's network/PID/IPC/user namespaces, the Docker socket, disabled
-// security profiles, and bind mounts of anything outside the environment's own folders.
-// Checked on `docker compose config --format json`, i.e. after variables and extends are resolved.
-
-function isInsideAny(p: string, roots: string[], win: boolean): boolean {
-  const norm = (x: string): string => {
-    const n = x.replace(/\\/g, '/').replace(/\/+$/, '');
-    return win ? n.toLowerCase() : n;
-  };
-  const target = norm(p);
-  return roots.some((r) => {
-    const root = norm(r);
-    return target === root || target.startsWith(`${root}/`);
-  });
-}
-
-/** What in a resolved compose config would let a container out of its sandbox. Empty = allowed. */
-export function composePolicyViolations(config: unknown, allowedRoots: string[], platform: NodeJS.Platform = process.platform): string[] {
-  const out: string[] = [];
-  const win = platform === 'win32';
-  const services = config && typeof config === 'object' ? (config as { services?: Record<string, Record<string, unknown>> }).services : undefined;
-  if (!services || typeof services !== 'object') { return ['The compose configuration has no services.']; }
-
-  for (const [name, svc] of Object.entries(services)) {
-    if (!svc || typeof svc !== 'object') { continue; }
-    const say = (what: string): void => { out.push(`${name}: ${what}`); };
-    if (svc.privileged === true) { say('privileged mode is not allowed'); }
-    if (Array.isArray(svc.cap_add) && svc.cap_add.length > 0) { say('adding capabilities is not allowed'); }
-    if (Array.isArray(svc.devices) && svc.devices.length > 0) { say('host devices are not allowed'); }
-    for (const key of ['network_mode', 'pid', 'ipc', 'userns_mode', 'uts', 'cgroup']) {
-      const v = svc[key];
-      if (typeof v === 'string' && (v === 'host' || v.startsWith('container:') || v.startsWith('service:') && key !== 'network_mode')) {
-        say(`${key}: ${v} is not allowed`);
-      }
-    }
-    if (Array.isArray(svc.security_opt) && svc.security_opt.some((o) => typeof o === 'string' && /unconfined|no-new-privileges[:=]false/i.test(o))) {
-      say('disabling security profiles is not allowed');
-    }
-    if (svc.cgroup_parent) { say('cgroup_parent is not allowed'); }
-    for (const v of Array.isArray(svc.volumes) ? svc.volumes : []) {
-      const vol = v as { type?: unknown; source?: unknown };
-      if (!vol || typeof vol !== 'object' || vol.type !== 'bind') { continue; }
-      const source = typeof vol.source === 'string' ? vol.source : '';
-      if (/docker\.sock|containerd\.sock|podman\.sock/.test(source)) { say(`mounting ${source} is not allowed`); continue; }
-      if (!source || !isInsideAny(source, allowedRoots, win)) { say(`mounting ${source || 'a host path'} from outside the project is not allowed`); }
-    }
-  }
-  return out;
-}
-
 /**
- * The environment a child process may see. The machine key and any tunnel token are removed even
- * though main() already took MOAG_ONOSOO_* out of process.env: the environments run code an AI
- * wrote, and this is the one place every docker and git call goes through.
+ * The ONLY variables a docker or git child process gets. An allow-list, not a deny-list: a branch's
+ * compose file can interpolate `${ANYTHING}` into a container, so whatever the main user has in its
+ * environment (API keys, GITHUB_TOKEN, AWS credentials, SSH_AUTH_SOCK, the machine key) would
+ * otherwise be one line away from an AI-written container. DOCKER_HOST/DOCKER_CONTEXT/DOCKER_CONFIG
+ * are kept so a non-default Docker setup still works; they identify the daemon, not a secret.
  */
+const CHILD_ENV_ALLOW = new Set([
+  'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'TEMP', 'TMP',
+  'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY',
+  'XDG_RUNTIME_DIR', 'SYSTEMROOT', 'COMSPEC', 'WINDIR', 'PATHEXT',
+]);
+
 export function childEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(env)) {
-    if (/^(MOAG_ONOSOO_|TUNNEL_TOKEN|CLOUDFLARED_|CF_)/i.test(k)) { continue; }
-    out[k] = v;
+    if (v !== undefined && CHILD_ENV_ALLOW.has(k.toUpperCase())) { out[k] = v; }
   }
   return out;
 }

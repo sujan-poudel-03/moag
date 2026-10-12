@@ -24,8 +24,16 @@ export interface TunnelDeps {
   tokenFile: string;
   spawnFn?: typeof spawn;
   readFile?: (f: string) => string;
+  /** The token file's permission bits; injectable for tests. */
+  fileMode?: (f: string) => number;
+  platform?: NodeJS.Platform;
   log?: (line: string) => void;
   env?: NodeJS.ProcessEnv;
+}
+
+/** True when the token file can be read or written by anyone but its owner. */
+export function tokenFileTooOpen(mode: number): boolean {
+  return (mode & 0o077) !== 0;
 }
 
 export class Tunnel {
@@ -46,6 +54,20 @@ export class Tunnel {
 
   private launch(): void {
     if (this.stopped) { return; }
+    // A tunnel token readable by other users (the runner account included) lets them serve anything
+    // under the preview domain. Refuse it rather than run with it.
+    if ((this.deps.platform ?? process.platform) !== 'win32') {
+      let mode: number | null = null;
+      try {
+        mode = (this.deps.fileMode ?? ((f: string): number => fs.statSync(f).mode))(this.deps.tokenFile);
+      } catch {
+        mode = null;
+      }
+      if (mode !== null && tokenFileTooOpen(mode)) {
+        this.log(`moag host: ${this.deps.tokenFile} is readable by other users; run "chmod 600 ${this.deps.tokenFile}". The tunnel stays off until then.`);
+        return this.retry();
+      }
+    }
     let token: string;
     try {
       token = (this.deps.readFile ?? ((f: string): string => fs.readFileSync(f, 'utf-8')))(this.deps.tokenFile).trim();

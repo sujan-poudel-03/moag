@@ -121,51 +121,20 @@ describe('host/compose', () => {
     });
   });
 
-  it('childEnv removes the machine key and tunnel tokens, and keeps everything else', () => {
-    const env = childEnv({ PATH: '/bin', MOAG_ONOSOO_KEY: 'onosoo_live_x', MOAG_ONOSOO_URL: 'u', TUNNEL_TOKEN: 't', CLOUDFLARED_TOKEN: 'c', HOME: '/h' });
-    assert.deepEqual(env, { PATH: '/bin', HOME: '/h' });
+  it('childEnv passes only an allow-list: no keys, tokens or agent sockets reach docker or git', () => {
+    const env = childEnv({
+      PATH: '/bin', HOME: '/h', LANG: 'C.UTF-8', DOCKER_HOST: 'unix:///run/docker.sock',
+      MOAG_ONOSOO_KEY: 'onosoo_live_x', MOAG_ONOSOO_URL: 'u', TUNNEL_TOKEN: 't', CLOUDFLARED_TOKEN: 'c',
+      ANTHROPIC_API_KEY: 'sk-ant', OPENAI_API_KEY: 'sk', GITHUB_TOKEN: 'ghp', AWS_SECRET_ACCESS_KEY: 'aws',
+      SSH_AUTH_SOCK: '/tmp/agent', DATABASE_URL: 'postgres://u:p@h/db', NPM_TOKEN: 'npm',
+    });
+    assert.deepEqual(env, { PATH: '/bin', HOME: '/h', LANG: 'C.UTF-8', DOCKER_HOST: 'unix:///run/docker.sock' });
   });
 });
 
-describe('host/compose policy and git-safe', () => {
+describe('host/git-safe', () => {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { composePolicyViolations } = require('../../../host/compose');
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { safeGitArgs, safeGitEnv } = require('../../../host/git-safe');
-  const root = '/srv/moag/host/worktrees/shop-main-1';
-
-  it('allows an ordinary stack with mounts inside the checkout', () => {
-    assert.deepEqual(composePolicyViolations({
-      services: {
-        web: { image: 'node', volumes: [{ type: 'bind', source: `${root}/src`, target: '/app' }, { type: 'volume', source: 'data', target: '/d' }], network_mode: 'service:api' },
-        api: { image: 'node', security_opt: ['no-new-privileges:true'] },
-      },
-    }, [root], 'linux'), []);
-  });
-
-  it('refuses every way out of the sandbox', () => {
-    const v = composePolicyViolations({
-      services: {
-        a: { privileged: true },
-        b: { cap_add: ['SYS_ADMIN'] },
-        c: { devices: ['/dev/kmsg'] },
-        d: { network_mode: 'host' },
-        e: { pid: 'host' },
-        f: { ipc: 'host' },
-        g: { userns_mode: 'host' },
-        h: { security_opt: ['seccomp:unconfined'] },
-        i: { volumes: [{ type: 'bind', source: '/var/run/docker.sock', target: '/s' }] },
-        j: { volumes: [{ type: 'bind', source: '/srv/moag/host/worktrees/shop-main-1-evil', target: '/x' }] },
-        k: { volumes: [{ type: 'bind', source: '/home/me/.config/moag', target: '/x' }] },
-        l: { network_mode: 'container:other-env' },
-      },
-    }, [root], 'linux');
-    for (const s of 'abcdefghijkl') { assert.ok(v.some((x: string) => x.startsWith(`${s}:`)), s); }
-  });
-
-  it('compares Windows paths case-insensitively', () => {
-    assert.deepEqual(composePolicyViolations({ services: { w: { volumes: [{ type: 'bind', source: 'C:\\Users\\Me\\WT\\x', target: '/x' }] } } }, ['c:/users/me/wt'], 'win32'), []);
-  });
+  const { gitVersionOk, safeGitArgs, safeGitEnv } = require('../../../host/git-safe');
 
   it('hardens every git call and only allows local transport when asked', () => {
     const a = safeGitArgs(['fetch', 'x'], { emptyHooksDir: '/e' });
@@ -173,5 +142,25 @@ describe('host/compose policy and git-safe', () => {
     assert.deepEqual(a.slice(-2), ['fetch', 'x']);
     assert.ok(safeGitArgs([], { emptyHooksDir: '/e', allowLocal: true }).includes('protocol.file.allow=always'));
     assert.equal(safeGitEnv({ PATH: '/b' }).GIT_CONFIG_NOSYSTEM, '1');
+  });
+
+  it('requires git 2.45.1 or newer', () => {
+    assert.equal(gitVersionOk('git version 2.45.1'), true);
+    assert.equal(gitVersionOk('git version 2.47.0.windows.1'), true);
+    assert.equal(gitVersionOk('git version 2.45.0'), false);
+    assert.equal(gitVersionOk('git version 2.39.5'), false);
+    assert.equal(gitVersionOk('nonsense'), false);
+  });
+});
+
+describe('host/tunnel', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { tokenFileTooOpen } = require('../../../host/tunnel');
+  it('refuses a token file anyone but its owner can read or write', () => {
+    assert.equal(tokenFileTooOpen(0o100600), false);
+    assert.equal(tokenFileTooOpen(0o100400), false);
+    assert.equal(tokenFileTooOpen(0o100640), true);
+    assert.equal(tokenFileTooOpen(0o100644), true);
+    assert.equal(tokenFileTooOpen(0o100602), true);
   });
 });

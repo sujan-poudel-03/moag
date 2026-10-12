@@ -24,7 +24,11 @@ import * as net from 'net';
 import type { OnosooCall } from './onosoo-client';
 import type { EnvRecord } from './types';
 
-export const SESSION_COOKIE = '__onosoo_preview';
+/**
+ * `__Host-`: browsers accept this cookie only with Secure, Path=/ and no Domain, so it is bound to
+ * exactly one environment's host — a sibling environment's app cannot set or toss it.
+ */
+export const SESSION_COOKIE = '__Host-onosoo_preview';
 const TICKET_PREFIX = 'obt_';
 const BEARER_TICKET_CACHE_MS = 5 * 60 * 1000;
 const DEFAULT_RECHECK_MS = 60_000;
@@ -54,14 +58,29 @@ export function envKeyFromHost(host: string | undefined, previewDomain: string):
   return /^[a-z0-9][a-z0-9-]{0,62}$/.test(label) ? label : null;
 }
 
+/** Cookie name → value. The FIRST occurrence wins: browsers send the most specific cookie first. */
 export function parseCookies(header: string | undefined): Map<string, string> {
   const out = new Map<string, string>();
   for (const part of (header ?? '').split(';')) {
     const eq = part.indexOf('=');
     if (eq <= 0) { continue; }
-    out.set(part.slice(0, eq).trim(), part.slice(eq + 1).trim());
+    const name = part.slice(0, eq).trim();
+    if (!out.has(name)) { out.set(name, part.slice(eq + 1).trim()); }
   }
   return out;
+}
+
+/**
+ * An app's Set-Cookie made host-only: any Domain attribute is removed, so one environment's app can
+ * never plant cookies on a sibling environment under the same preview domain. Returns null for a
+ * cookie that tries to use the gateway's session name.
+ */
+export function hostOnlySetCookie(cookie: string): string | null {
+  const [pair, ...attrs] = cookie.split(';');
+  const name = pair.split('=')[0]?.trim() ?? '';
+  if (name === SESSION_COOKIE || name.toLowerCase() === SESSION_COOKIE.toLowerCase()) { return null; }
+  const kept = attrs.filter((a) => !/^\s*domain\s*=/i.test(a));
+  return [pair, ...kept].join(';');
 }
 
 /** The Cookie header without `name`; undefined when nothing is left. */
@@ -71,10 +90,22 @@ export function stripCookie(header: string | undefined, name: string): string | 
   return kept.length > 0 ? kept.join('; ') : undefined;
 }
 
-/** A redirect target on the same host: a path, never `//host` or a scheme. */
+/**
+ * A redirect target on the same host. Parsed the way a browser parses it — browsers drop tabs and
+ * newlines, so "/\t/evil.com" would become "//evil.com" — and kept only when it stays on our origin.
+ * Returns the path, query and fragment, never a full URL.
+ */
 export function safeNext(next: string | null): string {
-  if (!next || !next.startsWith('/') || next.startsWith('//') || next.startsWith('/\\')) { return '/'; }
-  return next;
+  if (!next || !next.startsWith('/')) { return '/'; }
+  const base = 'https://gateway.invalid';
+  try {
+    const u = new URL(next, base);
+    if (u.origin !== base) { return '/'; }
+    const out = `${u.pathname}${u.search}${u.hash}`;
+    return out.startsWith('//') || out.startsWith('/\\') ? '/' : out;
+  } catch {
+    return '/';
+  }
 }
 
 export function canReadLogs(role: Role): boolean {
@@ -160,10 +191,15 @@ export class SessionStore {
     return [...new Set([...this.sessions.values()].map((s) => s.userId))];
   }
 
-  /** Apply ONOSOO's answer: drop sessions of non-members, and logs sessions of members who lost access. */
-  applyMembership(members: Record<string, unknown>): number {
+  /**
+   * Apply ONOSOO's answer: drop sessions of non-members, and logs sessions of members who lost
+   * access. With `judged`, only sessions of those users are considered — the ones ONOSOO was asked
+   * about; without it (a revoked machine), every session.
+   */
+  applyMembership(members: Record<string, unknown>, judged?: Set<string>): number {
     let dropped = 0;
     for (const [id, s] of this.sessions) {
+      if (judged && !judged.has(s.userId)) { continue; }
       const role = members[s.userId];
       const keep = isRole(role) && (s.scope === 'preview' || canReadLogs(role));
       if (!keep) { this.sessions.delete(id); dropped++; } else { s.role = role; }
@@ -274,24 +310,27 @@ export class Gateway {
     await new Promise<void>((resolve) => (this.server ? this.server.close(() => resolve()) : resolve()));
   }
 
-  /** Ask ONOSOO whether each session's member is still in the workspace. Fails closed only on 401. */
+  /**
+   * Ask ONOSOO whether each session's member is still in the workspace, in batches of 200, and apply
+   * the answers once every batch has answered — applying one batch's map to all sessions would log
+   * out everyone in the other batches. Network trouble changes nothing (sessions expire anyway); a
+   * 401 means this machine was revoked and closes every session.
+   */
   async recheck(): Promise<void> {
     this.sessions.sweep();
     const ids = this.sessions.userIds();
+    if (ids.length === 0) { return; }
+    const members: Record<string, unknown> = {};
     for (let i = 0; i < ids.length; i += 200) {
       const r = await this.deps.call('previews/check', { user_ids: ids.slice(i, i + 200) }).catch(() => null);
-      if (!r) { continue; } // network trouble: keep sessions until the next check (they expire anyway)
-      if (r.status === 401) {
-        // This machine was revoked: nobody gets in any more.
-        this.sessions.applyMembership({});
-        return;
-      }
-      const members = r.json?.members;
-      if (r.status === 200 && members && typeof members === 'object') {
-        const dropped = this.sessions.applyMembership(members as Record<string, unknown>);
-        if (dropped > 0) { this.log(`moag host: closed ${dropped} preview session(s) of people no longer allowed`); }
-      }
+      if (r?.status === 401) { this.sessions.applyMembership({}); return; }
+      const batch = r?.status === 200 ? r.json?.members : undefined;
+      if (!batch || typeof batch !== 'object') { return; }
+      Object.assign(members, batch);
     }
+    // Only users ONOSOO was asked about are judged; sessions created mid-check keep their access.
+    const dropped = this.sessions.applyMembership(members, new Set(ids));
+    if (dropped > 0) { this.log(`moag host: closed ${dropped} preview session(s) of people no longer allowed`); }
   }
 
   private async redeem(ticket: string, envKey: string): Promise<Session | null> {
@@ -394,7 +433,10 @@ export class Gateway {
     if (url.pathname === '/__onosoo/status') { return json(200, this.deps.status(envKey)); }
 
     if (url.pathname === '/__onosoo/logs') {
-      if (!canReadLogs(session.role)) { return json(403, { error: 'Your role in this workspace cannot read logs.' }); }
+      // A preview session is for the app; reading logs takes a logs ticket, and a role that may.
+      if (session.scope !== 'logs' || !canReadLogs(session.role)) {
+        return json(403, { error: 'Open the logs from ONOSOO; your role in this workspace must allow it.' });
+      }
       const service = url.searchParams.get('service') ?? '';
       const tailN = Number(url.searchParams.get('tail') ?? '500');
       try {
@@ -418,9 +460,9 @@ export class Gateway {
       headers: forwardHeaders(req.headers, { port, originalHost, remoteAddress: req.socket.remoteAddress, keepUpgrade: false }),
     }, (up) => {
       const headers = { ...up.headers };
-      // The app must not be able to read or overwrite the gateway's session.
+      // The app must not be able to overwrite the gateway's session, nor set cookies on its siblings.
       const setCookie = headers['set-cookie'];
-      if (setCookie) { headers['set-cookie'] = setCookie.filter((c) => !c.trim().startsWith(`${SESSION_COOKIE}=`)); }
+      if (setCookie) { headers['set-cookie'] = setCookie.map(hostOnlySetCookie).filter((c): c is string => c !== null); }
       res.writeHead(up.statusCode ?? 502, headers);
       up.pipe(res);
     });
@@ -440,6 +482,13 @@ export class Gateway {
     const session = envKey ? this.sessions.find(parseCookies(req.headers.cookie).get(SESSION_COOKIE), envKey) : null;
     if (!envKey || !env || !session || !env.web || env.desired !== 'running') {
       socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      return;
+    }
+    // A WebSocket is not covered by SameSite: another page (a sibling environment included) could
+    // open one with the visitor's cookie. Only the environment's own pages may.
+    const host = (req.headers.host ?? '').toLowerCase().replace(/:443$/, '');
+    if (req.headers.origin?.toLowerCase() !== `https://${host}`) {
+      socket.end('HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n');
       return;
     }
     this.deps.touch(envKey);

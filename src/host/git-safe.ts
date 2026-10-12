@@ -55,6 +55,21 @@ export function safeGitEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   };
 }
 
+/**
+ * `git --version` output is 2.45.1 or newer: the release that hardened local clones against
+ * repositories prepared by someone else (CVE-2024-32004 and siblings).
+ */
+export function gitVersionOk(output: string): boolean {
+  const m = /(\d+)\.(\d+)\.(\d+)/.exec(output);
+  if (!m) { return false; }
+  const v = [Number(m[1]), Number(m[2]), Number(m[3])];
+  const min = [2, 45, 1];
+  for (let i = 0; i < 3; i++) {
+    if (v[i] !== min[i]) { return v[i] > min[i]; }
+  }
+  return true;
+}
+
 /** The mirror of an approved project. */
 export function mirrorPath(stateDir: string, projectId: string): string {
   return path.join(stateDir, 'host', 'repos', `${projectId}.git`);
