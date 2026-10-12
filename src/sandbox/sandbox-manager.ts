@@ -11,6 +11,7 @@ import { SandboxConfig } from '../models/types';
 // One tree-kill implementation for the whole extension. `runner/evidence` is
 // dependency-free (fs/path/child_process only) so this import adds no cycle.
 import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
+import { trackChildProcess } from '../utils/child-tracker';
 
 export type SandboxStatus = 'stopped' | 'starting' | 'running' | 'error';
 
@@ -114,7 +115,8 @@ export class SandboxManager extends EventEmitter {
   /** Start a background process without tracking its URL or state. */
   private _spawnBackground(command: string, cwd: string): void {
     const [cmd, ...args] = command.split(' ');
-    const proc = spawn(cmd, args, { cwd, shell: true, stdio: 'ignore', detached: SPAWN_DETACHED });
+    const proc = spawn(cmd, args, { cwd, shell: true, stdio: 'ignore', detached: SPAWN_DETACHED, windowsHide: true });
+    trackChildProcess(proc);
     this._backgroundProcesses.push(proc);
     const cleanup = () => {
       this._backgroundProcesses = this._backgroundProcesses.filter(p => p !== proc);
@@ -165,7 +167,9 @@ export class SandboxManager extends EventEmitter {
       cwd,
       shell: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
+    trackChildProcess(this._process);
 
     const onOutput = (chunk: Buffer): void => {
       const text = chunk.toString();
@@ -225,7 +229,9 @@ export class SandboxManager extends EventEmitter {
       cwd,
       shell: true,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
+    trackChildProcess(this._process);
 
     this._process.stdout?.on('data', (chunk: Buffer) => this.emit('output', chunk.toString()));
     this._process.stderr?.on('data', (chunk: Buffer) => this.emit('output', chunk.toString()));

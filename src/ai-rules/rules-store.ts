@@ -15,10 +15,15 @@ export interface AiRule {
 }
 
 export class AiRulesStore {
-  constructor(private readonly _globalStoragePath: string) {}
+  /**
+   * @param _globalStoragePath where the global tier lives, or null for a host with no
+   *   global storage (the headless CLI): the store then has the workspace tier only —
+   *   global rules read as empty and global writes are no-ops.
+   */
+  constructor(private readonly _globalStoragePath: string | null) {}
 
-  private _globalPath(): string {
-    return path.join(this._globalStoragePath, 'ai-rules.json');
+  private _globalPath(): string | null {
+    return this._globalStoragePath === null ? null : path.join(this._globalStoragePath, 'ai-rules.json');
   }
 
   private _workspacePath(cwd: string): string {
@@ -26,8 +31,10 @@ export class AiRulesStore {
   }
 
   getGlobalRules(): AiRule[] {
+    const globalPath = this._globalPath();
+    if (globalPath === null) { return []; }
     try {
-      return JSON.parse(fs.readFileSync(this._globalPath(), 'utf8')) as AiRule[];
+      return JSON.parse(fs.readFileSync(globalPath, 'utf8')) as AiRule[];
     } catch {
       return [];
     }
@@ -52,9 +59,11 @@ export class AiRulesStore {
   }
 
   private _saveGlobal(rules: AiRule[]): void {
+    const globalPath = this._globalPath();
+    if (globalPath === null) { return; }
     try {
-      fs.mkdirSync(path.dirname(this._globalPath()), { recursive: true });
-      fs.writeFileSync(this._globalPath(), JSON.stringify(rules, null, 2), 'utf8');
+      fs.mkdirSync(path.dirname(globalPath), { recursive: true });
+      fs.writeFileSync(globalPath, JSON.stringify(rules, null, 2), 'utf8');
     } catch { /* no-op */ }
   }
 

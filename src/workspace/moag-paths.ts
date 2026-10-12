@@ -30,6 +30,46 @@ export function getMoagPlanPath(): string | null {
   return path.join(dir, MOAG_FALLBACK_PLAN_FILE);
 }
 
+/**
+ * Pure migration for .gitignore's `.moag/` entry so `.moag/usage-log.jsonl`
+ * survives ignore rules (it must be committed — it is the Contribution
+ * Ledger's source of truth and needs to merge across branches).
+ *  (a) an exact bare `.moag/` (or `.moag`) line is replaced in place with
+ *      `.moag/*` followed by `!.moag/usage-log.jsonl` on the next line
+ *  (b) `.moag/*` present without the negation gets the negation appended
+ *  (c) neither present: both lines are appended
+ *  (d) idempotent — running twice never duplicates a line
+ * @param content Current .gitignore content (empty string if none)
+ */
+export function upgradeGitignoreForUsageLog(content: string): string {
+  const STAR = '.moag/*';
+  const NEGATION = '!.moag/usage-log.jsonl';
+
+  const endsWithNewline = content.length === 0 || content.endsWith('\n');
+  let lines = content.length === 0 ? [] : content.split('\n');
+  if (lines.length > 0 && endsWithNewline && lines[lines.length - 1] === '') {
+    lines = lines.slice(0, -1);
+  }
+
+  const bareIdx = lines.findIndex(l => {
+    const t = l.trim();
+    return t === '.moag/' || t === '.moag';
+  });
+  const hasStar = lines.some(l => l.trim() === STAR);
+  const hasNegation = lines.some(l => l.trim() === NEGATION);
+
+  if (bareIdx !== -1) {
+    lines.splice(bareIdx, 1, STAR, NEGATION);
+  } else if (hasStar && !hasNegation) {
+    lines.push(NEGATION);
+  } else if (!hasStar && !hasNegation) {
+    lines.push(STAR, NEGATION);
+  }
+  // else: both already present — no-op, keeps this idempotent
+
+  return lines.length === 0 ? '' : lines.join('\n') + '\n';
+}
+
 /** Ensure .moag/ directory exists */
 export function ensureMoagDir(): string | null {
   const dir = getMoagDir();
@@ -41,18 +81,31 @@ export function ensureMoagDir(): string | null {
       return null; // read-only FS or permission denied
     }
   }
-  // Add .moag/ to .gitignore if not already there
   const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   if (workspaceRoot) {
+    // Add / upgrade .moag/'s .gitignore entry so usage-log.jsonl is tracked.
     const gitignorePath = path.join(workspaceRoot, '.gitignore');
     try {
       const content = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, 'utf-8') : '';
-      if (!content.includes('.moag')) {
-        const newLine = content.endsWith('\n') ? '' : '\n';
-        fs.appendFileSync(gitignorePath, `${newLine}# MOAG agent orchestrator\n.moag/\n`);
-      }
+      const updated = upgradeGitignoreForUsageLog(content);
+      if (updated !== content) { fs.writeFileSync(gitignorePath, updated, 'utf-8'); }
     } catch {
       // ignore gitignore errors
+    }
+
+    // Best-effort: ensure usage-log.jsonl merges cleanly across branches
+    // instead of producing spurious conflicts.
+    const gitattributesPath = path.join(workspaceRoot, '.gitattributes');
+    const GITATTR_LINE = '.moag/usage-log.jsonl merge=union';
+    try {
+      const content = fs.existsSync(gitattributesPath) ? fs.readFileSync(gitattributesPath, 'utf-8') : '';
+      const hasLine = content.split('\n').some(l => l.trim() === GITATTR_LINE);
+      if (!hasLine) {
+        const newLine = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+        fs.appendFileSync(gitattributesPath, `${newLine}${GITATTR_LINE}\n`);
+      }
+    } catch {
+      // ignore gitattributes errors
     }
   }
   return dir;

@@ -8,6 +8,7 @@ import { HistoryStore } from '../history/store';
 import { TaskRunner } from '../runner/runner';
 import { designSystemCssTokens } from './design-system';
 import { SandboxState } from '../sandbox/sandbox-manager';
+import { ContributionLedgerPayload } from '../utils/contribution-ledger';
 
 // Diagnostic output channel for debugging dashboard issues
 const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
@@ -16,7 +17,7 @@ const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '11';
+const HTML_VERSION = '12';
 
 /** A fresh nonce per render; the CSP admits only the script carrying it. */
 function dashboardNonce(): string {
@@ -48,6 +49,7 @@ export class DashboardPanel {
     private readonly getSelectedPromptEngineId: () => string | undefined,
     private readonly submitPrompt: (prompt: string, engineId?: string) => Promise<boolean>,
     private readonly generatePlanFromPrompt: (prompt: string) => Promise<boolean>,
+    private readonly getContributionLedger: () => ContributionLedgerPayload | null,
   ) {
     this._panel = panel;
     // Register handlers BEFORE setting HTML so the initial webview-ready
@@ -64,7 +66,12 @@ export class DashboardPanel {
 
     // Resend state whenever the panel becomes visible (e.g. user switches tabs)
     this._panel.onDidChangeViewState(
-      () => { if (this._panel.visible) { this.update(); } },
+      () => {
+        if (this._panel.visible) {
+          this.update();
+          this.pushContributionLedger();
+        }
+      },
       null,
       this._disposables,
     );
@@ -80,6 +87,7 @@ export class DashboardPanel {
     getSelectedPromptEngineId: () => string | undefined,
     submitPrompt: (prompt: string, engineId?: string) => Promise<boolean>,
     generatePlanFromPrompt: (prompt: string) => Promise<boolean>,
+    getContributionLedger: () => ContributionLedgerPayload | null,
   ): DashboardPanel {
     const column = vscode.ViewColumn.Beside;
 
@@ -121,6 +129,7 @@ export class DashboardPanel {
       getSelectedPromptEngineId,
       submitPrompt,
       generatePlanFromPrompt,
+      getContributionLedger,
     );
     return DashboardPanel.currentPanel;
   }
@@ -218,6 +227,18 @@ export class DashboardPanel {
   }
 
   /** Push context memory info to the dashboard for the current task */
+  /**
+   * Push the Contribution Ledger rollup to the dashboard. Guarded on a
+   * non-null payload — a workspace with no .moag/ directory yet (or the
+   * feature disabled) simply leaves the section rendering its neutral,
+   * zero-data state instead of receiving a message.
+   */
+  public pushContributionLedger(): void {
+    const payload = this.getContributionLedger();
+    if (!payload) { return; }
+    this.safePostMessage({ type: 'contribution-ledger', ...payload });
+  }
+
   public postContextMemory(info: {
     taskId: string;
     taskName: string;
@@ -414,6 +435,7 @@ export class DashboardPanel {
         this.clearWebviewReadyFallback();
         this.update();
         this.replayHistoryCards();
+        this.pushContributionLedger();
         break;
       case 'play':
         vscode.commands.executeCommand('agentTaskPlayer.play');
@@ -1099,6 +1121,67 @@ export class DashboardPanel {
     }
     .status-bar .spacer { flex: 1; min-width: 0; }
 
+    /* ─── Contribution Ledger ─── */
+    .cl-section { border-top: 1px solid var(--border); flex-shrink: 0; }
+    .cl-content { padding: 8px 12px 10px; display: flex; flex-direction: column; gap: 10px; }
+
+    .cl-stats { display: flex; gap: 8px; }
+    .cl-stat-tile {
+      flex: 1; min-width: 0; border: 1px solid var(--border); border-radius: 4px;
+      padding: 6px 8px; text-align: center;
+    }
+    .cl-stat-value { font-size: 14px; font-weight: 700; color: var(--fg); }
+    .cl-stat-label { font-size: 9px; color: var(--dimmed); text-transform: uppercase; letter-spacing: 0.3px; margin-top: 2px; }
+
+    .cl-leaderboard { font-size: 11px; }
+    .cl-row {
+      display: flex; align-items: center; gap: 6px; padding: 4px 2px;
+      border-bottom: 1px solid var(--border);
+    }
+    .cl-row-head { color: var(--dimmed); font-size: 9px; text-transform: uppercase; letter-spacing: 0.3px; font-weight: 700; }
+    .cl-row:last-child { border-bottom: none; }
+    .cl-cell { flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cl-col-name { flex: 1; min-width: 0; }
+    .cl-col-tasks { width: 40px; text-align: right; }
+    .cl-col-total { width: 64px; text-align: right; }
+    .cl-col-secondary { width: 56px; text-align: right; }
+    .cl-badge-top {
+      display: inline-block; margin-left: 4px; padding: 0 5px; border-radius: var(--ds-radius-pill, 999px);
+      font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px;
+      background: rgba(79,163,255,0.15); color: var(--vscode-textLink-foreground);
+      vertical-align: middle;
+    }
+
+    .cl-empty { font-size: 11px; color: var(--dimmed); padding: 6px 2px; }
+
+    .cl-coaching-section { display: flex; flex-direction: column; gap: 4px; }
+    .cl-coaching-label { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.3px; color: var(--dimmed); }
+    .cl-card { border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+    .cl-card-header {
+      display: flex; align-items: center; gap: 6px; width: 100%;
+      padding: 5px 8px; border: none; background: none; color: var(--fg);
+      cursor: pointer; font-family: var(--vscode-font-family); font-size: 11px; text-align: left;
+    }
+    .cl-card-header:hover { background: var(--hover-bg); }
+    .cl-card-chevron { font-size: 9px; color: var(--dimmed); flex-shrink: 0; transform: rotate(0deg); transition: transform 0.15s; }
+    .cl-card-header[aria-expanded="true"] .cl-card-chevron { transform: rotate(90deg); }
+    .cl-card-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cl-card-score { font-size: 9px; color: var(--warning); flex-shrink: 0; }
+    .cl-card-body { display: none; border-top: 1px solid var(--border); padding: 6px 8px 8px; }
+    .cl-card-body.expanded { display: block; }
+    .cl-card-flags { font-size: 9px; color: var(--dimmed); margin-bottom: 4px; }
+    .cl-card-prompt {
+      font-family: var(--vscode-editor-font-family, monospace); font-size: 10px; line-height: 1.4;
+      color: var(--terminal-fg); background: var(--terminal-bg); padding: 6px 8px; border-radius: 3px;
+      max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+    }
+
+    .cl-footnote { font-size: 9px; color: var(--dimmed); line-height: 1.4; }
+
+    @media (max-width: 520px) {
+      .cl-col-secondary { display: none; }
+    }
+
   </style>
 </head>
 <body>
@@ -1231,6 +1314,62 @@ export class DashboardPanel {
             <div class="sandbox-screenshot-label">Last screenshot (attached to next task)</div>
             <img class="sandbox-screenshot-thumb" id="sandbox-screenshot-img" src="" alt="screenshot" />
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Contribution Ledger — cost/usage attribution + prompt coaching. Always
+         in the DOM (never hidden) and collapsed by default; content is filled
+         in by the webview script from a 'contribution-ledger' message. The
+         coaching-card prompt box shows the short, human-written task prompt
+         only — never assembled buildContext() output. -->
+    <div class="cl-section" id="cl-section">
+      <button class="section-toggle collapsed" data-section="contribution-ledger"
+              onclick="toggleSection('contribution-ledger')"
+              aria-expanded="false" aria-controls="body-contribution-ledger">
+        <span class="section-toggle-icon">&#x25BC;</span>
+        <span class="section-toggle-label">Contribution Ledger</span>
+        <span class="section-toggle-count" id="cl-count"></span>
+      </button>
+      <div class="section-body collapsed" id="body-contribution-ledger">
+        <div class="cl-content" id="cl-content">
+          <div class="cl-stats" id="cl-stats">
+            <div class="cl-stat-tile">
+              <div class="cl-stat-value" id="cl-stat-tokens">—</div>
+              <div class="cl-stat-label">Tokens this week</div>
+            </div>
+            <div class="cl-stat-tile">
+              <div class="cl-stat-value" id="cl-stat-cost">—</div>
+              <div class="cl-stat-label">Est. cost this week</div>
+            </div>
+            <div class="cl-stat-tile">
+              <div class="cl-stat-value" id="cl-stat-contributors">—</div>
+              <div class="cl-stat-label">Contributors</div>
+            </div>
+          </div>
+
+          <div class="cl-leaderboard" id="cl-leaderboard" role="table" aria-label="Contribution leaderboard, last 7 days">
+            <div class="cl-row cl-row-head" role="row">
+              <span class="cl-cell cl-col-name" role="columnheader">Contributor</span>
+              <span class="cl-cell cl-col-tasks" role="columnheader">Tasks</span>
+              <span class="cl-cell cl-col-secondary" role="columnheader">Tokens in</span>
+              <span class="cl-cell cl-col-secondary" role="columnheader">Tokens out</span>
+              <span class="cl-cell cl-col-total" role="columnheader">Total tokens</span>
+              <span class="cl-cell cl-col-secondary" role="columnheader">Cost</span>
+              <span class="cl-cell cl-col-secondary" role="columnheader">Tokens/task</span>
+            </div>
+            <div id="cl-leaderboard-body"></div>
+          </div>
+          <button class="completed-show-all" id="cl-show-all" hidden></button>
+
+          <div class="cl-empty" id="cl-empty" hidden>No usage recorded in the last 7 days.</div>
+
+          <div class="cl-coaching-section" id="cl-coaching-section">
+            <div class="cl-coaching-label" id="cl-coaching-label" hidden>Prompt coaching</div>
+            <div id="cl-coaching-list"></div>
+          </div>
+
+          <div class="cl-footnote" id="cl-footnote"></div>
         </div>
       </div>
     </div>

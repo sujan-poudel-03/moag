@@ -144,3 +144,21 @@ export function describeIsolationFailure(reason: IsolationFailure): string {
       return 'Concurrent playlists need agentTaskPlayer.git.autoCommit so each playlist can commit inside its own checkout. Running playlists one at a time instead.';
   }
 }
+
+/**
+ * Add one worktree at `wtPath` with `branch` checked out, (re)pointing the branch at
+ * `startPoint` (`git worktree add -B`). Used by the ONOSOO remote child, which runs
+ * every remote run in its own worktree of a runner-owned mirror. Never throws.
+ */
+export async function addBranchWorktree(
+  repo: string,
+  wtPath: string,
+  branch: string,
+  startPoint: string,
+  git: GitRunner,
+): Promise<{ ok: boolean; detail: string }> {
+  const out = await git(['worktree', 'add', '-B', branch, wtPath, startPoint], repo);
+  return out === null
+    ? { ok: false, detail: `Could not create a worktree for ${branch} at ${startPoint}.` }
+    : { ok: true, detail: out };
+}

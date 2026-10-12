@@ -1,5 +1,22 @@
 import { strict as assert } from 'assert';
-import { TaskStatus, RunnerState } from '../../../models/types';
+import {
+  TaskStatus, RunnerState, DEPENDENCY_ECOSYSTEMS, DEPENDENCY_EVENT_NAMES, DEPENDENCY_STAGES, DEPENDENCY_TRIGGERS,
+} from '../../../models/types';
+
+describe('dependency-install enumerations are closed', () => {
+  it('pins the ecosystems', () => {
+    assert.deepEqual([...DEPENDENCY_ECOSYSTEMS], ['npm', 'pnpm', 'yarn', 'python', 'go', 'dotnet', 'maven', 'gradle', 'cargo']);
+  });
+  it('pins the event names', () => {
+    assert.deepEqual([...DEPENDENCY_EVENT_NAMES], ['dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed']);
+  });
+  it('pins the stages', () => {
+    assert.deepEqual([...DEPENDENCY_STAGES], ['task', 'verify', 'standards', 'bench']);
+  });
+  it('pins the triggers', () => {
+    assert.deepEqual([...DEPENDENCY_TRIGGERS], ['manifest-changed', 'install-dir-missing', 'first-seen']);
+  });
+});
 
 describe('TaskStatus', () => {
   it('should have 7 members', () => {

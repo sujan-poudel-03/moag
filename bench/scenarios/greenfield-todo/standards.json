@@ -1,0 +1,35 @@
+{
+  "stackTemplateId": "node-ts",
+  "repoState": "greenfield",
+  "structure": {
+    "requiredDirs": [],
+    "allowedTopLevel": [
+      "src", "test", "tests", "bin", "docs", "scripts",
+      ".*", "*.md", "LICENSE*", "*.json", "*.js", "*.cjs", "*.mjs", "*.ts"
+    ],
+    "placement": [
+      { "id": "ts-tests", "files": "**/*.test.ts", "under": ["src", "test", "tests"] },
+      { "id": "js-tests", "files": "**/*.test.js", "under": ["src", "test", "tests"] }
+    ]
+  },
+  "frontend": { "componentKit": "", "styleSource": "", "rawPatterns": [] },
+  "backend": { "layers": [], "forbiddenImports": [], "importAliases": [] },
+  "naming": {
+    "files": [{ "globs": ["src/**/*.ts", "bin/**/*.js", "test/**/*.js", "tests/**/*.js"], "style": "kebab-case" }],
+    "notes": "Test files end in .test.ts or .test.js"
+  },
+  "comments": {
+    "maxDensityPct": 30,
+    "minAddedLines": 20,
+    "forbidCommentedOutCode": true,
+    "bannedPhrases": ["// rest of the code", "// implementation goes here", "// your code here", "... rest of the code ...", "... existing code ..."]
+  },
+  "testing": {
+    "runner": "npm test",
+    "fileGlobs": ["**/*.test.ts", "**/*.test.js"],
+    "notes": "npm test must exit 0 and cover every requirement"
+  },
+  "commands": [{ "label": "Test", "run": "npm test" }],
+  "builtInRuleIds": ["builtin-clean-code", "builtin-self-documenting", "builtin-tdd", "builtin-error-handling"],
+  "freeText": "The command-line entry point lives in bin/. Persisted data is plain JSON. No runtime dependencies beyond Node.js itself."
+}

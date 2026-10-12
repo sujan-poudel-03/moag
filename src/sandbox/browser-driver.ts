@@ -77,7 +77,7 @@ export async function capturePageScreenshotDetailed(
   const args = [runner.bin, 'screenshot', '--full-page', url, outputPath];
 
   const success = await new Promise<boolean>((resolve) => {
-    const proc = spawn(args[0], args.slice(1), { cwd, shell: true, stdio: 'pipe' });
+    const proc = spawn(args[0], args.slice(1), { cwd, shell: true, stdio: 'pipe', windowsHide: true });
     const timer = setTimeout(() => { proc.kill(); resolve(false); }, SCREENSHOT_TIMEOUT_MS);
     proc.on('exit', (code) => {
       clearTimeout(timer);
@@ -107,7 +107,7 @@ export async function runPlaywrightSpec(specFile: string, cwd: string): Promise<
   const args = [runner.bin, 'test', specFile, '--reporter=line'];
 
   return new Promise((resolve) => {
-    const proc = spawn(args[0], args.slice(1), { cwd, shell: true, stdio: 'pipe' });
+    const proc = spawn(args[0], args.slice(1), { cwd, shell: true, stdio: 'pipe', windowsHide: true });
     let output = '';
     proc.stdout?.on('data', (chunk: Buffer) => { output += chunk.toString(); });
     proc.stderr?.on('data', (chunk: Buffer) => { output += chunk.toString(); });

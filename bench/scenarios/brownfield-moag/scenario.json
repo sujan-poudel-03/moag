@@ -1,0 +1,31 @@
+{
+  "name": "brownfield-moag",
+  "description": "A fresh clone of this repository at the HEAD of feat/sdlc-automation (never the live working tree) gets one small, testable PRD: a USD formatting helper with its own mocha test file.",
+  "repo": { "kind": "clone", "path": "../../..", "ref": "feat/sdlc-automation" },
+  "setupCommands": ["npm ci", "npm run compile"],
+  "stack": "node-ts",
+  "engine": "claude",
+  "budgetUsd": 5,
+  "perCallCapUsd": 1.0,
+  "minVersionUsd": 1,
+  "reserveFactor": 1.5,
+  "versionTimeoutMin": 60,
+  "passEnv": ["NODE_OPTIONS"],
+  "gateTimeoutMs": 1800000,
+  "gateCommands": [
+    "npm run compile",
+    "npx mocha --require ts-node/register src/test/unit/utils/usd-format.test.ts"
+  ],
+  "allowedCommands": [
+    "npm run lint",
+    "npm test",
+    "npm run test",
+    "npx mocha --require ts-node/register \"src/test/unit/utils/usd-format.test.ts\""
+  ],
+  "environmentProbes": ["npm test"],
+  "versions": [
+    { "id": "v1", "prdFile": "prd/v1.md", "intendedBump": "initial", "dryRunFixture": "dry-run/v1" }
+  ],
+  "dryRun": { "planCommand": "npx mocha --require ts-node/register src/test/unit/utils/usd-format.test.ts" },
+  "standardsProfile": "standards.json"
+}

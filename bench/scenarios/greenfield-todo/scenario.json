@@ -1,0 +1,31 @@
+{
+  "name": "greenfield-todo",
+  "description": "A Node + TypeScript command-line todo app built from an empty repository across three PRD versions: v1 initial (add/list/complete, JSON persistence, npm test), v2 wording and bugfix edits (intended patch), v3 due dates and an overdue filter (minor).",
+  "repo": { "kind": "template", "templateDir": "template" },
+  "setupCommands": [],
+  "stack": "node-ts",
+  "engine": "claude",
+  "budgetUsd": 10,
+  "perCallCapUsd": 1.0,
+  "minVersionUsd": 1,
+  "reserveFactor": 1.5,
+  "versionTimeoutMin": 60,
+  "passEnv": [],
+  "gateCommands": ["npm test"],
+  "gateTimeoutMs": 600000,
+  "allowedCommands": [
+    "npm run test",
+    "npm run build",
+    "npm install",
+    "npm ci",
+    "npm install && npm test",
+    "npm run build && npm test"
+  ],
+  "versions": [
+    { "id": "v1", "prdFile": "prd/v1.md", "intendedBump": "initial", "dryRunFixture": "dry-run/v1" },
+    { "id": "v2", "prdFile": "prd/v2.md", "intendedBump": "patch", "dryRunFixture": "dry-run/v2" },
+    { "id": "v3", "prdFile": "prd/v3.md", "intendedBump": "minor", "dryRunFixture": "dry-run/v3" }
+  ],
+  "dryRun": { "planCommand": "npm test" },
+  "standardsProfile": "standards.json"
+}

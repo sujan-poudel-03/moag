@@ -951,3 +951,76 @@ describe('Context Builder — role charter', () => {
     assert.ok(!result.includes('## AI Rules'), 'AI Rules should have been squeezed out first');
   });
 });
+
+// ─── Project standards section ───
+
+describe('Context Builder — project standards', () => {
+  const STANDARDS = 'Project standards v3 · stack node-ts · brownfield repository\n### Naming\n- src/**/*.ts: kebab-case file names';
+
+  function build(over: Record<string, unknown> = {}, settingsOver: Record<string, unknown> = {}): string {
+    const { plan, playlist, tasks } = makePlanWithTasks();
+    const settings = { ...defaultSettings(), projectState: false, changedFiles: false, priorTaskOutputs: false, cumulativeProgress: false, ...settingsOver };
+    return buildContext({
+      plan, playlist, task: tasks[1], cwd: '/mock/workspace', historyStore: createMockHistoryStore(), settings,
+      roleCharter: 'You are the engineer.',
+      aiRules: '### Clean Code\nWrite clean, readable code',
+      knowledge: 'npm test passes here',
+      ...over,
+    } as never);
+  }
+
+  const headers = (ctx: string): string[] => ctx.split('\n').filter((l) => l.startsWith('## '));
+
+  it('emits ## Project Standards directly before ## AI Rules, after the role', () => {
+    const ctx = build({ standards: STANDARDS });
+    assert.deepEqual(headers(ctx).slice(0, 4), ['## Role', '## Project Standards', '## AI Rules', '## Verified Project Knowledge']);
+    assert.ok(ctx.includes(`## Project Standards\n${STANDARDS}\n\n## AI Rules\n`), 'nothing sits between the two sections');
+  });
+
+  it('emits no section when no standards are given, or only whitespace', () => {
+    assert.ok(!build().includes('## Project Standards'));
+    assert.ok(!build({ standards: '   \n' }).includes('## Project Standards'));
+  });
+
+  it('keeps the block whole when the budget is smaller than the block, dropping everything else', () => {
+    const big = `${STANDARDS}\n${'- a rule line that takes up room\n'.repeat(60)}`.trim();
+    const ctx = build({ standards: big }, { maxContextChars: 200 });
+    assert.ok(ctx.includes(`## Project Standards\n${big}`), 'the whole block survives');
+    assert.ok(!ctx.includes('[truncated]'), 'the pinned block is never cut');
+    assert.deepEqual(headers(ctx), ['## Project Standards'], 'every other section gave way');
+  });
+
+  it('charges the block against the shared budget, so lower-priority sections drop earlier', () => {
+    const settings = { maxContextChars: 400 };
+    const without = build({}, settings);
+    assert.ok(without.includes('## Plan'), 'the plan overview fits when there are no standards');
+    const withStandards = build({ standards: `${STANDARDS}\n${'x'.repeat(150)}` }, settings);
+    assert.ok(withStandards.includes('## Project Standards'));
+    assert.ok(!withStandards.includes('## Plan'), 'the plan overview is what gives way');
+    assert.ok(withStandards.includes('## Role'), 'higher-priority sections are still kept');
+  });
+
+  it('reports the section in the budget telemetry', () => {
+    const { plan, playlist, tasks } = makePlanWithTasks();
+    const budgetUsage = { totalCharsUsed: 0, totalCharsBudget: 0, sectionsDropped: 0, usedSemanticRetrieval: false, semanticSpansReturned: 0 } as {
+      totalCharsUsed: number; sectionsDropped: number; sectionBreakdown?: Record<string, number>;
+    };
+    buildContext({
+      plan, playlist, task: tasks[1], cwd: '/mock/workspace', historyStore: createMockHistoryStore(),
+      settings: { ...defaultSettings(), projectState: false, changedFiles: false, priorTaskOutputs: false, cumulativeProgress: false },
+      standards: STANDARDS, budgetUsage,
+    } as never);
+    assert.equal(budgetUsage.sectionBreakdown?.['Project Standards'], '## Project Standards'.length + 1 + STANDARDS.length + 2);
+    assert.equal(budgetUsage.sectionsDropped, 0);
+  });
+
+  it('emits ## Design System right after the standards; pinned, so a budget smaller than both keeps both whole', () => {
+    const design = `Design system v3 · DESIGN.md at docs/design/DESIGN.md · tokens in src/styles/tokens.css\n${'--color-x: #ffffff\n'.repeat(40)}`.trim();
+    const big = `${STANDARDS}\n${'- a rule line that takes up room\n'.repeat(60)}`.trim();
+    const ctx = build({ standards: big, design }, { maxContextChars: 300 });
+    assert.deepEqual(headers(ctx), ['## Project Standards', '## Design System'], 'every other section gave way');
+    assert.ok(ctx.includes(`## Project Standards\n${big}\n\n## Design System\n${design}`), 'both whole, standards first, never cut by the design');
+    assert.ok(!ctx.includes('[truncated]'));
+    assert.ok(!build({ standards: STANDARDS }).includes('## Design System'), 'no design, no section');
+  });
+});

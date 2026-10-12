@@ -100,6 +100,22 @@ describe('git-delivery — prepareBranch guards', () => {
     assert.ok(!calls.some((c) => c[0] === 'checkout' && c[1] === '-b'));
   });
 
+  it('opts.branch: an existing branch is checked out, not created', async () => {
+    const { git, calls } = stubGit({ ...CLEAN, 'rev-parse --verify': 'abc123' });
+    const out = await prepareBranch('/x', 'Nightly', 'run-1', CFG, git, { branch: 'moag/given-branch' });
+    assert.deepStrictEqual(out, { ok: true, branch: 'moag/given-branch', created: false });
+    assert.ok(calls.some((c) => c[0] === 'rev-parse' && c[3] === 'refs/heads/moag/given-branch'));
+    assert.ok(calls.some((c) => c[0] === 'checkout' && c[1] === 'moag/given-branch'));
+    assert.ok(!calls.some((c) => c[0] === 'checkout' && c[1] === '-b'));
+  });
+
+  it('opts.branch: a missing branch is created under that exact name', async () => {
+    const { git, calls } = stubGit(CLEAN);
+    const out = await prepareBranch('/x', 'Nightly', 'run-1', CFG, git, { branch: 'moag/new-one' });
+    assert.strictEqual((out as { branch: string }).branch, 'moag/new-one');
+    assert.ok(calls.some((c) => c[0] === 'checkout' && c[1] === '-b' && c[2] === 'moag/new-one'));
+  });
+
   it('never pushes', async () => {
     const { git, calls } = stubGit(CLEAN);
     await prepareBranch('/x', 'p', 'r', CFG, git);
@@ -128,6 +144,31 @@ describe('git-delivery — commitTask', () => {
     assert.strictEqual((out as { sha: string }).sha, 'abc1234');
     assert.ok(calls.some((c) => c[0] === 'commit' && c[1] === '-m'));
   });
+
+  it('reads the full sha alongside the short one', async () => {
+    const { git } = stubGit({
+      add: '', 'diff --cached': 'a.ts', commit: 'ok', 'rev-parse --short': 'abc1234', 'rev-parse HEAD': 'a'.repeat(40) + '\n',
+    });
+    const out = await commitTask(req, git);
+    assert.deepStrictEqual(out, { committed: true, sha: 'abc1234', fullSha: 'a'.repeat(40) });
+  });
+
+  it('accepts a 64-hex (sha256) full sha', async () => {
+    const { git } = stubGit({
+      add: '', 'diff --cached': 'a.ts', commit: 'ok', 'rev-parse --short': 'abc1234', 'rev-parse HEAD': 'b'.repeat(64),
+    });
+    assert.strictEqual((await commitTask(req, git) as { fullSha: string | null }).fullSha, 'b'.repeat(64));
+  });
+
+  for (const [label, reply] of [['unrouted (empty)', ''], ['failed', null], ['garbage', 'not-a-sha'], ['short', 'abc1234']] as Array<[string, string | null]>) {
+    it(`fullSha is null when rev-parse HEAD is ${label}`, async () => {
+      const { git } = stubGit({ add: '', 'diff --cached': 'a.ts', commit: 'ok', 'rev-parse --short': 'abc1234', 'rev-parse HEAD': reply });
+      const out = await commitTask(req, git);
+      assert.strictEqual(out.committed, true);
+      assert.strictEqual((out as { sha: string }).sha, 'abc1234');
+      assert.strictEqual((out as { fullSha: string | null }).fullSha, null);
+    });
+  }
 
   it('treats a no-op task as nothing-to-commit, not a failure', async () => {
     const { git, calls } = stubGit({ add: '', 'diff --cached': '' });

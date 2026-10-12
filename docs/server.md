@@ -1,0 +1,869 @@
+# MOAG hosted server (Product Owner web app)
+
+The server lets a team use MOAG from a browser. A product owner writes and versions a PRD. A reviewer approves the generated delta plan. Coding agents run it inside a per-project workspace on the server, within a cost cap. An approver signs off the ship gate. Every step is recorded in an audit log under the user who took it.
+
+It is a Node 20 process (`out/server/main.js`) with no database. All state lives in one data directory. It never loads the VS Code API: agent work runs in short-lived worker child processes under the headless shim, the same path `moag run` uses.
+
+**Running agents on a server is remote code execution by design.** Read [Threat model](#threat-model) before exposing this to anyone.
+
+To measure the whole flow end to end (PRD versions, plans, runs and ship gates, with cost and human interventions recorded), see [docs/benchmark.md](benchmark.md) (`moag bench`).
+
+## Quick start (Docker)
+
+```bash
+docker build -t moag-server .
+
+docker run --init -d --name moag -p 8080:8080 \
+  -v moag-data:/data \
+  -v /etc/moag/master.key:/run/secrets/moag_master_key:ro \
+  -e MOAG_PUBLIC_URL=https://moag.example.com \
+  -e MOAG_TRUST_PROXY=1 \
+  -e MOAG_MASTER_KEY_FILE=/run/secrets/moag_master_key \
+  -e MOAG_BOOTSTRAP_TOKEN="$(openssl rand -base64 32)" \
+  moag-server
+```
+
+Then check it is up:
+
+```bash
+curl -fsS http://localhost:8080/healthz              # {"ok":true}
+curl -fsS http://localhost:8080/api/bootstrap/status # {"needed":true} until the first admin exists
+```
+
+The image:
+
+- builds and runs on `node:20-bookworm-slim`
+- runs as the non-root user `moag` (uid 10001)
+- keeps every piece of state on the `/data` volume
+- exposes port 8080 and has a `HEALTHCHECK` against `/healthz`
+- does **not** set `CI` (see [The CI lock](#the-ci-lock))
+
+Use `--init` (or `tini`). Engine CLIs run in their own process groups. If a worker has to be force-killed, an init process reaps the orphans.
+
+## Configuration
+
+Everything is configured with environment variables, validated once at boot. A bad value stops the server with a message. It never falls back silently.
+
+| Variable | Required | Meaning |
+|---|---|---|
+| `MOAG_DATA_DIR` | yes | Data directory. The image sets `/data`. Created with mode 0700. |
+| `MOAG_PUBLIC_URL` | yes | The URL users type, such as `https://moag.example.com`. It decides cookie security and the allowed `Origin`. |
+| `MOAG_PROJECTS_ROOT` | no | Where project workspaces live. Default `<data>/workspaces`. Projects can only be created inside it. |
+| `MOAG_HOST` / `MOAG_PORT` | no | Listen address. Defaults `127.0.0.1` / `8080`; the image sets `0.0.0.0`. |
+| `MOAG_TRUST_PROXY` | no | `1` to take the client IP from `X-Forwarded-For` (rightmost hop). Set it only behind your proxy. |
+| `MOAG_BOOTSTRAP_TOKEN` | until an admin exists | One-time token, 24+ characters, used to create the first admin. |
+| `MOAG_MASTER_KEY_FILE` or `MOAG_MASTER_KEY` | for API keys | Master secret for encrypting engine API keys, 16+ characters. The file must be **outside** the data dir. |
+| `MOAG_MAX_CONCURRENT_JOBS` | no | Worker processes server-wide, 1–8, default 2. Extra requests get 429. There is no queue. |
+| `MOAG_MAX_USD_PER_ENGINE_CALL` | no | Cap in USD on any single Claude call, greater than 0 and at most 1000. Passed as `--max-budget-usd`, together with what remains of the version cap (the smaller wins). See [Cost reporting](#cost-reporting). |
+| `MOAG_GATE_TIMEOUT_MS` | no | How long, in milliseconds, verify lets one gate command (for example `npm test`) run in a run job: a whole number from 1000 to 3600000. Default 600000. A command still running then is killed and the gate fails, so nothing ships. A project cannot change it: the server never reads the repository's `.moag/config.json`. |
+| `MOAG_AUTO_INSTALL_DEPENDENCIES` | no | Install a project's dependencies automatically before a step that needs them (see [Dependency installs](#dependency-installs)). `1`/`true`/`yes` or `0`/`false`/`no`; unset means on. Any other value stops the server. |
+| `MOAG_INSTALL_IGNORE_SCRIPTS` | no | `1` to add `--ignore-scripts` to npm, pnpm and Yarn 1 installs (`--mode=skip-build` on Yarn 2+), so package lifecycle scripts do not run during automatic installs. Default off. |
+| `MOAG_RUN_ENV_PASSTHROUGH` | no | Comma-separated extra variable names passed to agents (see [below](#moag_run_env_passthrough)). |
+| `MOAG_ALLOW_SSH_CLONE` | no | `1` to allow `ssh://` clone URLs as well as `https://`. |
+
+`MOAG_MASTER_KEY` and `MOAG_BOOTSTRAP_TOKEN` are deleted from the server's `process.env` after they are read, so no child inherits them. The kernel still keeps the startup environment (`/proc/<pid>/environ`). Prefer `MOAG_MASTER_KEY_FILE`.
+
+## TLS with a reverse proxy
+
+The server speaks plain HTTP. Terminate TLS in a reverse proxy and set:
+
+- `MOAG_PUBLIC_URL=https://…`. With an https public URL, the session cookie becomes `__Host-moag_sid; Secure; HttpOnly; SameSite=Lax; Path=/`, and HSTS is sent.
+- `MOAG_TRUST_PROXY=1`, so the login rate limiter sees real client IPs.
+- Bind the server to a private address, or don't publish its port. A client that reaches it directly can forge `X-Forwarded-For` when `MOAG_TRUST_PROXY=1`.
+
+The proxy must forward `Host`. It must not buffer Server-Sent Events (`/api/projects/:id/events`); the server sends `X-Accel-Buffering: no` for nginx.
+
+**Caddy**
+
+```caddy
+moag.example.com {
+  reverse_proxy 127.0.0.1:8080 {
+    flush_interval -1
+  }
+}
+```
+
+**nginx**
+
+```nginx
+server {
+  listen 443 ssl http2;
+  server_name moag.example.com;
+  ssl_certificate     /etc/letsencrypt/live/moag.example.com/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/moag.example.com/privkey.pem;
+  client_max_body_size 2m;
+
+  location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_buffering off;          # Server-Sent Events
+    proxy_read_timeout 1h;
+  }
+}
+```
+
+With `http://` public URLs (local trials only), cookies are not `Secure`.
+
+## Bootstrap: the first admin
+
+1. Start the server with `MOAG_BOOTSTRAP_TOKEN` set to a random string of 24+ characters. The server refuses to start when no admin exists and no token is set.
+2. Open the public URL. While no admin exists, the app shows **Create the first admin**. Enter the token, a username and a password (12–256 characters).
+3. Once an admin exists, `/api/bootstrap` returns 404 for good. Remove the token from the environment on the next restart.
+
+Wrong bootstrap tokens are rate-limited **per client IP** (the same limiter as sign-in: 5 wrong tokens lock that IP for 15 minutes, before the token is even compared). One guessing client cannot lock out the operator, who signs in from another address. Behind a proxy this needs `MOAG_TRUST_PROXY=1`; otherwise every client shares the proxy's IP.
+4. The admin creates everyone else under **Users**. New users get a temporary password and must change it at first sign-in.
+
+Roles are `product-owner`, `reviewer`, `approver` and `admin`. One user can hold several. The server always keeps at least one active admin.
+
+Changing a user's roles, disabling them or setting a temporary password (`PATCH /api/admin/users/:id`) signs that user out of every session. When the admin changes **their own** account, that includes the session the request came on: the answer is `200` with `"sessionEnded": true` beside the user, and every later request on that session is `401 unauthenticated` (a signed-in user who lacks a permission gets `403 forbidden` instead). The web app then goes to the sign-in page with "Your roles changed, so you were signed out. Sign in again." (or "Your account changed, …" for a disable or password change), never the "no permission" message.
+
+## Engine CLIs and API keys
+
+The base image ships no engine CLIs. Install them in a derived image. Log in as the `moag` user, with `HOME` on the data volume so the login survives container upgrades:
+
+```dockerfile
+FROM moag-server
+USER root
+RUN npm install -g @anthropic-ai/claude-code @openai/codex @google/gemini-cli
+USER moag
+ENV HOME=/data/home
+```
+
+```bash
+docker exec -it moag mkdir -p /data/home
+docker exec -it moag claude      # complete the login flow once
+```
+
+Ollama can run as a sidecar. Point at it with `OLLAMA_HOST`, which is always passed to agents.
+
+**Admin → Engines** shows which CLIs the server found (a `--version` probe, run at boot and on **Re-check**). The probe spawns the command exactly as a run does: on Windows through cmd.exe, so it reports the binary cmd resolves by PATH order and PATHEXT (an npm `claude.cmd` earlier on PATH wins over a `claude.exe` later on it), and the version shown is the version a run starts. A configured command that is not a plain name or path (spaces, quotes or shell characters) is never put on a shell line by the probe; it shows no version. MOAG makes no live provider call to check sign-in, so CLI auth always shows "unknown". `copilot` and `custom` are not supported in the web app. A run whose engine the probe did not find is refused with "isn't installed on this server".
+
+The **anthropic** API key is set on the Engines screen:
+
+- It is stored encrypted at rest in `<data>/secrets.json` (mode 0600), using AES-256-GCM under a key derived with HKDF-SHA256 from the master secret.
+- The browser only ever gets back "set", its last 4 characters and when it was set.
+- The audit log records "key set" / "key cleared" and never any characters of the key.
+- Without a master key, setting a key returns 503. The rest of the server works.
+- A key is decrypted only for a job whose plan references that engine, and is injected as that job's `ANTHROPIC_API_KEY`. Jobs on other engines never see it.
+- If the master key changes, stored keys show **Key unreadable**. Set them again.
+
+### Cost reporting
+
+The per-version cost cap is enforced against the engine's **own** cost figure wherever one exists.
+
+- **Claude jobs run in JSON mode.** Every server job (runs and plan generation) runs `claude -p --output-format json`, and the cap uses the CLI-reported `total_cost_usd` of each call. The extension keeps `text` mode by default, so VS Code users still see live output.
+- **Every Claude call gets `--max-budget-usd`**, set to the smaller of what remains of the version cap and `MOAG_MAX_USD_PER_ENGINE_CALL`. With neither set, no flag is passed.
+- **Every engine call reaches the run's `cost` events** with a `source`:
+  - `reported`: the engine's own figure.
+  - `estimated`: MOAG derived it (another engine's text output or a price table).
+  - `none`: the call reported no cost at all, for example when it was killed, timed out or printed unparsable output. These calls are **counted but add $0**, and only the per-call cap bounds what they spent.
+- In JSON mode Claude streams no live output. The answer arrives when the call ends, and error tails come from Claude's `result` text.
+- A Claude CLI too old to know `--output-format` or `--max-budget-usd` exits with an error, so its jobs fail rather than run without a cost figure. Upgrade the CLI on the server.
+- If the CLI is signed in with a Claude subscription rather than an API key, `total_cost_usd` is a notional figure, not what you are billed.
+
+### Planner lockdown and `allowPlannerFileAccess`
+
+Plan generation is triggered by a product owner, so the planning agent runs with its tools locked down as far as each engine allows. The server's `git ls-files` listing, placed in the prompt as a context section before the output-format rules, is meant to be its only view of the repository. What is enforced differs per engine:
+
+| Engine | How plan generation is locked down |
+|---|---|
+| `claude` | `-p --strict-mcp-config --tools ""`: every built-in tool is removed and no MCP server loads. |
+| `codex` | `exec --skip-git-repo-check --sandbox read-only --disable shell_tool --disable unified_exec -c shell_environment_policy.inherit=none`: no shell or exec tool, and a read-only sandbox. Whether Codex can still read files through a non-shell built-in tool is **unverified**, so a Codex planner may be able to read files the server uid can read. |
+| `ollama` | `ollama run` is a plain completion with no tools. |
+| `gemini`, `anthropic` | Cannot be restricted: Gemini CLI has no flag that removes its file tools, and the anthropic API adapter always offers `read_file`, `write_file`, `list_directory` and `run_bash` (plus `take_screenshot` and `run_playwright_test`). Refused with `409 planner-file-access` (no worker, no plan record) unless an admin turns on `allowPlannerFileAccess`. |
+
+`allowPlannerFileAccess` (default **off**) is an admin setting, stored in `<data>/server-settings.json`:
+
+```bash
+GET   /api/admin/settings                                   # admin only
+PATCH /api/admin/settings  {"allowPlannerFileAccess": true}  # admin only, CSRF-protected
+```
+
+- Each change of the value is audited as `settings.update` with the before and after values. A PATCH that changes nothing is not audited.
+- While it is on, the `plan.generate` audit entry of a plan generated on gemini or anthropic carries `plannerFileAccess: true`.
+- It only unlocks the engines in the last row. Claude and Codex plans stay locked down either way.
+- On **anthropic** it grants **shell execution and file writes**, not just reads: the planner gets `run_bash` and `write_file` and runs them as the server uid. On **gemini** the planner gets its full default tool set.
+- A malformed settings file reads as off.
+
+### Master key
+
+Generate it once and keep it **out of the data volume**, so a copy of `/data` alone never contains both the ciphertext and the key:
+
+```bash
+sudo install -d -m 0700 /etc/moag
+openssl rand -base64 48 | sudo tee /etc/moag/master.key >/dev/null
+sudo chown 10001 /etc/moag/master.key && sudo chmod 0400 /etc/moag/master.key
+```
+
+Mount it read-only (as a file or a Docker/Swarm/Kubernetes secret) and set `MOAG_MASTER_KEY_FILE`. The server refuses to start if that path resolves inside `MOAG_DATA_DIR`. Back the key up separately from the data volume.
+
+## Data volume and backups
+
+```
+/data
+  users.json  sessions.json  projects.json   accounts, hashed session ids, project registry
+  audit.jsonl (+ audit-<ts>.jsonl)           append-only audit log, rotated at 20 MB, never deleted
+  secrets.json                               encrypted engine keys (0600)
+  outcomes.jsonl                             stack-recommendation evidence
+  probe/                                     engine probe job files
+  projects/<id>/plan.json                    canonical plan (outside the workspace)
+  projects/<id>/state.json                   plans under review, runs, spend per PRD version
+  projects/<id>/standards.json               every proposed version of the project standards (0600)
+  projects/<id>/runs/<runId>/                job, config, plan snapshot, events, standards job file and report
+  projects/<id>/plans/<planId>/              plan-generation job, repo file listing, standards job file, outcome; work/ = its empty cwd
+  workspaces/<name>/                         the git checkouts agents work in
+```
+
+Every JSON file is written atomically (temp file then rename), so a file is never half-written. Two ways to back up:
+
+- **Consistent:** `docker stop moag`, copy the volume (`docker run --rm -v moag-data:/data -v "$PWD":/backup busybox tar czf /backup/moag-data.tgz -C /data .`), then start it again.
+- **Live:** `cp -a /data <backup>` while it runs. Each file is self-consistent. A run in flight may be caught mid-way, and a restore marks it `interrupted`.
+
+Back up the master key separately. Restoring `/data` without it loses the stored API keys, but nothing else.
+
+On Windows hosts, `chmod` 0600/0700 has no effect. Protect the data directory with NTFS ACLs instead.
+
+## Restarts and the job lock
+
+Each project with a job running has `projects/<id>/job.lock`. It names everything that may still be working in the workspace:
+
+- the server pid and the worker pid;
+- on POSIX, the worker's process group (`workerPgid`);
+- `taskPids`: every agent CLI, shell command or gate command the worker currently has running. The worker reports each one as it starts and ends, and the server rewrites the lock to match (at most 64 pids).
+
+The lock is **held** while any of them is alive, even when the server and the worker are both gone. A new job for that project gets `409 project-locked`.
+
+On restart the server:
+
+1. Removes every lock whose holders are all dead.
+2. Recovers every project without a held lock: runs left `running` become `interrupted`, plan generations left `generating` become `interrupted`, and each interrupted run's snapshot is merged into the canonical plan, so tasks it completed (and paid for) are not rerun.
+3. Leaves a project whose lock is still held **alone**. Its previous worker is still running and still writing its snapshot, so marking it now would record a half-finished run as final. The server re-checks that lock every 5 seconds. Once every holder has exited, and no job of this server's own is running there, it removes the lock and runs step 2 for that project, merging the worker's final snapshot.
+
+A worker whose server dies stops its runner, which tree-kills the running task. If that has not settled within 30 seconds, the worker kills its own process tree and exits, so a hung task cannot hold a lock forever.
+
+### Task processes that outlive their job
+
+The same rule applies while the server is up. When a job ends but a recorded task pid is still alive (a tree-kill that missed a grandchild, or an agent that ignored its signal), the server **keeps** `job.lock`:
+
+- It rewrites the lock to name only the live task pids, and checks them again every second.
+- Once they have all exited, it removes the lock.
+- After 5 minutes it stops checking but **keeps the lock**, and logs that an admin can force-release it. The lock is also reclaimed by itself at the next job start once those pids are gone.
+- Meanwhile `GET /api/projects/:id` reports `lockHeld: true`, and a new run, gate approval or plan request on that project gets `409 project-locked`.
+
+An admin can force-release the lock:
+
+```bash
+POST /api/admin/projects/<id>/lock/release   {"reason": "..."}   # admin only, CSRF-protected
+```
+
+- The reason is required (400 without it).
+- The route returns `409 job-active` while this server runs a job in that project (stop the run instead), and `409 not-locked` when there is no lock.
+- On success the entry is audited as `job.lock-force-release`, with the recorded `taskPids`, `workerPid`, and whether the server was still watching the lock (`lingering`, `expired`) as `before`, and the reason as `after`.
+- **It kills nothing.** Confirm first that the recorded pids are gone, or kill them yourself (`taskkill /pid <pid> /T /F` on Windows, `kill -TERM` on POSIX). Otherwise a second agent can be admitted into a workspace where one is still running, and the audit entry is the only record that this happened.
+
+### Windows notes
+
+- Workers are spawned **detached on every platform**. Without that, Windows puts the worker in the server's kill-on-close job object, and a server crash would hard-kill the worker while leaving the agent it started running.
+- Every child process the server and its workers start is spawned with `windowsHide`: agent CLIs, task and gate commands, git, `taskkill`, version probes. A detached worker has no console, so without it each child would open a console window on the server's desktop.
+- Process trees are killed with `taskkill /pid <pid> /T /F`. Windows has no process groups, so the lock relies on the worker pid and `taskPids`.
+- `taskkill /T` finds descendants by parent pid only. A process whose parent has already exited (a shell the agent CLI started for a tool call, a `start /b` background command) cannot be found from any ancestor, so on its own it survives every stop. To close that gap, each run or plan worker joins a **kill-on-close job object** before it starts anything (`src/utils/process-job.ts`). Every process it starts inherits that membership, whatever happens to its parents. When the worker exits for any reason (normal exit, `stop`, the disconnect watchdog, or a hard kill of the worker itself), Windows ends every process still in the job.
+  - **Bound.** The server dies → the worker gets `disconnect` and stops its runner → if that has not settled in 30 s, the watchdog exits the worker → the job closes and its processes end. So everything a run started is gone about 35 s after the server, at most.
+  - **Limits.** The binding runs `powershell.exe` with `Add-Type`. Where that is missing or blocked (Constrained Language Mode, AppLocker), the worker logs a warning event ("Processes this run starts are not tied to the worker…") and runs exactly as before. A process that explicitly breaks away from its job (`CREATE_BREAKAWAY_FROM_JOB`, which the job permits so such tools keep working) escapes, as does anything started outside the tree (services, scheduled tasks, WMI). Engine probe jobs are not bound. The VS Code extension and the headless `moag run` are not bound either.
+  - A process the job ends on a **graceful** worker exit is ended too: a `service` task's dev server still running when the run finishes does not outlive the worker.
+- **POSIX** has no job object. Workers and task commands lead their own process groups, and the worker's last-resort cleanup kills its descendants found by parent pid and their groups. A descendant that calls `setsid` (a new session) escapes both. A worker killed with SIGKILL runs no cleanup at all: its children keep running, but the lock still holds them through `taskPids` until they exit.
+- A task `cwd` such as `C:\x`, `C:x` or `\\server\share` is absolute, so a generated plan using one is refused at review.
+
+## The CI lock
+
+With `CI=true`, the headless runner auto-skips manual tasks, which would approve every ship gate. So when the server sees `CI=true`:
+
+- it refuses to start runs and plan generation, and the UI shows "Runs are disabled";
+- it strips `CI` from every worker environment, and the worker refuses to start if `CI` is somehow set.
+
+Ship gates are also forced to halt in the generated worker config (`prdLoop.onManualGate: halt`). The repository's own `.moag/config.json` is never read for server runs. To leave the lock, unset `CI` and restart.
+
+## `MOAG_RUN_ENV_PASSTHROUGH`
+
+Agents get a **built** environment, not the server's. It contains:
+
+- the OS and toolchain basics (`PATH`, `HOME`, locale, temp dirs, proxies and CA bundles, `GIT_AUTHOR_*` / `GIT_COMMITTER_*`, `OLLAMA_HOST`)
+- the path of a server-generated config
+- the API keys of the engines the job's plan uses
+
+`CI` and every `MOAG_*` variable are never passed.
+
+To give agents more, such as a package-registry token, list the names:
+
+```bash
+-e MOAG_RUN_ENV_PASSTHROUGH=NPM_TOKEN,GH_TOKEN -e NPM_TOKEN=… -e GH_TOKEN=…
+```
+
+Names must match `^[A-Z_][A-Z0-9_]*$`. `MOAG_*` and `CI` are rejected at boot. Anything passed through is readable by every agent on this server.
+
+## Project standards
+
+Every project has one agreed, versioned **standards profile**. Every planner and task prompt carries it, and every run is checked against it before anything is marked shipped. No model is asked at any step: detection, proposal and checking are deterministic.
+
+**MOAG blocks on your project's own tools; its own scans are advisory unless you promote them.** What stops a release is the profile's **commands** — real linters, formatters, type-checkers and tests, judged by their exit code — and nothing else by default. Everything MOAG scans for itself, required directories and nested repositories included, is **advisory**: it is reported with file, line and rule, and stops nothing. See [Blocking and advisory rules](#blocking-and-advisory-rules).
+
+### The profile
+
+A profile is a JSON object with these sections, plus the optional `severity`, `design` and Project Rulebook sections. Unknown keys are rejected at every level.
+
+| Section | Holds |
+|---|---|
+| `stackTemplateId` | One of the server's stack ids. |
+| `repoState` | `greenfield` or `brownfield`. For greenfield, the planner is told that the first task scaffolds the required directories. |
+| `structure` | `requiredDirs`, `allowedTopLevel` (names or globs), and `placement` rules (`{id, files, under[]}`: files matching a glob belong under one of the listed directories). A required directory is a path inside the repository: an absolute path (`/x`, `C:\x`, `\\host\x`), any `..` segment and any invisible or format character are rejected, and separators are normalised to `/` (a leading `./` and a trailing or doubled `/` are dropped). Its case is kept, and it is compared case-sensitively with the paths git lists. |
+| `frontend` | `componentKit`, `styleSource`, and `rawPatterns` (`{id, kind, value, globs[], message}`). `kind` is `literal` (plain text) or `builtin` (`hex-color`, `css-color-function`, `inline-style`). |
+| `backend` | `layers` (`{name, globs[]}`), `forbiddenImports` (`{from, to}` layer names) and `importAliases` (`{prefix, path}`). |
+| `naming` | `files` (`{globs[], style}`, style one of `kebab-case`, `camelCase`, `PascalCase`, `snake_case`) and `notes`. |
+| `comments` | `maxDensityPct`, `minAddedLines`, `forbidCommentedOutCode`, `bannedPhrases[]`. |
+| `testing` | `runner`, `fileGlobs[]`, `notes`. |
+| `commands` | Up to 6 `{label, run}` entries. Each `run` is one line of at most 500 characters. |
+| `builtInRuleIds` | Ids of MOAG's built-in AI rules. The rule text is referenced, never copied. |
+| `freeText` | Up to 20,000 characters of project rules in prose. |
+| `severity` | Optional per-rule overrides (see [Blocking and advisory rules](#blocking-and-advisory-rules)). |
+| `design` | Optional: the project's **design system**, `{docPath, tokensPath, doc, tokens}` — DESIGN.md and the tokens file, verbatim. `doc` is at most 12,000 characters and `tokens` at most 8,000. Both paths are inside the repository (no absolute path, no `..`, nothing under `.git` or `.moag`), differ from each other, and end in `.md` and in one of `.css .scss .ts .js .mjs .cjs .json`. No line may hold an invisible or bidirectional character, and credential shapes are refused as everywhere else. See [The design system](#the-design-system). |
+| `practice`, `testPolicy`, `security`, `accessibility`, `apiData`, `docsGit`, `performance` | Optional: the **Project Rulebook** — coding practice, testing policy, security, accessibility, API and data, docs and git, performance. Each holds the few settings MOAG checks and one-line guidance (at most 12 entries of 200 characters). See [The Project Rulebook](#the-project-rulebook). |
+
+Limits and refusals:
+
+- Lists hold at most 50 entries of at most 200 characters each.
+- A value that looks like a credential (`sk-…`, `ghp_…`, `AKIA…`, a PEM header) is refused.
+- A profile never carries a regular expression. Patterns are literals, globs (`*`, `**`, `?`) or a named built-in.
+- The text a prompt carries is at most 4,000 characters. The structured rules are always included in full; a profile whose structured rules alone exceed the cap is refused. Free text is added as a quoted block and cut to the room that is left. Built-in rule bodies are inlined while they fit, and listed by name otherwise.
+
+Each proposed field is tagged `detected` (with the file that proved it) or `assumed` (the stack default). The tags are stored beside the profile as `provenance`. A detected directory's evidence ends in `tracked by git`; when git gave no listing, the structure fields are `assumed` and their evidence says why no directory was proposed.
+
+For an existing repository the proposal's `commands` are the project's own tools, because only commands block a release. Each is a fixed template chosen by what a file proves; a script body is never copied:
+
+| Proposed command | Proved by |
+|---|---|
+| `npm run lint`, `npm run format:check`, `npm run typecheck` | a script of that name in `package.json` |
+| `npx eslint .`, `npx biome check .`, `npx prettier --check .`, `npx stylelint "**/*.css"` | the tool's config file, when no script covers it |
+| `npm test` | a `test` script in `package.json` that runs something. The `npm init` placeholder (`echo "Error: no test specified" && exit 1`) and an empty script prove nothing |
+| `ruff check .`, `flake8`, `black --check .` | the tool's config (`ruff.toml`, `.flake8`, `[tool.ruff]` / `[tool.black]` in `pyproject.toml`) |
+| `pytest` | `pytest.ini`, `conftest.py`, or a Python manifest that lists `pytest` |
+| `mypy .` (else `pyright`) | `mypy.ini`, `.mypy.ini`, `[tool.mypy]` in `pyproject.toml` or `[mypy]` in `setup.cfg` (`pyrightconfig.json` or `[tool.pyright]` for pyright) |
+| `pip-audit -r requirements.txt` (requirements.txt projects) / `pip-audit .` (pyproject.toml or setup.py projects; never bare `pip-audit`, which would audit the server's own environment) | a `pip-audit` dependency (a line in `requirements.txt`, `requirements-dev.txt`, `dev-requirements.txt` or `requirements_dev.txt`; a quoted entry or Poetry key in `pyproject.toml`; a `Pipfile` key) or a `pip-audit` hook in `.pre-commit-config.yaml` |
+| `go vet ./...`, `go test ./...` | `go.mod`; plus `golangci-lint run` from a golangci config |
+| `go tool govulncheck ./...` (else `go run golang.org/x/vuln/cmd/govulncheck ./...`) | a go.mod `tool golang.org/x/vuln/cmd/govulncheck` directive (else a root `tools.go` importing it, its version pinned by go.mod) |
+| `mvn dependency-check:check` / `./mvnw …` (`mvnw.cmd …` on Windows), `gradle dependencyCheckAnalyze` / `./gradlew …` (`gradlew.bat …` on Windows) | the OWASP `dependency-check-maven` plugin in `pom.xml`, or the `org.owasp.dependencycheck` plugin id in `build.gradle(.kts)`; the tracked wrapper is used when there is one |
+| `dotnet format --verify-no-changes` | `.editorconfig` in a .NET repository |
+
+A type checker or audit tool is proposed only where a file in the repository declares it; a mention in a comment or a README declares nothing, and a stack alone never does. Commands come in this order — style, type check, tests, then audits (which need the network), so at the command limit an audit is the first left out. In the Rulebook, a `Typecheck`, `Lint` or `Vet` command is listed under Coding practice, a `Test` command under Testing and an `Audit` command under Security. .NET gets no audit or type-check command: no repository-declared tool for it gives a gating exit code that the detection could prove.
+
+Java and .NET get no test command: the build wrapper or project file a test run needs is not proved by the detection, so it is left to the reviewer. Package.json, like every other file, counts only when git tracks it (when git gives no listing, it is read from disk, as the lint configuration is). The `commands` area is tagged `detected` with the first command's proving file and the note `not executed`; when no command can be proposed it stays `assumed` and names the stack's usual tools. A `test` script with no recognised framework also makes the testing area `detected` (`package.json — test script`). Every proposed command is shown verbatim and, as an enforcement change, needs the reviewer's acknowledged approval before it runs.
+
+For an existing repository the file-naming rule follows the names the repository already has, measured over the first 1,000 source files. If at least 70% of the names a rule covers fit one style, that style is proposed, and tagged `detected` when a name proves it (`useAuth` proves camelCase; `index` proves nothing). If the names fit no single style, no naming rule is proposed and `naming/files` reports `not-checked`.
+
+A `detected` tag is the server's own statement, so a person's edit cannot inherit it:
+
+- When a person proposes a version, each area is compared with the last automatic version the proposal descends from, not with the version it was edited from.
+- An area that is still identical to that automatic version keeps its tag.
+- Every other area is tagged `assumed`, with the evidence `entered by <username>`. This includes a value that is submitted again unchanged on top of someone's edit.
+- A proposal with no automatic ancestor is tagged `entered by <username>` throughout.
+
+The screen also marks what changed since the previous version.
+
+### Versions and who decides
+
+Standards live in `projects/<id>/standards.json` in the data directory, outside the workspace. The server never reads a `.moag/standards.json` or `.moag/rules.json` that a repository ships.
+
+- Proposing always creates version N+1 as `pending`. A pending version that a newer proposal replaces becomes `superseded`.
+- A reviewer approves or rejects a pending version. An approved version is never changed again.
+- The version **in effect** is the latest approved one. It stays in effect while a newer proposal is pending or rejected.
+- A project keeps at most 200 versions.
+
+| Action | Roles | Route |
+|---|---|---|
+| Read | any signed-in user | `GET /api/projects/:id/standards` |
+| `standards.propose` | product-owner, admin | `POST /api/projects/:id/standards/versions` with `{profile, baseVersion}` |
+| `standards.approve` | reviewer | `POST …/standards/versions/:version/approve` with `{contentHash, acknowledgedEnforcementHash?}` |
+| `standards.reject` | reviewer | `POST …/standards/versions/:version/reject` with `{reason}` |
+| `standards.accept-defaults` | admin | `POST …/standards/accept-defaults` with `{contentHash, acknowledgedEnforcementHash?}` |
+
+- `baseVersion` is the latest version the proposer saw. If someone proposed in between, the answer is `409 stale`.
+- Approve and accept-defaults echo the `contentHash` the user saw. If it does not match, the answer is `409 hash-mismatch` and nothing is approved. A version that was already decided answers `409 already-decided`.
+- A version that **changes enforcement** (see [Changing what blocks](#changing-what-blocks)) is put into effect only with an acknowledgement: the approve or accept-defaults body must also carry `acknowledgedEnforcementHash`, equal to that version's `contentHash`. Without it, or with the hash of other content, the answer is `409 acknowledgement-required` with the differing `fields` and `comparedTo`; nothing is approved and nothing is audited. The review screen sends it only after the reviewer ticks the checkbox under the enforcement changes.
+- An invalid profile answers `400 invalid-standards` with the list of problems in `errors`.
+- A **product owner or an admin proposes; a reviewer approves or rejects.** That holds for every change to the standards, including promoting a rule to blocking or demoting one. A reviewer who wants a change asks for a proposal, or rejects the pending one with the reason.
+- A user who holds both roles and approves their own proposal is allowed. The audit entry is flagged `self-approval`.
+- Every mutation writes one audit entry holding the version number, the content hash and the origin (`auto` or `user`), plus what the version changes about enforcement (see **Changing what blocks** below): for each differing field, what it held before and after. That includes command lines and labels, required directories and rule severities — they decide what can stop a release, and an auditor needs to read them. When a version changes the design system the entry is also flagged `design-changed` and carries, in `after.designChanged`, the two file paths (`files: {before, after}`, each `{doc, values}`), each changed token's value before and after (`values`, at most 100 rows, `valuesTruncated` beyond), whether DESIGN.md changed and how many of its sections did — never any DESIGN.md text. (The keys avoid the words `token` and `key`, which the audit log refuses as secret-shaped.) No other profile text (free text, notes, style source, DESIGN.md) is written to the audit log. A refused request writes nothing.
+
+Approving a version lets its `commands` run in the project workspace on every run. The reviewer is shown each command exactly as it will run.
+
+### The design system
+
+A project with a user interface carries a **design system** in its standards: a DESIGN.md (colour palette, typography, spacing, radii and elevation, components, page layout, the empty/loading/error states, forms, accessibility minimums, writing tone, and how the design system changes) and the **tokens file** the code must use. It is part of the profile (`design`), so it is versioned, hashed, reviewed and approved with the rest of the standards.
+
+- **Proposal.** For a `node-ts` or `static-web` project whose repository shows a user interface — a static site, React, Vue, Svelte, Angular or Next.js, a known component library, or an `index.html` — the proposal drafts one from a fixed template per stack (no model is asked): `docs/design/DESIGN.md` and `src/styles/tokens.css` (node-ts) or `css/tokens.css` (static-web), a `:root` block of colour, type, spacing, radius and focus tokens whose text colours reach 4.5:1 on the background. An existing tokens or theme file (a CSS file declaring custom properties on `:root`, alone or in a selector list such as `:root, [data-theme="light"]`; a Tailwind config or a theme module, from a fixed list of places) and an existing design document are **adopted as they are**, never overwritten, and tagged `detected` (`… — adopted, not overwritten`); one that fails validation is left out and the provenance says why. A file MOAG does not adopt — too large (over the caps above), unreadable, not tracked by git, a stylesheet with no `:root` custom properties, or one that failed validation — is **never a target**: the template part moves to the stack's fallback path (`docs/design/DESIGN-SYSTEM.md`, then `docs/design-system/DESIGN.md`; `src/styles/design-tokens.css`, then `src/design-tokens.css` for node-ts; `css/design-tokens.css`, then `styles/design-tokens.css` for static-web), and the provenance shown on the review card names the file kept, e.g. `css/tokens.css exists, not adopted (larger than 8000 characters): proposed css/design-tokens.css instead`. A file that already holds exactly what MOAG would write there (its own earlier write, not yet committed) is no collision. With no free path left, no design system is proposed. Other stacks, and projects with no UI signal, get no design system. A project whose standards in effect have none, but whose workspace shows a UI, is offered one on the standards screen (`designSuggestion`, for a proposer only; `designTemplate` is the stack's template, `null` where there is none).
+- **Review.** The standards screen shows the design system read-only — paths, a token table with swatches and each colour's contrast on the background token, and DESIGN.md as plain text — and, for a pending version, every change from the version in force. Approving a change needs the acknowledgement (see [Changing what blocks](#changing-what-blocks)). Plan review and the run's ship gate show the same design system.
+- **The server copy is canonical.** `POST …/runs` writes the frozen version's DESIGN.md and tokens file into the workspace before the worker starts (only when the content differs, atomically). Only a file MOAG is answerable for is ever replaced: one whose content is exactly an approved version's design file at that path (written or adopted under it — a newer approved version, whose design difference its reviewer acknowledged, changed it), or one at a path an earlier run's approved design wrote at its start (a run's or a person's edit of MOAG's own file). Any other file there — one the approved design never adopted, e.g. a path a reviewer typed over an existing file, or a file that appeared after the proposal — refuses the run with `409 design-file-conflict` (`path` names it): nothing is written, nothing is spawned, no run is recorded, and the fix is a standards version that adopts the file or uses another path. A replaced file is first kept under `runs/<runId>/design-replaced/<path>` in the data directory, never in the workspace, and the `run.start` audit entry names it (`designFilesReplaced`, `designBackupDir`), and so does the run record: the run DTO carries both, and the gate card and the run's standards card show *Reverted to the approved design: …* with where the backup went. If that copy cannot be made, nothing is written and the run is refused the same way. The replacement shows in the run's diff, so this notice is how a reviewer tells it apart from the run's own edits. **A run whose standards were frozen at its ship approval** (a run that started before standards existed) wrote nothing at its start, so it never counts as "an earlier run that wrote this path": the run record says so (`standardsFrozenAt: "gate-approval"`, or `"start"`); for an older record the `gate.approve` audit entry's `standardsFrozenAtApproval` flag decides, and when the audit cannot be read every such run is counted as frozen at approval — the outcome is a refusal (`409 design-file-conflict`), never an overwrite. A path that leaves the workspace or passes through a symbolic link refuses the run: `409 design-files-unwritable`, nothing is spawned and no run is recorded. A gate resume never rewrites them, so a change the run made stays visible as a finding. A run frozen before its version had a design system never had the files written; its check may report them missing (advisory).
+- **Prompts.** Every agent task prompt carries a `## Design System` block of at most 2,000 characters right after `## Project Standards` — the two paths, the rules (read DESIGN.md first, use only the tokens, the approved kit, every screen handles empty/loading/error, visible labels, 4.5:1 contrast, visible focus, never edit the design files) and as many tokens as fit. It is pinned like the standards and never cut from them. The planning prompt carries a summary of at most 800 characters, and the planner is told to plan UI work against it.
+- **Check.** `frontend/design-tokens` (advisory by default; see the rules table) reads the two files as they stand in the workspace at verify time.
+- **Not work.** While DESIGN.md and the tokens file hold exactly the approved content, they do not count as a change for the verify change gate ("something must have changed"): a run whose agents changed nothing fails that gate even though the server wrote the design files at its start. The files are part of the product and go into the run's diff and delivery like any other file.
+- **No downgrade.** Once a version with a design system is approved, an older MOAG build refuses that profile (unknown key `design`), and its runs fail with "not a valid standards profile". Do not downgrade after approving a design system.
+
+### The Project Rulebook
+
+Beyond structure, style and the design system, the profile carries the rules an AI coding agent needs for professional work, as seven optional sections of the **same** versioned profile — proposed, reviewed, acknowledged and approved exactly like the rest:
+
+| Section | Checked by MOAG (each advisory unless promoted) | Guidance only |
+|---|---|---|
+| `practice` `{todoNeedsIssue, noDebugStatements, guidance[]}` | `practice/todo-without-issue`, `practice/debug-statement` | error handling, logging, typing strictness, no placeholders or dead code |
+| `testPolicy` `{requirementReference, guidance[]}` | `testing/requirement-reference` | a test per requirement and its failure path, the test command, deterministic tests |
+| `security` `{guidance[]}` | `security/env-file`, `security/secret-literal` — **on every run, whatever the profile holds** | input validation, the stack's dependency audit |
+| `accessibility` `{imgAlt, htmlLang, guidance[]}` | `a11y/img-alt`, `a11y/html-lang` (HTML pages) | keyboard access, labels, WCAG AA contrast, the design system |
+| `apiData` `{migrationsGlob, guidance[]}` | `data/migration-edited` once `migrationsGlob` is set | configuration from the environment and `.env.example`, one API error shape |
+| `docsGit` `{changelogPath, guidance[]}` | `docs/changelog-updated` once `changelogPath` is set | README kept current, a changelog entry per version, commit message style |
+| `performance` `{guidance[]}` | none — a budget is checked only by a command (bundle size, Lighthouse CI, a benchmark) | N+1 queries, pagination, bundle size |
+
+Each guidance entry is one line of at most 200 characters, at most 12 per section. Every field of a present section is required; a section a profile does not have is **absent, never empty**, so every profile written before the rulebook keeps its content hash and renders exactly the same prompt. MOAG checks only what it can evaluate reliably; everything else is guidance — given to agents, shown to the reviewer, and labelled **(guidance — not checked)** everywhere.
+
+**Defaults per stack.** A new project's proposal (the built-in profile) has: `practice` with TODO/FIXME-cites-an-issue on for every stack and no-debugger on for node-ts, python and static-web; `testPolicy` (every stack but `other`) with requirement references **off** — the check before the ship gate is not given requirement ids yet, so on it would read `not checked` at every gate; switch it on to have verification check it; `security`; `apiData` (not static-web), `docsGit` and `performance` with their settings empty; `accessibility` with both HTML checks on for static-web, and — with guidance only — for any other project once it has a design system or a component kit. `other` gets `practice` and `security` only. The dependency audit is named **as guidance**, never added as a command: `npm audit --audit-level=high` (node-ts), `pip-audit` (python), `govulncheck ./...` (go), `dotnet list package --vulnerable` (dotnet), OWASP dependency-check (java), Subresource Integrity for third-party scripts (static-web). Nothing in the defaults blocks.
+
+**Brownfield.** A brownfield proposal adopts what the repository already does, from **tracked files only**, each tagged `detected` with the file as evidence: a `CHANGELOG.md` / `CHANGELOG` / `HISTORY.md` becomes `docsGit.changelogPath`; the first of `prisma/migrations`, `alembic/versions`, `db/migrate`, `src/main/resources/db/migration`, `Migrations` becomes `apiData.migrationsGlob` (`<dir>/**`); a `.env.example` and a commitlint or commitizen config become guidance lines. A project's own `audit` script is proposed as an `Audit` command **last**, so at the limit of six commands it is the first left out; like every command it needs the network and blocks once a reviewer approves it.
+
+**In the prompt.** The checked items render in full under `### <Section> (MOAG checks these)` with the structured rules, which are never cut (a profile whose structured rules exceed 4,000 characters is refused at proposal). Then the free text. Then the guidance, under `### <Section> (guidance — not checked)`, item by item while it fits — **guidance is cut before free text is**, and a cut is named (`- …N guidance items not shown (cut to fit)`). Then built-in rule bodies. The planner gets the checked items and one summary line per section (at most 160 characters). The standards resource sends, per version, `rulebook` (what is checked and what is guidance, per section), `promptText` and `plannerText` — exactly what a job file carries — and `guidanceCut`, so the approval screen shows what an agent will receive. While the version in effect predates the rulebook, a proposer is offered the stack's default sections (`rulebookSuggestion`) to propose.
+
+**No downgrade.** An older build refuses a profile with any of these sections (unknown keys are errors), so a version written by this build cannot be read after a downgrade.
+
+### The plan gate
+
+- `POST /api/projects/:id/plans` answers `409 standards-not-approved` while no version is approved. No job starts and nothing is audited. The response carries `state` (`pending`, `rejected` or `none`) and `pendingVersion`.
+- The PRD resource omits the generate actions from `allowedActions` in that state and sets `planBlockedReason: "standards-not-approved"`.
+- The check is made again when a plan is approved, so a plan that was pending before the project had standards cannot be approved while none are approved.
+- A run is refused with the same code whenever the project has no approved version, whatever its plan was generated under (a plan approved before the project had standards included, and a store that lost its versions). The plan card says why (`startBlockedReason: "standards-not-approved"`). Approving or skipping a ship gate is refused the same way; rejecting the ship stays possible.
+
+### New and existing projects
+
+- **New project:** `POST /api/projects` proposes v1 at once. Detection reads **only the files git tracks** in the workspace (`git ls-files`, asked asynchronously, with a minimal environment that carries no `GIT_DIR` or `GIT_WORK_TREE`) and lays what it finds over the stack's built-in profile. A directory that `.gitignore` names, or that is merely on disk, is never proposed — as a required directory, in the allowed layout, or anywhere else. A repository with no tracked source files is proposed as greenfield, with every field `assumed`.
+- **When git gives no listing** — the workspace is not a repository or not its root, git is missing or times out, or git refuses the directory (`safe.directory`: "dubious ownership") — no directory is proposed at all, and the provenance of the structure fields says why (for example `no directory is proposed: git refuses this workspace: it is owned by another user (see git safe.directory)`). Facts about the code itself (stack, test runner, lint configuration) are still read from disk.
+- **Existing project:** at boot, each project without a standards file gets the same automatic v1, marked `migrated`. The audit entry is written by `system` with the flags `auto-proposed` and `migration`, plus `enforcement-changed` when the proposal brings a command or a required directory (it is measured against an empty baseline). A migrated workspace usually holds earlier runs' build and test output; none of it is proposed, because only what git tracks is. A second boot proposes nothing. If detection fails, the proposal is the built-in profile with every field `assumed`; the boot never fails for it.
+- A migrated project has two ways forward:
+  - a reviewer approves the proposal (or a product owner edits it first), or
+  - an admin **accepts the defaults**. This is offered only while the project is `migrated` and its pending version is still the untouched automatic one. It is audited as `standards.accept-defaults`, never as an approval, and the version is shown as "not reviewed". It needs the same acknowledgement as an approval when the proposal changes enforcement.
+- Until then, new plans are blocked, and so are runs, including runs of plans approved before the project had standards. Once a version is approved (or the defaults accepted), such a plan can start without being approved again, and its run is held to the standards then in effect like any other.
+- A run that was started before the upgrade carries no standards version. Its ship gate can be approved only while the project has approved standards. Approving it freezes the standards then in effect onto the run, so the resumed segment runs the standards check in its verification pass and nothing ships unless that check passes. The check diffs from the last ship or, failing that, the earliest recorded run base. With neither, it checks every file, because HEAD may already include the run's own work. No pre-gate report exists for such a run, so the approver sees none. Skipping its gate freezes nothing, since a skip ships nothing.
+- Changing a project's stack proposes nothing. The standards resource reports `stackMismatch: true` and the screen says so.
+- Rolling back to an older server build is safe: it ignores `standards.json`. The standards version on a release row is dropped the next time that build saves the plan.
+
+### The new-project form
+
+**The folder.** "Folder on the server" names a folder **relative to the projects root** (`MOAG_PROJECTS_ROOT`). The form shows the root (only to a user who may create projects: `GET /api/session` adds `meta.projectsRoot`, the root's real path) and the full path the value resolves to, and prefills the folder from the project name (lowercased; every run of characters outside `a-z 0-9 . _ -` becomes `-`; at most 64 characters) until you type in it. The server's own validation is unchanged: it still refuses an absolute path, `..`, the root itself and anything outside it with `400 invalid-path`. It also refuses, with `400 invalid-path` on every platform, a folder name Windows would open as a different folder: one made only of dots (`...`), one that starts with a space or ends with a space or a dot (`.. `, `a.`), a device name with or without an extension (`CON`, `nul.txt`, `COM1`–`COM9`, `LPT1`–`LPT9`, `PRN`, `AUX`), and one containing `< > " | ? *` or a control character. Windows strips a trailing dot or space when git or a process opens the path, so `...` would have been created as a literal folder while git ran in the projects root. The form refuses the same names on the field.
+
+- **An absolute path inside the root** (`/srv/moag/projects/acme`) is turned into its relative name (`acme`) in the browser, and the field says so (*Converted … to acme.*). It is never stripped silently, and a path outside the root (`/projects` when the root is `/srv/moag/projects`) is refused on the field before anything is sent, with the root named. On Windows the comparison ignores case.
+- **The live check.** While you type (300 ms after the last key), `GET /api/projects/folder-check?path=<rel>` (needs `project.create`, read-only, always `200`) answers one status and the resolved full path — never a path outside the root:
+
+| `status` | Meaning |
+|---|---|
+| `ok` | A git repository's top-level folder; ready to create. |
+| `path-not-found` | No such folder under the root. Choose *Start a new empty project* to have the server create it, or clone instead. "Folder on the server" itself never creates anything. |
+| `not-a-git-repo` | The folder exists but is not a git repository. |
+| `not-repo-root` | Inside a repository, not its top level; `topLevelRel` names the top level when it is inside the root (the form offers *Use …*), else `null`. |
+| `workspace-registered` | Another project already uses this folder. |
+| `workspace-nested` | The folder is inside another project's folder. |
+| `invalid-path` | The value is refused as `POST /api/projects` would refuse it; `reason` says why. |
+| `root-missing` | The projects root does not exist on the server. |
+
+A status the check reports never blocks the *Create project* button: creating the project validates again.
+
+**Start a new empty project.** The third source choice is for a product owner (or admin) starting from nothing. The Folder field works as above — prefilled from the name, shown against the root, converted from an absolute path inside the root, refused on the field when it is the root or outside it — and `POST /api/projects` gets `source: { kind: "new", path: "<rel>" }`. The server then:
+
+1. holds the path to the same rules as an existing folder (relative, no `..`, not the root, and no `:` in any folder name — a drive letter part-way such as `foo/Q:x` would point at another drive, and `foo:bar` names an NTFS stream; the form refuses it on the field too). The nearest folder on the way that already exists must resolve, symlinks followed, inside the root, so a symlinked parent cannot lead out of it (`400 path-escape`);
+2. refuses a folder another project owns or is nested with (`409 workspace-registered` / `workspace-nested`) **before** creating anything;
+3. creates the folder (and any missing parents), or uses an existing one only when it is **empty**: a folder with anything in it is refused with `409 dest-not-empty`, and a file with `400 not-a-directory`;
+4. runs `git init` (branch `main`), checks that `git rev-parse --show-toplevel` is the new folder itself (anything else, such as the root or a parent, is `400 path-escape` with no commit made and the folders it created removed), and makes one empty commit as `MOAG server <moag-server@moag.invalid>`, message *Initial empty commit (created by MOAG)*, with hooks and commit signing off, so the first run has a HEAD to diff against;
+5. registers the project with `source: { kind: "new" }`, audited as `project.create` with `source: "new"`, and proposes standards v1 as for any new project.
+
+Git missing on the server is `500 git-missing`; git failing is `502 init-failed` with git's last line. On any failure nothing it made is left and nothing it did not make is touched: the folder is removed only if this request created it, a parent it created only while that parent is still empty, and in an empty folder that was already there only a `.git` its own `git init` made. New-project creates are serialized per projects root (plan, create and register as one step), so two requests for the same or a nested name — two tabs, or two product owners — get one project and a `409`, and never undo each other's folder or repository. With `&mode=new` the live check answers `will-create` (the folder does not exist), `empty-folder` (it exists and is empty) or `not-empty`, plus the same path refusals, and creates nothing.
+
+### Stack suggestion
+
+The form's *Tech stack* card comes from `GET /api/projects/recommendation` (`?path=`, `?projectId=`, optional `&building=web-app|api|cli|static-site`; any other `building` is `400`). It answers, in this order:
+
+1. **Measured** — once one connected engine × stack group has at least 10 finished agent tasks on this server (`outcomes.jsonl`), the measured path decides, unchanged: Wilson lower bound, *Recommended* only with a comparison, a detected stack stays primary.
+2. **Static default with a detected stack** — nothing measured, and the repository's marker files name a stack: that stack is offered. When general model strengths would pick another, `priorSuggests` names it and the card says so; the detected stack is still the one offered.
+3. **Prior** (`source: "prior"`) — nothing measured and nothing detected, and a connected engine has a strength: a **Suggested stack** with a `LOW CONFIDENCE` badge and the label *based on general model strengths — not yet measured on this server*. It carries no rate, count or interval of any kind.
+4. **Static default** — nothing measured, nothing detected, and no connected engine has a strength (none connected, or only `ollama`).
+
+The prior is a fixed table maintained with MOAG — maintainer judgement about what each engine is generally good at, **not a measurement**, the same on every server, reviewed each release. It is ordinal only and is a switch, never a blend: the first eligible measured group replaces it.
+
+| Engine | node-ts | python | go | java | dotnet | static-web |
+|---|---|---|---|---|---|---|
+| claude, anthropic | strong | strong | adequate | adequate | adequate | strong |
+| codex | strong | strong | adequate | adequate | adequate | adequate |
+| gemini | adequate | strong | adequate | adequate | adequate | adequate |
+
+**Why each row says what it says.** Every entry below is general public knowledge about coding models as a class, held with **LOW confidence**. None of it was measured by MOAG, none of it is a number, and none of it is a claim about any one model version. It is written down so a reviewer can disagree with it, not so anyone relies on it.
+
+| Row | Basis (LOW confidence, not measured) |
+|---|---|
+| `strong` for node-ts, python, static-web (claude, anthropic, codex) | TypeScript/JavaScript, Python and HTML/CSS are among the most common languages in public code, and the widely cited public coding benchmarks (HumanEval, MBPP, SWE-bench) are written in Python or drawn from Python repositories. General-purpose frontier coding models are commonly reported to do best where both their training data and their evaluations are densest. |
+| `adequate` for go, java, dotnet (every frontier row) | These languages are well represented in public code but less so in the published coding evaluations. A run here also has to get the build tooling right (modules, Maven/Gradle, `.csproj`) before any test passes. Nothing public we know of separates one frontier engine from another on these stacks, so all of them get the same middle value. |
+| claude and anthropic share a row | They are the same model family: the CLI and the API differ in how they are driven, not in what the model knows. |
+| codex: static-web `adequate` | Codex is publicly presented and evaluated mainly on repository and backend tasks (SWE-bench-style issue fixing), with little published about visual front-end work. Without that signal the row stays at the middle value instead of guessing upwards. |
+| gemini: python `strong`, node-ts and static-web `adequate` | Gemini's published coding results are mostly on Python-centred benchmarks. Elsewhere the row stays at the middle value for the same reason as codex: no public signal to justify more. |
+| ollama `none` | A local model of unknown size and family. Capability varies by orders of magnitude between the models Ollama can serve, so there is no basis for any rank. |
+| custom `none` | An arbitrary command. Nothing is known about what it runs. |
+| copilot `none` | Not runnable by the server (see the server engine list). |
+| every engine's `other` | The stack is unknown, so there is nothing to rank. |
+
+**Measured data replaces the prior.** Once one connected engine × stack group has at least 10 finished agent tasks on this server (`minPerGroup`, from `outcomes.jsonl`), the measured path decides (case 1 above), and the table plays no part in it. The prior is never averaged with measurements and never adjusts them. The table is reviewed each release. When a row disagrees with what servers measure, the measurement wins and the row is the thing to change.
+
+`ollama`, `custom` and `copilot`, and every engine's `other`, have no strength. The prior picks, among the candidate stacks, the one whose best connected engine is strongest; ties go to candidate order. Candidates by `building`: `web-app` → node-ts, python, static-web; `api` → node-ts, python, go, java, dotnet; `cli` → go, python, node-ts; `static-site` → static-web; unset → every stack but `other`.
+
+A folder that does not resolve yet is not an error here: the response is `200` with `detectionSkipped: true`, the repository is not read, and the card says *Repository not checked: the folder isn't valid yet.*
+
+### What a run does with them
+
+1. **At run start** the server freezes the version in effect on the run record, with its content hash and the diff base. A version approved later does not change a run that has started. A resumed segment uses the recorded version.
+   - **The diff base is the last ref that shipped, not `HEAD` at run start.** When a run stamps a release, the server records the workspace's `HEAD` as the project's last-shipped ref, and every later run diffs against it. Before the first ship, a run uses the base of the project's earliest run; only the very first run uses `HEAD` as it stands. A ship whose `HEAD` cannot be read does not move the base: the previous one stays, so the next check covers that ship's work again rather than diffing against the empty tree. A last-shipped entry without a ref (written by an earlier build) is ignored the same way.
+   - This keeps unshipped work inside the check. If a run commits a violation and ends `gaps`, the next run still sees that commit in its diff. Committing work never clears it.
+   - If there is no base (a repository with no commits), every file counts as added.
+   - If a base was recorded but the repository no longer has that commit (its history was rewritten and pruned, or the workspace was cloned again), the check also falls back to the empty tree: every file is judged as added, and the report's `baseRef` shows the empty-tree id. Code written before the run is then in scope and can fail the run. A lost base never turns the check off.
+   - If a base was recorded and no diff can be taken at all, the standards gate fails.
+   - A rule that finds nothing in the diff to judge is `not-checked`, never "no findings". An empty diff clears nothing.
+2. The server writes the version to `projects/<id>/runs/<runId>/standards.json` and gives the worker that path. The file holds the profile and the prompt text, rendered by the server. The worker never renders the text, never infers a command, and never builds an AI-rules store.
+3. **Every task prompt** carries the text under `## Project Standards`, directly before `## AI Rules`. It is present even when context building is turned off or the context budget is smaller than the block.
+4. **Before the ship gate**, when the run halts for approval, the worker checks the standards once with no model call and sends a report marked `pre-gate`. The approver sees it, and it binds: while it shows a blocking failure, or a blocking rule or command that was **not checked**, `POST …/gate/approve` answers `409 standards-blocking` with a message that says which, and nothing resumes. Rejecting the ship is always possible; a skip, which ships nothing, is not held back. The check is made on the totals the server stored on the run record, never on a file in the run directory.
+5. **After the gate**, the run's verification checks the standards again. That check decides.
+6. **When the run ends**, the server accepts a clean exit only with proof of that check. The worker's report names the hash of the profile it used and the base ref it was given, and the server compares both, and the version, with what it froze on the run record at run start. If the run exited 0 without a verify-phase report, or the report was made with a different profile or base, the run ends `gaps` and nothing is shipped. The standards job file sits in the run directory, which an agent can write; this comparison is what detects a rewritten file.
+
+### What the approver sees at the ship gate
+
+- **The files the run changed.** When a run halts at its ship gate, the server — under the project lock, so no approval can interleave — lists every file changed in the workspace since the run's diff base (`baseRef`, the same base the standards check uses; the empty tree when there is none): tracked changes, staged or not, plus untracked files not ignored by a `.gitignore` file. As in the standards evidence, only `.gitignore` files (which are in the tree, so editing one is itself a listed change) decide what is ignored: `.git/info/exclude` and a global excludes file are not honoured. A tracked file the index flags skip-worktree or assume-unchanged (`git ls-files -v` tag `S` or lowercase) and that is on disk is listed as changed, with the words *hidden from git (skip-worktree or assume-unchanged), lines not counted*, because git would otherwise report it as unchanged whatever it holds. `.moag/` is never listed. Each row has its path, `+added −removed` line counts from `git diff --numstat` (none for a binary file; an untracked file's lines are counted from at most 1 MB of it, the first 5,000 untracked files only), and the words *new (untracked)*, *deleted*, *renamed* (with the old path) or *binary*. The list is capped at **500 rows**; `total` is always the true count and the card says when rows were left out. The `+added −removed` line above the list comes from `totals` (`added`, `removed`, `binary`, `hiddenFromGit`, `uncounted`), which the server counts over **every** changed file before the list is capped; a list stored before `totals` existed is summed from its listed rows and says *across the N listed files*. The gate card shows 20 rows and a *Show all N* button.
+- **What the files changed since.** The heading names the base: *Changed files since the last shipped version (<sha>)* when the run's base is the ref the project last shipped at, *since the first run (<sha>)* when nothing has shipped yet (the base is then the start of the project's first run), the empty tree for a first commit-less run, and the bare commit otherwise. The base is a commit, so the list holds everything changed since that commit. The note under it says so: a ship records the commit HEAD is at but does not commit the work itself, so the list also holds shipped work that was never committed — in a project that ships without committing, every version's card lists the earlier versions' files too — as well as the work of any earlier run that was not shipped. The base is never simply HEAD at this run's start. The server records which case it was (`baseKind`: `last-shipped` or `before-first-ship`) when it collects the list.
+- Git runs here against a workspace an agent wrote to, so every call is narrowed: no shell, array arguments, `-c core.fsmonitor=false -c core.hooksPath=/dev/null -c core.quotepath=false -c core.excludesFile=`, `--no-ext-diff --no-textconv`, a base that must be a full commit id, a 30 s timeout and a 10 MB output cap. **Residual risk:** `git diff` against the working tree still runs any clean or process filter driver that the workspace's `.git/config` defines and its `.gitattributes` selects, and both are writable by the agent. Agents already run as the server's user, so this crosses no privilege boundary, but it is code the workspace chooses, now run by the server process outside a run. The standards evidence collector runs the same diff inside the worker. The list is written to `runs/<runId>/changed-files.json` and its sha256 is kept on the run record in `state.json`; the run directory is writable by the agent, so a list whose hash no longer matches is shown as **not collected**, never as a list. A failure (git missing, a legacy run with no recorded base) is shown as *Changed files: not collected for this run.* with the reason — never as "0 files" — and never fails the run end. The DTO carries `changedFiles` only for a run that is `awaiting-approval`.
+- **Design files reverted at run start.** When a run's start reverted DESIGN.md or the tokens file to the approved content (see [The design system](#the-design-system)), the run record carries `designFilesReplaced` and `designBackupDir` (`runs/<runId>/design-replaced`), and both the gate card and the run's standards card say *Reverted to the approved design: …. Backup: …* (*Backup: not recorded.* when no directory was recorded).
+
+### The verification order
+
+Verification applies its gates in this order and stops at the first failure. No model is called unless all of them pass.
+
+1. **status**: every task reached a completed state.
+2. **change**: the diff is not empty.
+3. **standards, static rules**: the diff is checked against the profile.
+4. **command**: the repository's own gate commands.
+5. **standards, profile commands**: the profile's `commands`. A command that already ran as a repository gate is not run twice.
+6. **UAT** and **artifacts**, as before.
+
+A **blocking** failure in step 3 or 5 is reported as the failed gate `standards`. The run ends with status `gaps` (worker exit 1), the approved ship is not stamped, and no requirement becomes `shipped`, even when every task completed and the ship gate was approved. An **advisory** finding is reported in the same place with the same detail and stops nothing; see [Blocking and advisory rules](#blocking-and-advisory-rules).
+
+With a default profile, step 3 stops nothing: every static rule is advisory. What stops a run is step 5, the profile's commands. Step 3 can stop a run only where a project promoted a rule.
+
+**Unevaluated blocking evidence is not a pass.** After step 5 the blocking set — the commands, and any promoted rule the profile configures — is in one of three states, and the gate row `moag:standards v<N>` says which:
+
+| Blocking set | Gate row | Release |
+|---|---|---|
+| evaluated: every blocking row has a result and none failed | exit 0, `nothing blocking` | ships, stamped with the standards version |
+| a blocking row failed or has findings | exit 1, `stopped` | stopped (`gaps`) |
+| a blocking row was **not checked**: a command never ran, or a promoted rule could not read a changed file, had no diff, or found nothing in the change to judge | exit 1, `stopped`; its text says `could not be checked` and names each row and its reason | stopped (`gaps`) |
+| none configured: no command and no promoted rule | exit 0, `no blocking rules configured` | ships; the stamp carries `noBlockingRules` and is shown as "no blocking rules configured", never as passed |
+
+**The row is worded, never shown as a pass or a fail.** It is not a command, so no surface reads its exit code as a result. Each one says the same single word, from one function (`standardsGateWord`): `stopped`, `no blocking rules configured` or `nothing blocking`. That holds for the gate table of the VS Code verification report, the Gates cell of the hosted trace, the `standards` key on the row in `GET /api/projects/:id/trace` and `moag trace`, the evidence block handed to the verifying model (`- moag:standards v3 — nothing blocking (2 advisory findings · 1 file not checked, 12ms)`, where a command reads `exit 0 (PASS, 12ms)`), and the stored `.moag/verification-<ts>.json`, where the row has `standards` and `standardsOpen` and no `passed` key at all. A real command keeps `pass` / `fail` / `timeout` and its exit code everywhere.
+
+The row's text also gives the number of advisory findings, of rules not checked and of files not checked. When an earlier gate already failed (a repository command, say), the profile's commands are listed as not checked in the report and no standards row is written at all: the run has already failed.
+
+On the hosted server the same rule is applied a second time to the worker's report: which rows block is decided by the profile the server froze on the run, and a command of that profile the report says nothing about is added as not checked. A report that merely leaves a command out therefore stops the ship; it can never read as "no blocking rules".
+
+Release and deploy tasks run after the ship gate and before this verification, as they do for a failing test suite. A deploy can therefore have happened before a standards failure is found. The pre-gate report exists so that the approver sees the result first.
+
+### What is checked
+
+The static rules look only at what the run changed: added lines of changed files, and for naming and placement, added and renamed files. Code the run did not touch is not judged.
+
+- **Renames are detected.** A file git matches to one that existed at the base (`git mv`, or a plain move whose content is byte-for-byte a deleted file) is `renamed`: its new path is judged for placement and naming, and only the lines the change really altered count as added. Moving a legacy file adds no line. Every diff is taken with an explicit rename limit of 20,000 files, so neither a large change nor a `diff.renameLimit` or `diff.renames` setting in the repository's git config can turn detection off. This holds for the committed and staged versions below as well.
+- **A nested repository is reported, never read past.** A directory that is a git repository of its own is one entry to git, which shows none of its files. The rule `structure/nested-repository` reads the **current state of the tree** — no base ref enters into it:
+  - a gitlink in the index that no **tracked** `.gitmodules` declares, and an untracked directory holding a `.git`, are each a finding on the rule, naming the directory, **and** the directory is listed under files not checked as `not checked (nested repository — files inside were not read)`. It makes no difference whether this change added it or it has been there for years;
+  - a submodule a tracked `.gitmodules` declares is listed as `not checked (submodule — files inside were not read)` and is no finding. A `.gitmodules` that exists only in the working tree declares nothing;
+  - untracked directories are taken from git's own listing with its standard excludes, so `.git/info/exclude` and a global excludes file hide one exactly as `git status` would.
+
+  The rule is advisory by default, like every scan; promoted, a finding stops the release.
+- **What is committed is what ships.** A file committed since the base and then deleted or rewritten in the working tree without a commit is judged a second time, from the commit. Its findings say so.
+- **What is staged is what the next commit ships.** Content that was `git add`ed and then deleted from, or rewritten in, the working tree is not in a working-tree diff at all. It is judged from the index, and its findings say so. A staged version that adds no line to a file the working tree still holds (a `git mv` followed by an unstaged edit) is not listed a second time.
+
+Which files changed is decided without trusting git state that leaves no trace in the repository:
+
+- Untracked files are listed honouring `.gitignore` files only. `.git/info/exclude` and a global excludes file are ignored, so a file listed there is still checked. On a developer's own machine this means files hidden only by a global ignore (editor folders, `.DS_Store`) are seen by `moag standards check`; add them to `.gitignore` or to the profile's allowed top level.
+- A tracked file flagged `assume-unchanged` or `skip-worktree` in the index is listed as changed and unread. Its rules are `not-checked`, and the report names it.
+
+Vendored and generated files are not judged like hand-written code. A file under a top-level `vendor/`, `node_modules/` or `third_party/` directory — or under a deeper `node_modules/` beside a `package.json`, or a deeper `vendor/` beside a `go.mod`, `composer.json` or `Gemfile` — a file named `*.pb.go`, `*.g.cs` or `*.Designer.cs`, the Maven and Gradle wrapper scripts, and a file whose first five lines carry `Code generated … DO NOT EDIT`, `@generated` or `<auto-generated` **in a comment** is left out. A directory that merely has the name (`src/vendor/`) and a marker inside a string literal exempt nothing. Such a file is left out of the placement, naming, raw-pattern, layering and comment rules. The top-level rule still applies to it. A profile cannot yet name its own generated directories.
+
+**Every exemption is visible.** The report lists each changed file the line rules did not read, as `not checked (<reason>)`, and counts them (`notCheckedFiles`, `totals.notCheckedFiles`):
+
+- vendored code, and whether this change added it;
+- a generated file, and whether this change added or newly marked it;
+- a file in a language with no lexer (`No checker for .rb files`);
+- a file of a type no scanner reads, as `unsupported type (<type>)`: build scripts (`.gradle`, `.kts`), shell scripts (`.sh`, `.bash`, `.zsh`), component and stylesheet dialects (`.vue`, `.svelte`, `.scss`, `.sass`, `.less`), `.mdx`, `.svg`, pipeline and tool configuration (`.yml`, `.yaml`, `.toml`), `Dockerfile`, `Containerfile` and `Makefile`. These are code or configuration a project is built from; a change to one is listed, never skipped in silence;
+- a file that could not be read or lexed (too large, binary, an ambiguous construct), with the reason;
+- a directory that is a nested repository or a submodule (see above).
+
+Such a file is never evidence for "no findings": a rule that read nothing else is `not-checked`. Plain data and prose (`.json`, `.md`, `.txt`, an image, `LICENSE`) is out of scope for the line rules and is not listed. The list is capped at 200 entries; the count is always the true one.
+
+A file this change **newly marked as generated** — it wrote the marker comment, on a new file or onto an existing one — is also a finding of its own, on the marker's line, under the rule `exemption/newly-generated`. It is advisory by default. A file that is generated by its name or vendored by its directory carries no marker anybody wrote: it is listed as not checked and is no finding.
+
+| Rule | Default | Checks |
+|---|---|---|
+| `structure/required-dirs` | advisory | Each required directory holds at least one path git lists for the tree — tracked, or untracked and not ignored. The comparison is case-sensitive whatever the file system is: `SRC` does not satisfy `src`. An empty directory, and one that only `.gitignore`d files sit in, does not exist for this rule. |
+| `structure/top-level` | advisory | A new top-level entry is in the allowed layout. |
+| `structure/placement` | advisory | An added or renamed file that matches a placement rule sits under one of its directories. |
+| `structure/nested-repository` | advisory | The tree holds no directory that is a git repository of its own and that no tracked `.gitmodules` declares. |
+| `frontend/raw-pattern` | advisory | No added line contains a configured raw pattern. The design system's tokens file is never scanned by it. |
+| `frontend/design-tokens` | advisory | Only with a design system (`not configured` otherwise). No added line of a `.css`, `.html` or `.htm` file — nor the **style-shaped** text on an added line of a `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs` or `.cjs` file — holds a raw colour (hex, `rgb()`, `hsl()`) or a raw length (`px`, `rem`, `em`). In a script, only this text is style-shaped: a template literal tagged `css`, `keyframes`, `createGlobalStyle`, `injectGlobal` or `styled.x` / `styled(X)` (with `.attrs(…)`); a string assigned to a style key (`color:`, `background-color:`, `padding:`, `marginTop:`, `fontSize:` …); a JSX colour attribute (`color=`, `fill=`, `stroke=`, `stopColor=`, `floodColor=`); and a literal that itself reads as a CSS declaration with a raw value (`'border: 1px solid #333'`). So an issue reference (`'fixes #123'`, `'Issue: #123'` — a declaration is read only under a real CSS property name such as `color`, `background-color`, `border`, `margin-top`, `width`, or a custom property `--name`), a selector (`querySelector('#id')`) and a colour assigned to a plain constant are not read (the last is a known recall loss of an advisory rule). Files matching `testing.fileGlobs` or a backend layer glob are out of scope: neither evidence nor "not checked". `0`, `1px`, `var(…)` and `@media`/`@container`/`@supports` lines are allowed, comments are not read, and the tokens file itself is exempt. A file importing another known UI kit (MUI, Ant Design, Chakra UI, Mantine, Radix UI, Headless UI, Vuetify, React Bootstrap, Bootstrap, Tailwind CSS) than the approved `componentKit` is a finding on the import line. DESIGN.md and the tokens file in the workspace must match the approved content (line endings aside): a missing or changed one is a finding on line 1. A changed `.vue`, `.svelte`, `.scss`, `.sass` or `.less` file, or a UI or script file that could not be read or lexed, leaves the rule `not-checked` with the reason. |
+| `layering/imports` | advisory | No added import crosses a forbidden layer boundary. Relative imports, declared aliases, the repository's own workspace packages (`package.json` `workspaces`, `pnpm-workspace.yaml`) and TypeScript path aliases are resolved: `compilerOptions.paths` and `baseUrl` in `tsconfig.json`, `tsconfig.base.json` or `jsconfig.json` at the root and above each changed file, with `extends` followed, and with project `references` followed one level (a "solution" config whose paths live in `tsconfig.app.json`). An alias import that cannot be resolved leaves the rule `not-checked`; it is never reported as "no findings". `.mts` and `.cts` files are read like `.ts`. For Python, `from <package> import <name>` also checks each imported name as a submodule. |
+| `naming/files` | advisory | An added or renamed file's name follows the configured style. |
+| `comment-policy/commented-out-code` | advisory | No added comment is commented-out code. A comment counts when it is unmistakably a statement, or when two code-shaped comment lines sit together. A call-shaped note such as `// O(1)` or `// rgb(0, 0, 0)` is not code on its own, and neither is an indented example in a Go doc comment. |
+| `comment-policy/banned-phrase` | advisory | No added comment contains a banned phrase. Each phrase is matched against **one comment**: a single `//` or `#` comment, or one whole block comment with its lines put back together. Two comments on one line, or on neighbouring lines, are never run together. A phrase written as a comment (`// rest of the code`) must be the whole comment, give or take surrounding dots and brackets, a leading "the" and a leading `TODO:`; an ellipsis in a phrase matches `...`, `..` and `…`. The built-in list holds truncation placeholders only: whole-comment placeholders (`// rest of the code`, `// your code here`) and placeholders between two ellipses (`... existing code ...`). It holds no assistant-voice phrase such as "as an AI", which honest prose also contains, and no bare two-word label such as `// existing code`. A sentence that merely shares the words ("put your code here if you need a custom step") is not matched. A project may add any plain phrase to its own profile. Comments inside inline `<script>` and `<style>` in an HTML file are read like any other. |
+| `comment-policy/density` | advisory | In a file with at least `minAddedLines` added lines, comment lines are at most `maxDensityPct` of them. Documentation comments are not counted. |
+| `exemption/newly-generated` | advisory | No file was newly marked as generated by this change (see above). |
+| `practice/todo-without-issue` | advisory | Only with `practice.todoNeedsIssue`. A `TODO` or `FIXME` in a comment on an added line cites an issue: `#123`, a tracker key such as `ABC-123`, or a link. A source file that cannot be lexed is `not-checked`. |
+| `practice/debug-statement` | advisory | Only with `practice.noDebugStatements`. No added line of a JS-family file holds a `debugger` statement (literals blanked first), and none of a Python file a `breakpoint()`, `pdb.set_trace()` or `ipdb.set_trace()`. Other languages are out of scope. |
+| `security/env-file` | advisory | **Always, whatever the profile holds.** No changed path is a `.env` file (`.env`, `.env.local`, `.env.production` …); `.env.example`, `.env.sample` and `.env.template` are fine. |
+| `security/secret-literal` | advisory | **Always.** No added line of any read file holds a credential-shaped value (an `sk-…` API key, a GitHub token, an AWS access key id, a PEM block). The finding names the shape and **never repeats the value**. A binary file is out of scope; any other unread file leaves the rule `not-checked`. |
+| `a11y/img-alt` | advisory | Only with `accessibility.imgAlt`. Every `<img>` that starts on an added line of a `.html` or `.htm` file has an `alt` attribute. Other files (JSX included) are out of scope. |
+| `a11y/html-lang` | advisory | Only with `accessibility.htmlLang`. The `<html>` element of a new `.html` page, or one on an added line, declares `lang`. |
+| `docs/changelog-updated` | advisory | Only with `docsGit.changelogPath`. A change that touches anything but MOAG's own files and the design files also changes the changelog; otherwise a finding at the changelog's path, line 1. |
+| `data/migration-edited` | advisory | Only with `apiData.migrationsGlob`. A file under the migrations glob that this change modified, renamed away or deleted is a finding; one it added is fine. `not-checked` when the deleted files were not listed. |
+| `testing/requirement-reference` | advisory, **cannot be promoted yet** | Only with `testPolicy.requirementReference`. Each requirement id the check is given (`R-1`, `R-2` …) is named, as a whole token, in a changed file matching `testing.fileGlobs` (`R-1` never matches `R-10`); an id named in none is a finding at `requirement R-n`, line 1. The verify pass gives the requirement ids its tasks cite, less any whose tagged tasks all went out in that requirement's last release — a v2 verification is not asked about a v1 id it did not touch, and a task added for a shipped id brings it back in; **the check before the ship gate is not given them, so there the rule always reads `not checked: no requirement ids were given to this check`**. Because a blocking rule that is not checked refuses every gate approval, the validator refuses `severity: {"testing/requirement-reference": "blocking"}` until the pre-gate check gets the ids. |
+| profile commands | blocking (always) | Each command exits 0. A command is a real tool with a real exit code, and cannot be made advisory. |
+
+### Blocking and advisory rules
+
+Every rule is `blocking` or `advisory`. The finding detail is the same for both; the difference is what a finding does.
+
+- A **blocking** rule that fails or has findings fails the standards gate: the run ends `gaps` and nothing is marked shipped.
+- An **advisory** rule's findings are listed with file, line and rule in the report, shown to the reviewer and the approver, counted in the totals (`advisory`, `advisoryFindings`), and stop nothing.
+
+**The default blocking set is the profile's commands, and only them.** Each is a real linter, formatter, type-checker or test, and its exit code is the evidence. A command is always blocking and cannot be made advisory.
+
+Every rule MOAG decides itself — required directories, nested repositories, placement, the top-level layout, naming, layering, raw patterns, commented-out code, banned phrases, comment density and generated markers — is **advisory by default**: in the built-in profiles, in every proposal and in the defaults a profile inherits. Each has been shown to flag correct code or to miss real violations. Detecting a required directory in the repository does not make the rule blocking either. Style and structure are meant to be enforced by the stack's own tools as profile commands: a proposal adds the standard check command for each tool whose config file is tracked in the repository, and says so when it found none.
+
+A profile with **no command and no promoted rule** has an empty blocking set. That is allowed: a run under it may ship. Every surface then says `no blocking rules configured` — the CLI, the web cards, the HTML report, the gate row and the release stamp — and none says that anything passed.
+
+Detection proposes only **top-level** directories that hold tracked source files as required directories (a nested test or fixture folder is never required).
+
+**Honest wording.** A scan that found nothing has not proved that nothing is there, so a scanner rule is never said to have passed:
+
+| Kind of row | Outcomes shown |
+|---|---|
+| A profile command | `passed`, `failed`, `not checked` |
+| Every rule MOAG decides itself | `no findings`, `findings`, `not checked` |
+
+The CLI, the web cards, the HTML report and the `moag:standards` gate row all use these words. The badge of the run's standards card follows the same rule: the green `✓ NOTHING BLOCKING` is shown only when a profile **command** passed and nothing was left open. When the blocking set is made only of promoted scanner rules and they found nothing, the badge is `NOTHING BLOCKING · NO FINDINGS` in the neutral colour, with no tick and no green frame; with something left open it is `NOTHING BLOCKING · 3 ADVISORY · 2 FILES NOT CHECKED` in the warning colour. The stored report keeps one closed set of result values (`passed`, `failed`, `not-checked`) for every row; the words above are how a row is shown. The totals keep the two apart as well: `passed` counts commands only, and `noFindings` counts rules that read something and found nothing.
+
+**Promoting a scanner rule.** A profile changes any rule with `"severity": { "<rule>": "blocking" | "advisory" }`, so a project may still make a scanner rule blocking. The editor warns at the control the moment one is set to blocking, the review screen repeats the warning for the reviewer, and every report of a run names the promoted rules: scanner rules are heuristic, and as blocking rules they can stop correct code and can miss real violations. A product owner or an admin proposes the promotion and a reviewer approves it, like any other change.
+
+#### Changing what blocks
+
+MOAG does not try to tell a change that tightens enforcement from one that loosens it. `npm test` rewritten to `npm test || true` removes nothing and adds nothing, and switches a check off all the same. So **any difference** between a version and the version in force, in a field that decides what can stop a release, is an *enforcement change*:
+
+| Field | A difference is |
+|---|---|
+| `commands` | anything: a command added or removed, a command line edited, a label renamed, the order changed, the list emptied. Compared exactly. |
+| `severity` | a rule promoted or demoted. Compared as each rule resolves, so writing a default out explicitly is not a difference. |
+| `structure.requiredDirs` | anything: an entry added, removed or swapped, the order changed, the list emptied. Compared exactly. |
+| the settings of a rule that is **blocking** (`ruleConfig`) | anything, for a rule that is blocking in either version: a promoted naming rule whose patterns were emptied can stop nothing, though its severity never moved. The settings of an advisory rule are not compared. |
+
+One comparison (`enforcementReview`) drives three things, so none can show or require something another missed:
+
+- **The review screen** shows the differences at the top of the version card, un-collapsed, with what each field held before and after (`enforcementChanged` on each version of `GET …/standards`: `comparedTo`, `changed`, `fields`, `commands`, `severity`, `requiredDirs`, `ruleConfig`). **Approve** (and **Accept defaults**) stay disabled until the reviewer ticks "I have read the enforcement changes…".
+- **The server** refuses to approve such a version without the acknowledgement (`409 acknowledgement-required`; see above). The screen's checkbox is a convenience; this is the enforcement.
+- **The audit log**: the entry of every propose, approve and accept-defaults carries the flag `enforcement-changed` and, in `after.enforcementChanged`, the same before/after for each differing field. `severity-changed` and `commands-changed` are added beside it when those fields are among the differences. The flags `blocking-set-reduced` and `blocking-set-extended` no longer exist.
+
+The comparison is with the version **in force** — the latest approved version below the one being proposed or approved — at propose time and again at approve time. It is never made with the proposal a version was typed on top of, which may be a superseded or rejected one: a change carried along a chain of unapproved proposals under word edits is still shown, still needs the acknowledgement, and is still flagged when the last of them is approved. While nothing is approved the comparison is with an **empty baseline** — no command, default severities, no required directory — so a first version that brings any of them is an enforcement change too. A version that changes none of these fields is not flagged and needs no acknowledgement.
+
+If the store cannot be read when the entry is written, the entry is flagged `enforcement-changed` and `enforcement-reference-unreadable`: a change is then over-reported, never missed.
+
+**A design-system change needs the same acknowledgement.** Any difference in `profile.design` from the version in force — a token, a DESIGN.md section, a path, adding or removing the design system — is shown on the version card under the enforcement changes (`designChanged` on each version: `comparedTo`, `changed`, `paths`, `tokens`, `sections`, `docChanged`, and `raw` when a tokens file cannot be listed), and the version is approved only with `acknowledgedEnforcementHash`; without it the answer is `409 acknowledgement-required` with `design` among the `fields`. It is audited as `design-changed`. It is **not** an enforcement change by itself — the design rule is advisory — unless `frontend/design-tokens` is blocking in either version: then its configuration (paths, the hashes of both files, the kit) is compared like any promoted rule's `ruleConfig`, and the entry is also `enforcement-changed`.
+
+Promoting or demoting a rule is an edit to the profile like any other: a new version, pending until a reviewer approves it. The review screen also keeps its list of promotions and demotions in the severity section (`severityChanged`, `severityComparedTo`), from the same comparison.
+
+The report shows its groups apart and never mixes them: **Blocking**, **Advisory**, **Rules not checked** and **Files not checked** — and, apart from all four, the rules the profile does not configure (**Not configured**). A blocking rule or command that was not checked is listed first in its group, marked, and counted on its own (`blockingNotChecked`); any such row stops the release. On the server, severities are re-derived from the standards version frozen on the run, and so is whether each rule is configured at all, so a report cannot arrive with a blocking rule demoted — or with an advisory one made to block. A row the report marks "not configured" (by its flag, or by the reason text an older report used) is "not configured" only when the frozen profile really does not configure that rule; a configured rule that arrives so marked counts as not checked, and when it blocks, it stops the release. With no frozen version to read, no row is "not configured". When the server refuses a row's "not configured" claim it also replaces the old *Not configured in this profile* reason with one that says the row was not checked, and the gate card reads that reason text as "not configured" only on a row with no severity (a report from before severities), so the card can never show *Not configured* or *no blocking rules configured* for a row the gate counts as blocking and not checked.
+
+Each finding names a file, a line and a rule.
+
+**Not configured is not "not checked".** A rule the profile does not configure (no required directories, no naming rules, no design system, no changelog path, …) is reported as **not configured**: counted apart (`totals.notConfigured`), listed in its own collapsed **Not configured** group on the run page and in the verification report, and left out of the rules not checked, `notCheckedRules` on the requirement trace, and `blockingNotChecked`. It is no gap in the check and not a pass. A report stored before this distinction existed is read the same way: a row whose reason is `Not configured in this profile` counts as not configured. When an earlier gate failed first, a rule the profile does not configure still says not configured; only the rules it configures carry the skip's reason.
+
+**Not checked is not a pass.** A rule is `not-checked`, with a reason, when:
+
+- the file's language has no lexer (the supported ones are TypeScript and JavaScript — `.ts`, `.tsx`, `.mts`, `.cts`, `.js`, `.jsx`, `.mjs`, `.cjs` — Java, C#, Go, Python, HTML and CSS);
+- the file has no extension and starts with `#!`: it is a script the checker cannot read (`LICENSE` and similar prose files are out of scope by name; `Dockerfile` and `Makefile` are listed as an unsupported type);
+- no diff could be taken, or git gave no listing of the tree (every rule then, required directories and nested repositories included);
+- it is a profile command that did not run: an earlier command or gate failed, the check was stopped, or `--no-commands` was given;
+- git was told to ignore changes to the file (`assume-unchanged` or `skip-worktree`);
+- the diff holds only vendored or generated files for that rule;
+- it is a rule the project promoted to blocking and the change itself made a file exempt: it added the file under a vendor directory, added a file with a generated name (`.pb.go`, `.g.cs`, `.Designer.cs`), wrote the generated marker, or added the manifest that marks the directory as third-party. The file is named and counted in `blockingNotChecked`. For an advisory rule, and for a file that was already vendored or generated at the base ref, the rule only notes how many files it did not check. Either way the file is in the report's list of files not checked;
+- a Python `from <package> import (` or `import *` names one of the project's own packages and the imported names are not on that line;
+- the file could not be read with certainty: it is over 512 KB, binary, has an unterminated string or comment, or holds a `/` that may divide or open a regular expression, a `<` that may open a JSX element or a type parameter list, or an inline `<script>` in a language other than JavaScript or JSON. Where the language settles the question the file is read: a property named like a keyword is an operand (`obj.in / 2`, `this.of! / 2` divide), and in a `.tsx` file `<T extends Base>(…)` and a `<T>(…)` after `type Name =` are type parameter lists, as the TypeScript compiler reads them. In a `.js` or `.jsx` file `<T extends …>` cannot be settled and the file is not checked;
+- an import names a workspace package and the workspace could not be read;
+- a tsconfig or jsconfig above the file could not be read, extends a file that was not found, or refers (`references`) to a config that is missing or unreadable: any non-relative import may then be one of its aliases;
+- an earlier gate failed first;
+- it is a layering rule for C#, whose `using` lines cannot be mapped to paths.
+
+A not-checked rule is always shown and never counted as passed or as "no findings". An **advisory** rule that is not-checked stops nothing. A **blocking** row that is not-checked — a command, or a promoted rule the profile configures — stops the release, whatever the reason: no reason is weighed. A promoted scan therefore also stops a change that gives it nothing to judge (a documentation-only change under a promoted comment rule, say); a command always runs and does not have that problem, which is one more reason to block on commands.
+
+The report is stored in the run directory as `standards-report.json`, with only its totals on the run record. Findings are capped at 200, not-checked files at 200 and command output at 2,000 characters; the totals keep the true counts. `GET /api/projects/:id` returns it as `currentRun.standardsReport`; a run with no report has no such field.
+
+When a requirement ships, its release row records the standards version it shipped under (`standardsVersion`). `GET /api/projects/:id/trace` and `moag trace` both show it. A release whose check left a blocking rule or a command not-checked does not ship at all (above), so a recorded version means one of two things, and the counts beside it say which: the blocking set was evaluated and nothing in it failed, or the profile had no blocking set. What the advisory scans managed to read plays no part. A local release task follows the same rule: it stamps the version only when the requirement's latest gates hold an exit-0 `moag:standards v<N>` row for that version.
+
+Each requirement's latest gates are in the row too (`gates`, as `{ command, exitCode }`). The `moag:standards` row among them carries two more keys, so that neither the trace screen nor a reader of `moag trace` has to guess what `exitCode: 0` means there: `standards`, the word above (`stopped`, `no blocking rules configured` or `nothing blocking`), and `standardsCounts` when the row was recorded with them. No other gate has either key. The trace screen's Gates cell tallies commands only (`1/1 pass`) and puts the word beside the tally (`· standards: no blocking rules configured`).
+
+Beside the version, the release row records what the check left open, as numbers only (`standardsCounts`): `advisoryFindings`, `notCheckedRules` (rules the profile configures that were not checked) and `notCheckedFiles` — and `noBlockingRules: true` when the profile had no command and no promoted rule. The trace screen then shows "no blocking rules configured" beside the version; the key is absent whenever a blocking set existed. A checked release is not always a clean one, and the trace says by how much. The counts are never recorded without a version. A plan file written before they existed loads unchanged.
+
+### Local workspaces
+
+The VS Code extension and the headless CLI use `<workspace>/.moag/standards.json`, which is trusted because the workspace is the user's own. There is no approval step locally.
+
+```json
+{ "schemaVersion": 1, "version": 1, "profile": { "…": "…" }, "provenance": { "…": "…" } }
+```
+
+A file that exists but is invalid is an error that names the file. It is never treated as "no standards".
+
+```
+moag standards show
+moag standards check [--base <ref>] [--no-commands]
+moag standards propose [--stack <id>] [--write [--force]]
+```
+
+- `show` prints the document and the text every prompt carries.
+- `check` checks the diff since `--base`. Without `--base` that is the commit captured when the first run since the last passed verification started (`.moag/standards-base.json`), so work a run committed is still checked; with none captured it is `HEAD`. Its exit codes are: **0** nothing blocking — every command passed, or the profile has no blocking rules configured (the output then says so, and prints no row as passed); **1** a command failed, or a promoted rule has findings; **2** a usage error, or no usable profile; **5** no diff could be taken at all, so nothing was checked; **6** nothing blocking failed, but a command or a promoted rule was **not checked** — unevaluated blocking evidence is not a pass. `--no-commands` leaves every command not checked, so with a profile that has commands it exits 6. Advisory findings are printed and do not change the exit code. The output has four groups — Blocking, Advisory, Rules not checked, Files not checked — with one `file:line rule` line per finding and one `path — not checked (reason)` line per file. Only a command is printed as `passed` or `FAILED`; every rule MOAG decides itself as `no findings` or `FINDINGS`. A blocking row that was not checked is marked `!! BLOCKING RULE NOT CHECKED`. When the profile promotes a scanner rule to blocking, the output says which and repeats the warning.
+- `show` also prints the design system, when there is one: both paths, every listed token, and the design block every task prompt carries.
+- `propose` detects the repository's conventions from the files git tracks (it asks git which they are; with no listing it proposes no directory and says why in the provenance) and prints a proposal. It writes the file, as the next version, only with `--write`. An existing file that differs from the proposal may hold hand edits and is replaced only with `--force`; the file it replaces is kept as `.moag/standards.json.bak`. A proposal with a design system also writes DESIGN.md and the tokens file under the same contract: one that exists and differs is replaced only with `--force` and kept as `<file>.bak`. Every design file is checked before anything is written, so a refusal (exit 2) writes nothing — not the standards file either.
+- `--no-standards` on `run` and `verify` turns project standards off for that invocation: task prompts carry no standards block, and verification runs no standards gate.
+
+## Threat model
+
+**Assets**
+- user credentials and sessions
+- engine API keys and the master secret
+- the audit log's integrity
+- the canonical plans and approval state
+- the repos and workspaces
+- the host and container
+- spend (tokens cost money)
+
+**Actors**
+- unauthenticated network clients
+- authenticated users in each role
+- a malicious or compromised repo (its `.moag/*`, its build scripts)
+- **coding agents**, which execute arbitrary commands by design and can be prompt-injected through PRD text or repo content
+- the operator
+
+**Trust boundaries**
+- browser ↔ reverse proxy ↔ server
+- server ↔ worker (process boundary, scrubbed env, IPC)
+- worker ↔ agent CLI (same uid)
+- the container ↔ the host
+
+| Threat | Mitigation | Residual |
+|---|---|---|
+| Credential stuffing or brute force | scrypt, 429 per account+IP and per IP, uniform error and timing. Bootstrap tokens are limited per IP. Wrong *current* passwords on `POST /api/me/password` are limited per user, from any IP (5 wrong, then 15 minutes of 429 before scrypt runs), so a stolen session is not a password oracle | In-memory limiters reset on restart |
+| Session theft | HttpOnly, `__Host-`, Secure on https, hashed ids at rest, epoch invalidation, no-store on `/api`. A revoked session (logout, role change, disable, password set) ends its live event streams at once with an SSE `session-ended` event; an expired one at the next heartbeat | TLS is the reverse proxy's job (documented) |
+| CSRF | synchronizer token, JSON-only bodies, Origin check, SameSite=Lax | — |
+| XSS from agent-authored task names, error tails or PRD text | CSP `default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'`, nosniff. A static test bans `innerHTML`, `insertAdjacentHTML`, `outerHTML`, `document.write`, `eval`, `new Function` and inline handlers/scripts in `web/**` | — |
+| Privilege escalation | `canPerform` on every route, last-admin guard, role change kills sessions, table-driven matrix test | — |
+| **Run = RCE** | Only `reviewer` and `admin` start runs, only on a reviewer-approved, content-hash-bound plan. A run job runs as a separate process with `cwd` = its project workspace, a server-generated config (the repo's `.moag/config.json` is ignored, `custom`/`copilot` are rejected at plan approval), and an env allowlist plus only that job's engine keys. **Plan generation** (`product-owner`-triggered) does NOT start in the repository: its agent CLI runs with `cwd` = an empty server-owned scratch dir (`projects/<id>/plans/<planId>/work`), auto-approve forced off (no `--dangerously-skip-permissions`, no Claude allow-list, no Codex `--full-auto`, no Gemini extra args), and its tools locked down (see [Planner lockdown](#planner-lockdown-and-allowplannerfileaccess)): Claude gets `--tools "" --strict-mcp-config` (no tools at all), Codex `--disable shell_tool --disable unified_exec --sandbox read-only` and `--skip-git-repo-check` (the scratch dir is not a repo; no shell or exec tool, but whether it can still read files through a non-shell built-in is unverified), and engines that cannot be restricted (gemini, anthropic) are refused unless an admin turns on `allowPlannerFileAccess`. The planner sees the repo only as a server-generated, size-capped `git ls-files` listing (first 2000 paths) in its prompt. No repo-shipped engine config (`.claude/settings*.json` hooks, `.mcp.json`, `.gemini/`) is loaded during plan generation. The generated playlist and rejections are scrubbed of the job's injected engine key before they are hashed, stored or shown; if the key appeared, the plan can never be approved. | **Agents run as the same OS user as the server.** An agent can read the data dir (`users.json` hashes, `secrets.json`, other workspaces) and `/proc/<server pid>/environ`, which holds the master key if it came from env. **The container is the real boundary.** An approved **run** executes inside the repository, so the engine CLI loads the repo's own engine config (`.claude/`, `.mcp.json`, `.gemini/`): hooks and MCP servers run as the server uid. That is why only `reviewer` and `admin` can start runs, and why a reviewer must trust a repository before approving its first run (the plan review card warns when the repo ships engine config or agent instructions; see [Who can trigger agents](#who-can-trigger-agents-and-how-they-are-contained)). Documented with a recommendation: one instance per trust domain. Separating the agent UID is deferred. **Plan generation still runs as the server uid** with the engine key in its environment. Under the lockdown a Claude or Ollama planner has no tool to read files with; a Codex planner has no shell, but may still be able to read files the server uid can read (unverified). The job's own engine key is redacted from its output in case the model echoes it. If an admin turns on `allowPlannerFileAccess`, a gemini or anthropic planner **can** read any file that uid can, and a PRD can steer those contents into the generated plan, which every signed-in user can read. On anthropic the override also grants shell execution and file writes (`run_bash`, `write_file`). A CLI too old to know a lockdown flag exits with an error, so its plans fail rather than run unrestricted. Codex only warns about an unknown *feature name* (`--disable <name>`) rather than rejecting it; the read-only sandbox is the backstop there. |
+| Generated plan reaching outside its project | Every task `cwd` must stay inside the workspace: an absolute path (POSIX, `C:\`, drive-relative `C:x`, UNC) or a `..` that climbs above the root makes the plan unapprovable (`409 review-errors`), and unstartable if it was approved before the check existed. Every command, cwd, `healthCheckUrl`, `skipIf`, `failurePolicy` and monitor `incidentRepo`/`incidentLabel` is listed verbatim on the review card. `env`, `inheritEnvFiles`, `githubRelease` and `releaseTag` are stripped before hashing | A command can still `cd` anywhere the uid can; the reviewer reads the commands |
+| Two projects sharing files | A project's workspace must be a git repository's top-level folder (`not-a-git-repo`, `not-repo-root`), and may not contain or sit inside another project's workspace (`409 workspace-nested`), compared as realpaths | — |
+| Command injection through clone URL or path | `execFile('git', ['-c','protocol.file.allow=never','-c','protocol.ext.allow=never','clone','--no-recurse-submodules','--',url,dest], {shell:false})`, `GIT_ALLOW_PROTOCOL`, URL allowlist, paths realpath-confined to the projects root | Re-validated at each job start (symlink TOCTOU) |
+| Ship-gate bypass | `CI` stripped and refused, `onManualGate:'halt'` forced, approve is approver-only, skip is admin-only with a reason, distinct audit actions | An agent could edit the run snapshot plan file (same uid). The server re-reads only statuses and trace from it. Documented. |
+| Key exfiltration through the API | GET returns last4 only; audit records "key set"/"key cleared" only; error tails are redacted of injected key values before persisting | Keys in the agent env are visible to that agent by design |
+| Audit tampering | Append-only API with no edit or delete route | Same-uid writes are not prevented. A hash chain is deferred. |
+| Cost runaway | per-version cap, worker `costBudgetUsd` = remaining, plan generation counted, Claude jobs in JSON mode with `--max-budget-usd` per call ([Cost reporting](#cost-reporting)) | Overshoot by one call (the ceiling check runs after each call, `runner.ts:533-551`) |
+| DoS | 1 MB body cap, SSE limit 5 per session, job concurrency cap, scrypt semaphore | — |
+| Standards text as a prompt-injection carrier (author-written, in every task and planner prompt) | Reviewer approval bound to a content hash. Caps of 20,000 characters of free text and 4,000 characters rendered. Free text is rendered as a `> ` blockquote. A credential-shape scan rejects the proposal. The audit log records the version and hash only | A reviewer who approves hostile text has approved it, the same as a PRD |
+| Profile commands are server-side execution | Commands are shown verbatim before approval. Each is a single line of at most 500 characters, and there are at most 6. The worker never infers them, and takes them from the approved version's job file. Approve echoes `contentHash`. A job file rewritten during the run is detected when the run ends (the reported profile hash no longer matches the frozen one) and the run ends `gaps` | `npm run lint` expands to a repo-defined script the reviewer does not see. This is the same exposure as auto-detected gates. The detection of a rewritten job file comes after verification ran, so a command an agent wrote into the file can execute once before the run is failed. That gives the agent nothing new: it already runs commands as the same user |
+| Repo-shipped `.moag/standards.json` or `.moag/rules.json` steering a server run | The server worker always receives `--standards <jobfile>` or `--no-standards` and never constructs an AI-rules store. A test stubs `fs` and asserts neither path is read | A local headless run trusts both files by design |
+| Standards detector fed a hostile repo | Detection reads files as data. The only processes it starts are bounded, read-only git queries (`git rev-parse --show-prefix`, `git ls-files`) to learn which files the repository tracks — run asynchronously, never on the server's event loop, with a minimal environment from which every inherited `GIT_*` variable is removed; nothing from the repository is executed. Proposed commands are fixed templates, never copied script bodies. File reads are capped, and proposals pass the same validator as user input | Detected values are attacker-influenced until the reviewer reads them, which is why every field is tagged |
+| An agent making the standards checker go blind (same uid) | The server freezes the standards version, its content hash and the base ref on the run record in `state.json`. The worker reads them from a job file in the run directory, which the agent can write, so the file is not trusted: the worker reports the hash of the profile it really used and the base it was given, and the server ends the run `gaps` unless a verify-phase report matches what it froze. The base ref is the last ref that shipped, so committing work does not move it out of the diff. The base commit itself lives in the agent-writable `.git`; if it can no longer be resolved the check diffs against the empty tree and judges every file, and if no diff can be taken the gate fails. The patch is taken with `--text --no-textconv --no-ext-diff`, so a `-diff` or `binary` attribute, a textconv driver or an external diff driver cannot hide hunks. A changed file that has content but no rendered hunk is reported as not checked, never as "no lines added". Untracked files are listed honouring `.gitignore` files only, never `.git/info/exclude` or a global excludes file, with `core.fsmonitor=false`. A tracked file flagged `assume-unchanged` or `skip-worktree` is reported as changed and not checked. A rule that found nothing to judge is not checked, never passed, and a release stamps a standards version only when a diff-based rule was decided. `.moag/` is excluded from the diff | Same-uid tampering cannot be fully closed without isolating the agent. What remains: an agent can turn a failure into `not-checked` by crafting a file the lexer finds ambiguous, by flagging a file in the index, or by putting a generated marker (`@generated`) or a `vendor/` path on a file. All three are named in the report. It can hide a new file by adding it to a `.gitignore`; that edit is itself in the diff, but the hidden file is not reported. Not-checked does not block shipping. An agent that can write `state.json` or the server's memory is outside this row: see **Run = RCE** |
+| Standards pattern denial of service | No profile-authored regular expression. Globs compile through a bounded internal translator. List and length caps apply to every field | — |
+| Standards report as an XSS or leak path | The `verify-standards` payload is shape-validated server-side, findings are capped at 200, command tails at 2,000 characters and redacted with the job's redact list, and the web app renders it with DOM text nodes only | — |
+| Planner prompt splice confusion | The `Rules:` marker line cannot occur inside the rendered standards block, because free text is blockquoted. A test covers a profile whose free text contains a `Rules:` line | — |
+
+### Dependency installs
+
+A run installs the project's dependencies itself, before the first step that needs them: a command, check, service, deploy or release task, a verify gate command, or a standards profile command. It does not rely on the agent remembering to run `npm install`. The plan review card states the rule, with the exact commands, before anyone approves.
+
+**When.** Before such a step, MOAG hashes the dependency manifests and lockfiles in the step's working directory (and the npm/pnpm workspace packages that the root `package.json` or `pnpm-workspace.yaml` lists). It installs when the hash differs from the one recorded after the last successful install in `.moag/dependencies.json`, or when `node_modules` (`obj/` for .NET) is missing while a manifest declares dependencies. For `package.json` only the dependency fields count (`dependencies`, `devDependencies`, `optionalDependencies`, `peerDependencies`, `overrides`, `resolutions`, `workspaces`, `packageManager`, `pnpm`): editing a script does not reinstall. Nothing changed means nothing runs.
+
+**What.** The commands come from a fixed table in the server code. The repository, the plan and the model never supply a command string.
+
+| Found | Command |
+|---|---|
+| `package-lock.json` / `npm-shrinkwrap.json` | `npm ci --no-audit --no-fund` |
+| `package.json` with no lockfile | `npm install --no-audit --no-fund` |
+| `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` |
+| `yarn.lock` (Yarn 1) | `yarn install --frozen-lockfile` |
+| `yarn.lock` with `.yarnrc.yml` or `packageManager: yarn@2+` | `yarn install --immutable` |
+| `requirements.txt` and a `.venv` or `venv` | `<venv>/bin/python -m pip install -r requirements.txt` |
+| `go.mod` | `go mod download` |
+| `*.sln` / `*.csproj` / `*.fsproj` / `*.vbproj` | `dotnet restore` |
+| `pom.xml`, `build.gradle(.kts)`, `Cargo.toml` | nothing: their build command resolves dependencies. A note says so |
+
+- **Lockfile refresh.** When the dependency fields of `package.json` changed since the last install but the lockfile did not (an agent added a dependency and never ran the package manager), the frozen command would refuse. MOAG runs the refresh command instead: `npm install --no-audit --no-fund`, `pnpm install --no-frozen-lockfile` or `yarn install`, which updates the lockfile. That change is part of the task's diff, is committed with it and is seen by the standards check.
+- **First sight.** When there is no record yet and `node_modules` already holds every package declared in `dependencies`, `devDependencies` and `optionalDependencies` (of `package.json` and each listed workspace package), MOAG records the current state and installs nothing: it never wipes a working tree that is already complete. An empty or partial `node_modules` (an earlier `npm install express` before `typescript` was added, a tool's `.cache`) is installed over. For dotnet, an existing `obj/` is enough. An install that was stopped or failed records nothing, so it is retried.
+- **First sight with a lockfile.** With no record, nothing says whether the lockfile still matches `package.json` — on a fresh clone an agent may already have added a dependency. For npm, MOAG compares the root (and each workspace package's) `dependencies`, `devDependencies` and `optionalDependencies` with the lockfile's `packages` entries (lockfileVersion 2 or 3); on any difference, or a lockfile it cannot read, it runs `npm install --no-audit --no-fund` instead of `npm ci`. For pnpm and Yarn it runs the frozen command and, if that fails (not on a timeout or stop), retries once with the refresh command.
+- **Python** installs only into a virtualenv the repository already has (`.venv` or `venv`), never into the system interpreter. Without one, the run shows `not installed: no virtualenv` and continues.
+- **Missing toolchain.** A table command whose tool is not on PATH (`go`, `dotnet`, `pnpm`, `yarn`) is not run: the run shows a note and continues, and the step fails later if it really needed the tool. The image ships Node 20 with npm; pnpm and Yarn need `corepack enable` in a derived image.
+- **Failure.** An install that exits non-zero or times out fails the step that needed it, with the command, its exit code and the end of its output. It is never a silent pass. A failed command task may then trigger the runner's usual auto-fix, which is an engine call.
+
+**Visibility.** Every install is a `dependencies-installed` or `dependencies-install-failed` event (a note is `dependencies-not-installed`) with the exact command, how long it took and the last 2,000 characters of its output, redacted like other tails. The run view lists them.
+
+**Trust.** An install executes what the repository's packages say, with the same trust as running its `npm test`:
+
+- npm, pnpm and Yarn run package lifecycle scripts (`preinstall`, `postinstall`) by default. That is a known supply-chain path. Set `MOAG_INSTALL_IGNORE_SCRIPTS=1` to skip them; packages that need a build step may then fail at test time.
+- The package manager still reads the repository's own `.npmrc` / `.yarnrc.yml`, so a repository can point installs at another registry. That is the same trust as running its tests.
+- A repository-shipped `.venv` interpreter is executed.
+- Installs run in the same minimal worker environment as every other command, under `MOAG_GATE_TIMEOUT_MS` (default 10 minutes; raise it for a cold install of a large repository), in their own process group, and are tree-killed when the run is stopped.
+- An agent can rewrite `.moag/dependencies.json`. That can only suppress an install, and the missing-`node_modules` check still applies, so the result is a failing step, not a silent pass.
+- Two installs in one workspace at once are serialised inside one process. Nothing locks across processes; the server's job lock already allows one job per project.
+
+Set `MOAG_AUTO_INSTALL_DEPENDENCIES=0` to turn installs off. The review card then says that a command which needs dependencies fails unless the plan installs them.
+
+### Who can trigger agents, and how they are contained
+
+- **Starting a run** is restricted to `reviewer` and `admin`. It needs a plan a reviewer approved, and the approval is bound to the plan's content hash.
+- **Plan generation** (product owner) runs an agent CLI in an **empty server-owned scratch directory**, never in the repository, with every engine's auto-approve forced off. Because the CLI does not start inside the repo, repo-shipped engine config (`.claude/settings*.json` hooks, `.mcp.json`, `.gemini/settings.json`) cannot load and run code on a product owner's click. The planner's tools are also locked down ([Planner lockdown](#planner-lockdown-and-allowplannerfileaccess)): Claude runs with `--tools ""` and `--strict-mcp-config` (no tools), Codex with no shell or exec tool and a read-only sandbox (whether it can still read files through a non-shell built-in is unverified), and gemini and anthropic are refused unless an admin sets `allowPlannerFileAccess`, which on anthropic grants shell execution and file writes. The planner gets the repository only as text: a server-generated `git ls-files` listing capped at 2000 paths (git runs with array args, no shell, `core.fsmonitor=false`), placed before the output-format rules in the prompt. The server still redacts the job's engine key from the generated plan and refuses to approve a plan that contained it.
+- **Approving a plan** (reviewer, admin) binds two things: the plan's content hash, and **the engine the review card shows**, which is the engine the plan was generated with.
+  - If the project's default engine changed while the plan was pending, approval is refused with `409 engine-changed`. Switch the project back or request a new plan.
+  - After approval the engine stays locked. A run, or a resumed segment, on a project whose engine has since changed is also refused with `409 engine-changed`.
+  - A plan with a task `cwd` outside the workspace cannot be approved at all.
+  - A plan whose playlist is marked `parallel` cannot be approved at all. Server runs make one engine call at a time, because the per-call cap and the per-version budget depend on it. The review card says so; request a new plan.
+  - A plan that fails review is refused with one of two codes. The response `message` is the review errors joined, and `errors` is the same text as a list:
+    - `409 engine-not-allowed` when every error is about an engine the server does not allow (`custom`, `copilot`, or one outside the server's list).
+    - `409 review-errors` for anything else: a `parallel` playlist, a `cwd` outside the workspace, a redacted credential, or a mix that includes one of these.
+  - The review is **re-run at approval**, not read from the stored result. A plan that was already pending before a review rule existed is refused by that rule.
+  - The review is **re-run again when a run starts**, on both the approved playlist and the copy in the project's plan. An approval is not a waiver: a plan approved before a rule existed gets `409 review-errors` (or `409 engine-not-allowed`), no worker is started and no run is recorded. The message starts with `This plan no longer passes review, so it cannot start.` Request a new plan.
+  - The review is **re-run when a ship-gate decision resumes a run** (`gate/approve` and `gate/skip`), on the approved playlist and on the run's own snapshot, which is the copy the next segment loads. A run that halted at its gate before a rule existed — a `parallel` playlist, say — is refused with the same two codes; no segment is spawned, the snapshot is not rewritten, no decision is recorded and the run stays `awaiting-approval`. The message starts with `This plan no longer passes review, so the run cannot resume.` `gate/reject` resumes nothing and stays possible: it is how such a run is closed.
+  - **The plan card is drawn from the same re-run**, so it never offers a button the server would refuse. In `GET /api/projects/:id`, a pending plan the rules now refuse has `review.ok: false` with today's errors and no `plan.approve` in `allowedActions` (`plan.reject` and `plan.cancel` stay). An approved plan the rules now refuse has no `run.start`, `startBlockedReason: "review-errors"` and the errors in `startBlockedErrors`; the card lists them. Nothing is written back to the stored plan: the review is derived on every read.
+- **Starting a run** (reviewer, admin) is where repository code and repository config become live: the run's agent starts inside the repo and loads what the repo ships. **A reviewer must trust the repository before approving its first run.** The plan review card warns, listing each of these entries the repo has:
+  - engine config: `.claude/`, `.mcp.json`, `.gemini/`, `.codex/`
+  - agent instruction files: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules`
+  - MOAG workspace rules: `.moag/rules.json`. A hosted run does **not** inject this file: its prompts carry only the approved [project standards](#project-standards). It is listed because a local `moag run` or VS Code session in the same checkout does inject it
+
+  Read them before approving.
+- **Stopping a run** (reviewer, admin) asks the worker to stop over IPC, and kills it if it has not exited 30 seconds later. Stop is idempotent: a second stop while the first is still settling returns `200` with `alreadyStopping: true`, changes nothing and is not audited again.
+- **The ship gate gates shipping.** The server appends a `manual` task, **Ship approval**, to every generated plan.
+  - The gate depends on all the non-shipping work.
+  - Every `release` and `deploy` task, and anything that depends on one, depends on the gate, so nothing ships before an approver says so.
+  - The playlist is reordered to: work, then the gate, then shipping tasks.
+  - Without a release or deploy task, the gate is simply the last task.
+- **Approving a ship gate** (approver) resumes the halted run, and the release and deploy tasks run after it. The server stamps each ready requirement as shipped only when the resumed run finishes with its verify gates green (exit 0) **and** every `release` and `deploy` task in its playlist completed. The stamp goes under the server-generated tag `ship-<runId>`, a trace label rather than a git tag (generated plans may not tag or push). A failing verify ships nothing, and so does a release or deploy task that failed, was skipped, was blocked or never ran. **Skipping** a gate is admin-only, needs a reason, is audited separately from approval, and never ships: the gate is marked done so the rest of the run (its verify pass included) continues, but every release and deploy task behind the gate, and everything that depends on one, is set to Skipped and never runs. Only an approval runs the release.
+
+Each job is its own process: a run with the project workspace as its working directory, a plan generation with its empty scratch directory. It gets the built environment above and only its own engine's key.
+
+**The same-uid residual is the important one.** Agents run as the server's OS user. An agent can read `/data`, which includes password hashes, the encrypted key store and other projects' workspaces, as well as the server's environment. **In practice, anyone who can get a run approved and started — including through engine config shipped in the repository, which loads when the run starts — can read the server's secrets.** Treat the container as the security boundary and run **one instance per trust domain**. Separating the agent UID is deferred.
+
+Other known limits:
+
+- The login, bootstrap and current-password rate limiters are in memory and reset on restart.
+- The audit log is append-only through the API but not tamper-evident against the server's own user.
+- One extra model call can overshoot the cost cap.
+- Two server instances on one data directory are unsupported.

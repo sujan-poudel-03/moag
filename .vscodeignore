@@ -15,6 +15,7 @@ node_modules/@types/**
 node_modules/**/*.ts
 node_modules/**/*.map
 .gitignore
+.gitattributes
 tsconfig.json
 tsconfig.test.json
 .vscode-test.mjs
@@ -42,3 +43,13 @@ scripts/**
 docs/**
 # ...except the manual, which is the one doc a user wants.
 !docs/MANUAL.md
+
+# Hosted PO web server and its front-end: not part of the extension.
+web/**
+out/server/**
+Dockerfile
+.dockerignore
+
+# Benchmark harness and its scenarios: a development tool, not part of the extension.
+bench/**
+out/bench/**

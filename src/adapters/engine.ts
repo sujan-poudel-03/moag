@@ -1,7 +1,7 @@
 // ─── Engine adapter interface and registry ───
 
 import { EngineId, EngineResult } from '../models/types';
-import { OutputCallback } from './base-cli';
+import { OutputCallback, probeVersion } from './base-cli';
 import { commandExists } from '../utils/command-exists';
 import { costLedger } from '../utils/cost-ledger';
 
@@ -106,16 +106,28 @@ export function withCostAccounting(adapter: EngineAdapter): EngineAdapter {
         return { stdout: '', stderr: CEILING_BLOCKED_MESSAGE, exitCode: 1, durationMs: 0 };
       }
 
-      // KNOWN BLIND SPOT: a rejection (abort, timeout kill, spawn failure)
-      // records nothing, because there is no EngineResult to read tokenUsage
-      // from. Tokens spent before the failure stay invisible to the ceiling,
-      // so the ledger under-counts on exactly the runs that cost the most.
-      const result = await adapter.runTask(options);
-      // Recorded even on a non-zero exit — a failed task still burned tokens.
-      costLedger.record(result.tokenUsage, {
-        engineId: adapter.id,
-        label: options.costLabel,
-      });
+      // Contract: every call that reaches the engine is accounted exactly once.
+      // A result with a finite, non-negative cost is recorded (even on a
+      // non-zero exit: a failed task still burned tokens). A result without one,
+      // or a rejection (abort, timeout kill, spawn failure), is reported on the
+      // ledger's separate unreported channel: its spend is unknown, so consumers
+      // that must bound it (server, bench) count it against a per-call cap.
+      let result: EngineResult;
+      try {
+        result = await adapter.runTask(options);
+      } catch (err) {
+        costLedger.recordUnreported({ engineId: adapter.id, label: options.costLabel });
+        throw err;
+      }
+      const cost = result.tokenUsage?.estimatedCost;
+      if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+        costLedger.record(result.tokenUsage, {
+          engineId: adapter.id,
+          label: options.costLabel,
+        });
+      } else {
+        costLedger.recordUnreported({ engineId: adapter.id, label: options.costLabel });
+      }
       return result;
     },
   };
@@ -153,28 +165,6 @@ export interface EngineAvailability {
 }
 
 /**
- * Probe a command with --version (or --help fallback) and return the first line of output.
- * Returns null if the command is not found or times out (5s).
- */
-async function probeVersion(command: string): Promise<string | null> {
-  const { execFile } = await import('child_process');
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), 5000);
-    execFile(command, ['--version'], { timeout: 5000 }, (err, stdout, stderr) => {
-      clearTimeout(timer);
-      if (err) {
-        // Some CLIs only respond to --help
-        resolve(null);
-        return;
-      }
-      const output = (stdout || stderr || '').trim();
-      const firstLine = output.split('\n')[0]?.trim() || null;
-      resolve(firstLine);
-    });
-  });
-}
-
-/**
  * Check availability of multiple engines in parallel.
  * Returns a Map from EngineId to availability info.
  * First checks PATH existence, then probes --version for available engines.
@@ -198,7 +188,9 @@ export async function checkEngineAvailability(
         results.set(id, { available: false, command, displayName: adapter.displayName });
         return;
       }
-      // Probe --version to verify the command actually works
+      // Probe --version the way a run spawns the command (base-cli's engineSpawnShape),
+      // so on Windows the version is that of the binary cmd resolves (a .cmd shim
+      // earlier on PATH), not of a .exe a shell-less lookup would find instead.
       const version = await probeVersion(command);
       results.set(id, {
         available: true,

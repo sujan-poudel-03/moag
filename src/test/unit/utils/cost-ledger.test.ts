@@ -41,7 +41,17 @@ describe('costLedger', () => {
         engineId: 'claude',
         label: 'task',
         lifetimeUsd: 0.25,
+        costSource: 'estimated',
       });
+    });
+
+    it('costSource defaults to estimated and carries reported through', () => {
+      const seen: CostEvent[] = [];
+      listen((e) => seen.push(e));
+      costLedger.record({ estimatedCost: 0.1 }, { engineId: 'claude' });
+      costLedger.record({ estimatedCost: 0.2, costSource: 'estimated' }, { engineId: 'claude' });
+      costLedger.record({ estimatedCost: 0.3, costSource: 'reported' }, { engineId: 'claude' });
+      assert.deepEqual(seen.map((e) => e.costSource), ['estimated', 'estimated', 'reported']);
     });
 
     it('defaults the label to "unattributed" and tokens to 0', () => {
@@ -106,6 +116,43 @@ describe('costLedger', () => {
       costLedger.record({ estimatedCost: NaN }, { engineId: 'claude' });
 
       assert.equal(costLedger.getLifetimeUsd(), 2);
+    });
+  });
+
+  describe('onUnreported', () => {
+    it('fires with the attribution and leaves the lifetime total and onRecord listeners untouched', () => {
+      costLedger.record({ estimatedCost: 1 }, { engineId: 'claude' });
+      let recorded = 0;
+      listen(() => recorded++);
+      const seen: Array<{ engineId: string; label: string }> = [];
+      unsubs.push(costLedger.onUnreported((e) => seen.push(e)));
+
+      costLedger.recordUnreported({ engineId: 'claude', label: 'task' });
+      costLedger.recordUnreported({ engineId: 'codex' });
+
+      assert.deepEqual(seen, [{ engineId: 'claude', label: 'task' }, { engineId: 'codex', label: 'unattributed' }]);
+      assert.equal(costLedger.getLifetimeUsd(), 1);
+      assert.equal(recorded, 0, 'onRecord never hears an unreported call');
+    });
+
+    it('a throwing unreported listener is isolated from the caller and from other listeners', () => {
+      let second = 0;
+      unsubs.push(costLedger.onUnreported(() => { throw new Error('boom'); }));
+      unsubs.push(costLedger.onUnreported(() => second++));
+      assert.doesNotThrow(() => costLedger.recordUnreported({ engineId: 'claude' }));
+      assert.equal(second, 1);
+    });
+
+    it('unsubscribe stops delivery and is idempotent', () => {
+      const before = costLedger.unreportedListenerCount();
+      let n = 0;
+      const off = costLedger.onUnreported(() => n++);
+      assert.equal(costLedger.unreportedListenerCount(), before + 1);
+      off();
+      off();
+      costLedger.recordUnreported({ engineId: 'claude' });
+      assert.equal(n, 0);
+      assert.equal(costLedger.unreportedListenerCount(), before);
     });
   });
 

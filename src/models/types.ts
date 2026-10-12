@@ -147,6 +147,8 @@ export interface Task {
   incidentRepo?: string;
   /** monitor task: label applied to filed incident issues (default "moag:incident") */
   incidentLabel?: string;
+  /** PRD requirement IDs (e.g. "R-4") this task implements — IDs only, never requirement text */
+  requirementIds?: string[];
   /** Runtime status (not persisted in the plan file) */
   status: TaskStatus;
 }
@@ -204,11 +206,123 @@ export interface SandboxConfig {
   port?: number;
 }
 
+/** Semver bump kinds used when labelling a saved PRD version. */
+export const SEMVER_BUMPS = ['patch', 'minor', 'major'] as const;
+export type SemverBump = typeof SEMVER_BUMPS[number];
+
+// ─── Dependency installs ───
+
+/** Ecosystems MOAG recognises when deciding whether a project's dependencies need installing. */
+export const DEPENDENCY_ECOSYSTEMS = ['npm', 'pnpm', 'yarn', 'python', 'go', 'dotnet', 'maven', 'gradle', 'cargo'] as const;
+export type DependencyEcosystem = typeof DEPENDENCY_ECOSYSTEMS[number];
+
+/** The events an automatic dependency install reports. */
+export const DEPENDENCY_EVENT_NAMES = ['dependencies-installed', 'dependencies-install-failed', 'dependencies-not-installed'] as const;
+export type DependencyEventName = typeof DEPENDENCY_EVENT_NAMES[number];
+
+/** Which step needed the dependencies. */
+export const DEPENDENCY_STAGES = ['task', 'verify', 'standards', 'bench'] as const;
+export type DependencyStage = typeof DEPENDENCY_STAGES[number];
+
+/** Why an install was considered. */
+export const DEPENDENCY_TRIGGERS = ['manifest-changed', 'install-dir-missing', 'first-seen'] as const;
+export type DependencyTrigger = typeof DEPENDENCY_TRIGGERS[number];
+
+/** One automatic dependency install (or the note that it could not be done). */
+export interface DependencyEvent {
+  event: DependencyEventName;
+  stage: DependencyStage;
+  taskId?: string;
+  ecosystem: DependencyEcosystem;
+  /** '.' or a path relative to the command's working directory. */
+  dir: string;
+  trigger: DependencyTrigger;
+  /** The exact command that ran; null only for `dependencies-not-installed`. */
+  command: string | null;
+  durationMs: number;
+  exitCode: number | null;
+  timedOut: boolean;
+  /** Last 2000 characters of the install output ('' for not-installed). */
+  tail: string;
+  /** Why nothing was installed; null for the other two events. */
+  note: string | null;
+}
+
 /** A saved snapshot of a PRD at a specific version */
 export interface PrdVersion {
   version: string;
   text: string;
   createdAt: string;
+  /** Bump MOAG recommended from the requirement diff (absent on the first version) */
+  recommendedBump?: SemverBump;
+  /** Bump the owner applied — equals recommendedBump unless overridden */
+  chosenBump?: SemverBump;
+}
+
+/**
+ * What a standards check left open beside its result: numbers only, never a file name or a
+ * finding. A passing check is not a clean one — these say how far from clean it was.
+ */
+export interface StandardsCheckCounts {
+  /** Findings of advisory rules: reported, never blocking. */
+  advisoryFindings: number;
+  /** Rules the profile configures that were not checked. */
+  notCheckedRules: number;
+  /** Changed files no line rule read (vendored, generated, no lexer for the language, unreadable). */
+  notCheckedFiles: number;
+  /**
+   * Set — and only ever `true` — when the profile checked against had no blocking rule at
+   * all: no command and no promoted rule. Such a check is shown as "no blocking rules
+   * configured", never as passed. Absent whenever a blocking set existed.
+   */
+  noBlockingRules?: true;
+}
+
+/**
+ * One gate command's real exit code, recorded against a requirement.
+ * IDs only, never requirement text.
+ */
+export interface RequirementGateResult {
+  command: string;
+  exitCode: number;
+  timedOut: boolean;
+  at: string;
+  /** Only on the `moag:standards` row: what that check left open. Absent on rows recorded before it existed. */
+  standardsCounts?: StandardsCheckCounts;
+}
+
+/**
+ * A release that shipped a requirement — the tag and the then-latest PRD version label.
+ * IDs only, never requirement text.
+ */
+export interface RequirementRelease {
+  releaseTag: string;
+  prdVersion: string;
+  at: string;
+  taskIds: string[];
+  /**
+   * The project standards version the release was checked against (an integer >= 1).
+   * Absent when it shipped with no standards — a plan that predates them — or when the
+   * blocking set of its standards was not evaluated.
+   */
+  standardsVersion?: number;
+  /**
+   * What that standards check left open: advisory findings, rules and files not checked.
+   * Only ever beside a `standardsVersion`; absent on a release stamped before it existed.
+   */
+  standardsCounts?: StandardsCheckCounts;
+}
+
+/**
+ * Deterministic evidence linking one requirement ID to tasks, commits, gates and releases.
+ * IDs only, never requirement text.
+ */
+export interface RequirementTraceRecord {
+  id: string;
+  taskIds: string[];
+  commits: string[];
+  gates: RequirementGateResult[];
+  releases: RequirementRelease[];
 }
 
 /** Top-level plan file structure */
@@ -239,6 +353,8 @@ export interface Plan {
   prdVersions?: PrdVersion[];
   /** Number of fix-iteration playlists generated so far (iteration guard ceiling: 3) */
   fixIterations?: number;
+  /** Requirement trace evidence keyed by requirement ID — IDs only, never requirement text */
+  requirementTrace?: RequirementTraceRecord[];
   /** GitHub issues this plan was generated from — used to close them after successful completion */
   sourceIssues?: Array<{ repo: string; number: number; title: string }>;
   playlists: Playlist[];
@@ -269,6 +385,13 @@ export interface TokenUsage {
   totalTokens?: number;
   /** Estimated cost in USD (if computable) */
   estimatedCost?: number;
+  /**
+   * Where `estimatedCost` came from: 'reported' = the engine's own billing
+   * figure (e.g. Claude JSON `total_cost_usd`), 'estimated' = derived by MOAG
+   * (price table, text scraping). Absent = treated as 'estimated'. Runtime
+   * only — not a plan-file field.
+   */
+  costSource?: 'reported' | 'estimated';
 }
 
 /** Result of an AI-driven PRD verification pass */
@@ -352,6 +475,8 @@ export interface HistoryEntry {
   modelId?: string;
   /** Why this model was selected by auto-selection */
   modelReason?: string;
+  /** Why auto-routing picked this engine (undefined when routing didn't fire) */
+  engineRoutingReason?: string;
   /** Whether this task was auto-fixed after initial failure */
   autoFixed?: boolean;
   /** Per-target pass/fail/skip breakdown for validate tasks */
@@ -419,6 +544,8 @@ export interface PlanFile {
   prdVersions?: PrdVersion[];
   /** Number of fix-iteration playlists generated so far */
   fixIterations?: number;
+  /** Requirement trace evidence keyed by requirement ID — IDs only, never requirement text */
+  requirementTrace?: RequirementTraceRecord[];
   /** Optional sandbox configuration — overrides project auto-detection */
   sandbox?: SandboxConfig;
   /** Optional plan-level validation defaults */
@@ -491,6 +618,8 @@ export interface PlanFileTask {
   failureThreshold?: number;
   incidentRepo?: string;
   incidentLabel?: string;
+  /** PRD requirement IDs this task implements — IDs only, never requirement text */
+  requirementIds?: string[];
   /** Persisted execution status (omitted or 'pending' means not yet run) */
   status?: string;
 }

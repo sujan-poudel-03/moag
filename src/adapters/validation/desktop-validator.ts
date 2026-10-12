@@ -10,6 +10,7 @@ import {
   ValidationStageResult,
 } from './types';
 import { resolveValidationProfile } from '../../models/execution-profiles';
+import { trackChildProcess } from '../../utils/child-tracker';
 
 type DesktopTool = 'electron-playwright' | 'spectron' | 'winappdriver' | 'generic';
 
@@ -182,7 +183,9 @@ function runCommand(
       shell: true,
       env: { ...process.env, ...(opts.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
     });
+    trackChildProcess(proc);
 
     let settled = false;
     const finish = (code: number) => {

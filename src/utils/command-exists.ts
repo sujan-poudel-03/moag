@@ -13,7 +13,7 @@ export function commandExists(command: string): Promise<boolean> {
       return;
     }
     const checker = process.platform === 'win32' ? 'where' : 'which';
-    execFile(checker, [command], (error) => {
+    execFile(checker, [command], { windowsHide: true }, (error) => {
       resolve(!error);
     });
   });

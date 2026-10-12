@@ -20,9 +20,16 @@ npx mocha --require ts-node/register "src/test/unit/runner/runner.test.ts"
 
 **Node version.** CI pins Node 20 and `.nvmrc` matches it. On Node 22.6+ the runtime
 strips TypeScript natively and loads `.ts` as ESM, which breaks `ts-node/register`
-with `require is not defined in ES module scope`. If you are on a newer Node, either
-`nvm use` or prefix test commands with `NODE_OPTIONS=--no-experimental-strip-types`.
-That flag does not exist on Node 20, so it must not go into the npm scripts.
+with `require is not defined in ES module scope`. If you are on a newer Node, `nvm use`.
+Prefixing `NODE_OPTIONS=--no-experimental-strip-types` does **not** fix `npm test`
+(checked on Node 24.16); pass the flags to `node` directly instead:
+
+```bash
+node --no-experimental-strip-types --no-experimental-detect-module node_modules/mocha/bin/mocha.js --require ts-node/register --require ./src/test/unit/test-setup.ts "src/test/unit/**/*.test.ts" --ignore "src/test/unit/**/*live.test.ts"
+```
+
+`--no-experimental-strip-types` does not exist on Node 20 (`bad option`), so it must not
+go into the npm scripts.
 
 ## Architecture
 
@@ -42,13 +49,13 @@ Plan JSON  →  Runner (state machine)  →  Adapter (per engine)  →  CLI subp
 
 **Runner** (`src/runner/runner.ts`): State machine Idle→Playing→Paused→Stopping→Idle. Has `_playLock` mutex preventing concurrent `play()` calls. Git operations use a 30 s timeout. Per-task timeout is configurable via `agentTaskPlayer.taskTimeoutMs` (default 1800000 ms = 30 min, per `package.json`; profile timeouts are fast=10 min, balanced=30 min, quality=45 min).
 
-**PRD verification loop** (`src/runner/prd-loop.ts` + `src/runner/evidence.ts`): Both files are dependency-injected and contain **zero `vscode` imports**, so the same loop runs from the VS Code command (`cmdVerifyAgainstPrd` → `runPrdLoopInteractive`) and from `moag verify` in the headless CLI. `evidence.ts` collects only facts — the git diff since a captured base ref, the exit code of each resolved gate command, whether declared artifacts exist. `prd-loop.ts` applies four deterministic gates (task status → changed files → gate commands → artifacts) **before** any model call; a failed gate returns `passed: false` with `modelCallsMade: 0`, so a model can never override evidence. Gate commands come from `agentTaskPlayer.prdLoop.gateCommands` or auto-detection; an empty resolved list is a hard failure when unattended and a warning when interactive. Halt state (`noteManualGate`/`noteBudgetExceeded`) is per-controller closure state, never module-level, because two loops can be live at once.
+**PRD verification loop** (`src/runner/prd-loop.ts` + `src/runner/evidence.ts`): Both files are dependency-injected and contain **zero `vscode` imports**, so the same loop runs from the VS Code command (`cmdVerifyAgainstPrd` → `runPrdLoopInteractive`) and from `moag verify` in the headless CLI. `evidence.ts` collects only facts — the git diff since a captured base ref, the exit code of each resolved gate command, whether declared artifacts exist. `prd-loop.ts` applies five deterministic gates (task status → changed files → project standards → gate commands → artifacts) **before** any model call — the standards gate runs only when the workspace has a standards profile, its static rules before the gate commands and its own commands right after them, and only a *blocking* rule or command fails it. MOAG blocks on the project's own tools; its own scans are advisory unless promoted: by default the blocking set is the profile's commands and nothing else, and every rule MOAG decides itself (required directories and nested repositories included) is advisory, is worded "findings" / "no findings" (never "passed"), and blocks only where a profile promotes it. A blocking rule or command that ends *not checked* fails the gate too (unevaluated blocking evidence is not a pass); a profile with no command and no promoted rule ships, and is reported as "no blocking rules configured". A failed gate returns `passed: false` with `modelCallsMade: 0`, so a model can never override evidence. Gate commands come from `agentTaskPlayer.prdLoop.gateCommands` or auto-detection; an empty resolved list is a hard failure when unattended and a warning when interactive. Halt state (`noteManualGate`/`noteBudgetExceeded`) is per-controller closure state, never module-level, because two loops can be live at once.
 
 **Adapters** (`src/adapters/`): One per engine, all use `useStdin: true` to pipe prompts. `BaseCliAdapter` handles spawn, abort, output streaming, and `--version` probing.
 
 **Context builder** (`src/context/context-builder.ts`): Assembles the final prompt in priority-ordered sections. AI Rules are inserted at priority `-1` (highest), before plan overview, prior outputs, changed files, retrieved code spans, and screenshots.
 
-**AI Rules** (`src/ai-rules/`): Three-tier injection — global (`<globalStorage>/ai-rules.json`), workspace (`.moag/rules.json`), VS Code setting (`agentTaskPlayer.promptRules`). `AiRulesStore.getEnabledText(cwd)` returns the merged markdown block injected into every task.
+**AI Rules** (`src/ai-rules/`): Two store tiers — global (`<globalStorage>/ai-rules.json`) and workspace (`.moag/rules.json`). `AiRulesStore.getEnabledText(cwd)` merges them into the `## AI Rules` block of every task prompt. The VS Code setting `agentTaskPlayer.promptRules` is not a tier: the runner appends it raw, separately from the store. The headless CLI has the workspace tier only (`new AiRulesStore(null)`; there is no global storage). The hosted server builds no rules store at all: its prompts carry the approved project standards (`src/standards/`), which reference built-in rules by id.
 
 **Dashboard** (`src/ui/dashboard-panel.ts`): Webview with live output streaming. Uses `safePostMessage()` to handle disposed panels. Collapsible sections persist within session. Auto-opens on any execution command.
 

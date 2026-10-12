@@ -273,7 +273,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       }
 
       if (message.type === 'savePrdVersion') {
-        void vscode.commands.executeCommand('agentTaskPlayer.savePrdVersion', { text: message.text as string, version: message.version as string });
+        void vscode.commands.executeCommand('agentTaskPlayer.savePrdVersion', { text: message.text as string });
         return;
       }
 
@@ -2944,7 +2944,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       <div class="prd-version-bar" id="prdVersionBar">
         <span>Version:</span>
         <select id="prdVersionSelect" class="prd-version-select"></select>
-        <button id="prdVersionSaveBtn" class="prd-version-save-btn" type="button">Save as v1.0</button>
+        <button id="prdVersionSaveBtn" class="prd-version-save-btn" type="button">Save new version</button>
       </div>
       <div class="prd-input-body">
         <div id="prdProjectCard" class="prd-project-card" style="display:none">

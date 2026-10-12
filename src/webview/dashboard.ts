@@ -53,6 +53,9 @@ let completedOrder = [];
 let completedTasks = [];
 const completedExpandedState = {};
 let showAllCompletedCards = false;
+let showAllContributors = false;
+const clCoachingExpandedState = {};
+let lastContributionLedgerPayload = null;
 let totalTasks = 0;
 let completedCount = 0;
 let failedCount = 0;
@@ -546,6 +549,9 @@ window.addEventListener('message', function(event) {
     case 'context-memory':
       renderContextMemory(msg);
       break;
+    case 'contribution-ledger':
+      renderContributionLedger(msg);
+      break;
     case 'sandbox-state':
       renderSandboxPanel(msg.sandboxState);
       break;
@@ -608,6 +614,145 @@ function renderContextMemory(msg) {
     }).join(', ') + '</div>';
   }
   body.innerHTML = html;
+}
+
+// ─── Contribution Ledger ───
+//
+// Renders the rollup posted by extension.ts's buildContributionLedgerPayload().
+// Leaderboard sort order and tokens/task exclusion rules are all decided
+// server-side (contribution-ledger.ts) — this file only renders what it is
+// given. Do not add a clickable sort-by-cost/sort-by-tokens-per-task header;
+// the only sort is tasks-completed desc, name asc, and that is a deliberate
+// non-goal to change here. The coaching card's prompt box shows the short,
+// human-written task prompt only (never assembled buildContext() output —
+// the runner records only the short prompt, see usage-log.ts) and is shown
+// unredacted to every viewer — the `leads` setting has no effect on
+// visibility and must not be wired into any gating here.
+
+function clFormatTokens(n) {
+  return n === null || n === undefined ? '—' : Math.round(n).toLocaleString();
+}
+
+function clFormatCost(n) {
+  return n === null || n === undefined ? '—' : ('$' + n.toFixed(4));
+}
+
+function renderContributionLedger(msg) {
+  lastContributionLedgerPayload = msg;
+  const countEl = document.getElementById('cl-count');
+  const tokensEl = document.getElementById('cl-stat-tokens');
+  const costEl = document.getElementById('cl-stat-cost');
+  const contributorsEl = document.getElementById('cl-stat-contributors');
+  const leaderboardEl = document.getElementById('cl-leaderboard');
+  const leaderboardBody = document.getElementById('cl-leaderboard-body');
+  const showAllBtn = document.getElementById('cl-show-all');
+  const emptyEl = document.getElementById('cl-empty');
+  const coachingLabel = document.getElementById('cl-coaching-label');
+  const coachingList = document.getElementById('cl-coaching-list');
+  const footnoteEl = document.getElementById('cl-footnote');
+  if (!countEl || !tokensEl || !leaderboardBody) { return; }
+
+  const leaderboard = msg.leaderboard || [];
+  const coachingCards = msg.coachingCards || [];
+
+  countEl.textContent = leaderboard.length > 0
+    ? (leaderboard.length + ' contributor' + (leaderboard.length === 1 ? '' : 's'))
+    : '';
+
+  tokensEl.textContent = clFormatTokens(msg.totalTokens || 0);
+  if (costEl) { costEl.textContent = clFormatCost(msg.totalCostUsd || 0); }
+  if (contributorsEl) { contributorsEl.textContent = String(msg.contributorCount || 0); }
+
+  // Zero-data state: neutral empty message, no error styling, no fallback badge.
+  if (leaderboard.length === 0) {
+    if (leaderboardEl) { leaderboardEl.hidden = true; }
+    if (showAllBtn) { showAllBtn.hidden = true; }
+    if (emptyEl) { emptyEl.hidden = false; }
+  } else {
+    if (leaderboardEl) { leaderboardEl.hidden = false; }
+    if (emptyEl) { emptyEl.hidden = true; }
+
+    const visible = showAllContributors ? leaderboard : leaderboard.slice(0, 8);
+    leaderboardBody.innerHTML = '';
+    visible.forEach(function(row, idx) {
+      const tr = document.createElement('div');
+      tr.className = 'cl-row';
+      tr.setAttribute('role', 'row');
+      // Badge only the very top row of the full sorted leaderboard, and only
+      // when the server decided it clears the volume threshold — never a
+      // fallback badge for a non-qualifying leader.
+      const isTop = idx === 0 && leaderboard[0] === row && !!msg.isTopThisWeek;
+      const name = row.developerEmail || 'Unknown';
+      tr.innerHTML =
+        '<span class="cl-cell cl-col-name" role="cell">' + escHtml(name) +
+          (isTop ? '<span class="cl-badge-top">Top this week</span>' : '') + '</span>' +
+        '<span class="cl-cell cl-col-tasks" role="cell">' + (row.tasksCompleted || 0) + '</span>' +
+        '<span class="cl-cell cl-col-secondary" role="cell">' + clFormatTokens(row.inputTokens) + '</span>' +
+        '<span class="cl-cell cl-col-secondary" role="cell">' + clFormatTokens(row.outputTokens) + '</span>' +
+        '<span class="cl-cell cl-col-total" role="cell">' + clFormatTokens(row.totalTokens) + '</span>' +
+        '<span class="cl-cell cl-col-secondary" role="cell">' + clFormatCost(row.estimatedCostUsd) + '</span>' +
+        '<span class="cl-cell cl-col-secondary" role="cell">' + clFormatTokens(row.tokensPerTask) + '</span>';
+      leaderboardBody.appendChild(tr);
+    });
+
+    if (showAllBtn) {
+      showAllBtn.hidden = leaderboard.length <= 8;
+      showAllBtn.textContent = showAllContributors ? 'Show less' : ('Show all (' + leaderboard.length + ')');
+      showAllBtn.onclick = function() {
+        showAllContributors = !showAllContributors;
+        renderContributionLedger(lastContributionLedgerPayload);
+      };
+    }
+  }
+
+  // Coaching cards — status-agnostic, one per distinct flagged task. Zero
+  // cards (every prompt adequate) is a neutral empty state, not an error.
+  if (coachingList) {
+    coachingList.innerHTML = '';
+    if (coachingCards.length === 0) {
+      if (coachingLabel) { coachingLabel.hidden = true; }
+    } else {
+      if (coachingLabel) { coachingLabel.hidden = false; }
+      coachingCards.forEach(function(card, idx) {
+        const expanded = !!clCoachingExpandedState[card.taskId];
+        const headerId = 'cl-card-header-' + idx;
+        const bodyId = 'cl-card-body-' + idx;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'cl-card' + (expanded ? ' expanded' : '');
+
+        const header = document.createElement('button');
+        header.className = 'cl-card-header';
+        header.id = headerId;
+        header.type = 'button';
+        header.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        header.setAttribute('aria-controls', bodyId);
+        header.innerHTML =
+          '<span class="cl-card-chevron">&#x25BA;</span>' +
+          '<span class="cl-card-name">' + escHtml(card.taskName) + '</span>' +
+          '<span class="cl-card-score">score ' + card.score + '</span>';
+        header.onclick = function() {
+          clCoachingExpandedState[card.taskId] = !clCoachingExpandedState[card.taskId];
+          renderContributionLedger(lastContributionLedgerPayload);
+        };
+
+        const body = document.createElement('div');
+        body.id = bodyId;
+        body.className = 'cl-card-body' + (expanded ? ' expanded' : '');
+        body.innerHTML =
+          '<div class="cl-card-flags">' + escHtml((card.flags || []).join(', ')) + '</div>' +
+          '<div class="cl-card-prompt">' + escHtml(card.promptText) + '</div>';
+
+        wrap.appendChild(header);
+        wrap.appendChild(body);
+        coachingList.appendChild(wrap);
+      });
+    }
+  }
+
+  if (footnoteEl) {
+    footnoteEl.textContent = 'Tokens/task counts only completed tasks; retries on the same task are summed.';
+  }
 }
 
 // ─── Sandbox Panel ───
@@ -1254,7 +1399,7 @@ function renderStatus(state) {
   updateTimers();
 }
 
-const collapsedSections = { completed: false, sandbox: true, 'ctx-mem': false };
+const collapsedSections = { completed: false, sandbox: true, 'ctx-mem': false, 'contribution-ledger': true };
 
 function toggleSection(sectionId) {
   collapsedSections[sectionId] = !collapsedSections[sectionId];

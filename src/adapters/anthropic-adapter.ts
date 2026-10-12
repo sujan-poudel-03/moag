@@ -10,6 +10,7 @@ import { spawn } from 'child_process';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId, TokenUsage } from '../models/types';
 import { capturePageScreenshotBase64, runPlaywrightSpec } from '../sandbox/browser-driver';
+import { trackChildProcess } from '../utils/child-tracker';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type AnySDK = any;
@@ -402,7 +403,9 @@ export class AnthropicAdapter implements EngineAdapter {
         shell: true,
         cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
       });
+      trackChildProcess(proc);
 
       let stdout = '';
       let stderr = '';

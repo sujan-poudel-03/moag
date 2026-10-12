@@ -1,7 +1,8 @@
 import { strict as assert } from 'assert';
 import * as sinon from 'sinon';
-import { Plan, TaskStatus, RunnerState, EngineResult } from '../../../models/types';
+import { Plan, Task, TaskStatus, RunnerState, EngineResult, EngineId } from '../../../models/types';
 import { createEmptyPlan, createPlaylist, createTask } from '../../../models/plan';
+import type { EngineCallUsage } from '../../../utils/usage-log';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const proxyquire = require('proxyquire').noCallThru();
@@ -18,6 +19,12 @@ const mockEngineResult: EngineResult = {
 
 let engineRunStub: sinon.SinonStub;
 let spawnStub: sinon.SinonStub;
+/** Every process the runner asked to have killed, through the stubbed `utils/process-kill`. */
+let killProcessStub: sinon.SinonStub;
+/** The dependency installer the runner sees; ok and silent unless a test replaces it. */
+let ensureDepsStub: sinon.SinonStub;
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const realDependencyInstall = require('../../../runner/dependency-install');
 
 function createSpawnProc(options?: {
   stdoutChunks?: string[];
@@ -79,6 +86,9 @@ function createSpawnProc(options?: {
   // Expose handler maps for tests that need to emit service output after spawn.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (proc as any).__stdoutHandlers = stdoutHandlers;
+  // Emit a process event (`close`, `error`) to whatever is listening right now.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (proc as any).__emit = (event: string, ...args: unknown[]) => { [...(handlers[event] || [])].forEach(h => h(...args)); };
 
   if (!options?.keepOpen) {
     setTimeout(() => {
@@ -116,25 +126,41 @@ function createMockHistoryStore() {
 }
 
 // Build TaskRunner with mocked dependencies
-function buildRunner() {
+function buildRunner(routingOverrides?: {
+  '../routing/routing-store'?: { loadWorkspaceRoutingConfig: (root: string) => unknown };
+}) {
   const historyStore = createMockHistoryStore();
   const mockEngine = createMockEngine();
   spawnStub = sinon.stub().callsFake(() => createSpawnProc());
+  // The real helper shells out (`taskkill /pid <pid> /T /F` on Windows, a group signal on
+  // POSIX) with its OWN child_process import, which the stub below does not reach: left in
+  // place it spends real process-spawn time inside a test and aims a real kill at the fake
+  // pid 1234. Here it only marks the fake process killed, as a real kill would.
+  killProcessStub = sinon.stub().callsFake((proc: { kill?: () => void }) => { proc.kill?.(); });
+  ensureDepsStub = sinon.stub().resolves({ ok: true, aborted: false, failed: null, events: [] });
+
+  let lastEngineId: string | undefined;
 
   const { TaskRunner } = proxyquire('../../../runner/runner', {
     'vscode': vscodeMock,
     '../adapters/index': {
-      getEngine: () => mockEngine,
+      getEngine: (id: string) => { lastEngineId = id; return mockEngine; },
     },
     '../context/context-builder': {
       buildContext: () => '',
       getContextSettings: () => ({ enabled: false }),
     },
     'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+    '../utils/process-kill': { killProcess: killProcessStub, SPAWN_DETACHED: false },
+    './dependency-install': {
+      ...realDependencyInstall,
+      ensureDependencies: (...args: unknown[]) => ensureDepsStub(...args),
+    },
+    ...(routingOverrides ?? {}),
   });
 
   const runner = new TaskRunner(historyStore);
-  return { runner, historyStore, mockEngine };
+  return { runner, historyStore, mockEngine, getLastEngineId: () => lastEngineId };
 }
 
 function makePlan(): Plan {
@@ -458,17 +484,25 @@ describe('TaskRunner', () => {
   it('should keep a service task running after it becomes ready', async () => {
     const { runner } = buildRunner();
     const serviceProc = createSpawnProc({ keepOpen: true });
+    // No real time decides this test. The runner polls readiness on an interval; only that
+    // interval is faked (the git stub above still closes on a real timer), and the test fires
+    // it itself. Before, a 10 ms timer raced a 400 ms poll against mocha's 2 s limit.
+    const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    let polls = 0;
     spawnStub.callsFake((command: string) => {
       if (command === 'git') {
         return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
       }
-      setTimeout(() => {
+      // runServiceTask attaches its output listeners and starts its readiness poll in the
+      // same synchronous stretch that called spawn(), so by the time this microtask runs
+      // both exist: the service prints its ready line, then the poll fires once.
+      queueMicrotask(() => {
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const handlers = (serviceProc as any).__stdoutHandlers;
-        if (handlers?.data) {
-          handlers.data.forEach((handler: (...args: unknown[]) => void) => handler(Buffer.from('server ready')));
-        }
-      }, 10);
+        (handlers?.data ?? []).forEach((handler: (...args: unknown[]) => void) => handler(Buffer.from('server ready')));
+        polls = clock.countTimers();
+        clock.next();
+      });
       return serviceProc;
     });
 
@@ -478,11 +512,54 @@ describe('TaskRunner', () => {
     plan.playlists[0].tasks[0].command = 'npm run dev';
     plan.playlists[0].tasks[0].readyPattern = 'server ready';
 
-    await runner.play(plan);
+    try {
+      await runner.play(plan);
 
-    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
-    assert.equal(runner.getRunningServices().length, 1);
-    runner.stopAllServices();
+      assert.equal(polls, 1, 'the readiness poll was the one pending interval when the service printed its line');
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+      assert.equal(runner.getRunningServices().length, 1);
+      assert.equal(clock.countTimers(), 0, 'the poll was cleared once the service was ready');
+      assert.equal(killProcessStub.called, false, 'a ready service is kept, not killed');
+      runner.stopAllServices();
+      assert.equal(killProcessStub.calledOnceWithExactly(serviceProc), true, 'stopping the services kills it, once');
+      assert.equal(runner.getRunningServices().length, 0);
+    } finally {
+      runner.stopAllServices();
+      clock.restore();
+    }
+  });
+
+  it('should fail a service task whose process exits before it is ready, and keep nothing running', async () => {
+    const { runner } = buildRunner();
+    const serviceProc = createSpawnProc({ keepOpen: true });
+    const clock = sinon.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    spawnStub.callsFake((command: string) => {
+      if (command === 'git') {
+        return createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 });
+      }
+      // The process dies before any readiness poll fires: same sequencing, no timer.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      queueMicrotask(() => { (serviceProc as any).__emit('close', 3); });
+      return serviceProc;
+    });
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'service';
+    plan.playlists[0].tasks[0].command = 'npm run dev';
+    plan.playlists[0].tasks[0].readyPattern = 'server ready';
+
+    try {
+      await runner.play(plan);
+
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+      assert.equal(runner.getRunningServices().length, 0);
+      assert.equal(clock.countTimers(), 0, 'the readiness poll does not outlive the failed start');
+      assert.equal(killProcessStub.calledWith(serviceProc), true, 'what is left of the failed start is killed');
+    } finally {
+      runner.stopAllServices();
+      clock.restore();
+    }
   });
 
   it('should play a single task', async () => {
@@ -1086,6 +1163,113 @@ describe('TaskRunner', () => {
     assert.ok(gitArgs.some((a) => a[0] === 'tag' && a.includes('v1.2.3')), 'should create an annotated git tag');
   });
 
+  /** A release plan whose latest PRD version has R-1, implemented by a completed agent task with passing gates. */
+  function tracedReleasePlan(): Plan {
+    const plan = shipPlan((t) => { t.type = 'release'; t.releaseTag = 'v1.2.3'; });
+    const impl = createTask('Implement R-1', 'build it');
+    impl.status = TaskStatus.Completed;
+    impl.requirementIds = ['R-1'];
+    plan.playlists[0].tasks.unshift(impl);
+    plan.prdVersions = [
+      { version: '1.0.0', text: '## Requirements\n- [R-1] x', createdAt: '2026-10-01T00:00:00.000Z' },
+      { version: '2.0.0', text: '## Requirements\n- [R-1] x\n', createdAt: '2026-10-02T00:00:00.000Z' },
+    ];
+    plan.requirementTrace = [{
+      id: 'R-1',
+      taskIds: [impl.id],
+      commits: [],
+      gates: [{ command: 'npm test', exitCode: 0, timedOut: false, at: '2026-10-03T00:00:00.000Z' }],
+      releases: [],
+    }];
+    return plan;
+  }
+
+  it('a successful release stamps the requirement with the tag and the latest PRD version', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+    const output: string[] = [];
+    runner.on('task-output', (_t: unknown, chunk: string) => { output.push(chunk); });
+
+    const plan = tracedReleasePlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
+    const release = plan.requirementTrace![0].releases[0];
+    assert.ok(release, 'R-1 must be stamped');
+    assert.equal(release.releaseTag, 'v1.2.3');
+    assert.equal(release.prdVersion, '2.0.0');
+    assert.deepEqual(release.taskIds, [plan.playlists[0].tasks[0].id]);
+    assert.ok(output.some((c) => c.includes('[Release] Shipped R-1 in PRD 2.0.0.')));
+    assert.equal('standardsVersion' in release, false, 'no standards on this host: no version is stamped');
+  });
+
+  it('a successful release stamps the standards version only when the last verification judged the diff against it; unreadable standards stamp none and do not fail the release', async () => {
+    const a = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+    a.runner.setStandardsProvider(() => ({ text: 'Project standards v7', version: 7 }));
+    const planA = tracedReleasePlan();
+    // What the PRD loop records when the standards gate really judged the diff: its own row.
+    planA.requirementTrace![0].gates.unshift({ command: 'moag:standards v7', exitCode: 0, timedOut: false, at: '2026-10-03T00:00:00.000Z' });
+    await a.runner.play(planA);
+    assert.equal(planA.playlists[0].tasks[1].status, TaskStatus.Completed);
+    assert.equal(planA.requirementTrace![0].releases[0].standardsVersion, 7);
+
+    // The host carries standards v7, but the last verification never judged the diff against
+    // them (no standards row among the gates): the release ships and claims no check.
+    const unjudged = buildRunner();
+    unjudged.runner.setStandardsProvider(() => ({ text: 'Project standards v7', version: 7 }));
+    const planU = tracedReleasePlan();
+    await unjudged.runner.play(planU);
+    assert.equal(planU.playlists[0].tasks[1].status, TaskStatus.Completed);
+    assert.equal(planU.requirementTrace![0].releases[0].releaseTag, 'v1.2.3');
+    assert.equal('standardsVersion' in planU.requirementTrace![0].releases[0], false);
+
+    // Judged — but against another version than the one in effect now: not this version's stamp.
+    const stale = buildRunner();
+    stale.runner.setStandardsProvider(() => ({ text: 'Project standards v8', version: 8 }));
+    const planS = tracedReleasePlan();
+    planS.requirementTrace![0].gates.unshift({ command: 'moag:standards v7', exitCode: 0, timedOut: false, at: '2026-10-03T00:00:00.000Z' });
+    await stale.runner.play(planS);
+    assert.equal('standardsVersion' in planS.requirementTrace![0].releases[0], false);
+
+    // The tag already exists by the time the stamp is written: a broken standards file
+    // must not turn a release that happened into a failed task.
+    const b = buildRunner();
+    b.runner.setStandardsProvider(() => { throw new Error('".moag/standards.json" contains invalid JSON.'); });
+    const planB = tracedReleasePlan();
+    await b.runner.play(planB);
+    assert.equal(planB.playlists[0].tasks[1].status, TaskStatus.Completed);
+    const release = planB.requirementTrace![0].releases[0];
+    assert.equal(release.releaseTag, 'v1.2.3');
+    assert.equal('standardsVersion' in release, false);
+  });
+
+  it('a failed git tag fails the release and stamps nothing (F3.5)', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake((command: string, args: string[]) =>
+      command === 'git' && args[0] === 'tag'
+        ? createSpawnProc({ stderrChunks: ['fatal: tag exists'], closeCode: 1 })
+        : createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+
+    const plan = tracedReleasePlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Failed);
+    assert.deepEqual(plan.requirementTrace![0].releases, []);
+  });
+
+  it('a release with failing recorded gates stamps nothing', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: [''], closeCode: 0 }));
+    const plan = tracedReleasePlan();
+    plan.requirementTrace![0].gates[0].exitCode = 1;
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Completed);
+    assert.deepEqual(plan.requirementTrace![0].releases, []);
+  });
+
   it('release task with neither command nor tag fails', async () => {
     const { runner } = buildRunner();
     const plan = shipPlan((t) => { t.type = 'release'; });
@@ -1382,5 +1566,1196 @@ describe('TaskRunner — role charter on review tasks', () => {
       'No history found for dependency task "target-task".',
     ));
     assert.ok(!failures[0].stderr.includes('## Role'), 'the guard must return before role resolution');
+  });
+});
+
+describe('TaskRunner — auto-routing engine resolution', () => {
+  const SIMPLE_PROMPT = 'rename variable foo to bar';
+  const COMPLEX_PROMPT = 'Refactor the entire authentication system to use OAuth2. ' +
+    'This involves redesigning the database schema, migrating existing users, ' +
+    'implementing security best practices, and optimizing performance. ' +
+    'The system architecture needs a complete overhaul with complex state management.';
+
+  function routingPlan(prompt: string, opts?: {
+    taskEngine?: EngineId;
+    playlistEngine?: EngineId;
+    planDefaultEngine?: EngineId;
+  }): Plan {
+    const plan = createEmptyPlan('Routing Plan');
+    // createEmptyPlan always sets defaultEngine to 'claude'; these tests need to
+    // clear it to isolate routing/playlist resolution, so the type is widened here.
+    plan.defaultEngine = opts?.planDefaultEngine as EngineId;
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    pl.engine = opts?.playlistEngine;
+    pl.tasks.push(createTask('Routed Task', prompt, opts?.taskEngine));
+    return plan;
+  }
+
+  function buildRoutedRunner(loadWorkspaceRoutingConfig: (root: string) => unknown) {
+    return buildRunner({
+      '../routing/routing-store': { loadWorkspaceRoutingConfig },
+    });
+  }
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  it('routes a simple-prompt task to simpleEngine when enabled and no workspace override exists', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT));
+
+    assert.equal(getLastEngineId(), 'ollama');
+  });
+
+  it('routes a complex-prompt task to complexEngine when enabled', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    const plan = routingPlan(COMPLEX_PROMPT);
+    plan.playlists[0].tasks[0].files = ['auth.ts', 'db.ts', 'middleware.ts', 'routes.ts', 'models.ts'];
+    plan.playlists[0].tasks[0].dependsOn = [];
+    plan.playlists[0].tasks[0].verifyCommand = 'npm test';
+
+    await runner.play(plan);
+
+    assert.equal(getLastEngineId(), 'claude');
+  });
+
+  it('lets an explicit task.engine override routing', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT, { taskEngine: 'codex' }));
+
+    assert.equal(getLastEngineId(), 'codex');
+  });
+
+  it('lets an explicit playlist.engine win over routing', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT, { playlistEngine: 'gemini' }));
+
+    assert.equal(getLastEngineId(), 'gemini');
+  });
+
+  it('lets an explicit plan.defaultEngine win over routing', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'gemini',
+      'autoRouting.complexityThreshold': 50,
+    });
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT, { planDefaultEngine: 'claude' }));
+
+    assert.equal(getLastEngineId(), 'claude');
+  });
+
+  it('regression pin: autoRouting disabled by default resolves to the pre-routing default engine', async () => {
+    // No 'autoRouting.*' keys set at all — mirrors an unconfigured workspace.
+    const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+
+    await runner.play(routingPlan(SIMPLE_PROMPT));
+
+    assert.equal(getLastEngineId(), 'claude');
+  });
+
+  it('two different workspace routing overrides against an identical task resolve to different engines', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+
+    const runA = buildRoutedRunner(() => ({}));
+    await runA.runner.play(routingPlan(SIMPLE_PROMPT));
+    const engineA = runA.getLastEngineId();
+
+    const runB = buildRoutedRunner(() => ({ simpleEngine: 'gemini' }));
+    await runB.runner.play(routingPlan(SIMPLE_PROMPT));
+    const engineB = runB.getLastEngineId();
+
+    assert.equal(engineA, 'ollama');
+    assert.equal(engineB, 'gemini');
+    assert.notEqual(engineA, engineB);
+  });
+
+  it('stamps engineRoutingReason on the history entry only when routing actually fired', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', {
+      'autoRouting.enabled': true,
+      'autoRouting.simpleEngine': 'ollama',
+      'autoRouting.complexEngine': 'claude',
+      'autoRouting.complexityThreshold': 50,
+    });
+
+    const routed = buildRoutedRunner(() => ({}));
+    await routed.runner.play(routingPlan(SIMPLE_PROMPT));
+    const routedEntry = routed.historyStore.add.firstCall.args[0];
+    assert.equal(typeof routedEntry.engineRoutingReason, 'string');
+    assert.ok(routedEntry.engineRoutingReason.length > 0);
+
+    const overridden = buildRoutedRunner(() => ({}));
+    await overridden.runner.play(routingPlan(SIMPLE_PROMPT, { taskEngine: 'codex' }));
+    const overriddenEntry = overridden.historyStore.add.firstCall.args[0];
+    assert.equal(overriddenEntry.engineRoutingReason, undefined);
+  });
+
+  describe('CLI-missing fallback (auto-routing tier substitution)', () => {
+    function autoRoutingCfg(threshold = 50) {
+      vscodeMock.setMockConfig('agentTaskPlayer', {
+        'autoRouting.enabled': true,
+        'autoRouting.simpleEngine': 'ollama',
+        'autoRouting.complexEngine': 'claude',
+        'autoRouting.complexityThreshold': threshold,
+      });
+    }
+
+    it('retries on the auto-routing complex tier when the auto-routed simple engine reports CLI-missing and no plan.fallbackEngine is set', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.onCall(0).resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'ollama: command not found',
+      });
+      engineRunStub.onCall(1).resolves(mockEngineResult);
+
+      const fallbackEvents: Array<{ taskId: string; fromEngine: string; toEngine: string }> = [];
+      runner.on('engine-fallback', (details: { taskId: string; fromEngine: string; toEngine: string }) => fallbackEvents.push(details));
+      const outputs: string[] = [];
+      runner.on('task-output', (_task: unknown, chunk: string) => outputs.push(chunk));
+
+      const plan = routingPlan(SIMPLE_PROMPT);
+      await runner.play(plan);
+
+      assert.equal(getLastEngineId(), 'claude');
+      assert.equal(fallbackEvents.length, 1);
+      assert.equal(fallbackEvents[0].fromEngine, 'ollama');
+      assert.equal(fallbackEvents[0].toEngine, 'claude');
+      assert.ok(outputs.some(o => o.includes('Engine CLI not found or unreachable') && o.includes('auto-routing')));
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    });
+
+    it('prefers an explicit plan.fallbackEngine over the auto-routing complex tier on CLI-missing', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.onCall(0).resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'ollama: command not found',
+      });
+      engineRunStub.onCall(1).resolves(mockEngineResult);
+
+      const plan = routingPlan(SIMPLE_PROMPT);
+      plan.fallbackEngine = 'gemini' as EngineId;
+      await runner.play(plan);
+
+      assert.equal(getLastEngineId(), 'gemini');
+    });
+
+    it('does not auto-substitute the other routing tier when the CLI-missing engine was an explicit task.engine override', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'codex: command not found',
+      });
+
+      const plan = routingPlan(SIMPLE_PROMPT, { taskEngine: 'codex' });
+      await runner.play(plan);
+
+      assert.equal(engineRunStub.callCount, 1);
+      assert.equal(getLastEngineId(), 'codex');
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    });
+
+    it('does not auto-substitute the other routing tier on a rate-limited auto-routed engine — only plan.fallbackEngine applies to rate-limit', async () => {
+      autoRoutingCfg();
+      const { runner, getLastEngineId } = buildRoutedRunner(() => ({}));
+      engineRunStub.resolves({
+        ...mockEngineResult,
+        exitCode: 1,
+        stderr: 'Error: rate limit exceeded, please retry later',
+      });
+
+      const fallbackEvents: unknown[] = [];
+      runner.on('engine-fallback', (d: unknown) => fallbackEvents.push(d));
+
+      const plan = routingPlan(SIMPLE_PROMPT);
+      await runner.play(plan);
+
+      assert.equal(engineRunStub.callCount, 1);
+      assert.equal(getLastEngineId(), 'ollama');
+      assert.equal(fallbackEvents.length, 0);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    });
+
+    it('isCliMissing matches known CLI-missing phrasings and rejects unrelated stderr', () => {
+      const { runner } = buildRunner();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const isCliMissing = (result: EngineResult) => (runner as any).isCliMissing(result);
+
+      assert.equal(isCliMissing({ stdout: '', stderr: 'ollama: command not found', exitCode: 127, durationMs: 0 }), true);
+      assert.equal(isCliMissing({ stdout: '', stderr: "'foo' is not recognized as an internal or external command", exitCode: 1, durationMs: 0 }), true);
+      assert.equal(isCliMissing({ stdout: '', stderr: 'AssertionError: expected 1 to equal 2', exitCode: 1, durationMs: 0 }), false);
+    });
+  });
+});
+
+describe('TaskRunner — usage recorder', () => {
+  afterEach(() => {
+    sinon.restore();
+  });
+
+  function singleTaskPlan(): Plan {
+    const plan = createEmptyPlan('Usage Recorder Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    pl.tasks.push(createTask('Solo Task', 'Do the one thing'));
+    return plan;
+  }
+
+  it('is called once on a normal successful agent task, with correct fields', async () => {
+    const { runner } = buildRunner();
+    engineRunStub.resolves({
+      ...mockEngineResult,
+      tokenUsage: { inputTokens: 10, outputTokens: 20, estimatedCost: 0.0015 },
+    });
+
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = singleTaskPlan();
+    await runner.play(plan);
+
+    assert.equal(records.length, 1);
+    const [record] = records;
+    assert.equal(record.taskId, plan.playlists[0].tasks[0].id);
+    assert.equal(record.taskName, 'Solo Task');
+    assert.equal(record.engine, 'claude');
+    assert.equal(record.prompt, 'Do the one thing');
+    assert.equal(record.tokenUsageAvailable, true);
+    assert.equal(record.inputTokens, 10);
+    assert.equal(record.outputTokens, 20);
+    assert.equal(record.estimatedCostUsd, 0.0015);
+  });
+
+  it('records tokenUsageAvailable:false and zero token fields when the adapter omits tokenUsage', async () => {
+    const { runner } = buildRunner();
+    // mockEngineResult (the default stub resolution) carries no tokenUsage.
+
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = singleTaskPlan();
+    await runner.play(plan);
+
+    assert.equal(records.length, 1);
+    assert.equal(records[0].tokenUsageAvailable, false);
+    assert.equal(records[0].inputTokens, 0);
+    assert.equal(records[0].outputTokens, 0);
+    assert.equal(records[0].estimatedCostUsd, 0);
+  });
+
+  it('is called twice for the same taskId, once per engine, when a rate-limit fallback fires', async () => {
+    const { runner } = buildRunner();
+    engineRunStub.onCall(0).resolves({
+      ...mockEngineResult,
+      exitCode: 1,
+      stderr: 'Error: rate limit exceeded, please retry later',
+    });
+    engineRunStub.onCall(1).resolves(mockEngineResult);
+
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = singleTaskPlan();
+    plan.defaultEngine = 'claude' as EngineId;
+    plan.fallbackEngine = 'codex' as EngineId;
+    await runner.play(plan);
+
+    assert.equal(records.length, 2);
+    assert.equal(records[0].taskId, records[1].taskId);
+    assert.notEqual(records[0].engine, records[1].engine);
+  });
+
+  it('is never called when no usage recorder has been set', async () => {
+    const { runner } = buildRunner();
+    const plan = singleTaskPlan();
+    // setUsageRecorder is never called — this must not throw or otherwise break the task.
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('does not fail the task when the recorder throws — task-completed still fires', async () => {
+    const { runner } = buildRunner();
+    runner.setUsageRecorder(() => { throw new Error('recorder boom'); });
+
+    const completed: string[] = [];
+    runner.on('task-completed', (task: { name: string }) => completed.push(task.name));
+
+    const plan = singleTaskPlan();
+    await runner.play(plan);
+
+    assert.deepEqual(completed, ['Solo Task']);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  // Regression pin for the HIGH finding: the recorder must receive only the
+  // short, human-written task prompt — never buildContext()'s assembled
+  // prompt (AI rules, retrieved code spans, prior outputs). Builds its own
+  // TaskRunner with context building actually enabled and a distinctive
+  // marker standing in for a large assembled-context blob, so a regression
+  // that starts passing `fullPrompt` again would fail this test even though
+  // every other test in this file stubs context building as disabled.
+  it('never records assembled buildContext() output — only the short task prompt', async () => {
+    const ASSEMBLED_CONTEXT_MARKER = 'ASSEMBLED-CONTEXT-'.repeat(200); // stands in for AI rules + retrieved code spans
+
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    const localSpawnStub = sinon.stub().callsFake(() => createSpawnProc());
+
+    const { TaskRunner } = proxyquire('../../../runner/runner', {
+      'vscode': vscodeMock,
+      '../adapters/index': {
+        getEngine: () => mockEngine,
+      },
+      '../context/context-builder': {
+        buildContext: () => ASSEMBLED_CONTEXT_MARKER,
+        getContextSettings: () => ({ enabled: true, maxFileContextChars: 2000, maxContextChars: 50000 }),
+        runRetrievalCascade: async () => ({ spans: [], usedSemantic: false }),
+        adaptiveContextBudget: () => 50000,
+      },
+      'child_process': { spawn: localSpawnStub, execSync: sinon.stub() },
+    });
+
+    const runner = new TaskRunner(historyStore);
+    const records: EngineCallUsage[] = [];
+    runner.setUsageRecorder((r: EngineCallUsage) => records.push(r));
+
+    const plan = createEmptyPlan('Assembled Context Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    pl.tasks.push(createTask('Context Task', 'Do the short thing'));
+
+    // Sanity: prove the assembled context actually flowed into task-started's
+    // fullPrompt, so a passing assertion below is not just an inert stub.
+    let observedFullPrompt = '';
+    runner.on('task-started', (_task: unknown, _playlist: unknown, fullPrompt: string) => {
+      observedFullPrompt = fullPrompt;
+    });
+
+    await runner.play(plan);
+
+    assert.ok(observedFullPrompt.includes(ASSEMBLED_CONTEXT_MARKER),
+      'test setup must actually exercise the assembled-context path');
+    assert.equal(records.length, 1);
+    assert.equal(records[0].prompt, 'Do the short thing');
+    assert.ok(!records[0].prompt.includes('ASSEMBLED-CONTEXT-'),
+      'usage recorder must never see assembled buildContext() output');
+    assert.ok(records[0].prompt.length < 100,
+      'the recorded prompt must be the short human prompt, not a large assembled blob');
+  });
+});
+
+
+// ─── Hosted-server worker: deferred stop on the manual gate ───
+//
+// The server's run worker (src/server/run-worker.ts) stops the runner one tick
+// AFTER the 'manual-gate' emit. This pins that the deferred path really unwinds:
+// play() resolves promptly and the gate task ends Failed (halted, not approved).
+
+describe('TaskRunner — deferred stop on manual-gate (server worker path)', () => {
+  afterEach(() => { sinon.restore(); });
+
+  function manualPlan(): Plan {
+    const plan = createEmptyPlan('Gate Plan');
+    const pl = plan.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    const gate = createTask('Release v1.0.0', 'Ship it');
+    gate.type = 'manual';
+    pl.tasks.push(gate);
+    return plan;
+  }
+
+  it('play() resolves within 3 s and the gate task is Failed when stop() is deferred via setImmediate', async function () {
+    this.timeout(5000);
+    const prevCi = process.env.CI;
+    delete process.env.CI;
+    try {
+      const { runner } = buildRunner();
+      const plan = manualPlan();
+      let gateSeen = false;
+      runner.on('manual-gate', () => {
+        gateSeen = true;
+        setImmediate(() => runner.stop());
+      });
+      const started = Date.now();
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<'timeout'>((resolve) => { timer = setTimeout(() => resolve('timeout'), 3000); });
+      const outcome = await Promise.race([runner.play(plan).then(() => 'resolved' as const), timeout]);
+      if (timer) { clearTimeout(timer); }
+      assert.equal(outcome, 'resolved', 'play() must resolve within 3 s');
+      assert.ok(Date.now() - started < 3000);
+      assert.equal(gateSeen, true);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+      assert.equal(runner.state, RunnerState.Idle);
+    } finally {
+      if (prevCi === undefined) { delete process.env.CI; } else { process.env.CI = prevCi; }
+    }
+  });
+});
+
+// ─── Project standards in the prompt ───
+
+describe('TaskRunner — project standards', () => {
+  const TEXT = 'Project standards v3 · stack node-ts · brownfield repository\n### Comments\n- Never leave commented-out code';
+  const SECTION = `## Project Standards\n${TEXT}`;
+
+  type ContextMode = 'off' | 'empty' | 'real';
+
+  /** A runner whose engine records every prompt. `real` loads the real context builder. */
+  function build(mode: ContextMode) {
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    const prompts: string[] = [];
+    const contextOptions: Array<Record<string, unknown>> = [];
+    engineRunStub.callsFake(async (opts: { prompt: string }) => { prompts.push(opts.prompt); return mockEngineResult; });
+    spawnStub = sinon.stub().callsFake(() => createSpawnProc());
+
+    const stubs: Record<string, unknown> = {
+      'vscode': vscodeMock,
+      '../adapters/index': { getEngine: () => mockEngine },
+      'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+    };
+    if (mode !== 'real') {
+      stubs['../context/context-builder'] = {
+        buildContext: (opts: Record<string, unknown>) => { contextOptions.push(opts); return ''; },
+        getContextSettings: () => ({ enabled: mode !== 'off', maxContextChars: 30000, maxFileContextChars: 4000 }),
+        runRetrievalCascade: async () => ({ spans: [], usedSemantic: false }),
+        adaptiveContextBudget: (_t: unknown, base: number) => base,
+      };
+    }
+    const { TaskRunner } = proxyquire('../../../runner/runner', stubs);
+    return { runner: new TaskRunner(historyStore), prompts, contextOptions, mockEngine };
+  }
+
+  function plan(tasks: Array<{ name: string; prompt: string; type?: 'agent' | 'command'; command?: string; dependsOn?: string[] }> = [{ name: 'Only', prompt: 'Do the thing' }]): Plan {
+    const p = createEmptyPlan('Standards Plan');
+    const pl = p.playlists[0];
+    pl.autoplay = true;
+    pl.autoplayDelay = 0;
+    for (const spec of tasks) {
+      const t = createTask(spec.name, spec.prompt);
+      if (spec.type) { t.type = spec.type; }
+      if (spec.command) { t.command = spec.command; }
+      pl.tasks.push(t);
+    }
+    return p;
+  }
+
+  const occurrences = (haystack: string, needle: string): number => haystack.split(needle).length - 1;
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  describe('run-start hook', () => {
+    it('runs once per run, before the first task reaches its engine', async () => {
+      const { runner, prompts } = build('off');
+      const seen: Array<{ cwd: string; promptsSoFar: number }> = [];
+      runner.setRunStartHook(async (cwd: string) => {
+        await new Promise((resolve) => setImmediate(resolve));
+        seen.push({ cwd, promptsSoFar: prompts.length });
+      });
+
+      await runner.play(plan([{ name: 'One', prompt: 'first' }, { name: 'Two', prompt: 'second' }]));
+
+      assert.equal(seen.length, 1, 'once for the run, not once per task');
+      assert.equal(seen[0].promptsSoFar, 0, 'awaited before any task started');
+      assert.equal(typeof seen[0].cwd, 'string');
+      assert.equal(prompts.length, 2);
+    });
+
+    it('a hook that throws or rejects never fails the run', async () => {
+      for (const hook of [() => { throw new Error('disk full'); }, async () => { throw new Error('git missing'); }]) {
+        const { runner, prompts } = build('off');
+        const errors: Error[] = [];
+        runner.on('error', (err: Error) => errors.push(err));
+        runner.setRunStartHook(hook);
+        const p = plan();
+        await runner.play(p);
+        assert.equal(prompts.length, 1);
+        assert.equal(p.playlists[0].tasks[0].status, TaskStatus.Completed);
+        assert.deepEqual(errors, []);
+      }
+    });
+
+    it('fires for a single-task run and a task-list run too, and not at all once cleared', async () => {
+      const single = build('off');
+      let calls = 0;
+      single.runner.setRunStartHook(() => { calls++; });
+      await single.runner.playTask(plan(), 0, 0);
+      assert.equal(calls, 1);
+
+      const list = build('off');
+      list.runner.setRunStartHook(() => { calls++; });
+      await list.runner.playTasks(plan(), [{ playlistIndex: 0, taskIndex: 0 }]);
+      assert.equal(calls, 2);
+
+      const cleared = build('off');
+      cleared.runner.setRunStartHook(() => { calls++; });
+      cleared.runner.setRunStartHook(null);
+      await cleared.runner.play(plan());
+      assert.equal(calls, 2);
+    });
+  });
+
+  it('carries the standards even when context is disabled', async () => {
+    const { runner, prompts } = build('off');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+
+    await runner.play(plan());
+
+    assert.equal(prompts.length, 1);
+    assert.ok(prompts[0].startsWith(`${SECTION}\n\n`), prompts[0]);
+    assert.ok(prompts[0].includes('Do the thing'));
+  });
+
+  it('hands the text to the context builder, and prepends it when the built context lacks the section', async () => {
+    const { runner, prompts, contextOptions } = build('empty');
+    runner.setStandardsProvider(() => ({ text: `  ${TEXT}\n`, version: 3 }));
+
+    await runner.play(plan());
+
+    assert.equal(contextOptions[0].standards, TEXT, 'trimmed text reaches the builder');
+    assert.equal(occurrences(prompts[0], '## Project Standards'), 1);
+    assert.ok(prompts[0].startsWith(SECTION));
+  });
+
+  it('with the real context builder: ## Project Standards sits directly before ## AI Rules, exactly once', async () => {
+    const { runner, prompts } = build('real');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+    runner.setAiRulesStore({ getEnabledText: () => '### House Rule\nKeep modules small' } as never);
+
+    await runner.play(plan());
+
+    assert.equal(occurrences(prompts[0], '## Project Standards'), 1, 'no duplicate from the fallback');
+    assert.ok(prompts[0].includes(`${SECTION}\n\n## AI Rules\n### House Rule`), prompts[0].slice(0, 600));
+    assert.ok(prompts[0].indexOf('[CONTEXT START]') < prompts[0].indexOf('## Project Standards'));
+  });
+
+  it('with the real context builder and a budget smaller than the block: still whole, still once', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer.context', { maxContextChars: 1000 });
+    const big = `${TEXT}\n${'- another convention line for the agent\n'.repeat(80)}`.trim();
+    assert.ok(big.length > 3000);
+    const { runner, prompts } = build('real');
+    runner.setStandardsProvider(() => ({ text: big, version: 3 }));
+    runner.setAiRulesStore({ getEnabledText: () => '### House Rule\nKeep modules small' } as never);
+
+    await runner.play(plan());
+
+    assert.ok(prompts[0].includes(`## Project Standards\n${big}`), 'the whole block is present');
+    assert.equal(occurrences(prompts[0], '## Project Standards'), 1);
+    assert.ok(!prompts[0].includes('## AI Rules'), 'the squeeze drops other sections, never the standards');
+  });
+
+  it('carries the design system after the standards when context is disabled; without one the prompt is unchanged', async () => {
+    const DESIGN = 'Design system v3 · DESIGN.md at docs/design/DESIGN.md · tokens in css/tokens.css\nTokens:\n--color-bg: #ffffff';
+    const withDesign = build('off');
+    withDesign.runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: DESIGN }));
+    await withDesign.runner.play(plan());
+    assert.ok(withDesign.prompts[0].startsWith(`${SECTION}\n\n## Design System\n${DESIGN}\n\n`), withDesign.prompts[0].slice(0, 400));
+    const plain = build('off');
+    plain.runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+    await plain.runner.play(plan());
+    const blank = build('off');
+    blank.runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: '   ' }));
+    await blank.runner.play(plan());
+    assert.equal(blank.prompts[0], plain.prompts[0], 'a blank design adds nothing');
+    assert.ok(!plain.prompts[0].includes('## Design System'));
+  });
+
+  it('hands the design text to the context builder', async () => {
+    const { runner, contextOptions } = build('empty');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: ' Design system v3 ' }));
+    await runner.play(plan());
+    assert.equal(contextOptions[0].design, 'Design system v3');
+  });
+
+  it('with the real context builder the design system appears exactly once, after the standards', async () => {
+    const DESIGN = 'Design system v3 · tokens in css/tokens.css';
+    const { runner, prompts } = build('real');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3, design: DESIGN }));
+    await runner.play(plan());
+    assert.equal(occurrences(prompts[0], '## Design System'), 1);
+    assert.ok(prompts[0].indexOf('## Project Standards') < prompts[0].indexOf('## Design System'));
+  });
+
+  it('passes the built-in rules the store already carries as skipRuleNames', async () => {
+    const { runner } = build('off');
+    const seen: Array<{ cwd: string; skipRuleNames: string[] }> = [];
+    runner.setStandardsProvider((cwd: string, opts: { skipRuleNames: string[] }) => { seen.push({ cwd, ...opts }); return { text: TEXT, version: 1 }; });
+    runner.setAiRulesStore({ getEnabledText: () => '### Clean Code\nbody\n\n### Test-Driven Development\nbody\n\n### My Own Rule\nbody' } as never);
+
+    await runner.play(plan());
+
+    assert.equal(seen.length, 1);
+    assert.deepEqual(seen[0].skipRuleNames, ['Clean Code', 'Test-Driven Development']);
+  });
+
+  it('adds nothing when no provider is set, or the provider reports no standards', async () => {
+    const none = build('off');
+    await none.runner.play(plan());
+    assert.ok(!none.prompts[0].includes('## Project Standards'));
+
+    const empty = build('off');
+    empty.runner.setStandardsProvider(() => null);
+    await empty.runner.play(plan());
+    assert.ok(!empty.prompts[0].includes('## Project Standards'));
+
+    const cleared = build('off');
+    cleared.runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+    cleared.runner.setStandardsProvider(null);
+    await cleared.runner.play(plan());
+    assert.ok(!cleared.prompts[0].includes('## Project Standards'));
+  });
+
+  it('a provider that throws fails the task with the file-named error and never calls the engine', async () => {
+    const { runner, prompts } = build('off');
+    runner.setStandardsProvider(() => { throw new Error('".moag/standards.json" contains invalid JSON. Check for syntax errors.'); });
+    const failed: Array<{ name: string; stderr: string; exitCode: number }> = [];
+    const output: string[] = [];
+    runner.on('task-failed', (t: Task, r: EngineResult) => failed.push({ name: t.name, stderr: r.stderr, exitCode: r.exitCode }));
+    runner.on('task-output', (_t: Task, text: string) => output.push(text));
+    runner.on('error', () => undefined);
+
+    const p = plan([{ name: 'First', prompt: 'a' }, { name: 'Second', prompt: 'b' }]);
+    p.playlists[0].tasks[1].dependsOn = [p.playlists[0].tasks[0].id];
+    await runner.play(p);
+
+    assert.equal(prompts.length, 0, 'no agent may run without the standards it is bound by');
+    assert.equal(p.playlists[0].tasks[0].status, TaskStatus.Failed);
+    assert.equal(failed[0].name, 'First');
+    assert.match(failed[0].stderr, /"\.moag\/standards\.json" contains invalid JSON/);
+    assert.equal(failed[0].exitCode, 1);
+    assert.ok(output.some((o) => /\[Standards Error\] "\.moag\/standards\.json" contains invalid JSON/.test(o)));
+    assert.equal(p.playlists[0].tasks[1].status, TaskStatus.Blocked, 'a dependent task is blocked, not run');
+  });
+
+  it('does not ask for standards for a task that sends no prompt to an agent', async () => {
+    const { runner } = build('off');
+    let calls = 0;
+    runner.setStandardsProvider(() => { calls++; throw new Error('must not be reached'); });
+
+    const p = plan([{ name: 'Build', prompt: '', type: 'command', command: 'echo ok' }]);
+    await runner.play(p);
+
+    assert.equal(calls, 0);
+    assert.equal(p.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('keeps the block when a huge task prompt forces the 80K truncation', async () => {
+    const { runner, prompts } = build('off');
+    runner.setStandardsProvider(() => ({ text: TEXT, version: 3 }));
+
+    await runner.play(plan([{ name: 'Huge', prompt: 'x'.repeat(90_000) }]));
+
+    assert.ok(prompts[0].startsWith(`${SECTION}\n\n`));
+    assert.ok(prompts[0].includes('[prompt truncated at 80K chars]'));
+    assert.ok(prompts[0].length < 80_100);
+  });
+});
+
+// ─── Task-settled hook (headless task-changes) ───
+
+describe('TaskRunner — task-settled hook', () => {
+  const HEAD = 'c'.repeat(40);
+  type SettledInfo = {
+    taskId: string; status: TaskStatus; cwd: string; snapshotRef: string | null; headRef: string | null;
+    untrackedAtStart: string[] | null; commit: { sha: string; branch: string } | null;
+  };
+
+  /** A runner whose git answers the three start-fact commands; `extra` adds proxyquire stubs. */
+  function build(extra: Record<string, unknown> = {}) {
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    spawnStub = sinon.stub().callsFake((cmd: string, args: string[] = []) => {
+      if (cmd === 'git' && args[0] === 'stash' && args[1] === 'create') { return createSpawnProc({ stdoutChunks: ['stashsha'] }); }
+      if (cmd === 'git' && args[0] === 'rev-parse' && args[1] === '--verify') { return createSpawnProc({ stdoutChunks: [HEAD] }); }
+      if (cmd === 'git' && args[0] === 'ls-files') { return createSpawnProc({ stdoutChunks: ['old.txt\0'] }); }
+      return createSpawnProc();
+    });
+    const mod = proxyquire('../../../runner/runner', {
+      'vscode': vscodeMock,
+      '../adapters/index': { getEngine: () => mockEngine },
+      '../context/context-builder': { buildContext: () => '', getContextSettings: () => ({ enabled: false }) },
+      'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+      '../utils/process-kill': { killProcess: sinon.stub(), SPAWN_DETACHED: false },
+      ...extra,
+    });
+    return { TaskRunner: mod.TaskRunner, runner: new mod.TaskRunner(historyStore) };
+  }
+
+  const spawnedLsFiles = (): boolean => spawnStub.getCalls().some((c) => c.args[0] === 'git' && (c.args[1] as string[])[0] === 'ls-files');
+
+  afterEach(() => {
+    vscodeMock.clearMockConfig();
+    sinon.restore();
+  });
+
+  it('is called once for a completed task, before task-completed, with the start facts', async () => {
+    const { runner } = build();
+    const order: string[] = [];
+    const infos: SettledInfo[] = [];
+    runner.setTaskSettledHook(async (info: SettledInfo) => { order.push('hook'); infos.push(info); });
+    runner.on('task-completed', () => order.push('completed'));
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+    await runner.play(plan);
+
+    assert.deepEqual(order, ['hook', 'completed']);
+    assert.equal(infos.length, 1);
+    assert.equal(infos[0].taskId, plan.playlists[0].tasks[0].id);
+    assert.equal(infos[0].status, TaskStatus.Completed);
+    assert.equal(infos[0].snapshotRef, 'stashsha');
+    assert.equal(infos[0].headRef, HEAD);
+    assert.deepEqual(infos[0].untrackedAtStart, ['old.txt']);
+    assert.equal(infos[0].commit, null);
+    assert.equal(typeof infos[0].cwd, 'string');
+  });
+
+  it('is called for a failed task, before task-failed', async () => {
+    const { runner } = build();
+    engineRunStub.resolves({ ...mockEngineResult, exitCode: 1 });
+    const order: string[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { order.push(`hook:${info.status}`); });
+    runner.on('task-failed', () => order.push('failed'));
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+    await runner.play(plan);
+
+    assert.deepEqual(order, ['hook:failed', 'failed']);
+  });
+
+  it('is not called for a dependency-blocked task', async () => {
+    const { runner } = build();
+    engineRunStub.resolves({ ...mockEngineResult, exitCode: 1 });
+    const ids: string[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { ids.push(info.taskId); });
+    const plan = makePlan();
+    plan.playlists[0].tasks[0].id = 'dep-task';
+    plan.playlists[0].tasks[1].dependsOn = ['dep-task'];
+
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[1].status, TaskStatus.Blocked);
+    assert.deepEqual(ids, ['dep-task']);
+  });
+
+  it('is not called for a skipped task', async () => {
+    const { runner } = build();
+    const ids: string[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { ids.push(info.taskId); });
+    const plan = makePlan();
+    const [first, second] = plan.playlists[0].tasks;
+    second.skipIf = { taskId: first.id, status: TaskStatus.Completed };
+
+    await runner.play(plan);
+
+    assert.equal(second.status, TaskStatus.Skipped);
+    assert.deepEqual(ids, [first.id]);
+  });
+
+  it('a throwing hook never changes the outcome', async () => {
+    for (const hook of [() => { throw new Error('sync boom'); }, async () => { throw new Error('async boom'); }]) {
+      const { runner } = build();
+      const completed: string[] = [];
+      runner.on('task-completed', (t: Task) => completed.push(t.id));
+      runner.setTaskSettledHook(hook);
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+      await runner.play(plan);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+      assert.deepEqual(completed, [plan.playlists[0].tasks[0].id]);
+    }
+  });
+
+  describe('bounded', () => {
+    let restore: (() => void) | null = null;
+    afterEach(() => { restore?.(); restore = null; });
+
+    it('a never-resolving hook is abandoned after TASK_SETTLED_HOOK_MS and its signal aborts', async () => {
+      const { runner, TaskRunner } = build();
+      const original = TaskRunner.TASK_SETTLED_HOOK_MS;
+      TaskRunner.TASK_SETTLED_HOOK_MS = 30;
+      restore = () => { TaskRunner.TASK_SETTLED_HOOK_MS = original; };
+      let seen: AbortSignal | null = null;
+      runner.setTaskSettledHook((_info: SettledInfo, signal: AbortSignal) => { seen = signal; return new Promise<void>(() => undefined); });
+      const completed: string[] = [];
+      runner.on('task-completed', (t: Task) => completed.push(t.id));
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+      await runner.play(plan);
+
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+      assert.equal(completed.length, 1);
+      assert.ok(seen);
+      assert.equal((seen as AbortSignal).aborted, true);
+    });
+  });
+
+  it('with no hook, no start facts are captured (no ls-files spawn)', async () => {
+    const { runner } = build();
+    const plan = makePlan();
+    await runner.play(plan);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.equal(spawnedLsFiles(), false);
+  });
+
+  it('a cleared hook is not called and captures nothing', async () => {
+    const { runner } = build();
+    let calls = 0;
+    runner.setTaskSettledHook(() => { calls++; });
+    runner.setTaskSettledHook(null);
+    await runner.play(makePlan());
+    assert.equal(calls, 0);
+    assert.equal(spawnedLsFiles(), false);
+  });
+
+  it('carries the full commit sha and the delivery branch when delivery committed the task', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const realDelivery = require('../../../runner/git-delivery');
+    const { runner } = build({
+      './git-delivery': {
+        ...realDelivery,
+        prepareBranch: async () => ({ ok: true, branch: 'moag/p', created: true }),
+        commitTask: async () => ({ committed: true, sha: 'abc1234', fullSha: 'f'.repeat(40) }),
+      },
+    });
+    const infos: SettledInfo[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { infos.push(info); });
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+    await runner.play(plan);
+
+    assert.equal(infos.length, 1);
+    assert.deepEqual(infos[0].commit, { sha: 'f'.repeat(40), branch: 'moag/p' });
+  });
+
+  it('a commit without a readable full sha reports commit null', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const realDelivery = require('../../../runner/git-delivery');
+    const { runner } = build({
+      './git-delivery': {
+        ...realDelivery,
+        prepareBranch: async () => ({ ok: true, branch: 'moag/p', created: true }),
+        commitTask: async () => ({ committed: true, sha: 'abc1234', fullSha: null }),
+      },
+    });
+    const infos: SettledInfo[] = [];
+    runner.setTaskSettledHook((info: SettledInfo) => { infos.push(info); });
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    await runner.play(plan);
+    assert.equal(infos[0].commit, null);
+  });
+});
+
+// ─── Required delivery branch (ONOSOO remote runs) ───
+
+describe('TaskRunner — required delivery branch', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const realDelivery = require('../../../runner/git-delivery');
+
+  function build(prepare: (...args: unknown[]) => Promise<unknown>) {
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    spawnStub = sinon.stub().callsFake(() => createSpawnProc());
+    const prepareCalls: unknown[][] = [];
+    const { TaskRunner } = proxyquire('../../../runner/runner', {
+      'vscode': vscodeMock,
+      '../adapters/index': { getEngine: () => mockEngine },
+      '../context/context-builder': { buildContext: () => '', getContextSettings: () => ({ enabled: false }) },
+      'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+      '../utils/process-kill': { killProcess: sinon.stub(), SPAWN_DETACHED: false },
+      './git-delivery': {
+        ...realDelivery,
+        prepareBranch: (...args: unknown[]) => { prepareCalls.push(args); return prepare(...args); },
+        commitTask: async () => ({ committed: false, reason: 'nothing-to-commit', detail: '' }),
+      },
+    });
+    const runner = new TaskRunner(historyStore);
+    const errors: string[] = [];
+    const started: string[] = [];
+    runner.on('error', (e: Error) => errors.push(e.message));
+    runner.on('task-started', (t: Task) => started.push(t.id));
+    return { runner, errors, started, prepareCalls };
+  }
+
+  const oneTask = (): Plan => {
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    return plan;
+  };
+
+  afterEach(() => { vscodeMock.clearMockConfig(); sinon.restore(); });
+
+  it('required + not a repo: no task starts, one error, state Idle, and the lock is released', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    const { runner, errors, started } = build(async () => ({ ok: false, reason: 'not-a-repo', detail: 'Not a git work tree.' }));
+    runner.setDeliveryBranch('moag/remote-1', { required: true });
+    await runner.play(oneTask());
+    assert.deepEqual(started, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /moag\/remote-1/);
+    assert.equal(runner.state, RunnerState.Idle);
+    assert.equal(runner.deliveryBranch, null);
+
+    // The lock was released: a second play (requirement cleared) runs.
+    runner.setDeliveryBranch(null);
+    const plan = oneTask();
+    await runner.play(plan);
+    assert.equal(started.length, 1);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('required + auto-commit off: no task starts, one error', async () => {
+    const { runner, errors, started, prepareCalls } = build(async () => ({ ok: true, branch: 'x', created: false }));
+    runner.setDeliveryBranch('moag/remote-2', { required: true });
+    await runner.play(oneTask());
+    assert.deepEqual(started, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /git\.autoCommit is off/);
+    assert.equal(prepareCalls.length, 0);
+  });
+
+  it('a set branch is passed to prepareBranch and exposed while the run delivers to it', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    const { runner, started, prepareCalls } = build(async (...args: unknown[]) => ({ ok: true, branch: (args[5] as { branch: string }).branch, created: false }));
+    runner.setDeliveryBranch('moag/remote-3', { required: true });
+    let during: string | null = null;
+    runner.on('task-started', () => { during = runner.deliveryBranch; });
+    await runner.play(oneTask());
+    assert.equal(started.length, 1);
+    assert.deepEqual(prepareCalls[0][5], { branch: 'moag/remote-3' });
+    assert.equal(during, 'moag/remote-3');
+  });
+
+  it('nothing set: today\'s behaviour — a refusal is a warning and the run proceeds', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    const { runner, errors, started, prepareCalls } = build(async () => ({ ok: false, reason: 'dirty-tree', detail: 'dirty' }));
+    await runner.play(oneTask());
+    assert.equal(errors.length, 1);
+    assert.equal(started.length, 1);
+    assert.deepEqual(prepareCalls[0][5], {});
+  });
+});
+
+describe('TaskRunner — automatic dependency installs', () => {
+  afterEach(() => {
+    sinon.restore();
+    vscodeMock.clearMockConfig();
+  });
+
+  const failedEvent = {
+    event: 'dependencies-install-failed', stage: 'task', taskId: 'x', ecosystem: 'npm', dir: '.',
+    trigger: 'manifest-changed', command: 'npm ci --no-audit --no-fund', durationMs: 2500, exitCode: 1,
+    timedOut: false, tail: 'npm ERR! ERESOLVE', note: null,
+  };
+
+  function commandPlan(command = 'npm run build'): Plan {
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].type = 'command';
+    plan.playlists[0].tasks[0].command = command;
+    return plan;
+  }
+
+  const commandSpawns = (): string[] =>
+    spawnStub.getCalls().map((c) => String(c.args[0])).filter((c) => c !== 'git');
+
+  it('a failing install fails the command task without running its command', async () => {
+    const { runner } = buildRunner();
+    ensureDepsStub.callsFake(async (_cwd: string, o: { onEvent: (ev: unknown) => void }) => {
+      o.onEvent(failedEvent);
+      return { ok: false, aborted: false, failed: failedEvent, events: [failedEvent] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    const seen: unknown[] = [];
+    runner.on('dependencies-install-failed', (t: Task, ev: unknown) => seen.push([t.name, ev]));
+    const failures: EngineResult[] = [];
+    runner.on('task-failed', (_t: Task, r: EngineResult) => failures.push(r));
+
+    const plan = commandPlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    assert.deepEqual(commandSpawns(), [], 'the task command never ran');
+    assert.ok(failures[0].stderr.includes('[Dependencies] Install failed: `npm ci --no-audit --no-fund` exited 1 after 2.5s (needed by "Task 1")'));
+    assert.ok(failures[0].stderr.includes('ERESOLVE'));
+    assert.deepEqual(seen, [['Task 1', failedEvent]]);
+  });
+
+  it('a passing install runs the command and forwards the event as (task, ev)', async () => {
+    const { runner } = buildRunner();
+    const installed = { ...failedEvent, event: 'dependencies-installed', exitCode: 0, tail: 'added 1' };
+    ensureDepsStub.callsFake(async (_cwd: string, o: { onEvent: (ev: unknown) => void }) => {
+      o.onEvent(installed);
+      return { ok: true, aborted: false, failed: null, events: [installed] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    const seen: unknown[] = [];
+    runner.on('dependencies-installed', (t: Task, ev: unknown) => seen.push([t.id, ev]));
+
+    const plan = commandPlan();
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+    assert.deepEqual(commandSpawns(), ['npm run build']);
+    assert.deepEqual(seen, [[plan.playlists[0].tasks[0].id, installed]]);
+    const [cwd, opts] = ensureDepsStub.firstCall.args;
+    assert.equal(typeof cwd, 'string');
+    assert.equal(opts.stage, 'task');
+    assert.equal(opts.taskId, plan.playlists[0].tasks[0].id);
+    assert.equal(opts.timeoutMs, 600_000);
+  });
+
+  it('an abort during the install is exit 130 with no failed event', async () => {
+    const { runner } = buildRunner();
+    ensureDepsStub.callsFake(async () => {
+      runner.stop();
+      return { ok: false, aborted: true, failed: null, events: [] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    let failedEvents = 0;
+    runner.on('dependencies-install-failed', () => { failedEvents++; });
+
+    const plan = commandPlan();
+    await runner.play(plan);
+
+    assert.equal(failedEvents, 0);
+    assert.deepEqual(commandSpawns(), []);
+    assert.notEqual(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('a verifyCommand whose install fails is a failed verification (pre-flight halts)', async () => {
+    const { runner } = buildRunner();
+    ensureDepsStub.callsFake(async (_cwd: string, o: { stage: string }) => (o.stage === 'verify'
+      ? { ok: false, aborted: false, failed: { ...failedEvent, stage: 'verify' }, events: [] }
+      : { ok: true, aborted: false, failed: null, events: [] }));
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+
+    const failures: EngineResult[] = [];
+    runner.on('task-failed', (_t: Task, r: EngineResult) => failures.push(r));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].verifyCommand = 'npm test';
+    await runner.play(plan);
+
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Failed);
+    assert.equal(engineRunStub.callCount, 0, 'the agent never ran against a baseline that could not be checked');
+    assert.deepEqual(commandSpawns(), [], 'npm test never ran');
+    assert.ok(ensureDepsStub.getCalls().some((c) => c.args[1].stage === 'verify'));
+    // QA M1: the halt keeps the real reason — marker first, command, tail — and never
+    // claims the project's tests were "already broken".
+    assert.equal(failures.length, 1);
+    const stderr = failures[0].stderr;
+    assert.ok(stderr.startsWith('[Dependencies] Install failed: `npm ci --no-audit --no-fund` exited 1 after 2.5s'), stderr);
+    assert.ok(stderr.includes('npm ERR! ERESOLVE'), 'the install tail survives');
+    assert.ok(stderr.includes('[Pre-flight] The baseline check "npm test" could not run because its dependencies could not be installed'));
+    assert.ok(!stderr.includes('Baseline already broken'), stderr);
+    assert.equal(failures[0].summary, 'Dependencies could not be installed.');
+  });
+
+  it('a pre-flight install failure with haltOnBrokenBaseline:false says so and lets the agent run', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { haltOnBrokenBaseline: false });
+    const { runner } = buildRunner();
+    let verifyCalls = 0;
+    ensureDepsStub.callsFake(async (_cwd: string, o: { stage: string }) => {
+      if (o.stage === 'verify' && verifyCalls++ === 0) {
+        return { ok: false, aborted: false, failed: { ...failedEvent, stage: 'verify' }, events: [] };
+      }
+      return { ok: true, aborted: false, failed: null, events: [] };
+    });
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    const output: string[] = [];
+    runner.on('task-output', (_t: Task, chunk: string) => output.push(chunk));
+
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    plan.playlists[0].tasks[0].verifyCommand = 'npm test';
+    await runner.play(plan);
+
+    const text = output.join('');
+    assert.ok(text.includes('[Pre-flight] Dependencies could not be installed for the baseline check'), text);
+    assert.ok(!text.includes('Baseline already broken'), text);
+    assert.equal(engineRunStub.callCount, 1, 'the agent ran');
+  });
+
+  it('agent tasks never call the installer', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake(() => createSpawnProc({ stdoutChunks: ['abc123'], closeCode: 0 }));
+    const plan = makePlan();
+    await runner.play(plan);
+    assert.equal(engineRunStub.callCount, 2);
+    assert.equal(ensureDepsStub.callCount, 0);
+  });
+
+  it('autoInstallDependencies:false reaches the installer as enabled:false', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { autoInstallDependencies: false, 'dependencyInstall.ignoreScripts': true });
+    const { runner } = buildRunner();
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    await runner.play(commandPlan());
+    assert.equal(ensureDepsStub.callCount, 1);
+    assert.deepEqual(ensureDepsStub.firstCall.args[1].settings, { enabled: false, ignoreScripts: true, pythonVenv: null });
+  });
+
+  it('the unit-test default is off (no test may install into the repository)', async () => {
+    const { runner } = buildRunner();
+    spawnStub.callsFake((command: string) => createSpawnProc({ stdoutChunks: command === 'git' ? ['abc123'] : ['ok'], closeCode: 0 }));
+    await runner.play(commandPlan());
+    assert.equal(ensureDepsStub.firstCall.args[1].settings.enabled, false);
   });
 });

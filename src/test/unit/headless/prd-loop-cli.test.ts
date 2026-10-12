@@ -13,8 +13,12 @@ import {
   exitCodeForReport,
   parseArgs,
   resolvePrdTextHeadless,
+  resolveVerifyStandards,
   verifyArgsError,
 } from '../../../headless/cli';
+import { writeLocalStandards } from '../../../standards/local-store';
+import { profileHash, renderPlannerStandards, renderStandardsText } from '../../../standards/profile';
+import { sampleProfile, sampleProvenance } from '../standards/fixtures';
 
 function makeTempDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -53,6 +57,112 @@ describe('moag verify — parseArgs', () => {
     const args = parseArgs(['run', 'plan.json', '--verify', '--fix']);
     assert.equal(args.verify, true);
     assert.equal(args.fix, true);
+  });
+});
+
+describe('moag verify — standards flags', () => {
+  it('leaves all three undefined by default', () => {
+    const args = parseArgs(['verify', 'plan.json']);
+    assert.equal(args.standardsPath, undefined);
+    assert.equal(args.noStandards, undefined);
+    assert.equal(args.base, undefined);
+  });
+
+  it('--standards resolves against --cwd, --no-standards is a boolean, --base is kept verbatim', () => {
+    const cwd = makeTempDir('moag-cli-stdflags-');
+    const args = parseArgs(['verify', 'plan.json', '--cwd', cwd, '--standards', 'job/standards.json', '--no-standards', '--base', 'HEAD~2']);
+    assert.equal(args.standardsPath, path.join(cwd, 'job', 'standards.json'));
+    assert.equal(args.noStandards, true);
+    assert.equal(args.base, 'HEAD~2');
+  });
+
+  it('a trailing --standards or --base with no value does not crash and sets nothing', () => {
+    let args: Args | undefined;
+    assert.doesNotThrow(() => { args = parseArgs(['verify', 'plan.json', '--base']); });
+    assert.equal(args!.base, undefined);
+    assert.doesNotThrow(() => { args = parseArgs(['verify', 'plan.json', '--standards']); });
+    assert.equal(args!.standardsPath, undefined);
+  });
+});
+
+describe('moag verify — resolveVerifyStandards', () => {
+  function argsFor(cwd: string, extra: string[] = []): Args {
+    return parseArgs(['verify', 'plan.json', '--cwd', cwd, ...extra]);
+  }
+
+  function writeLocal(cwd: string, version = 4): void {
+    writeLocalStandards(cwd, { schemaVersion: 1, version, profile: sampleProfile(), provenance: sampleProvenance() });
+  }
+
+  function writeJobFile(dir: string, over: Record<string, unknown> = {}): string {
+    const profile = sampleProfile();
+    profile.commands = [{ label: 'Approved', run: 'npm run approved' }];
+    const file = path.join(dir, 'standards.json');
+    fs.writeFileSync(file, JSON.stringify({
+      schemaVersion: 1, version: 9, contentHash: profileHash(profile), baseRef: 'c'.repeat(40), profile,
+      promptText: renderStandardsText(profile, 9), plannerText: renderPlannerStandards(profile, 9), ...over,
+    }));
+    return file;
+  }
+
+  it('is null for a workspace with no standards file', () => {
+    assert.equal(resolveVerifyStandards(argsFor(makeTempDir('moag-cli-nostd-'))), null);
+  });
+
+  it('reads the workspace file, with the base from --base (null when absent)', () => {
+    const cwd = makeTempDir('moag-cli-localstd-');
+    writeLocal(cwd, 4);
+    const plain = resolveVerifyStandards(argsFor(cwd));
+    assert.equal(plain?.version, 4);
+    assert.equal(plain?.baseRef, null);
+    assert.deepEqual(plain?.profile, sampleProfile());
+    assert.equal(resolveVerifyStandards(argsFor(cwd, ['--base', 'abc1234']))?.baseRef, 'abc1234');
+  });
+
+  it('--no-standards returns null without reading the workspace file at all', () => {
+    const cwd = makeTempDir('moag-cli-nostdflag-');
+    fs.mkdirSync(path.join(cwd, '.moag'));
+    fs.writeFileSync(path.join(cwd, '.moag', 'standards.json'), '{ broken');
+    assert.equal(resolveVerifyStandards(argsFor(cwd, ['--no-standards'])), null);
+  });
+
+  it('--standards reads the job file — profile, version and base — and never the workspace file', () => {
+    const cwd = makeTempDir('moag-cli-jobstd-');
+    fs.mkdirSync(path.join(cwd, '.moag'));
+    fs.writeFileSync(path.join(cwd, '.moag', 'standards.json'), '{ broken, and hostile');
+    const job = writeJobFile(makeTempDir('moag-cli-jobdir-'));
+    const resolved = resolveVerifyStandards(argsFor(cwd, ['--standards', job, '--base', 'ignored-for-job-files']));
+    assert.equal(resolved?.version, 9);
+    assert.equal(resolved?.baseRef, 'c'.repeat(40));
+    assert.deepEqual(resolved?.profile.commands, [{ label: 'Approved', run: 'npm run approved' }]);
+  });
+
+  it('--standards wins over --no-standards', () => {
+    const job = writeJobFile(makeTempDir('moag-cli-jobwin-'));
+    assert.equal(resolveVerifyStandards(argsFor(makeTempDir('moag-cli-jobwin-cwd-'), ['--no-standards', '--standards', job]))?.version, 9);
+  });
+
+  it('throws naming the file for an invalid workspace file, a missing job file and a tampered job file', () => {
+    const cwd = makeTempDir('moag-cli-badstd-');
+    fs.mkdirSync(path.join(cwd, '.moag'));
+    fs.writeFileSync(path.join(cwd, '.moag', 'standards.json'), '{ broken');
+    assert.throws(() => resolveVerifyStandards(argsFor(cwd)), /"\.moag\/standards\.json" contains invalid JSON/);
+
+    const jobDir = makeTempDir('moag-cli-badjob-');
+    assert.throws(() => resolveVerifyStandards(argsFor(cwd, ['--standards', path.join(jobDir, 'standards.json')])),
+      /Cannot read "standards\.json"/);
+    const tampered = writeJobFile(jobDir, { contentHash: 'f'.repeat(64) });
+    assert.throws(() => resolveVerifyStandards(argsFor(cwd, ['--standards', tampered])), /does not match its content hash/);
+  });
+
+  it('buildVerifyConfig carries the resolved standards and propagates a broken file as a throw', () => {
+    const ctx = { vscode: { workspace: { getConfiguration: () => ({ get: (_k: string, d: unknown) => d }) } } };
+    const cwd = makeTempDir('moag-cli-cfgstd-');
+    assert.equal(buildVerifyConfig(argsFor(cwd), ctx as never).standards, null);
+    writeLocal(cwd, 2);
+    assert.equal(buildVerifyConfig(argsFor(cwd), ctx as never).standards?.version, 2);
+    fs.writeFileSync(path.join(cwd, '.moag', 'standards.json'), '[]');
+    assert.throws(() => buildVerifyConfig(argsFor(cwd), ctx as never), /"\.moag\/standards\.json" is not a valid standards file/);
   });
 });
 
@@ -205,5 +315,32 @@ describe('moag verify — buildVerifyConfig', () => {
       ctx as never,
     );
     assert.equal(cfg.uat.specPath, 'from/cli.spec.ts');
+  });
+
+  it('reads the per-run PRD budget from prdLoop.versionBudgetUsd, defaulting to 0 (off)', () => {
+    assert.equal(buildVerifyConfig(parseArgs(['verify', 'p.json']), makeCtx() as never).versionBudgetUsd, 0);
+    const ctx = makeCtx({ 'prdLoop.versionBudgetUsd': 2.5 });
+    assert.equal(buildVerifyConfig(parseArgs(['verify', 'p.json']), ctx as never).versionBudgetUsd, 2.5);
+  });
+
+  it('coerces a negative or non-numeric budget to 0 instead of throwing', () => {
+    for (const bad of [-1, 'x', NaN, Infinity, null]) {
+      const ctx = makeCtx({ 'prdLoop.versionBudgetUsd': bad });
+      assert.equal(buildVerifyConfig(parseArgs(['verify', 'p.json']), ctx as never).versionBudgetUsd, 0, String(bad));
+    }
+  });
+
+  it('carries the dependency-install settings from the config (default on)', () => {
+    assert.deepEqual(buildVerifyConfig(parseArgs(['verify', 'p.json']), makeCtx() as never).dependencies,
+      { enabled: true, ignoreScripts: false, pythonVenv: null });
+    const ctx = makeCtx({
+      autoInstallDependencies: false, 'dependencyInstall.ignoreScripts': true, 'dependencyInstall.pythonVenv': '.env',
+    });
+    assert.deepEqual(buildVerifyConfig(parseArgs(['verify', 'p.json']), ctx as never).dependencies,
+      { enabled: false, ignoreScripts: true, pythonVenv: '.env' });
+  });
+
+  it('a budget halt maps to exit code 4', () => {
+    assert.equal(exitCodeForReport({ passed: false, haltReason: 'budget-exceeded' }), 4);
   });
 });

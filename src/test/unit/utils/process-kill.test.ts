@@ -132,3 +132,34 @@ describe('process-kill — killing the tree', () => {
     } finally { h.restore(); }
   });
 });
+
+describe('killOwnProcessTree', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { killOwnProcessTree } = require('../../../utils/process-kill') as typeof import('../../../utils/process-kill');
+
+  it('Windows: one taskkill /T /F on the root pid', () => {
+    const cmds: string[] = [];
+    killOwnProcessTree(100, (c) => { cmds.push(c); return ''; }, 'win32', () => { throw new Error('no direct kill on win32'); });
+    assert.deepStrictEqual(cmds, ['taskkill /pid 100 /T /F']);
+  });
+
+  it('POSIX: SIGKILLs every descendant (group and pid), never the root, its parent or a stranger', () => {
+    const table = [
+      '  1     0', ' 50     1', '100    50', // init, server, worker (root)
+      '200   100', '201   100', '300   200', '301   300', // descendants
+      '999     1', 'garbage line', '',
+    ].join('\n');
+    const kills: Array<[number, string]> = [];
+    killOwnProcessTree(100, () => table, 'linux', (pid, sig) => { kills.push([pid, sig]); });
+    const pids = new Set(kills.map(([p]) => Math.abs(p)));
+    assert.deepStrictEqual([...pids].sort((a, b) => a - b), [200, 201, 300, 301]);
+    assert.ok(kills.every(([, s]) => s === 'SIGKILL'));
+    assert.ok(kills.some(([p]) => p === -200), 'the group is signalled too');
+  });
+
+  it('never throws: ps failing, or kill throwing for gone processes', () => {
+    assert.doesNotThrow(() => killOwnProcessTree(100, () => { throw new Error('no ps'); }, 'linux'));
+    assert.doesNotThrow(() => killOwnProcessTree(100, () => '200 100', 'linux', () => { throw new Error('ESRCH'); }));
+    assert.doesNotThrow(() => killOwnProcessTree(100, () => { throw new Error('not found'); }, 'win32'));
+  });
+});

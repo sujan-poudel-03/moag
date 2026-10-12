@@ -812,6 +812,9 @@ function buildTurnCard(entry: HistoryEntry): string {
   if (entry.modelReason) {
     reasonLine = `<div class="auto-select-reason" title="${escHtml(entry.modelReason)}">Auto: ${escHtml(entry.modelReason)}</div>`;
   }
+  if (entry.engineRoutingReason) {
+    reasonLine += `<div class="auto-select-reason" title="${escHtml(entry.engineRoutingReason)}">Routed: ${escHtml(entry.engineRoutingReason)}</div>`;
+  }
 
   // Changed files
   let filesHtml = '';

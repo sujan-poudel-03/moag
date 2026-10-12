@@ -1,0 +1,11 @@
+{
+  "name": "slug",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Dry-run stand-in for the standards-violation benchmark (plain JavaScript, no dependencies).",
+  "main": "src/slug.js",
+  "scripts": {
+    "test": "node --test test/slug.test.js",
+    "lint": "node tools/lint.js"
+  }
+}

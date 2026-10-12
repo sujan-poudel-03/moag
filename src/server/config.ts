@@ -1,0 +1,216 @@
+// ─── Hosted server configuration ───
+//
+// All server configuration comes from environment variables, validated once at
+// boot. `loadServerConfig` never throws: a bad value is a startup error the
+// operator must fix, reported as `{ ok: false, error }`.
+
+import * as fs from 'fs';
+import * as path from 'path';
+
+export const DEFAULT_HOST = '127.0.0.1';
+export const DEFAULT_PORT = 8080;
+export const DEFAULT_MAX_CONCURRENT_JOBS = 2;
+export const MAX_CONCURRENT_JOBS_LIMIT = 8;
+export const MIN_BOOTSTRAP_TOKEN_LENGTH = 24;
+/** Upper bound for `MOAG_MAX_USD_PER_ENGINE_CALL` (a typo guard, not a policy). */
+export const MAX_USD_PER_ENGINE_CALL_LIMIT = 1000;
+/** Bounds for `MOAG_GATE_TIMEOUT_MS` (one verify gate command): 1 s to 1 h. */
+export const MIN_GATE_TIMEOUT_MS = 1_000;
+export const MAX_GATE_TIMEOUT_MS = 3_600_000;
+const ENV_NAME_RE = /^[A-Z_][A-Z0-9_]*$/;
+
+/** Why runs are refused server-wide, or null when runs are allowed. */
+export type RunsDisabledReason = 'ci' | null;
+
+export interface ServerConfig {
+  dataDir: string;
+  projectsRoot: string;
+  publicUrl: string;
+  /** Origin of `publicUrl` — mutating requests with an `Origin` header must match it. */
+  publicOrigin: string;
+  /** True when `publicUrl` is https: cookies get `Secure` + `__Host-`, HSTS is sent. */
+  secureCookies: boolean;
+  host: string;
+  port: number;
+  trustProxy: boolean;
+  bootstrapToken: string | null;
+  /** Raw master secret for the key store, or null when none is configured. */
+  masterKey: Buffer | null;
+  maxConcurrentJobs: number;
+  runEnvPassthrough: string[];
+  allowSshClone: boolean;
+  runsDisabledReason: RunsDisabledReason;
+  /** `MOAG_MAX_USD_PER_ENGINE_CALL`: server-wide cap on one engine call (Claude `--max-budget-usd`), or null. */
+  maxUsdPerEngineCall: number | null;
+  /**
+   * `MOAG_GATE_TIMEOUT_MS`: how long one verify gate command (e.g. `npm test`) may run in a
+   * run job, or null for verify's default (600000). Operator-set only: a repository's own
+   * `.moag/config.json` is never read, so a project cannot raise it for itself.
+   */
+  gateTimeoutMs: number | null;
+  /**
+   * `MOAG_AUTO_INSTALL_DEPENDENCIES`: install a project's dependencies from the fixed table
+   * before a step that needs them (default true). Passed to every run worker.
+   */
+  autoInstallDependencies: boolean;
+  /** `MOAG_INSTALL_IGNORE_SCRIPTS`: add --ignore-scripts to npm/pnpm/yarn installs (default false). */
+  installIgnoreScripts: boolean;
+}
+
+export type ServerConfigResult = { ok: true; config: ServerConfig } | { ok: false; error: string };
+
+function flag(v: string | undefined): boolean {
+  return v === '1' || v === 'true' || v === 'yes';
+}
+
+function realpathOrResolve(p: string): string {
+  const abs = path.resolve(p);
+  try { return fs.realpathSync.native(abs); } catch { return abs; }
+}
+
+/** True when `child` is `parent` or inside it (case-insensitive on win32). */
+export function isPathInside(parent: string, child: string): boolean {
+  const norm = (p: string) => (process.platform === 'win32' ? p.toLowerCase() : p);
+  const a = norm(path.resolve(parent));
+  const b = norm(path.resolve(child));
+  return b === a || b.startsWith(a.endsWith(path.sep) ? a : a + path.sep);
+}
+
+/** Validate the server environment. Never throws. */
+export function loadServerConfig(env: NodeJS.ProcessEnv): ServerConfigResult {
+  const fail = (error: string): ServerConfigResult => ({ ok: false, error });
+
+  const dataDirRaw = env.MOAG_DATA_DIR?.trim();
+  if (!dataDirRaw) { return fail('MOAG_DATA_DIR is required.'); }
+  const dataDir = path.resolve(dataDirRaw);
+
+  const projectsRoot = path.resolve(env.MOAG_PROJECTS_ROOT?.trim() || path.join(dataDir, 'workspaces'));
+
+  const publicUrlRaw = env.MOAG_PUBLIC_URL?.trim();
+  if (!publicUrlRaw) { return fail('MOAG_PUBLIC_URL is required (e.g. https://moag.example.com).'); }
+  let publicUrl: URL;
+  try { publicUrl = new URL(publicUrlRaw); } catch { return fail('MOAG_PUBLIC_URL is not a valid URL.'); }
+  if (publicUrl.protocol !== 'http:' && publicUrl.protocol !== 'https:') {
+    return fail('MOAG_PUBLIC_URL must be http or https.');
+  }
+
+  const host = env.MOAG_HOST?.trim() || DEFAULT_HOST;
+
+  let port = DEFAULT_PORT;
+  if (env.MOAG_PORT !== undefined && env.MOAG_PORT.trim() !== '') {
+    const n = Number(env.MOAG_PORT);
+    if (!Number.isInteger(n) || n < 0 || n > 65535) { return fail('MOAG_PORT must be an integer 0-65535.'); }
+    port = n;
+  }
+
+  let bootstrapToken: string | null = null;
+  if (env.MOAG_BOOTSTRAP_TOKEN !== undefined && env.MOAG_BOOTSTRAP_TOKEN !== '') {
+    if (env.MOAG_BOOTSTRAP_TOKEN.length < MIN_BOOTSTRAP_TOKEN_LENGTH) {
+      return fail(`MOAG_BOOTSTRAP_TOKEN must be at least ${MIN_BOOTSTRAP_TOKEN_LENGTH} characters.`);
+    }
+    bootstrapToken = env.MOAG_BOOTSTRAP_TOKEN;
+  }
+
+  let masterKey: Buffer | null = null;
+  if (env.MOAG_MASTER_KEY && env.MOAG_MASTER_KEY_FILE) {
+    return fail('Set only one of MOAG_MASTER_KEY and MOAG_MASTER_KEY_FILE.');
+  }
+  if (env.MOAG_MASTER_KEY) {
+    masterKey = Buffer.from(env.MOAG_MASTER_KEY, 'utf-8');
+  } else if (env.MOAG_MASTER_KEY_FILE) {
+    const keyFile = realpathOrResolve(env.MOAG_MASTER_KEY_FILE);
+    if (isPathInside(realpathOrResolve(dataDir), keyFile)) {
+      return fail('MOAG_MASTER_KEY_FILE must be outside MOAG_DATA_DIR (a data-volume backup would carry the key with the ciphertext).');
+    }
+    try {
+      masterKey = Buffer.from(fs.readFileSync(keyFile, 'utf-8').trim(), 'utf-8');
+    } catch {
+      return fail('MOAG_MASTER_KEY_FILE could not be read.');
+    }
+  }
+  if (masterKey && masterKey.length < 16) {
+    return fail('The master key must be at least 16 characters.');
+  }
+
+  let maxConcurrentJobs = DEFAULT_MAX_CONCURRENT_JOBS;
+  if (env.MOAG_MAX_CONCURRENT_JOBS !== undefined && env.MOAG_MAX_CONCURRENT_JOBS.trim() !== '') {
+    const n = Number(env.MOAG_MAX_CONCURRENT_JOBS);
+    if (!Number.isInteger(n) || n < 1 || n > MAX_CONCURRENT_JOBS_LIMIT) {
+      return fail(`MOAG_MAX_CONCURRENT_JOBS must be an integer 1-${MAX_CONCURRENT_JOBS_LIMIT}.`);
+    }
+    maxConcurrentJobs = n;
+  }
+
+  let maxUsdPerEngineCall: number | null = null;
+  if (env.MOAG_MAX_USD_PER_ENGINE_CALL !== undefined && env.MOAG_MAX_USD_PER_ENGINE_CALL.trim() !== '') {
+    const n = Number(env.MOAG_MAX_USD_PER_ENGINE_CALL);
+    if (!Number.isFinite(n) || n <= 0 || n > MAX_USD_PER_ENGINE_CALL_LIMIT) {
+      return fail(`MOAG_MAX_USD_PER_ENGINE_CALL must be a number greater than 0 and at most ${MAX_USD_PER_ENGINE_CALL_LIMIT}.`);
+    }
+    maxUsdPerEngineCall = n;
+  }
+
+  let gateTimeoutMs: number | null = null;
+  if (env.MOAG_GATE_TIMEOUT_MS !== undefined && env.MOAG_GATE_TIMEOUT_MS.trim() !== '') {
+    const n = Number(env.MOAG_GATE_TIMEOUT_MS);
+    if (!Number.isInteger(n) || n < MIN_GATE_TIMEOUT_MS || n > MAX_GATE_TIMEOUT_MS) {
+      return fail(`MOAG_GATE_TIMEOUT_MS must be a whole number of milliseconds from ${MIN_GATE_TIMEOUT_MS} to ${MAX_GATE_TIMEOUT_MS}.`);
+    }
+    gateTimeoutMs = n;
+  }
+
+  let autoInstallDependencies = true;
+  const autoInstallRaw = env.MOAG_AUTO_INSTALL_DEPENDENCIES?.trim().toLowerCase() ?? '';
+  if (autoInstallRaw !== '') {
+    if (['1', 'true', 'yes'].includes(autoInstallRaw)) {
+      autoInstallDependencies = true;
+    } else if (['0', 'false', 'no'].includes(autoInstallRaw)) {
+      autoInstallDependencies = false;
+    } else {
+      return fail('MOAG_AUTO_INSTALL_DEPENDENCIES must be one of 1, true, yes, 0, false, no (or unset for on).');
+    }
+  }
+
+  const runEnvPassthrough: string[] = [];
+  for (const name of (env.MOAG_RUN_ENV_PASSTHROUGH ?? '').split(',').map((s) => s.trim()).filter(Boolean)) {
+    if (!ENV_NAME_RE.test(name)) { return fail(`MOAG_RUN_ENV_PASSTHROUGH: "${name}" is not a valid variable name.`); }
+    if (name.startsWith('MOAG_')) { return fail(`MOAG_RUN_ENV_PASSTHROUGH: "${name}" — MOAG_* variables can never be passed to runs.`); }
+    if (name === 'CI') { return fail('MOAG_RUN_ENV_PASSTHROUGH: CI can never be passed to runs (it auto-approves ship gates).'); }
+    if (!runEnvPassthrough.includes(name)) { runEnvPassthrough.push(name); }
+  }
+
+  return {
+    ok: true,
+    config: {
+      dataDir,
+      projectsRoot,
+      publicUrl: publicUrl.toString(),
+      publicOrigin: publicUrl.origin,
+      secureCookies: publicUrl.protocol === 'https:',
+      host,
+      port,
+      trustProxy: flag(env.MOAG_TRUST_PROXY),
+      bootstrapToken,
+      masterKey,
+      maxConcurrentJobs,
+      runEnvPassthrough,
+      allowSshClone: flag(env.MOAG_ALLOW_SSH_CLONE),
+      runsDisabledReason: env.CI === 'true' ? 'ci' : null,
+      maxUsdPerEngineCall,
+      gateTimeoutMs,
+      autoInstallDependencies,
+      installIgnoreScripts: flag(env.MOAG_INSTALL_IGNORE_SCRIPTS),
+    },
+  };
+}
+
+/**
+ * Remove secrets from the live environment once they have been read, so that
+ * no child spawned later inherits them from `process.env`. This does NOT clear
+ * the kernel's copy (`/proc/<pid>/environ` keeps the startup environment) —
+ * prefer `MOAG_MASTER_KEY_FILE` over `MOAG_MASTER_KEY` for that reason.
+ */
+export function scrubServerSecrets(env: NodeJS.ProcessEnv): void {
+  delete env.MOAG_MASTER_KEY;
+  delete env.MOAG_BOOTSTRAP_TOKEN;
+}

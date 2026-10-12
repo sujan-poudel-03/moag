@@ -1,5 +1,5 @@
 import { strict as assert } from 'assert';
-import { selectModel } from '../../../models/model-selector';
+import { selectModel, computeComplexity } from '../../../models/model-selector';
 import { Task, TaskStatus } from '../../../models/types';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -13,6 +13,16 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 }
 
 describe('model-selector', () => {
+  describe('computeComplexity', () => {
+    it('should return a { score, factors } shape for a simple prompt', () => {
+      const task = makeTask({ prompt: 'rename variable foo to bar' });
+      const result = computeComplexity(task);
+      assert.equal(typeof result.score, 'number');
+      assert.ok(Array.isArray(result.factors));
+      assert.ok(result.score <= 25, `expected simple prompt score <= 25, got ${result.score}`);
+    });
+  });
+
   describe('selectModel', () => {
     it('should return a ModelSelection with required fields', () => {
       const result = selectModel(makeTask(), 'claude');

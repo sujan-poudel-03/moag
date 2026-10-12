@@ -11,6 +11,7 @@ import {
   serializePlanForSharing,
 } from './models/plan';
 import { registerAllEngines, checkEngineAvailability, getEngine, setCeilingGuard } from './adapters/index';
+import { loadWorkspaceRoutingConfig, saveWorkspaceRoutingConfig, RoutingRuleConfig } from './routing/routing-store';
 import { commandExists } from './utils/command-exists';
 import { ghSync, ghAsync } from './utils/gh';
 import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
@@ -60,7 +61,15 @@ import { PromptLibraryStore } from './templates/prompt-library';
 import { SandboxManager } from './sandbox/sandbox-manager';
 import { resolveBrowserRunner } from './sandbox/browser-driver';
 import { runGate } from './runner/evidence';
+import { formatDependencyEventLine, readDependencyInstallSettings } from './runner/dependency-install';
+import { clearStandardsBase, rememberStandardsBase, resolveStandardsBase } from './runner/standards-base';
+import { standardsReportSection, verificationGateRows } from './ui/standards-report-html';
+import { createLocalStandardsProvider, loadLocalStandards } from './standards/local-store';
 import { captureScreenshot } from './sandbox/screenshot';
+import { resolveDeveloperEmail } from './utils/git-identity';
+import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
+import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
+import { costLedger } from './utils/cost-ledger';
 
 // ─── Shared state ───
 
@@ -1374,6 +1383,7 @@ export function activate(context: vscode.ExtensionContext): void {
     detectPrdFileInWorkspace,
     getActivePlan,
     injectTestTaskIfMissing,
+    isRunnerBusy: () => runner.state !== RunnerState.Idle,
     saveAndRefresh,
     syncPromptProviderSidebar,
   });
@@ -1409,9 +1419,30 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({ dispose: () => setCeilingGuard(null) });
   runner.setPromptLibrary(promptLibraryStore);
 
+  // Contribution Ledger: record per-engine-call usage facts to
+  // .moag/usage-log.jsonl. Best-effort — appendUsageEntry never throws, and
+  // the recorder itself is already wrapped by the runner's own try/catch.
+  // The recorded `record.prompt` is always the short human prompt the
+  // runner computes — never the assembled buildContext() prompt; this file
+  // is git-tracked, so anything wider than that would land in git history.
+  runner.setUsageRecorder((record) => {
+    const enabled = vscode.workspace.getConfiguration('agentTaskPlayer')
+      .get<boolean>('contributionLedger.enabled', true);
+    if (!enabled) { return; }
+    const moagDir = getMoagDir();
+    if (!moagDir) { return; }
+    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+    const developerEmail = resolveDeveloperEmail(cwd);
+    appendUsageEntry(moagDir, { ...record, developerEmail });
+  });
+
   // Initialize AI rules store
   aiRulesStore = new AiRulesStore(context.globalStorageUri.fsPath);
   runner.setAiRulesStore(aiRulesStore);
+  runner.setStandardsProvider(createLocalStandardsProvider(() => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath));
+  // Before a run's first task: remember where the tree stood, so the standards check still
+  // sees work the run committed (git.autoCommit, or an agent that commits).
+  runner.setRunStartHook((cwd) => rememberStandardsBase(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? cwd));
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
@@ -1644,6 +1675,18 @@ export function activate(context: vscode.ExtensionContext): void {
     promptViewProvider?.postLiveOutputChunk(task.id, chunk);
   });
 
+  // Automatic dependency installs: one line each in the MOAG output channel. The
+  // install's own output already reaches the dashboard through task-output.
+  runner.on('dependencies-installed', (task, ev) => {
+    moagOutputChannel?.appendLine(formatDependencyEventLine(ev, task.name));
+  });
+  runner.on('dependencies-install-failed', (task, ev) => {
+    moagOutputChannel?.appendLine(formatDependencyEventLine(ev, task.name));
+  });
+  runner.on('dependencies-not-installed', (task, ev) => {
+    moagOutputChannel?.appendLine(formatDependencyEventLine(ev, task.name));
+  });
+
   runner.on('engine-fallback', ({ fromEngine, toEngine }) => {
     vscode.window.showInformationMessage(`Rate limit hit on ${fromEngine}. Retrying with ${toEngine}.`);
     DashboardPanel.currentPanel?.postEngineFallback(fromEngine, toEngine);
@@ -1716,6 +1759,7 @@ export function activate(context: vscode.ExtensionContext): void {
       task, entry?.result ?? _result, entry?.changedFiles, entry?.codeChanges, entry?.verification, entry?.artifacts,
       entry?.autoFixed, entry?.validationTargetResults,
     );
+    DashboardPanel.currentPanel?.pushContributionLedger();
     scheduleDashboardUpdate();
     // Update run session stats
     if (runner.currentRunId) {
@@ -2038,6 +2082,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.manageAiRules', () => {
       void handleRulesAction({ type: 'openLibrary' });
     }),
+    vscode.commands.registerCommand('agentTaskPlayer.configureAutoRouting', () => void cmdConfigureAutoRouting()),
     vscode.commands.registerCommand('agentTaskPlayer.switchEngine', cmdSwitchEngine),
     vscode.commands.registerCommand('agentTaskPlayer.playPlaylist', cmdPlayPlaylist),
     vscode.commands.registerCommand('agentTaskPlayer.playTask', cmdPlayTask),
@@ -2175,6 +2220,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context)),
     vscode.commands.registerCommand('agentTaskPlayer.planFromPrd', cmdPlanFromPRD),
     vscode.commands.registerCommand('agentTaskPlayer.generatePlanFromPrdText', (prdText: string) => generatePlanFromPrdText(prdText)),
+    vscode.commands.registerCommand('agentTaskPlayer.generateDeltaPlan', (args?: { prdText?: string }) =>
+      cmdGenerateDeltaPlan(args).catch((err) => UserMsg.showError(UserMsg.runnerError(err instanceof Error ? err.message : String(err))))),
     vscode.commands.registerCommand('agentTaskPlayer.prdChatAnswer', (payload: { answer: string; step: number; answers: string[] }) => void handlePrdChatAnswer(payload)),
     vscode.commands.registerCommand('agentTaskPlayer.openPrdFromPlan', cmdOpenPrdFromPlan),
     vscode.commands.registerCommand('agentTaskPlayer.savePrdToPlan', (prdText: string) => void cmdSavePrdToPlan(prdText)),
@@ -2182,9 +2229,9 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.prdAiImprove', (text: string) =>
       void handlePrdAiImprove(text, (improved) => promptViewProvider?.postMessage({ type: 'prdAiImproveResult', text: improved }))),
     vscode.commands.registerCommand('agentTaskPlayer.openPrdInBrowser', (text: string) => void openPrdInBrowser(text)),
-    vscode.commands.registerCommand('agentTaskPlayer.savePrdVersion', (payload: { text: string; version: string }) => {
-      const saved = savePrdVersionToActivePlan(payload.text, payload.version);
-      promptViewProvider?.postMessage({ type: 'prdVersionSaved', versions: saved.versions, version: saved.version });
+    vscode.commands.registerCommand('agentTaskPlayer.savePrdVersion', (payload: { text: string }) => {
+      const saved = savePrdVersionToActivePlan(payload.text);
+      promptViewProvider?.postMessage({ type: 'prdVersionSaved', ...saved });
     }),
     vscode.commands.registerCommand('agentTaskPlayer.suggestCommit', cmdSuggestCommit),
     vscode.commands.registerCommand('agentTaskPlayer.shareRunFeedback', cmdShareRunFeedback),
@@ -2596,6 +2643,38 @@ function handleTttPhaseStart(playlist: Playlist): void {
       );
       break;
   }
+}
+
+/**
+ * Build the Contribution Ledger payload for the dashboard: reads
+ * .moag/usage-log.jsonl, cross-references task status from the active plan,
+ * and rolls it up into the rolling 7-day leaderboard + coaching cards.
+ * Returns null when there is no workspace .moag/ directory to read from.
+ */
+function buildContributionLedgerPayload(): ContributionLedgerPayload | null {
+  const moagDir = getMoagDir();
+  if (!moagDir) { return null; }
+
+  const entries = readAllUsageEntries(moagDir);
+
+  const taskStatusById = new Map<string, string>();
+  const plan = getActivePlan();
+  if (plan) {
+    for (const playlist of plan.playlists) {
+      for (const task of playlist.tasks) {
+        taskStatusById.set(task.id, task.status);
+      }
+    }
+  }
+
+  const leads = vscode.workspace.getConfiguration('agentTaskPlayer')
+    .get<string[]>('contributionLedger.leads', []);
+
+  return rollupContributionLedger(entries, {
+    now: new Date(),
+    taskStatusById,
+    leads,
+  });
 }
 
 function saveAndRefresh(): void {
@@ -4684,6 +4763,7 @@ import {
   savePrdVersionToActivePlan,
   cmdPlanFromPRD,
   generatePlanFromPrdText,
+  cmdGenerateDeltaPlan,
 } from './ui/prd-authoring';
 
 // ─── PRD Verification ───
@@ -4692,8 +4772,15 @@ import {
  * Read the PRD loop configuration block.
  * Dotted keys resolve under the headless shim too, so both surfaces read the same values.
  */
+/**
+ * Throws a file-naming error when `.moag/standards.json` exists but is invalid — the
+ * caller surfaces it, so a broken file stops verification instead of disabling the gate.
+ */
 function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
   const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  // Local standards are the workspace's own file. The base ref is filled in by the caller,
+  // which can await git; null would make every file in the repository count as added.
+  const standardsDoc = loadLocalStandards(cwd);
   return {
     cwd,
     maxFixIterations: cfg.get<number>('prdLoop.maxFixIterations', 3),
@@ -4701,6 +4788,7 @@ function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
     gateTimeoutMs: cfg.get<number>('prdLoop.gateTimeoutMs', 600_000),
     maxDiffChars: cfg.get<number>('prdLoop.maxDiffChars', 40_000),
     onManualGate: cfg.get<'halt' | 'skip'>('prdLoop.onManualGate', 'halt'),
+    versionBudgetUsd: cfg.get<number>('prdLoop.versionBudgetUsd', 0),
     fix,
     // Interactive surface: an undetectable repo warns instead of hard-failing.
     unattended: false,
@@ -4710,6 +4798,10 @@ function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
       specPath: cfg.get<string>('prdLoop.uat.specPath', ''),
       timeoutMs: cfg.get<number>('prdLoop.uat.timeoutMs', 900_000),
     },
+    dependencies: readDependencyInstallSettings(cfg),
+    standards: standardsDoc
+      ? { profile: standardsDoc.profile, version: standardsDoc.version, baseRef: null }
+      : null,
   };
 }
 
@@ -4968,19 +5060,8 @@ function buildVerificationReportHtml(planName: string, prdText: string, report: 
   }).join('');
 
   // Deterministic gates — the facts the verdict actually rests on.
-  const gateRows = report.gates.map(gate => {
-    const statusColor = gate.passed ? '#28a745' : '#dc3545';
-    const status = gate.passed ? 'pass' : gate.timedOut ? 'timeout' : 'fail';
-    const snippet = gate.output
-      .split('\n').map(l => l.trim()).reverse().find(l => l.length > 0)?.substring(0, 160) ?? '—';
-    return `<tr>
-      <td><code>${escapeReportHtml(gate.command)}</code></td>
-      <td style="color:${statusColor}">${status}</td>
-      <td>${gate.exitCode}</td>
-      <td>${gate.durationMs}ms</td>
-      <td style="font-size:0.8em;color:#999">${escapeReportHtml(snippet)}</td>
-    </tr>`;
-  }).join('');
+  // The synthetic `moag:standards` row is worded there too, and never as a pass.
+  const gateRows = verificationGateRows(report.gates);
 
   const gateEmptyNote = report.gateCommandsEmpty
     ? '<p style="color:#f0ad4e;font-size:0.85em">No gate command could be detected for this repository — set <code>agentTaskPlayer.prdLoop.gateCommands</code> so verification rests on evidence, not judgment.</p>'
@@ -5088,6 +5169,7 @@ ${bannerHtml}
   ${uatSkipNote}
   <p class="meta">Iterations: ${report.iterations} · Model calls: ${report.modelCallsMade}${report.failedGate ? ' · verdict reached without a model' : ''}</p>
 </div>
+${standardsReportSection(report.standards)}
 <div class="section file-list">
   <h2>Changed files (${report.changedFiles.length})</h2>
   ${changedFilesHtml}
@@ -5137,7 +5219,14 @@ async function runPrdLoopInteractive(options: { fix: boolean; title: string }): 
       async (progress, token) => {
         const cancelSub = token.onCancellationRequested(() => abort.abort());
         try {
-          const controller = createPrdLoop(getPrdLoopConfig(cwd, options.fix), {
+          const loopConfig = getPrdLoopConfig(cwd, options.fix);
+          if (loopConfig.standards) {
+            // The standards gate judges everything since the base captured when the run
+            // started — so work the run committed is still in the diff — or since HEAD
+            // when no run captured one.
+            loopConfig.standards.baseRef = await resolveStandardsBase(cwd);
+          }
+          const controller = createPrdLoop(loopConfig, {
             plan: activePlan,
             resolvePrdText: async () => {
               const text = await resolvePrdTextInteractive(plan, cwd);
@@ -5150,12 +5239,19 @@ async function runPrdLoopInteractive(options: { fix: boolean; title: string }): 
             savePlan: () => saveAndRefresh(),
             onProgress: (phase: string, detail: string) => progress.report({ message: `${phase}: ${detail}` }),
             emitReport: (r: PrdLoopReport) => { holder.report = r; },
+            onDependencyEvent: (ev) => { moagOutputChannel?.appendLine(formatDependencyEventLine(ev)); },
             skipManualGate: (taskId: string) => runner.skipManualGate(taskId),
             prepareUat: (signal: AbortSignal) => prepareUatSession(cwd, signal),
+            // Per-run PRD budget: the loop keeps its own baseline from these per-call costs.
+            subscribeSpend: (cb: (usd: number) => void) => costLedger.onRecord((e) => cb(e.estimatedCostUsd)),
+            stopRun: () => runner.stop(),
             signal: abort.signal,
           });
           holder.controller = controller;
-          await controller.run();
+          const verified = await controller.run();
+          // Verified: the work since the captured base was judged and accepted, so the next
+          // run captures a new one. Anything else keeps the base — nothing unverified drops out.
+          if (verified.passed && loopConfig.standards) { clearStandardsBase(cwd); }
         } finally {
           cancelSub.dispose();
         }
@@ -5847,6 +5943,7 @@ function ensureDashboardOpen(): void {
     async (prompt: string) => {
       return generatePlanFromDashboardPrompt(prompt);
     },
+    () => buildContributionLedgerPayload(),
   );
   // Force a delayed update to ensure the webview receives the plan
   // even if the webview-ready handshake is slow
@@ -5892,6 +5989,77 @@ async function cmdSwitchEngine(): Promise<void> {
   refreshEngineStatusBar();
   scheduleDashboardUpdate();
   vscode.window.showInformationMessage(`Engine switched to ${pick.label.replace(' (current)', '')}.`);
+}
+
+const AUTO_ROUTING_ENGINE_LABELS: Record<EngineId, string> = {
+  codex: 'OpenAI Codex CLI',
+  claude: 'Claude Code CLI (recommended)',
+  gemini: 'Google Gemini CLI',
+  ollama: 'Ollama (local models)',
+  custom: 'Custom CLI command',
+  copilot: 'GitHub Copilot CLI',
+  anthropic: 'Anthropic API direct',
+};
+
+/**
+ * QuickPick-driven flow for `.moag/routing.json`, mirroring
+ * `ghSyncConfigureInteractive`'s shape: read current state, offer one action
+ * at a time, patch exactly the field that action changes, and write back —
+ * never a full overwrite of unrelated fields.
+ */
+async function cmdConfigureAutoRouting(): Promise<void> {
+  const cwd = getWorkspaceCwd();
+  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
+  const current = loadWorkspaceRoutingConfig(cwd);
+  const enabled = current.enabled ?? cfg.get<boolean>('autoRouting.enabled', false);
+  const simpleEngine = current.simpleEngine ?? cfg.get<EngineId>('autoRouting.simpleEngine', 'ollama');
+  const complexEngine = current.complexEngine ?? cfg.get<EngineId>('autoRouting.complexEngine', 'claude');
+  const threshold = current.complexityThreshold ?? cfg.get<number>('autoRouting.complexityThreshold', 50);
+
+  const pick = await vscode.window.showQuickPick([
+    {
+      label: enabled ? '$(debug-pause) Disable auto-routing for this workspace' : '$(play) Enable auto-routing for this workspace',
+      action: 'toggle' as const,
+    },
+    { label: `$(symbol-event) Simple-task engine — ${AUTO_ROUTING_ENGINE_LABELS[simpleEngine]}`, action: 'simple' as const },
+    { label: `$(symbol-event) Complex-task engine — ${AUTO_ROUTING_ENGINE_LABELS[complexEngine]}`, action: 'complex' as const },
+    { label: `$(settings-gear) Complexity threshold — ${threshold}`, action: 'threshold' as const },
+  ], { title: 'Configure Auto-Routing', placeHolder: 'Choose a setting to change' });
+  if (!pick) { return; }
+
+  // Re-read fresh from disk so this write only ever patches the one field the
+  // chosen action changes, never clobbering a concurrent edit to the others.
+  const patch: RoutingRuleConfig = { ...loadWorkspaceRoutingConfig(cwd) };
+
+  if (pick.action === 'toggle') {
+    patch.enabled = !enabled;
+  } else if (pick.action === 'simple' || pick.action === 'complex') {
+    const engineItems = ENGINE_IDS.map(id => ({ label: AUTO_ROUTING_ENGINE_LABELS[id], description: id, id }));
+    const engPick = await vscode.window.showQuickPick(engineItems, {
+      placeHolder: pick.action === 'simple' ? 'Engine for simple tasks' : 'Engine for complex tasks',
+    });
+    if (!engPick) { return; }
+    if (pick.action === 'simple') {
+      patch.simpleEngine = engPick.id;
+    } else {
+      patch.complexEngine = engPick.id;
+    }
+  } else {
+    const input = await vscode.window.showInputBox({
+      title: 'Complexity threshold (0-100)',
+      prompt: 'Tasks scoring at or below this are routed to the simple engine; above it, to the complex engine.',
+      value: String(threshold),
+      validateInput: v => {
+        const n = Number(v);
+        return v.trim() !== '' && Number.isFinite(n) && n >= 0 && n <= 100 ? undefined : 'Enter a number between 0 and 100';
+      },
+    });
+    if (input === undefined) { return; }
+    patch.complexityThreshold = Number(input);
+  }
+
+  saveWorkspaceRoutingConfig(cwd, patch);
+  vscode.window.showInformationMessage('Auto-routing configuration updated.');
 }
 
 function isPlaylistLikeItem(item: unknown): item is { kind?: string; playlistIndex: number } {

@@ -1,0 +1,904 @@
+[
+  {
+    "stack": "node-ts",
+    "profile": {
+      "stackTemplateId": "node-ts",
+      "repoState": "greenfield",
+      "structure": {
+        "requiredDirs": [
+          "src"
+        ],
+        "allowedTopLevel": [
+          "src",
+          "lib",
+          "app",
+          "pages",
+          "components",
+          "hooks",
+          "server",
+          "client",
+          "api",
+          "functions",
+          "test",
+          "tests",
+          "__tests__",
+          "e2e",
+          "packages",
+          "apps",
+          "bin",
+          "public",
+          "static",
+          "assets",
+          "styles",
+          "prisma",
+          "config",
+          "types",
+          "docs",
+          "scripts",
+          ".*",
+          "*.md",
+          "LICENSE*",
+          "LICENCE*",
+          "NOTICE*",
+          "CHANGELOG*",
+          "CODEOWNERS",
+          "Dockerfile*",
+          "Makefile",
+          "*.yml",
+          "*.yaml",
+          "*.lock",
+          "*.toml",
+          "*.json",
+          "*.js",
+          "*.cjs",
+          "*.mjs",
+          "*.ts",
+          "*.mts",
+          "*.html"
+        ],
+        "placement": [
+          {
+            "id": "tests",
+            "files": "**/*.test.ts",
+            "under": [
+              "src",
+              "lib",
+              "app",
+              "pages",
+              "components",
+              "hooks",
+              "server",
+              "client",
+              "api",
+              "functions",
+              "test",
+              "tests",
+              "__tests__",
+              "e2e",
+              "packages",
+              "apps"
+            ]
+          },
+          {
+            "id": "specs",
+            "files": "**/*.spec.ts",
+            "under": [
+              "src",
+              "lib",
+              "app",
+              "pages",
+              "components",
+              "hooks",
+              "server",
+              "client",
+              "api",
+              "functions",
+              "test",
+              "tests",
+              "__tests__",
+              "e2e",
+              "packages",
+              "apps"
+            ]
+          }
+        ]
+      },
+      "frontend": {
+        "componentKit": "",
+        "styleSource": "",
+        "rawPatterns": []
+      },
+      "backend": {
+        "layers": [],
+        "forbiddenImports": [],
+        "importAliases": []
+      },
+      "naming": {
+        "files": [
+          {
+            "globs": [
+              "src/**/*.ts"
+            ],
+            "style": "kebab-case"
+          }
+        ],
+        "notes": "Test files sit beside or mirror the module they cover and end in .test.ts"
+      },
+      "comments": {
+        "maxDensityPct": 30,
+        "minAddedLines": 20,
+        "forbidCommentedOutCode": true,
+        "bannedPhrases": [
+          "// rest of the code",
+          "// rest of code",
+          "// rest of the file",
+          "// rest of the implementation",
+          "// rest of the code goes here",
+          "// rest of the code here",
+          "// rest of the code remains",
+          "// rest of the code unchanged",
+          "// rest of the code remains unchanged",
+          "// rest of the code remains the same",
+          "// existing code here",
+          "// existing code remains",
+          "// existing code remains unchanged",
+          "// existing code remains the same",
+          "// implementation goes here",
+          "// your implementation here",
+          "// your code here",
+          "// your code goes here",
+          "// code goes here",
+          "... rest of the code ...",
+          "... existing code ...",
+          "... remaining code ..."
+        ]
+      },
+      "testing": {
+        "runner": "npm test",
+        "fileGlobs": [
+          "**/*.test.ts",
+          "**/*.spec.ts"
+        ],
+        "notes": "Every new module ships with a test file covering its failure paths"
+      },
+      "commands": [],
+      "builtInRuleIds": [
+        "builtin-clean-code",
+        "builtin-self-documenting",
+        "builtin-tdd",
+        "builtin-error-handling"
+      ],
+      "freeText": ""
+    },
+    "hash": "d4b1faa54bb3d1f22251098f002eafcb6511749ea1520c08c20c971ad7ed7509",
+    "text": "Project standards v3 · stack node-ts · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src\n- Allowed top-level entries: src, lib, app, pages, components, hooks, server, client, api, functions, test, tests, __tests__, e2e, packages, apps, bin, public, static, assets, styles, prisma, config, types, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.json, *.js, *.cjs, *.mjs, *.ts, *.mts, *.html\n- Files matching **/*.test.ts belong under: src, lib, app, pages, components, hooks, server, client, api, functions, test, tests, __tests__, e2e, packages, apps\n- Files matching **/*.spec.ts belong under: src, lib, app, pages, components, hooks, server, client, api, functions, test, tests, __tests__, e2e, packages, apps\n### Naming\n- src/**/*.ts: kebab-case file names\n- Test files sit beside or mirror the module they cover and end in .test.ts\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: npm test\n- Test files: **/*.test.ts, **/*.spec.ts\n- Every new module ships with a test file covering its failure paths\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n### Robust Error Handling\nHandle errors correctly at every layer:\n- Never swallow exceptions silently — either handle them or propagate them\n- Provide meaningful error messages with enough context to diagnose the problem\n- Validate inputs at system boundaries (user input, external APIs)\n- Use structured error types rather than generic Error strings where possible\n- Log errors with stack traces and the relevant context at the time of failure",
+    "plannerText": "Project standards (every task you plan must conform; cite the relevant convention in task prompts):\n\nProject standards v3 · stack node-ts · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src\n- Allowed top-level entries: src, lib, app, pages, components, hooks, server, client, api, functions, test, tests, __tests__, e2e, packages, apps, bin, public, static, assets, styles, prisma, config, types, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.json, *.js, *.cjs, *.mjs, *.ts, *.mts, *.html\n- Files matching **/*.test.ts belong under: src, lib, app, pages, components, hooks, server, client, api, functions, test, tests, __tests__, e2e, packages, apps\n- Files matching **/*.spec.ts belong under: src, lib, app, pages, components, hooks, server, client, api, functions, test, tests, __tests__, e2e, packages, apps\n### Naming\n- src/**/*.ts: kebab-case file names\n- Test files sit beside or mirror the module they cover and end in .test.ts\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: npm test\n- Test files: **/*.test.ts, **/*.spec.ts\n- Every new module ships with a test file covering its failure paths\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n### Robust Error Handling\nHandle errors correctly at every layer:\n- Never swallow exceptions silently — either handle them or propagate them\n- Provide meaningful error messages with enough context to diagnose the problem\n- Validate inputs at system boundaries (user input, external APIs)\n- Use structured error types rather than generic Error strings where possible\n- Log errors with stack traces and the relevant context at the time of failure\n\nThis is a greenfield repository. The FIRST task of the plan must scaffold the required structure (create: src) before any feature work, as an ordinary \"agent\" task."
+  },
+  {
+    "stack": "python",
+    "profile": {
+      "stackTemplateId": "python",
+      "repoState": "greenfield",
+      "structure": {
+        "requiredDirs": [
+          "src",
+          "tests"
+        ],
+        "allowedTopLevel": [
+          "src",
+          "app",
+          "tests",
+          "test",
+          "examples",
+          "docs",
+          "scripts",
+          ".*",
+          "*.md",
+          "LICENSE*",
+          "LICENCE*",
+          "NOTICE*",
+          "CHANGELOG*",
+          "CODEOWNERS",
+          "Dockerfile*",
+          "Makefile",
+          "*.yml",
+          "*.yaml",
+          "*.lock",
+          "*.toml",
+          "*.txt",
+          "*.cfg",
+          "*.ini",
+          "*.py",
+          "*.in",
+          "Pipfile"
+        ],
+        "placement": [
+          {
+            "id": "tests",
+            "files": "**/test_*.py",
+            "under": [
+              "tests",
+              "src",
+              "app"
+            ]
+          }
+        ]
+      },
+      "frontend": {
+        "componentKit": "",
+        "styleSource": "",
+        "rawPatterns": []
+      },
+      "backend": {
+        "layers": [],
+        "forbiddenImports": [],
+        "importAliases": []
+      },
+      "naming": {
+        "files": [
+          {
+            "globs": [
+              "**/*.py"
+            ],
+            "style": "snake_case"
+          }
+        ],
+        "notes": "Modules and packages are lowercase with underscores"
+      },
+      "comments": {
+        "maxDensityPct": 30,
+        "minAddedLines": 20,
+        "forbidCommentedOutCode": true,
+        "bannedPhrases": [
+          "// rest of the code",
+          "// rest of code",
+          "// rest of the file",
+          "// rest of the implementation",
+          "// rest of the code goes here",
+          "// rest of the code here",
+          "// rest of the code remains",
+          "// rest of the code unchanged",
+          "// rest of the code remains unchanged",
+          "// rest of the code remains the same",
+          "// existing code here",
+          "// existing code remains",
+          "// existing code remains unchanged",
+          "// existing code remains the same",
+          "// implementation goes here",
+          "// your implementation here",
+          "// your code here",
+          "// your code goes here",
+          "// code goes here",
+          "... rest of the code ...",
+          "... existing code ...",
+          "... remaining code ..."
+        ]
+      },
+      "testing": {
+        "runner": "pytest",
+        "fileGlobs": [
+          "**/test_*.py"
+        ],
+        "notes": "Every new module ships with a test module, under tests/ or beside the package"
+      },
+      "commands": [],
+      "builtInRuleIds": [
+        "builtin-clean-code",
+        "builtin-tdd",
+        "builtin-error-handling"
+      ],
+      "freeText": ""
+    },
+    "hash": "228846807e1993b55207ba8d0d11b5ae64828f7ffbc41d070576e2186df27463",
+    "text": "Project standards v3 · stack python · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src, tests\n- Allowed top-level entries: src, app, tests, test, examples, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.txt, *.cfg, *.ini, *.py, *.in, Pipfile\n- Files matching **/test_*.py belong under: tests, src, app\n### Naming\n- **/*.py: snake_case file names\n- Modules and packages are lowercase with underscores\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: pytest\n- Test files: **/test_*.py\n- Every new module ships with a test module, under tests/ or beside the package\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n### Robust Error Handling\nHandle errors correctly at every layer:\n- Never swallow exceptions silently — either handle them or propagate them\n- Provide meaningful error messages with enough context to diagnose the problem\n- Validate inputs at system boundaries (user input, external APIs)\n- Use structured error types rather than generic Error strings where possible\n- Log errors with stack traces and the relevant context at the time of failure",
+    "plannerText": "Project standards (every task you plan must conform; cite the relevant convention in task prompts):\n\nProject standards v3 · stack python · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src, tests\n- Allowed top-level entries: src, app, tests, test, examples, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.txt, *.cfg, *.ini, *.py, *.in, Pipfile\n- Files matching **/test_*.py belong under: tests, src, app\n### Naming\n- **/*.py: snake_case file names\n- Modules and packages are lowercase with underscores\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: pytest\n- Test files: **/test_*.py\n- Every new module ships with a test module, under tests/ or beside the package\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n### Robust Error Handling\nHandle errors correctly at every layer:\n- Never swallow exceptions silently — either handle them or propagate them\n- Provide meaningful error messages with enough context to diagnose the problem\n- Validate inputs at system boundaries (user input, external APIs)\n- Use structured error types rather than generic Error strings where possible\n- Log errors with stack traces and the relevant context at the time of failure\n\nThis is a greenfield repository. The FIRST task of the plan must scaffold the required structure (create: src, tests) before any feature work, as an ordinary \"agent\" task."
+  },
+  {
+    "stack": "go",
+    "profile": {
+      "stackTemplateId": "go",
+      "repoState": "greenfield",
+      "structure": {
+        "requiredDirs": [
+          "cmd",
+          "internal"
+        ],
+        "allowedTopLevel": [
+          "cmd",
+          "internal",
+          "pkg",
+          "api",
+          "vendor",
+          "testdata",
+          "examples",
+          "tools",
+          "web",
+          "configs",
+          "build",
+          "test",
+          "docs",
+          "scripts",
+          ".*",
+          "*.md",
+          "LICENSE*",
+          "LICENCE*",
+          "NOTICE*",
+          "CHANGELOG*",
+          "CODEOWNERS",
+          "Dockerfile*",
+          "Makefile",
+          "*.yml",
+          "*.yaml",
+          "*.lock",
+          "*.toml",
+          "go.mod",
+          "go.sum",
+          "go.work",
+          "go.work.sum",
+          "*.go"
+        ],
+        "placement": [
+          {
+            "id": "entrypoints",
+            "files": "**/main.go",
+            "under": [
+              "cmd",
+              "main.go",
+              "tools",
+              "internal/tools",
+              "examples",
+              "scripts"
+            ]
+          }
+        ]
+      },
+      "frontend": {
+        "componentKit": "",
+        "styleSource": "",
+        "rawPatterns": []
+      },
+      "backend": {
+        "layers": [
+          {
+            "name": "cmd",
+            "globs": [
+              "cmd/**"
+            ]
+          },
+          {
+            "name": "internal",
+            "globs": [
+              "internal/**"
+            ]
+          }
+        ],
+        "forbiddenImports": [
+          {
+            "from": "internal",
+            "to": "cmd"
+          }
+        ],
+        "importAliases": []
+      },
+      "naming": {
+        "files": [
+          {
+            "globs": [
+              "**/*.go"
+            ],
+            "style": "snake_case"
+          }
+        ],
+        "notes": "Package directories are short, lowercase, single words"
+      },
+      "comments": {
+        "maxDensityPct": 30,
+        "minAddedLines": 20,
+        "forbidCommentedOutCode": true,
+        "bannedPhrases": [
+          "// rest of the code",
+          "// rest of code",
+          "// rest of the file",
+          "// rest of the implementation",
+          "// rest of the code goes here",
+          "// rest of the code here",
+          "// rest of the code remains",
+          "// rest of the code unchanged",
+          "// rest of the code remains unchanged",
+          "// rest of the code remains the same",
+          "// existing code here",
+          "// existing code remains",
+          "// existing code remains unchanged",
+          "// existing code remains the same",
+          "// implementation goes here",
+          "// your implementation here",
+          "// your code here",
+          "// your code goes here",
+          "// code goes here",
+          "... rest of the code ...",
+          "... existing code ...",
+          "... remaining code ..."
+        ]
+      },
+      "testing": {
+        "runner": "go test ./...",
+        "fileGlobs": [
+          "**/*_test.go"
+        ],
+        "notes": "Tests live beside the package they cover"
+      },
+      "commands": [],
+      "builtInRuleIds": [
+        "builtin-clean-code",
+        "builtin-self-documenting",
+        "builtin-tdd",
+        "builtin-error-handling"
+      ],
+      "freeText": ""
+    },
+    "hash": "c2107939a6098b754e740dd2af9152d2f72413d8d0871d30e8d006985c697115",
+    "text": "Project standards v3 · stack go · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: cmd, internal\n- Allowed top-level entries: cmd, internal, pkg, api, vendor, testdata, examples, tools, web, configs, build, test, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, go.mod, go.sum, go.work, go.work.sum, *.go\n- Files matching **/main.go belong under: cmd, main.go, tools, internal/tools, examples, scripts\n### Backend layering\n- Layer cmd: cmd/**\n- Layer internal: internal/**\n- internal must not import from cmd\n### Naming\n- **/*.go: snake_case file names\n- Package directories are short, lowercase, single words\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: go test ./...\n- Test files: **/*_test.go\n- Tests live beside the package they cover\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n### Robust Error Handling\nHandle errors correctly at every layer:\n- Never swallow exceptions silently — either handle them or propagate them\n- Provide meaningful error messages with enough context to diagnose the problem\n- Validate inputs at system boundaries (user input, external APIs)\n- Use structured error types rather than generic Error strings where possible\n- Log errors with stack traces and the relevant context at the time of failure",
+    "plannerText": "Project standards (every task you plan must conform; cite the relevant convention in task prompts):\n\nProject standards v3 · stack go · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: cmd, internal\n- Allowed top-level entries: cmd, internal, pkg, api, vendor, testdata, examples, tools, web, configs, build, test, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, go.mod, go.sum, go.work, go.work.sum, *.go\n- Files matching **/main.go belong under: cmd, main.go, tools, internal/tools, examples, scripts\n### Backend layering\n- Layer cmd: cmd/**\n- Layer internal: internal/**\n- internal must not import from cmd\n### Naming\n- **/*.go: snake_case file names\n- Package directories are short, lowercase, single words\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: go test ./...\n- Test files: **/*_test.go\n- Tests live beside the package they cover\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n### Robust Error Handling\nHandle errors correctly at every layer:\n- Never swallow exceptions silently — either handle them or propagate them\n- Provide meaningful error messages with enough context to diagnose the problem\n- Validate inputs at system boundaries (user input, external APIs)\n- Use structured error types rather than generic Error strings where possible\n- Log errors with stack traces and the relevant context at the time of failure\n\nThis is a greenfield repository. The FIRST task of the plan must scaffold the required structure (create: cmd, internal) before any feature work, as an ordinary \"agent\" task."
+  },
+  {
+    "stack": "java",
+    "profile": {
+      "stackTemplateId": "java",
+      "repoState": "greenfield",
+      "structure": {
+        "requiredDirs": [
+          "src/main/java",
+          "src/test/java"
+        ],
+        "allowedTopLevel": [
+          "src",
+          "app",
+          "lib",
+          "gradle",
+          "config",
+          "buildSrc",
+          "docs",
+          "scripts",
+          ".*",
+          "*.md",
+          "LICENSE*",
+          "LICENCE*",
+          "NOTICE*",
+          "CHANGELOG*",
+          "CODEOWNERS",
+          "Dockerfile*",
+          "Makefile",
+          "*.yml",
+          "*.yaml",
+          "*.lock",
+          "*.toml",
+          "pom.xml",
+          "build.gradle*",
+          "settings.gradle*",
+          "gradle.properties",
+          "gradlew*",
+          "mvnw*",
+          "lombok.config"
+        ],
+        "placement": [
+          {
+            "id": "tests",
+            "files": "**/*Test.java",
+            "under": [
+              "src/test/java"
+            ]
+          },
+          {
+            "id": "sources",
+            "files": "**/*.java",
+            "under": [
+              "src/main/java",
+              "src/test/java",
+              "buildSrc"
+            ]
+          }
+        ]
+      },
+      "frontend": {
+        "componentKit": "",
+        "styleSource": "",
+        "rawPatterns": []
+      },
+      "backend": {
+        "layers": [],
+        "forbiddenImports": [],
+        "importAliases": []
+      },
+      "naming": {
+        "files": [
+          {
+            "globs": [
+              "**/*.java"
+            ],
+            "style": "PascalCase"
+          }
+        ],
+        "notes": "One public type per file, named after the type"
+      },
+      "comments": {
+        "maxDensityPct": 30,
+        "minAddedLines": 20,
+        "forbidCommentedOutCode": true,
+        "bannedPhrases": [
+          "// rest of the code",
+          "// rest of code",
+          "// rest of the file",
+          "// rest of the implementation",
+          "// rest of the code goes here",
+          "// rest of the code here",
+          "// rest of the code remains",
+          "// rest of the code unchanged",
+          "// rest of the code remains unchanged",
+          "// rest of the code remains the same",
+          "// existing code here",
+          "// existing code remains",
+          "// existing code remains unchanged",
+          "// existing code remains the same",
+          "// implementation goes here",
+          "// your implementation here",
+          "// your code here",
+          "// your code goes here",
+          "// code goes here",
+          "... rest of the code ...",
+          "... existing code ...",
+          "... remaining code ..."
+        ]
+      },
+      "testing": {
+        "runner": "JUnit",
+        "fileGlobs": [
+          "src/test/java/**/*Test.java"
+        ],
+        "notes": "Every new class ships with a test class in the mirrored package"
+      },
+      "commands": [],
+      "builtInRuleIds": [
+        "builtin-solid",
+        "builtin-clean-code",
+        "builtin-self-documenting",
+        "builtin-tdd"
+      ],
+      "freeText": ""
+    },
+    "hash": "9d7a13673b018fd1a1bd7f58dd8ab237e549126176e992c0d979e5838f670fdb",
+    "text": "Project standards v3 · stack java · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src/main/java, src/test/java\n- Allowed top-level entries: src, app, lib, gradle, config, buildSrc, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, pom.xml, build.gradle*, settings.gradle*, gradle.properties, gradlew*, mvnw*, lombok.config\n- Files matching **/*Test.java belong under: src/test/java\n- Files matching **/*.java belong under: src/main/java, src/test/java, buildSrc\n### Naming\n- **/*.java: PascalCase file names\n- One public type per file, named after the type\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: JUnit\n- Test files: src/test/java/**/*Test.java\n- Every new class ships with a test class in the mirrored package\n### SOLID Principles\nFollow SOLID design principles:\n- Single Responsibility: each class/function has one reason to change\n- Open/Closed: open for extension, closed for modification\n- Liskov Substitution: subtypes must be substitutable for their base types\n- Interface Segregation: prefer small, focused interfaces over large monolithic ones\n- Dependency Inversion: depend on abstractions, not concrete implementations\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests",
+    "plannerText": "Project standards (every task you plan must conform; cite the relevant convention in task prompts):\n\nProject standards v3 · stack java · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src/main/java, src/test/java\n- Allowed top-level entries: src, app, lib, gradle, config, buildSrc, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, pom.xml, build.gradle*, settings.gradle*, gradle.properties, gradlew*, mvnw*, lombok.config\n- Files matching **/*Test.java belong under: src/test/java\n- Files matching **/*.java belong under: src/main/java, src/test/java, buildSrc\n### Naming\n- **/*.java: PascalCase file names\n- One public type per file, named after the type\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: JUnit\n- Test files: src/test/java/**/*Test.java\n- Every new class ships with a test class in the mirrored package\n### SOLID Principles\nFollow SOLID design principles:\n- Single Responsibility: each class/function has one reason to change\n- Open/Closed: open for extension, closed for modification\n- Liskov Substitution: subtypes must be substitutable for their base types\n- Interface Segregation: prefer small, focused interfaces over large monolithic ones\n- Dependency Inversion: depend on abstractions, not concrete implementations\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n\nThis is a greenfield repository. The FIRST task of the plan must scaffold the required structure (create: src/main/java, src/test/java) before any feature work, as an ordinary \"agent\" task."
+  },
+  {
+    "stack": "dotnet",
+    "profile": {
+      "stackTemplateId": "dotnet",
+      "repoState": "greenfield",
+      "structure": {
+        "requiredDirs": [
+          "src",
+          "tests"
+        ],
+        "allowedTopLevel": [
+          "src",
+          "tests",
+          "test",
+          "docs",
+          "scripts",
+          ".*",
+          "*.md",
+          "LICENSE*",
+          "LICENCE*",
+          "NOTICE*",
+          "CHANGELOG*",
+          "CODEOWNERS",
+          "Dockerfile*",
+          "Makefile",
+          "*.yml",
+          "*.yaml",
+          "*.lock",
+          "*.toml",
+          "*.sln",
+          "*.slnx",
+          "*.props",
+          "*.targets",
+          "*.json",
+          "*.config",
+          "*.Config"
+        ],
+        "placement": [
+          {
+            "id": "tests",
+            "files": "**/*Tests.cs",
+            "under": [
+              "tests"
+            ]
+          }
+        ]
+      },
+      "frontend": {
+        "componentKit": "",
+        "styleSource": "",
+        "rawPatterns": []
+      },
+      "backend": {
+        "layers": [],
+        "forbiddenImports": [],
+        "importAliases": []
+      },
+      "naming": {
+        "files": [
+          {
+            "globs": [
+              "**/*.cs"
+            ],
+            "style": "PascalCase"
+          }
+        ],
+        "notes": "One public type per file, named after the type"
+      },
+      "comments": {
+        "maxDensityPct": 30,
+        "minAddedLines": 20,
+        "forbidCommentedOutCode": true,
+        "bannedPhrases": [
+          "// rest of the code",
+          "// rest of code",
+          "// rest of the file",
+          "// rest of the implementation",
+          "// rest of the code goes here",
+          "// rest of the code here",
+          "// rest of the code remains",
+          "// rest of the code unchanged",
+          "// rest of the code remains unchanged",
+          "// rest of the code remains the same",
+          "// existing code here",
+          "// existing code remains",
+          "// existing code remains unchanged",
+          "// existing code remains the same",
+          "// implementation goes here",
+          "// your implementation here",
+          "// your code here",
+          "// your code goes here",
+          "// code goes here",
+          "... rest of the code ...",
+          "... existing code ...",
+          "... remaining code ..."
+        ]
+      },
+      "testing": {
+        "runner": "dotnet test",
+        "fileGlobs": [
+          "tests/**/*Tests.cs"
+        ],
+        "notes": "Every new class ships with a test class in the matching tests project"
+      },
+      "commands": [],
+      "builtInRuleIds": [
+        "builtin-solid",
+        "builtin-clean-code",
+        "builtin-self-documenting",
+        "builtin-tdd"
+      ],
+      "freeText": ""
+    },
+    "hash": "4a06b76249debae1d3afe418c12c2cc7d556a3e013b8eab4e5852d37eeaf0019",
+    "text": "Project standards v3 · stack dotnet · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src, tests\n- Allowed top-level entries: src, tests, test, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.sln, *.slnx, *.props, *.targets, *.json, *.config, *.Config\n- Files matching **/*Tests.cs belong under: tests\n### Naming\n- **/*.cs: PascalCase file names\n- One public type per file, named after the type\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: dotnet test\n- Test files: tests/**/*Tests.cs\n- Every new class ships with a test class in the matching tests project\n### SOLID Principles\nFollow SOLID design principles:\n- Single Responsibility: each class/function has one reason to change\n- Open/Closed: open for extension, closed for modification\n- Liskov Substitution: subtypes must be substitutable for their base types\n- Interface Segregation: prefer small, focused interfaces over large monolithic ones\n- Dependency Inversion: depend on abstractions, not concrete implementations\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests",
+    "plannerText": "Project standards (every task you plan must conform; cite the relevant convention in task prompts):\n\nProject standards v3 · stack dotnet · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: src, tests\n- Allowed top-level entries: src, tests, test, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.sln, *.slnx, *.props, *.targets, *.json, *.config, *.Config\n- Files matching **/*Tests.cs belong under: tests\n### Naming\n- **/*.cs: PascalCase file names\n- One public type per file, named after the type\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Runner: dotnet test\n- Test files: tests/**/*Tests.cs\n- Every new class ships with a test class in the matching tests project\n### SOLID Principles\nFollow SOLID design principles:\n- Single Responsibility: each class/function has one reason to change\n- Open/Closed: open for extension, closed for modification\n- Liskov Substitution: subtypes must be substitutable for their base types\n- Interface Segregation: prefer small, focused interfaces over large monolithic ones\n- Dependency Inversion: depend on abstractions, not concrete implementations\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n### Test-Driven Development\nApply TDD practices:\n- Write tests before or alongside implementation\n- Each public function should have at least one unit test\n- Tests must be independent, deterministic, and fast\n- Cover edge cases: null/undefined inputs, empty collections, boundary values\n- Mock external dependencies (databases, APIs, filesystem) in unit tests\n\nThis is a greenfield repository. The FIRST task of the plan must scaffold the required structure (create: src, tests) before any feature work, as an ordinary \"agent\" task."
+  },
+  {
+    "stack": "static-web",
+    "profile": {
+      "stackTemplateId": "static-web",
+      "repoState": "greenfield",
+      "structure": {
+        "requiredDirs": [
+          "css",
+          "js"
+        ],
+        "allowedTopLevel": [
+          "css",
+          "js",
+          "assets",
+          "img",
+          "images",
+          "fonts",
+          "tests",
+          "src",
+          "public",
+          "docs",
+          "scripts",
+          ".*",
+          "*.md",
+          "LICENSE*",
+          "LICENCE*",
+          "NOTICE*",
+          "CHANGELOG*",
+          "CODEOWNERS",
+          "Dockerfile*",
+          "Makefile",
+          "*.yml",
+          "*.yaml",
+          "*.lock",
+          "*.toml",
+          "*.html",
+          "*.css",
+          "*.js",
+          "*.json",
+          "*.txt",
+          "*.xml",
+          "*.ico",
+          "*.svg",
+          "*.png",
+          "*.webmanifest",
+          "CNAME",
+          "_redirects",
+          "_headers"
+        ],
+        "placement": [
+          {
+            "id": "stylesheets",
+            "files": "**/*.css",
+            "under": [
+              "css"
+            ]
+          },
+          {
+            "id": "scripts",
+            "files": "**/*.js",
+            "under": [
+              "js",
+              "tests",
+              "sw.js",
+              "service-worker.js"
+            ]
+          }
+        ]
+      },
+      "frontend": {
+        "componentKit": "",
+        "styleSource": "css/",
+        "rawPatterns": [
+          {
+            "id": "no-inline-style",
+            "kind": "builtin",
+            "value": "inline-style",
+            "globs": [
+              "**/*.html"
+            ],
+            "message": "Keep styling in a stylesheet; do not use inline style attributes"
+          }
+        ]
+      },
+      "backend": {
+        "layers": [],
+        "forbiddenImports": [],
+        "importAliases": []
+      },
+      "naming": {
+        "files": [
+          {
+            "globs": [
+              "**/*.html",
+              "**/*.css",
+              "**/*.js"
+            ],
+            "style": "kebab-case"
+          }
+        ],
+        "notes": "Asset file names are lowercase"
+      },
+      "comments": {
+        "maxDensityPct": 30,
+        "minAddedLines": 20,
+        "forbidCommentedOutCode": true,
+        "bannedPhrases": [
+          "// rest of the code",
+          "// rest of code",
+          "// rest of the file",
+          "// rest of the implementation",
+          "// rest of the code goes here",
+          "// rest of the code here",
+          "// rest of the code remains",
+          "// rest of the code unchanged",
+          "// rest of the code remains unchanged",
+          "// rest of the code remains the same",
+          "// existing code here",
+          "// existing code remains",
+          "// existing code remains unchanged",
+          "// existing code remains the same",
+          "// implementation goes here",
+          "// your implementation here",
+          "// your code here",
+          "// your code goes here",
+          "// code goes here",
+          "... rest of the code ...",
+          "... existing code ...",
+          "... remaining code ..."
+        ]
+      },
+      "testing": {
+        "runner": "",
+        "fileGlobs": [
+          "tests/**/*.test.js"
+        ],
+        "notes": "Pages must load with no console errors"
+      },
+      "commands": [],
+      "builtInRuleIds": [
+        "builtin-clean-code",
+        "builtin-self-documenting"
+      ],
+      "freeText": ""
+    },
+    "hash": "8cf1c7272bec606ccbbb47d8d78d56ad01a4a0405076a5f20de5dd30050e8a76",
+    "text": "Project standards v3 · stack static-web · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: css, js\n- Allowed top-level entries: css, js, assets, img, images, fonts, tests, src, public, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.html, *.css, *.js, *.json, *.txt, *.xml, *.ico, *.svg, *.png, *.webmanifest, CNAME, _redirects, _headers\n- Files matching **/*.css belong under: css\n- Files matching **/*.js belong under: js, tests, sw.js, service-worker.js\n### Frontend\n- Style source: css/\n- In **/*.html: Keep styling in a stylesheet; do not use inline style attributes\n### Naming\n- **/*.html, **/*.css, **/*.js: kebab-case file names\n- Asset file names are lowercase\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Test files: tests/**/*.test.js\n- Pages must load with no console errors\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions",
+    "plannerText": "Project standards (every task you plan must conform; cite the relevant convention in task prompts):\n\nProject standards v3 · stack static-web · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Folder structure\n- Required directories: css, js\n- Allowed top-level entries: css, js, assets, img, images, fonts, tests, src, public, docs, scripts, .*, *.md, LICENSE*, LICENCE*, NOTICE*, CHANGELOG*, CODEOWNERS, Dockerfile*, Makefile, *.yml, *.yaml, *.lock, *.toml, *.html, *.css, *.js, *.json, *.txt, *.xml, *.ico, *.svg, *.png, *.webmanifest, CNAME, _redirects, _headers\n- Files matching **/*.css belong under: css\n- Files matching **/*.js belong under: js, tests, sw.js, service-worker.js\n### Frontend\n- Style source: css/\n- In **/*.html: Keep styling in a stylesheet; do not use inline style attributes\n### Naming\n- **/*.html, **/*.css, **/*.js: kebab-case file names\n- Asset file names are lowercase\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n### Testing\n- Test files: tests/**/*.test.js\n- Pages must load with no console errors\n### Clean Code\nWrite clean, readable code:\n- Use meaningful, intention-revealing names for variables, functions, and classes\n- Functions should do one thing and do it well (under 20 lines where practical)\n- Avoid magic numbers — use named constants\n- No dead code, no commented-out code blocks left behind\n- Prefer explicit early returns over deeply nested conditionals\n### Self-Documenting Code\nWrite self-documenting code — minimize comments:\n- Use descriptive variable and function names instead of inline comments\n- Only add a comment when the WHY is non-obvious (a workaround, an invariant, a hidden constraint)\n- Do not explain WHAT the code does — well-named identifiers already communicate that\n- No multi-paragraph docstrings on trivial functions\n\nThis is a greenfield repository. The FIRST task of the plan must scaffold the required structure (create: css, js) before any feature work, as an ordinary \"agent\" task."
+  },
+  {
+    "stack": "other",
+    "profile": {
+      "stackTemplateId": "other",
+      "repoState": "greenfield",
+      "structure": {
+        "requiredDirs": [],
+        "allowedTopLevel": [],
+        "placement": []
+      },
+      "frontend": {
+        "componentKit": "",
+        "styleSource": "",
+        "rawPatterns": []
+      },
+      "backend": {
+        "layers": [],
+        "forbiddenImports": [],
+        "importAliases": []
+      },
+      "naming": {
+        "files": [],
+        "notes": ""
+      },
+      "comments": {
+        "maxDensityPct": 30,
+        "minAddedLines": 20,
+        "forbidCommentedOutCode": true,
+        "bannedPhrases": [
+          "// rest of the code",
+          "// rest of code",
+          "// rest of the file",
+          "// rest of the implementation",
+          "// rest of the code goes here",
+          "// rest of the code here",
+          "// rest of the code remains",
+          "// rest of the code unchanged",
+          "// rest of the code remains unchanged",
+          "// rest of the code remains the same",
+          "// existing code here",
+          "// existing code remains",
+          "// existing code remains unchanged",
+          "// existing code remains the same",
+          "// implementation goes here",
+          "// your implementation here",
+          "// your code here",
+          "// your code goes here",
+          "// code goes here",
+          "... rest of the code ...",
+          "... existing code ...",
+          "... remaining code ..."
+        ]
+      },
+      "testing": {
+        "runner": "",
+        "fileGlobs": [],
+        "notes": ""
+      },
+      "commands": [],
+      "builtInRuleIds": [],
+      "freeText": ""
+    },
+    "hash": "283607246295933a1eaece32a470b77d5b52f71b8f9b44cbf438cfa0ee910817",
+    "text": "Project standards v3 · stack other · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"",
+    "plannerText": "Project standards (every task you plan must conform; cite the relevant convention in task prompts):\n\nProject standards v3 · stack other · greenfield repository\nThese conventions are binding. Blocking rules and commands stop a release; a reviewer sees every other finding.\n### Comments\n- Comment lines: at most 30% of added lines in any file with 20+ added lines\n- Never leave commented-out code\n- Never write these phrases in comments: \"// rest of the code\", \"// rest of code\", \"// rest of the file\", \"// rest of the implementation\", \"// rest of the code goes here\", \"// rest of the code here\", \"// rest of the code remains\", \"// rest of the code unchanged\", \"// rest of the code remains unchanged\", \"// rest of the code remains the same\", \"// existing code here\", \"// existing code remains\", \"// existing code remains unchanged\", \"// existing code remains the same\", \"// implementation goes here\", \"// your implementation here\", \"// your code here\", \"// your code goes here\", \"// code goes here\", \"... rest of the code ...\", \"... existing code ...\", \"... remaining code ...\"\n\nThis is a greenfield repository. The FIRST task of the plan must scaffold the required structure before any feature work, as an ordinary \"agent\" task."
+  }
+]

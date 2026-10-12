@@ -17,7 +17,7 @@
 
 import { strict as assert } from 'assert';
 import { hydratePlan, dehydratePlan, createEmptyPlan, createTask } from '../../../models/plan';
-import { Plan, Playlist, Task, TaskStatus } from '../../../models/types';
+import { Plan, Playlist, RequirementGateResult, RequirementRelease, Task, TaskStatus } from '../../../models/types';
 
 // ─── Exemptions (verbatim reasoning — do not extend) ───
 //
@@ -97,6 +97,7 @@ function buildMaximalFixture(): Plan {
     failureThreshold: 4109,
     incidentRepo: 'fixture-owner/fixture-incidents',
     incidentLabel: 'fixture:incident',
+    requirementIds: ['R-1', 'R-2'],
     status: TaskStatus.Completed,
   };
 
@@ -144,10 +145,38 @@ function buildMaximalFixture(): Plan {
     aiRules: 'fixture-plan-aiRules',
     prdSource: 'fixture-plan-prdSource',
     prdVersions: [
-      { version: 'v1', text: 'fixture-prd-v1', createdAt: '2026-01-01T00:00:00.000Z' },
-      { version: 'v2', text: 'fixture-prd-v2', createdAt: '2026-01-02T00:00:00.000Z' },
+      {
+        version: 'v1', text: 'fixture-prd-v1', createdAt: '2026-01-01T00:00:00.000Z',
+        recommendedBump: 'minor', chosenBump: 'major',
+      },
+      {
+        version: 'v2', text: 'fixture-prd-v2', createdAt: '2026-01-02T00:00:00.000Z',
+        recommendedBump: 'minor', chosenBump: 'major',
+      },
     ],
     fixIterations: 3,
+    requirementTrace: [
+      {
+        id: 'R-1',
+        taskIds: ['fixture-task-1'],
+        commits: ['fixture0sha1'],
+        gates: [
+          { command: 'npm run fixture:gate', exitCode: 0, timedOut: false, at: '2026-01-03T00:00:00.000Z' },
+          {
+            command: 'moag:standards v3', exitCode: 0, timedOut: false, at: '2026-01-03T00:00:00.000Z',
+            standardsCounts: { advisoryFindings: 4, notCheckedRules: 2, notCheckedFiles: 7 },
+          },
+        ],
+        releases: [{
+          releaseTag: 'v4.1.0-fixture',
+          prdVersion: 'v2',
+          at: '2026-01-04T00:00:00.000Z',
+          taskIds: ['fixture-task-1'],
+          standardsVersion: 3,
+          standardsCounts: { advisoryFindings: 4, notCheckedRules: 2, notCheckedFiles: 7 },
+        }],
+      },
+    ],
     sourceIssues: [{ repo: 'fixture-owner/fixture-repo', number: 4116, title: 'fixture-issue-title' }],
     playlists: [playlist],
   };
@@ -197,6 +226,7 @@ const TASK_FIELDS: Record<keyof Task, true> = {
   failureThreshold: true,
   incidentRepo: true,
   incidentLabel: true,
+  requirementIds: true,
   status: true,
 };
 
@@ -229,9 +259,149 @@ const PLAN_FIELDS: Record<keyof Plan, true> = {
   prdSource: true,
   prdVersions: true,
   fixIterations: true,
+  requirementTrace: true,
   sourceIssues: true,
   playlists: true,
 };
+
+// A release row is nested too deep for the top-level records above to see, so it gets
+// its own: a new field on RequirementRelease fails to compile here until it is listed,
+// and the test below then requires it in the maximal fixture.
+const RELEASE_FIELDS: Record<keyof RequirementRelease, true> = {
+  releaseTag: true,
+  prdVersion: true,
+  at: true,
+  taskIds: true,
+  standardsVersion: true,
+  standardsCounts: true,
+};
+
+// The same guard for a recorded gate row.
+const GATE_FIELDS: Record<keyof RequirementGateResult, true> = {
+  command: true,
+  exitCode: true,
+  timedOut: true,
+  at: true,
+  standardsCounts: true,
+};
+
+describe('requirement release row round trip (trace stamp)', () => {
+  it('every release field is in the maximal fixture and survives dehydrate → hydrate → dehydrate', () => {
+    const fixture = buildMaximalFixture();
+    const release = fixture.requirementTrace![0].releases[0];
+    for (const key of Object.keys(RELEASE_FIELDS)) {
+      assert.ok(key in release, `RequirementRelease field "${key}" is missing from the maximal fixture`);
+    }
+    const file = dehydratePlan(fixture);
+    assert.equal(file.requirementTrace![0].releases[0].standardsVersion, 3);
+    assert.deepEqual(file.requirementTrace![0].releases[0].standardsCounts, { advisoryFindings: 4, notCheckedRules: 2, notCheckedFiles: 7 });
+    const restored = hydratePlan(JSON.parse(JSON.stringify(file)));
+    assert.deepEqual(restored.requirementTrace, fixture.requirementTrace);
+    assert.deepEqual(dehydratePlan(restored).requirementTrace, file.requirementTrace);
+  });
+
+  it('every gate field is in the maximal fixture and survives the round trip; a gate without counts gains none', () => {
+    const fixture = buildMaximalFixture();
+    const [plain, standards] = fixture.requirementTrace![0].gates;
+    for (const key of Object.keys(GATE_FIELDS)) {
+      assert.ok(key in standards, `RequirementGateResult field "${key}" is missing from the maximal fixture`);
+    }
+    const file = dehydratePlan(fixture);
+    assert.deepEqual(file.requirementTrace![0].gates[1].standardsCounts, { advisoryFindings: 4, notCheckedRules: 2, notCheckedFiles: 7 });
+    assert.equal('standardsCounts' in file.requirementTrace![0].gates[0], false, 'an ordinary gate row stays as it was on disk');
+    assert.equal('standardsCounts' in plain, false);
+    const restored = hydratePlan(JSON.parse(JSON.stringify(file)));
+    assert.deepEqual(restored.requirementTrace![0].gates, fixture.requirementTrace![0].gates);
+  });
+
+  it('the counts are copied field by field: an extra key in them never reaches the file', () => {
+    const fixture = buildMaximalFixture();
+    const leaky = { advisoryFindings: 1, notCheckedRules: 0, notCheckedFiles: 0, file: 'src/secret.ts' } as unknown as RequirementGateResult['standardsCounts'];
+    fixture.requirementTrace![0].gates[1].standardsCounts = leaky;
+    fixture.requirementTrace![0].releases[0].standardsCounts = leaky;
+    const text = JSON.stringify(dehydratePlan(fixture));
+    assert.equal(text.includes('secret'), false);
+  });
+
+  it('the "no blocking rules configured" marker survives dehydrate → hydrate → dehydrate on a gate row and on a release, and only ever as true', () => {
+    const counts = { advisoryFindings: 2, notCheckedRules: 0, notCheckedFiles: 1, noBlockingRules: true as const };
+    const fixture = buildMaximalFixture();
+    fixture.requirementTrace![0].gates[1].standardsCounts = { ...counts };
+    fixture.requirementTrace![0].releases[0].standardsCounts = { ...counts };
+    const file = JSON.parse(JSON.stringify(dehydratePlan(fixture)));
+    assert.deepEqual(file.requirementTrace[0].gates[1].standardsCounts, counts);
+    assert.deepEqual(file.requirementTrace[0].releases[0].standardsCounts, counts);
+    const restored = hydratePlan(file);
+    assert.deepEqual(restored.requirementTrace![0].gates[1].standardsCounts, counts);
+    assert.deepEqual(restored.requirementTrace![0].releases[0].standardsCounts, counts);
+    assert.deepEqual(JSON.parse(JSON.stringify(dehydratePlan(restored))).requirementTrace, file.requirementTrace);
+
+    // Absent stays absent: a check that had a blocking set never gains the key on a save.
+    const plain = JSON.parse(JSON.stringify(dehydratePlan(buildMaximalFixture())));
+    assert.equal('noBlockingRules' in plain.requirementTrace[0].releases[0].standardsCounts, false);
+    assert.equal('noBlockingRules' in hydratePlan(plain).requirementTrace![0].releases[0].standardsCounts!, false);
+
+    // Anything but the literal true is refused, naming the field: false would read as "had a blocking set".
+    for (const bad of [false, 1, 'true', null, {}]) {
+      const onRelease = JSON.parse(JSON.stringify(file));
+      onRelease.requirementTrace[0].releases[0].standardsCounts.noBlockingRules = bad;
+      assert.throws(() => hydratePlan(onRelease, 'plan.json'),
+        /"plan\.json" has invalid "requirementTrace\[0\]\.releases\[0\]\.standardsCounts\.noBlockingRules" — expected true, or absent\./, JSON.stringify(bad));
+      const onGate = JSON.parse(JSON.stringify(file));
+      onGate.requirementTrace[0].gates[1].standardsCounts.noBlockingRules = bad;
+      assert.throws(() => hydratePlan(onGate, 'plan.json'), /"requirementTrace\[0\]\.gates\[1\]\.standardsCounts\.noBlockingRules"/, JSON.stringify(bad));
+    }
+  });
+
+  it('a plan file written before the counts existed loads, and saving it adds no key', () => {
+    const file = JSON.parse(JSON.stringify(dehydratePlan(buildMaximalFixture())));
+    delete file.requirementTrace[0].releases[0].standardsCounts;
+    delete file.requirementTrace[0].gates[1].standardsCounts;
+    const plan = hydratePlan(file);
+    assert.equal('standardsCounts' in plan.requirementTrace![0].releases[0], false);
+    assert.equal(plan.requirementTrace![0].releases[0].standardsVersion, 3);
+    const saved = dehydratePlan(plan).requirementTrace![0];
+    assert.equal('standardsCounts' in saved.releases[0], false);
+    assert.equal('standardsCounts' in saved.gates[1], false);
+  });
+
+  it('counts that are not three whole numbers >= 0 are refused with the user-facing error naming the field', () => {
+    const bads: unknown[] = [null, 7, 'x', [], {}, { advisoryFindings: 1, notCheckedRules: 1 }, { advisoryFindings: -1, notCheckedRules: 0, notCheckedFiles: 0 },
+      { advisoryFindings: 1.5, notCheckedRules: 0, notCheckedFiles: 0 }, { advisoryFindings: '1', notCheckedRules: 0, notCheckedFiles: 0 }];
+    for (const bad of bads) {
+      const onRelease = JSON.parse(JSON.stringify(dehydratePlan(buildMaximalFixture())));
+      onRelease.requirementTrace[0].releases[0].standardsCounts = bad;
+      assert.throws(() => hydratePlan(onRelease, 'plan.json'),
+        /"plan\.json" has invalid "requirementTrace\[0\]\.releases\[0\]\.standardsCounts" — expected \{ advisoryFindings, notCheckedRules, notCheckedFiles: integers >= 0 \}\./,
+        `release ${JSON.stringify(bad)}`);
+      const onGate = JSON.parse(JSON.stringify(dehydratePlan(buildMaximalFixture())));
+      onGate.requirementTrace[0].gates[1].standardsCounts = bad;
+      assert.throws(() => hydratePlan(onGate, 'plan.json'), /"requirementTrace\[0\]\.gates\[1\]\.standardsCounts"/, `gate ${JSON.stringify(bad)}`);
+    }
+  });
+
+  it('a plan file written before standards existed loads, and saving it adds no key', () => {
+    const file = JSON.parse(JSON.stringify(dehydratePlan(buildMaximalFixture())));
+    delete file.requirementTrace[0].releases[0].standardsVersion;
+    const plan = hydratePlan(file);
+    const release = plan.requirementTrace![0].releases[0];
+    assert.equal('standardsVersion' in release, false);
+    assert.equal(release.releaseTag, 'v4.1.0-fixture');
+    assert.equal('standardsVersion' in dehydratePlan(plan).requirementTrace![0].releases[0], false, 'no key is invented on save');
+  });
+
+  it('a standards version that is not an integer >= 1 is refused with the user-facing error naming the field', () => {
+    for (const bad of ['3', 0, -1, 2.5, null, true, [3], { v: 3 }]) {
+      const file = JSON.parse(JSON.stringify(dehydratePlan(buildMaximalFixture())));
+      file.requirementTrace[0].releases[0].standardsVersion = bad;
+      assert.throws(
+        () => hydratePlan(file, 'plan.json'),
+        /"plan\.json" has invalid "requirementTrace\[0\]\.releases\[0\]\.standardsVersion" — expected an integer >= 1\./,
+        `standardsVersion ${JSON.stringify(bad)}`,
+      );
+    }
+  });
+});
 
 describe('plan schema round trip (anti-recurrence harness)', () => {
   it('preserves every field of the maximal fixture through dehydrate → hydrate', () => {
@@ -261,7 +431,7 @@ describe('plan schema round trip (anti-recurrence harness)', () => {
     plan.playlists[0].tasks.push(createTask('Only Task', 'Only prompt'));
 
     const file = dehydratePlan(plan) as unknown as Record<string, unknown>;
-    for (const key of ['sandbox', 'aiRules', 'prdVersions', 'fixIterations', 'validation', 'defaultRole', 'customRoles']) {
+    for (const key of ['sandbox', 'aiRules', 'prdVersions', 'fixIterations', 'validation', 'defaultRole', 'customRoles', 'requirementTrace']) {
       assert.ok(!(key in file), `minimal plan should not emit "${key}"`);
     }
 
@@ -269,6 +439,7 @@ describe('plan schema round trip (anti-recurrence harness)', () => {
     assert.ok(!('timeoutMs' in rawTask), 'minimal task should not emit "timeoutMs"');
     assert.ok(!('status' in rawTask), 'minimal task should not emit a Pending "status"');
     assert.ok(!('role' in rawTask), 'minimal task should not emit "role"');
+    assert.ok(!('requirementIds' in rawTask), 'minimal task should not emit "requirementIds"');
 
     const rawPlaylist = dehydratePlan(plan).playlists[0] as unknown as Record<string, unknown>;
     assert.ok(!('role' in rawPlaylist), 'minimal playlist should not emit "role"');

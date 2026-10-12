@@ -60,6 +60,7 @@ async function captureWebScreenshot(url: string, outputPath: string, cwd: string
       cwd,
       shell: true,
       stdio: 'pipe',
+      windowsHide: true,
     });
 
     const timer = setTimeout(() => { proc.kill(); resolve(null); }, 30000);
@@ -92,7 +93,7 @@ function captureMobileScreenshot(outputPath: string): string | null {
 function tryAdbScreenshot(outputPath: string): boolean {
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    execSync(`adb exec-out screencap -p > "${outputPath}"`, { shell: true, timeout: 10000 } as any);
+    execSync(`adb exec-out screencap -p > "${outputPath}"`, { shell: true, timeout: 10000, windowsHide: true } as any);
     return fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
   } catch {
     return false;
@@ -104,6 +105,7 @@ function tryXcrunScreenshot(outputPath: string): boolean {
     execSync(`xcrun simctl io booted screenshot "${outputPath}"`, {
       timeout: 10000,
       stdio: 'ignore',
+      windowsHide: true,
     });
     return fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0;
   } catch {
