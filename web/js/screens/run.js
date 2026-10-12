@@ -57,6 +57,7 @@ const RESULT_ORDER = { failed: 0, 'not-checked': 1, passed: 2 };
  * findings or no findings — that a scan found nothing is not proof nothing is there.
  */
 export function ruleOutcome(row) {
+  if (isNotConfigured(row)) { return { glyph: '–', label: 'Not configured', cls: 'muted' }; }
   if (row.result === 'not-checked') { return { glyph: '○', label: 'Not checked', cls: 'muted' }; }
   if (isScanner(row)) {
     return row.result === 'failed'
@@ -71,14 +72,25 @@ const EMPTY_TREE = '4b825dc642cb6eb9a060e54bf8d69288fbee4904';
 
 /** A rule row or finding is blocking unless it says it is advisory; a command always blocks. */
 const isAdvisory = (row) => row.rule !== 'command' && row.severity === 'advisory';
+/** The reason the server writes on a rule the profile does not configure (checker `NOT_CONFIGURED`). */
+const NOT_CONFIGURED_REASON = 'Not configured in this profile';
+/**
+ * A rule the profile does not configure. Not a gap in the check, so never "not checked":
+ * it is shown apart as "not configured". The server's flag decides; the reason text is read
+ * only on a row with no `severity` (a report stored before severities and the flag existed),
+ * because the server re-derives the flag and may refuse a row's own "not configured" text.
+ * Mirrors the server's `isNotConfigured`.
+ */
+export const isNotConfigured = (row) => row.result === 'not-checked' && row.rule !== 'command'
+  && (row.unconfigured === true || (row.severity === undefined && row.reason === NOT_CONFIGURED_REASON));
 /**
  * A blocking row the profile configures that ended not checked, whatever the reason: a
  * command that did not run, or a promoted rule that could not read what it had to or found
  * nothing to judge. Mirrors the server's `isBlockingNotChecked`.
  */
-const isUnreadBlocking = (row) => row.result === 'not-checked' && !isAdvisory(row) && row.unconfigured !== true;
+const isUnreadBlocking = (row) => row.result === 'not-checked' && !isAdvisory(row) && !isNotConfigured(row);
 /** A profile with no command and no configured promoted rule: nothing in the report can stop a release. */
-const hasNoBlockingRules = (rules) => !rules.some((r) => !isAdvisory(r) && r.unconfigured !== true);
+const hasNoBlockingRules = (rules) => !rules.some((r) => !isAdvisory(r) && !isNotConfigured(r));
 
 /**
  * A standards report in the shape the card renders, or null when `data` is not
@@ -108,7 +120,8 @@ export function asStandardsReport(data) {
       noFindings: cleanRows.filter(isScanner).length,
       failed: failedRows.filter((r) => !isAdvisory(r)).length,
       advisory: failedRows.filter(isAdvisory).length,
-      notChecked: rules.filter((r) => r.result === 'not-checked').length,
+      notChecked: rules.filter((r) => r.result === 'not-checked' && !isNotConfigured(r)).length,
+      notConfigured: rules.filter(isNotConfigured).length,
       blockingNotChecked: rules.filter(isUnreadBlocking).length,
       noBlockingRules: hasNoBlockingRules(rules),
       findings: atLeast('findings', findings.length),
@@ -132,7 +145,9 @@ function totalsLine(t) {
     `${t.passed} passed`, `${t.noFindings} no findings`, `${t.failed} blocking`,
     `${t.advisory} advisory with findings`, `${plural(t.notChecked, 'rule')} not checked`,
     `${plural(t.notCheckedFiles, 'file')} not checked`,
-  ].join(' · ');
+    // Rules the profile does not configure: said apart, never as rules not checked.
+    t.notConfigured > 0 ? `${t.notConfigured} not configured` : null,
+  ].filter(Boolean).join(' · ');
 }
 
 /**
@@ -190,7 +205,7 @@ const legacyGateText = (legacy) => (legacy.kind === 'apply' ? STR.C63(legacy.ver
 function standardsCard(run, stored, effectiveVersion, designVersion) {
   const name = standardsName(run, stored);
   const heading = h('h2', { tabindex: '-1', dataset: { focus: 'standards-report' } }, name);
-  const design = designReportParts(stored, designVersion || null);
+  const design = designReportParts(run, stored, designVersion || null);
   if (!stored) {
     const legacy = legacyGateStandards(run, stored, effectiveVersion);
     const text = legacy ? legacyGateText(legacy)
@@ -214,13 +229,15 @@ function standardsCard(run, stored, effectiveVersion, designVersion) {
   const decided = report.rules.filter((r) => r.result !== 'not-checked');
   const blockingRows = decided.filter((r) => !isAdvisory(r)).sort(byResult);
   const advisoryRows = decided.filter(isAdvisory).sort(byResult);
-  // Blocking rules that could not read a changed file lead the not-checked group.
-  const notCheckedRows = report.rules.filter((r) => r.result === 'not-checked')
+  // Blocking rules that could not read a changed file lead the not-checked group. Rules the
+  // profile does not configure are no gap: they are listed apart, as not configured.
+  const notCheckedRows = report.rules.filter((r) => r.result === 'not-checked' && !isNotConfigured(r))
     .sort((a, b) => Number(isUnreadBlocking(b)) - Number(isUnreadBlocking(a)));
+  const notConfiguredRows = report.rules.filter(isNotConfigured);
   const blockingFindings = report.findings.filter((f) => !isAdvisory(f));
   const advisoryFindings = report.findings.filter(isAdvisory);
   // Scanner rules this project made blocking: said out loud wherever a report is shown.
-  const promoted = report.rules.filter((r) => isScanner(r) && !isAdvisory(r) && r.unconfigured !== true).map((r) => r.rule);
+  const promoted = report.rules.filter((r) => isScanner(r) && !isAdvisory(r) && !isNotConfigured(r)).map((r) => r.rule);
 
   const ruleRow = (r) => {
     const info = ruleOutcome(r);
@@ -272,6 +289,10 @@ function standardsCard(run, stored, effectiveVersion, designVersion) {
     advisoryFindings.length > 0 ? h('p', { class: 'muted' }, STR.C49.text) : null,
     findingList('Advisory findings', advisoryFindings, false),
     ruleTable(`Rules not checked  ${notCheckedRows.length}`, notCheckedRows, 'rules that were not checked: not a pass'),
+    notConfiguredRows.length > 0 ? h('details', { class: 'diff-group' },
+      h('summary', null, `Not configured  ${notConfiguredRows.length}`),
+      h('p', { class: 'muted' }, STR.C100.text),
+      h('ul', { class: 'diff-list' }, notConfiguredRows.map((r) => h('li', null, h('span', { class: 'diff-id' }, r.rule))))) : null,
     t.notCheckedFiles > 0 ? h('details', { class: 'diff-group' },
       h('summary', null, `Files not checked  ${t.notCheckedFiles}`),
       h('p', { class: 'muted' }, STR.C53.text),
@@ -322,16 +343,119 @@ function designGateLine(run, standards) {
 }
 
 /**
- * The design-system disclosure of the report card, and the C69 alert for each design file the
- * run changed. Empty when the frozen version has no design system (or it could not be fetched).
+ * The note that this run's start reverted design files to the approved content, and where the
+ * replaced files were kept (C99). Null when the run replaced none, and for a run recorded
+ * before this was kept.
  */
-function designReportParts(stored, version) {
+export function designRevertNotice(run) {
+  const paths = run && Array.isArray(run.designFilesReplaced) ? run.designFilesReplaced.filter((p) => typeof p === 'string') : [];
+  if (paths.length === 0) { return null; }
+  const dir = typeof run.designBackupDir === 'string' && run.designBackupDir !== '' ? run.designBackupDir : null;
+  return h('p', { class: 'text-info', role: 'note' }, glyph('ⓘ'), ' ', STR.C99(paths.join(', '), dir).text);
+}
+
+/** How many files the gate's list shows before "Show all". */
+const CHANGED_FILES_SHOWN = 20;
+
+/** One changed file: the path as text, what happened to it in words, and its line counts. */
+function changedFileRow(f) {
+  const words = [
+    f.untracked ? 'new (untracked)' : null,
+    f.deleted ? 'deleted' : null,
+    f.renamedFrom ? 'renamed' : null,
+    f.binary ? 'binary' : null,
+    f.hiddenFromGit ? 'hidden from git (skip-worktree or assume-unchanged), lines not counted' : null,
+  ].filter(Boolean);
+  const added = Number.isFinite(f.added) ? f.added : null;
+  const removed = Number.isFinite(f.removed) ? f.removed : null;
+  const counted = added !== null || removed !== null;
+  return h('li', null,
+    h('span', { class: 'diff-id' }, f.renamedFrom ? `${f.renamedFrom} → ${f.path}` : f.path),
+    words.length > 0 ? h('span', { class: 'muted' }, `${words.join(', ')} `) : null,
+    added !== null && added > 0 ? h('span', { class: 'text-success', 'aria-hidden': 'true' }, `+${added} `) : null,
+    removed !== null && removed > 0 ? h('span', { class: 'text-error', 'aria-hidden': 'true' }, `−${removed}`) : null,
+    counted ? h('span', { class: 'sr-only' }, ` ${added ?? 0} lines added, ${removed ?? 0} removed`) : null);
+}
+
+/**
+ * What the changed files are counted from, for the gate card's heading and the note under it:
+ * `{ heading, note }`. The base is the last shipped version, or — nothing shipped yet — the
+ * start of the project's first run, so the list may hold earlier runs that were not shipped.
+ * A list that does not say which (`baseKind` absent) names the commit only.
+ */
+export function changedFilesSince(changed) {
+  if (changed.emptyTreeBase || !changed.baseRef) { return { heading: 'the empty tree', note: STR.C95b.text }; }
+  const sha = String(changed.baseRef).slice(0, 12);
+  if (changed.baseKind === 'last-shipped') { return { heading: `the last shipped version (${sha})`, note: STR.C101(sha).text }; }
+  if (changed.baseKind === 'before-first-ship') { return { heading: `the first run (${sha})`, note: STR.C102(sha).text }; }
+  return { heading: sha, note: STR.C95(sha).text };
+}
+
+/**
+ * The +/− and file tallies of the gate card. The server counts them over EVERY changed file
+ * (`changed.totals`), not only the listed rows; a list stored before it did carries none, and
+ * then only the listed rows are summed — `partial` says so when some files are not listed.
+ */
+export function changedFilesTotals(changed, files, total) {
+  const t = changed && changed.totals && typeof changed.totals === 'object' ? changed.totals : null;
+  const num = (v) => (Number.isFinite(v) && v >= 0 ? v : 0);
+  if (t) {
+    return {
+      added: num(t.added), removed: num(t.removed), binary: num(t.binary), hidden: num(t.hiddenFromGit),
+      uncounted: num(t.uncounted), partial: false,
+    };
+  }
+  const out = { added: 0, removed: 0, binary: 0, hidden: 0, uncounted: 0, partial: total > files.length };
+  for (const f of files) {
+    if (f.hiddenFromGit) { out.hidden++; } else if (f.binary) { out.binary++; }
+    if (Number.isFinite(f.added)) { out.added += f.added; }
+    if (Number.isFinite(f.removed)) { out.removed += f.removed; }
+  }
+  return out;
+}
+
+/**
+ * What the run changed since its diff base, for the approver at the ship gate (run.changedFiles,
+ * collected by the server). Never "0 files" for a list that was not collected.
+ */
+export function changedFilesBlock(changed) {
+  if (!changed || changed.collected !== true) {
+    return h('p', { class: 'muted' }, glyph('○'), ' ', STR.C96.text, changed && changed.reason ? ` (${changed.reason})` : '');
+  }
+  const files = Array.isArray(changed.files) ? changed.files : [];
+  const total = Number.isFinite(changed.total) ? changed.total : files.length;
+  if (total === 0) { return h('p', { class: 'text-warning' }, glyph('⚠'), ' ', STR.C97.text); }
+  const { added, removed, binary, hidden, uncounted, partial } = changedFilesTotals(changed, files, total);
+  const since = changedFilesSince(changed);
+  const list = cappedList(files, changedFileRow, CHANGED_FILES_SHOWN);
+  list.setAttribute('aria-label', `Changed files since ${since.heading}, ${plural(total, 'file')}`);
+  const base = since.note;
+  return [
+    h('h3', { class: 'section-header' }, `Changed files since ${since.heading}  ${total}`),
+    h('p', null, `+${added.toLocaleString('en-US')} −${removed.toLocaleString('en-US')} across ${partial ? `the ${plural(files.length, 'listed file')}` : plural(total, 'file')}.`,
+      binary > 0 ? ` ${plural(binary, 'binary file')} not counted.` : '',
+      hidden > 0 ? ` ${plural(hidden, 'file')} git was told to ignore: changed, lines not counted.` : '',
+      uncounted > 0 ? ` ${plural(uncounted, 'file')} not read: lines not counted.` : ''),
+    h('p', { class: 'muted' }, base),
+    list,
+    total > files.length ? h('p', { class: 'muted' }, STR.C98(files.length, total).text) : null,
+  ];
+}
+
+/**
+ * The design-system disclosure of the report card, the C69 alert for each design file the
+ * run changed, and the note of design files its start reverted. Empty when there is nothing to
+ * say: no reverted file and no design system in the frozen version (or it could not be fetched).
+ */
+function designReportParts(run, stored, version) {
+  const reverted = designRevertNotice(run);
   const d = version && version.design;
-  if (!d) { return []; }
+  if (!d) { return reverted ? [reverted] : []; }
   const findings = stored && stored.report && Array.isArray(stored.report.findings) ? stored.report.findings : [];
   const changed = [d.docPath, d.tokensPath].filter((path) => findings.some((f) => f && f.rule === DESIGN_RULE && f.file === path));
   const tokens = Array.isArray(d.tokens) ? d.tokens : [];
   return [
+    reverted,
     changed.map((path) => h('p', { class: 'text-warning', role: 'alert' }, glyph('⚠'), ' ', STR.C69(path).text)),
     h('details', { class: 'diff-group', dataset: { focus: 'design-system' } },
       h('summary', null, `Design system v${version.version}  ${tokens.length} tokens`),
@@ -879,6 +1003,8 @@ function gateCard(app, project, run, tasks, statusOf, live, refresh, standards) 
     h('p', null, cost.noCap ? `Cost so far ${fmtUsd(live.spentUsd)} · no cap set` : `Cost so far ${fmtUsd(live.spentUsd)} of ${fmtUsd(cost.capUsd)}`),
     standardsGateLine(run, standards.stored, standards.focusReport, standards.effectiveVersion),
     designGateLine(run, standards),
+    designRevertNotice(run),
+    changedFilesBlock(run.changedFiles),
     after.length > 0 ? h('p', null, `Tasks that run after approval: ${after.join(', ')}`) : null,
     canDecide ? [note.wrap,
       h('div', { class: 'form-actions gate-actions' },

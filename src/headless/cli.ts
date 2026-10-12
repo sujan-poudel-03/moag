@@ -1568,6 +1568,11 @@ export function renderStandardsCheck(report: StandardsReport): string {
       out.push(`${mark}${ruleLabel(row)} — ${row.reason ?? 'no reason given'}`);
     }
   }
+  if (groups.notConfigured.length > 0) {
+    // Rules this profile never asked for: listed so the reader knows, never a gap in the check.
+    out.push('', 'Not configured in this profile:');
+    for (const row of groups.notConfigured) { out.push(`  ${ruleLabel(row)}`); }
+  }
   const t = report.totals;
   const files = report.notCheckedFiles ?? [];
   if (t.notCheckedFiles > 0) {
@@ -1583,6 +1588,9 @@ export function renderStandardsCheck(report: StandardsReport): string {
     ` · ${t.notCheckedFiles} file${t.notCheckedFiles === 1 ? '' : 's'} not checked` +
     ` · ${t.findings} finding${t.findings === 1 ? '' : 's'}` +
     (blockingState === 'none-configured' ? ` · ${NO_BLOCKING_RULES}` : ''));
+  if (t.notConfigured > 0) {
+    out.push(`${t.notConfigured} rule${t.notConfigured === 1 ? '' : 's'} not configured in this profile (not a gap in this check)`);
+  }
   return out.join('\n') + '\n';
 }
 

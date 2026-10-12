@@ -19,6 +19,17 @@ import {
   parseDesignTokens,
   renderDesignPlannerSummary,
 } from './design';
+import {
+  GUIDANCE_SUFFIX,
+  MAX_RULEBOOK_GUIDANCE_ENTRIES,
+  RULEBOOK_KEYS,
+  RULEBOOK_TITLES,
+  RulebookKey,
+  RulebookSections,
+  checkedLines,
+  guidanceItems,
+  plannerSummaryLines,
+} from './rulebook';
 
 // ─── Closed sets ───
 
@@ -64,6 +75,16 @@ export const STANDARDS_RULE_IDS = [
   'comment-policy/banned-phrase',
   'comment-policy/density',
   'exemption/newly-generated',
+  // Project Rulebook (see rulebook.ts). Every one is advisory by default.
+  'practice/todo-without-issue',
+  'practice/debug-statement',
+  'security/env-file',
+  'security/secret-literal',
+  'a11y/img-alt',
+  'a11y/html-lang',
+  'docs/changelog-updated',
+  'data/migration-edited',
+  'testing/requirement-reference',
 ] as const;
 export type StandardsRuleId = typeof STANDARDS_RULE_IDS[number];
 
@@ -109,6 +130,15 @@ export const DEFAULT_RULE_SEVERITY: Record<StandardsRuleId, RuleSeverity> = {
   'comment-policy/banned-phrase': 'advisory',
   'comment-policy/density': 'advisory',
   'exemption/newly-generated': 'advisory',
+  'practice/todo-without-issue': 'advisory',
+  'practice/debug-statement': 'advisory',
+  'security/env-file': 'advisory',
+  'security/secret-literal': 'advisory',
+  'a11y/img-alt': 'advisory',
+  'a11y/html-lang': 'advisory',
+  'docs/changelog-updated': 'advisory',
+  'data/migration-edited': 'advisory',
+  'testing/requirement-reference': 'advisory',
 };
 
 /** A profile's per-rule overrides of {@link DEFAULT_RULE_SEVERITY}. */
@@ -158,10 +188,24 @@ export function ruleConfigured(profile: StandardsProfile, rule: StandardsRuleId)
     case 'naming/files': return profile.naming.files.length > 0;
     case 'comment-policy/commented-out-code': return profile.comments.forbidCommentedOutCode;
     case 'comment-policy/banned-phrase': return profile.comments.bannedPhrases.length > 0;
+    case 'practice/todo-without-issue': return !!profile.practice?.todoNeedsIssue;
+    case 'practice/debug-statement': return !!profile.practice?.noDebugStatements;
+    case 'a11y/img-alt': return !!profile.accessibility?.imgAlt;
+    case 'a11y/html-lang': return !!profile.accessibility?.htmlLang;
+    case 'docs/changelog-updated': return !!profile.docsGit?.changelogPath;
+    case 'data/migration-edited': return !!profile.apiData?.migrationsGlob;
+    case 'testing/requirement-reference': return !!profile.testPolicy?.requirementReference;
+    // Checked on every run, whatever the profile holds.
+    case 'security/env-file':
+    case 'security/secret-literal':
     case 'structure/nested-repository':
     case 'comment-policy/density':
     case 'exemption/newly-generated':
       return true;
+    default: {
+      const unhandled: never = rule;
+      return unhandled;
+    }
   }
 }
 
@@ -242,10 +286,23 @@ function ruleConfigOf(profile: StandardsProfile | null, rule: StandardsRuleId): 
     case 'comment-policy/commented-out-code': return profile.comments.forbidCommentedOutCode;
     case 'comment-policy/banned-phrase': return profile.comments.bannedPhrases;
     case 'comment-policy/density': return { maxDensityPct: profile.comments.maxDensityPct, minAddedLines: profile.comments.minAddedLines };
+    case 'practice/todo-without-issue': return profile.practice?.todoNeedsIssue ?? null;
+    case 'practice/debug-statement': return profile.practice?.noDebugStatements ?? null;
+    case 'a11y/img-alt': return profile.accessibility?.imgAlt ?? null;
+    case 'a11y/html-lang': return profile.accessibility?.htmlLang ?? null;
+    case 'docs/changelog-updated': return profile.docsGit?.changelogPath ?? null;
+    case 'data/migration-edited': return profile.apiData?.migrationsGlob ?? null;
+    case 'testing/requirement-reference': return profile.testPolicy?.requirementReference ?? null;
+    case 'security/env-file':
+    case 'security/secret-literal':
     case 'structure/required-dirs':
     case 'structure/nested-repository':
     case 'exemption/newly-generated':
       return null;
+    default: {
+      const unhandled: never = rule;
+      return unhandled;
+    }
   }
 }
 
@@ -287,7 +344,7 @@ export type ProvenanceField = typeof PROVENANCE_FIELDS[number];
  * Provenance areas present only when the profile has the matching part: `design` goes with
  * `profile.design`. Optional, so every provenance written before them still validates.
  */
-export const OPTIONAL_PROVENANCE_FIELDS = ['design'] as const;
+export const OPTIONAL_PROVENANCE_FIELDS = ['design', ...RULEBOOK_KEYS] as const;
 export type OptionalProvenanceField = typeof OPTIONAL_PROVENANCE_FIELDS[number];
 
 export const REPO_STATES = ['greenfield', 'brownfield'] as const;
@@ -320,7 +377,12 @@ const MAX_VALIDATION_ERRORS = 50;
 
 // ─── Types ───
 
-export interface StandardsProfile {
+/**
+ * The rulebook sections (coding practice, testing, security, accessibility, API and data,
+ * docs and git, performance) come from {@link RulebookSections}: each is absent — never
+ * empty — on a profile that does not have it, so older profiles keep their content hash.
+ */
+export interface StandardsProfile extends RulebookSections {
   stackTemplateId: StackId;
   repoState: RepoState;
   structure: {
@@ -389,6 +451,14 @@ const CREDENTIAL_PATTERNS: Array<{ name: string; re: RegExp }> = [
   { name: 'an AWS access key id', re: /\bAKIA[0-9A-Z]{16}\b/ },
   { name: 'a PEM block', re: /-----BEGIN [A-Z0-9 ]+-----/ },
 ];
+
+/**
+ * The name of the credential shape `text` holds ("an API key (sk-…)"), or null. The checker
+ * reports the shape, never the value.
+ */
+export function credentialShapeIn(text: string): string | null {
+  return CREDENTIAL_PATTERNS.find((p) => p.re.test(text))?.name ?? null;
+}
 
 /** True when `value` holds a line break or any control character other than tab. */
 function hasControlChars(value: string): boolean {
@@ -536,7 +606,7 @@ export function validateProfile(raw: unknown): ProfileValidation {
   const root = shape(raw, 'profile', [
     'stackTemplateId', 'repoState', 'structure', 'frontend', 'backend', 'naming',
     'comments', 'testing', 'commands', 'builtInRuleIds', 'freeText',
-  ], c, ['severity', 'design']);
+  ], c, ['severity', 'design', ...RULEBOOK_KEYS]);
   if (!root) { return { ok: false, errors: c.errors }; }
 
   const structure = shape(root.structure, 'profile.structure', ['requiredDirs', 'allowedTopLevel', 'placement'], c) ?? {};
@@ -683,6 +753,9 @@ export function validateProfile(raw: unknown): ProfileValidation {
     if (design) { profile.design = design; }
   }
 
+  // Copied only when present: a profile without them stays exactly as it was.
+  validateRulebook(root, profile, c);
+
   scanCredentials(profile, 'profile', c);
 
   if (c.errors.length === 0) {
@@ -702,6 +775,76 @@ export function validateProfile(raw: unknown): ProfileValidation {
   }
 
   return c.errors.length > 0 ? { ok: false, errors: c.errors } : { ok: true, profile };
+}
+
+// ─── Rulebook sections ───
+
+/** A strict boolean: anything but true or false is an error. */
+function flag(raw: unknown, at: string, c: Collector): boolean {
+  if (typeof raw !== 'boolean') { c.add(`${at}: expected true or false`); return false; }
+  return raw;
+}
+
+/** A section's guidance: single lines of at most 200 characters, at most 12 of them. */
+function guidance(raw: unknown, at: string, c: Collector): string[] {
+  return list(raw, at, c, (entry, where) => line(entry, where, c), MAX_RULEBOOK_GUIDANCE_ENTRIES);
+}
+
+/** A repository-relative file path that may be '' (nothing configured): {@link requiredDir}'s rules otherwise. */
+function optionalRepoPath(raw: unknown, at: string, c: Collector): string {
+  if (raw === '') { return ''; }
+  return requiredDir(raw, at, c);
+}
+
+/**
+ * Validate each rulebook section `root` holds and copy it onto `profile`. Every field of a
+ * present section is required; unknown keys are errors; a section that is absent stays absent.
+ */
+function validateRulebook(root: Obj, profile: StandardsProfile, c: Collector): void {
+  const at = (key: RulebookKey): string => `profile.${key}`;
+  const section = (key: RulebookKey, keys: readonly string[]): Obj | null =>
+    (root[key] === undefined ? null : shape(root[key], at(key), keys, c) ?? {});
+  const practice = section('practice', ['todoNeedsIssue', 'noDebugStatements', 'guidance']);
+  if (practice) {
+    profile.practice = {
+      todoNeedsIssue: flag(practice.todoNeedsIssue, 'profile.practice.todoNeedsIssue', c),
+      noDebugStatements: flag(practice.noDebugStatements, 'profile.practice.noDebugStatements', c),
+      guidance: guidance(practice.guidance, 'profile.practice.guidance', c),
+    };
+  }
+  const testPolicy = section('testPolicy', ['requirementReference', 'guidance']);
+  if (testPolicy) {
+    profile.testPolicy = {
+      requirementReference: flag(testPolicy.requirementReference, 'profile.testPolicy.requirementReference', c),
+      guidance: guidance(testPolicy.guidance, 'profile.testPolicy.guidance', c),
+    };
+  }
+  const security = section('security', ['guidance']);
+  if (security) { profile.security = { guidance: guidance(security.guidance, 'profile.security.guidance', c) }; }
+  const accessibility = section('accessibility', ['imgAlt', 'htmlLang', 'guidance']);
+  if (accessibility) {
+    profile.accessibility = {
+      imgAlt: flag(accessibility.imgAlt, 'profile.accessibility.imgAlt', c),
+      htmlLang: flag(accessibility.htmlLang, 'profile.accessibility.htmlLang', c),
+      guidance: guidance(accessibility.guidance, 'profile.accessibility.guidance', c),
+    };
+  }
+  const apiData = section('apiData', ['migrationsGlob', 'guidance']);
+  if (apiData) {
+    profile.apiData = {
+      migrationsGlob: line(apiData.migrationsGlob, 'profile.apiData.migrationsGlob', c, { allowEmpty: true, visibleOnly: true }),
+      guidance: guidance(apiData.guidance, 'profile.apiData.guidance', c),
+    };
+  }
+  const docsGit = section('docsGit', ['changelogPath', 'guidance']);
+  if (docsGit) {
+    profile.docsGit = {
+      changelogPath: optionalRepoPath(docsGit.changelogPath, 'profile.docsGit.changelogPath', c),
+      guidance: guidance(docsGit.guidance, 'profile.docsGit.guidance', c),
+    };
+  }
+  const performance = section('performance', ['guidance']);
+  if (performance) { profile.performance = { guidance: guidance(performance.guidance, 'profile.performance.guidance', c) }; }
 }
 
 // ─── Design system ───
@@ -796,10 +939,23 @@ function validateSeverity(raw: unknown, c: Collector): SeverityOverrides {
       c.add(`profile.severity.${key}: expected one of ${RULE_SEVERITIES.join(', ')}`);
       continue;
     }
+    if (key === REQUIREMENT_REFERENCE_RULE && value === 'blocking') {
+      c.add(REQUIREMENT_REFERENCE_NOT_BLOCKING);
+      continue;
+    }
     out[key as StandardsRuleId] = value as RuleSeverity;
   }
   return out;
 }
+
+/**
+ * The rule that each requirement id is named in a test file. It cannot be made blocking yet:
+ * the check before the ship gate is not given the run's requirement ids, so there it is always
+ * "not checked" — and a blocking rule that is not checked refuses every gate approval.
+ */
+const REQUIREMENT_REFERENCE_RULE: StandardsRuleId = 'testing/requirement-reference';
+export const REQUIREMENT_REFERENCE_NOT_BLOCKING =
+  'testing/requirement-reference can\'t be blocking yet: the check before the ship gate can\'t read requirement ids';
 
 /**
  * Validate a provenance record: exactly the {@link PROVENANCE_FIELDS}, each a
@@ -893,6 +1049,8 @@ function structuredText(profile: StandardsProfile, version: number | null): stri
       bullet('Test files', p.testing.fileGlobs),
       p.testing.notes ? `- ${p.testing.notes}` : null,
     ]),
+    // Rulebook items MOAG checks: never cut (the validator holds them under the cap).
+    ...checkedLines(p).map((entry) => section(`${RULEBOOK_TITLES[entry.key]} (MOAG checks these)`, entry.lines)),
     section('Commands that must pass', p.commands.map((cmd) => `- ${cmd.label}: ${cmd.run}`)),
   ].join('');
 }
@@ -924,21 +1082,37 @@ function quoteWithin(text: string, budget: number): string {
   return used + TRUNCATED_QUOTE.length + 1 <= budget ? [...out, TRUNCATED_QUOTE].join('\n') + '\n' : '';
 }
 
+/** Room kept for the line that says how many guidance items were cut. */
+const GUIDANCE_CUT_MARKER_RESERVE = 60;
+
+/** The rendered standards text, and the guidance items that were cut to fit it (empty when none). */
+export interface RenderedStandards {
+  text: string;
+  guidanceCut: string[];
+}
+
 /**
- * Render the text every agent prompt carries.
+ * Render the text every agent prompt carries, and say what guidance it had to leave out.
  *
- * Structured rules always appear in full (the validator guarantees they fit).
- * Free text follows as a `> ` blockquote — so no author-written line can pose as
- * a prompt marker — cut to the remaining room. Built-in rule bodies are inlined
- * while the result stays under {@link MAX_STANDARDS_PROMPT_CHARS}; the rest are
- * listed by name. Rules named in `skipRuleNames` (already present elsewhere in
- * the prompt) are only ever listed by name. Never longer than the cap.
+ * Order: the structured rules — checked rulebook items included — always in full (the
+ * validator guarantees they fit); the free text as a `> ` blockquote, so no author-written
+ * line can pose as a prompt marker, cut to the remaining room; then the rulebook GUIDANCE,
+ * one `### <Section> (guidance — not checked)` block per section, item by item while it fits
+ * — every item that does not is listed in `guidanceCut` and counted on a marker line; then
+ * built-in rule bodies, inlined while the result stays under {@link MAX_STANDARDS_PROMPT_CHARS},
+ * the rest listed by name. Rules named in `skipRuleNames` (already present elsewhere in the
+ * prompt) are only ever listed by name. Never longer than the cap.
+ *
+ * `rulebook: 'summary'` (the planner) replaces the guidance blocks with one
+ * `### Rulebook guidance (not checked)` block of one line per section.
+ *
+ * A profile with no rulebook section renders exactly as it did before the rulebook existed.
  */
-export function renderStandardsText(
+export function renderStandardsTextDetailed(
   profile: StandardsProfile,
   version: number | null,
-  opts: { skipRuleNames?: string[] } = {},
-): string {
+  opts: { skipRuleNames?: string[]; rulebook?: 'full' | 'summary' } = {},
+): RenderedStandards {
   const cap = MAX_STANDARDS_PROMPT_CHARS;
   const skip = new Set(opts.skipRuleNames ?? []);
   const rules = profile.builtInRuleIds
@@ -947,12 +1121,45 @@ export function renderStandardsText(
 
   const base = structuredText(profile, version);
   const reserved = ruleNamesLine(rules.map((r) => r.id)).length;
+  const items = guidanceItems(profile);
+  const summary = opts.rulebook === 'summary' ? plannerSummaryLines(profile) : [];
+  const markerReserve = items.length > 0 || summary.length > 0 ? GUIDANCE_CUT_MARKER_RESERVE : 0;
 
   let freeBlock = '';
   if (profile.freeText.trim().length > 0) {
     const header = '### Project rules\n';
-    const quoted = quoteWithin(profile.freeText, cap - base.length - reserved - header.length);
+    const quoted = quoteWithin(profile.freeText, cap - base.length - reserved - markerReserve - header.length);
     freeBlock = quoted ? header + quoted : '';
+  }
+
+  // Guidance takes what is left, item by item; whatever does not fit is cut and named.
+  const room = cap - base.length - freeBlock.length - reserved - markerReserve;
+  const guidanceCut: string[] = [];
+  let guidanceBlock = '';
+  if (opts.rulebook === 'summary') {
+    const header = '### Rulebook guidance (not checked)\n';
+    const kept: string[] = [];
+    let used = header.length;
+    for (const l of summary) {
+      if (used + l.length + 1 > room) { guidanceCut.push(l); continue; }
+      kept.push(l);
+      used += l.length + 1;
+    }
+    guidanceBlock = kept.length > 0 ? header + kept.map((l) => `${l}\n`).join('') : '';
+  } else {
+    let used = 0;
+    let current: RulebookKey | null = null;
+    for (const item of items) {
+      const header = item.key === current ? '' : `### ${RULEBOOK_TITLES[item.key]} ${GUIDANCE_SUFFIX}\n`;
+      const entry = `- ${item.text}\n`;
+      if (used + header.length + entry.length > room) { guidanceCut.push(item.text); continue; }
+      guidanceBlock += header + entry;
+      used += header.length + entry.length;
+      current = item.key;
+    }
+  }
+  if (guidanceCut.length > 0) {
+    guidanceBlock += `- …${guidanceCut.length} guidance item${guidanceCut.length === 1 ? '' : 's'} not shown (cut to fit)\n`;
   }
 
   // Upgrade rules from "named" to "inlined" in declared order while the whole text still fits.
@@ -960,7 +1167,7 @@ export function renderStandardsText(
   const build = (): string => {
     const named = rules.filter((r) => !inlined.includes(r));
     const bodies = inlined.map((r) => `### ${r.name}\n${r.text.trim()}\n`).join('');
-    return (base + freeBlock + bodies + ruleNamesLine(named.map((r) => r.id))).trimEnd();
+    return (base + freeBlock + guidanceBlock + bodies + ruleNamesLine(named.map((r) => r.id))).trimEnd();
   };
   for (const rule of rules) {
     if (skip.has(rule.name)) { continue; }
@@ -970,17 +1177,27 @@ export function renderStandardsText(
 
   const text = build();
   // Unreachable for a validated profile; an unvalidated one is still never over the cap.
-  return text.length <= cap ? text : text.slice(0, cap);
+  return { text: text.length <= cap ? text : text.slice(0, cap), guidanceCut };
+}
+
+/** {@link renderStandardsTextDetailed}'s text: what every agent prompt carries. */
+export function renderStandardsText(
+  profile: StandardsProfile,
+  version: number | null,
+  opts: { skipRuleNames?: string[] } = {},
+): string {
+  return renderStandardsTextDetailed(profile, version, opts).text;
 }
 
 /**
- * The block a planning prompt carries: the standards text and, for a greenfield
- * repository, the instruction that the first task scaffolds the required structure.
+ * The block a planning prompt carries: the standards text (with the rulebook guidance as a
+ * one-line-per-section summary) and, for a greenfield repository, the instruction that the
+ * first task scaffolds the required structure.
  */
 export function renderPlannerStandards(profile: StandardsProfile, version: number | null): string {
   const parts = [
     'Project standards (every task you plan must conform; cite the relevant convention in task prompts):',
-    renderStandardsText(profile, version),
+    renderStandardsTextDetailed(profile, version, { rulebook: 'summary' }).text,
   ];
   if (profile.design) { parts.push(renderDesignPlannerSummary(profile.design, profile.frontend.componentKit)); }
   if (profile.repoState === 'greenfield') {

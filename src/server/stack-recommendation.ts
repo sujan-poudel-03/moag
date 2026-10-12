@@ -8,9 +8,12 @@
 // it has at least {@link MIN_GROUP_N} tasks. A stack's score is its best
 // eligible engine.
 //
-// With no eligible group the answer is the literal "Insufficient data — static
-// default": a stack detected from repository marker files, or the static
-// default, labelled as such, and the response carries NO numeric rate field.
+// With no eligible group, and nothing detected from the repository, the answer is
+// the cold-start PRIOR when a connected engine has one: a fixed table of general
+// model strengths, labelled "not yet measured on this server", LOW confidence, no
+// number of any kind (see § Cold-start prior). Otherwise — or when a stack was
+// detected — it is the literal "Insufficient data — static default": the detected
+// stack or the static default, labelled as such, with NO numeric rate field.
 // Records without a stack (anything recorded before stacks existed) are counted
 // as excluded and never guessed into a group. Gate pass rate is a supporting
 // figure with its own n, shown only from {@link MIN_GATE_RUNS} gate runs, and is
@@ -113,9 +116,107 @@ export interface StaticRecommendation {
   recordedTasks: number;
   excludedNoStack: number;
   minPerGroup: number;
+  /**
+   * The stack general model strengths would suggest, set only when a stack was detected from
+   * the repository and the prior would pick another one. Supporting text; never the offer.
+   */
+  priorSuggests?: StackId;
 }
 
-export type StackRecommendation = MeasuredRecommendation | StaticRecommendation;
+export type StackRecommendation = MeasuredRecommendation | StaticRecommendation | PriorRecommendation;
+
+// ─── Cold-start prior (general model strengths, not measured) ───
+//
+// A fresh server has measured nothing, so measured evidence cannot pick a stack. The prior
+// is a fixed, documented table of what each engine is generally good at, maintained with
+// MOAG and the same on every server — maintainer judgement, reviewed each release. It is
+// ORDINAL ONLY ('strong' / 'adequate' / 'none'): it carries no rate, no sample and no
+// interval, its label says it is not measured, and its confidence is always LOW.
+//
+// It is used only when no engine × stack group has reached {@link MIN_GROUP_N} tasks AND
+// nothing was detected from the repository (a detected stack stays primary) AND at least
+// one connected engine has a strength for some candidate stack. It is a SWITCH, never a
+// blend: the moment one group is eligible, the measured path runs unchanged and the prior
+// is not consulted.
+
+/** The prior's label, shown verbatim. Never claims a measurement. */
+export const PRIOR_LABEL = 'based on general model strengths — not yet measured on this server';
+
+/** What a product owner may say they are building; narrows the prior's candidate stacks. */
+export const BUILDING_KINDS = ['web-app', 'api', 'cli', 'static-site'] as const;
+export type BuildingKind = typeof BUILDING_KINDS[number];
+
+/** True for a member of {@link BUILDING_KINDS}. */
+export function isBuildingKind(value: unknown): value is BuildingKind {
+  return typeof value === 'string' && (BUILDING_KINDS as readonly string[]).includes(value);
+}
+
+/** How well an engine generally does on a stack. Ordinal; never a number. */
+export type PriorStrength = 'strong' | 'adequate' | 'none';
+
+const NONE_ROW: Readonly<Record<StackId, PriorStrength>> = Object.freeze({
+  'node-ts': 'none', python: 'none', go: 'none', java: 'none', dotnet: 'none', 'static-web': 'none', other: 'none',
+});
+const FRONTIER_ROW: Readonly<Record<StackId, PriorStrength>> = Object.freeze({
+  'node-ts': 'strong', python: 'strong', go: 'adequate', java: 'adequate', dotnet: 'adequate', 'static-web': 'strong', other: 'none',
+});
+
+/**
+ * The prior: per engine, per stack. Every engine is listed. `copilot`, `custom` and `ollama`
+ * (a local model of unknown size) and every engine's `other` are 'none'. Maintainer
+ * judgement, not a measurement — see docs/server.md § Stack recommendation.
+ */
+export const ENGINE_STACK_PRIOR: Readonly<Record<EngineId, Readonly<Record<StackId, PriorStrength>>>> = Object.freeze({
+  claude: FRONTIER_ROW,
+  anthropic: FRONTIER_ROW,
+  codex: Object.freeze({ ...FRONTIER_ROW, 'static-web': 'adequate' as const }),
+  gemini: Object.freeze({ ...FRONTIER_ROW, 'node-ts': 'adequate' as const, 'static-web': 'adequate' as const }),
+  ollama: NONE_ROW,
+  custom: NONE_ROW,
+  copilot: NONE_ROW,
+});
+
+/** The stacks the prior chooses among for each kind of project, in preference order. */
+export const BUILDING_CANDIDATES: Readonly<Record<BuildingKind, readonly StackId[]>> = Object.freeze({
+  'web-app': ['node-ts', 'python', 'static-web'],
+  api: ['node-ts', 'python', 'go', 'java', 'dotnet'],
+  cli: ['go', 'python', 'node-ts'],
+  'static-site': ['static-web'],
+});
+
+/** The prior's answer. LOW confidence always; no numeric field of any kind. */
+export interface PriorRecommendation {
+  source: 'prior';
+  stack: StackId;
+  label: typeof PRIOR_LABEL;
+  confidence: 'low';
+  /** The connected engines that have a strength for the chosen stack, strongest first. */
+  enginesConsidered: Array<{ engine: EngineId; strength: 'strong' | 'adequate' }>;
+  minPerGroup: number;
+}
+
+const STRENGTH_SCORE: Record<PriorStrength, number> = { strong: 2, adequate: 1, none: 0 };
+
+/**
+ * The prior's pick among the candidate stacks for `building` (every stack but `other` when
+ * unset): the stack whose best connected engine is strongest. Ties go to candidate order.
+ * Null when no connected engine has a strength for any candidate.
+ */
+export function priorPick(connected: readonly EngineId[], building?: BuildingKind): PriorRecommendation | null {
+  const candidates = building ? BUILDING_CANDIDATES[building] : STACK_IDS.filter((s) => s !== 'other');
+  let best: { stack: StackId; score: number } | null = null;
+  for (const stack of candidates) {
+    const score = Math.max(0, ...connected.map((e) => STRENGTH_SCORE[ENGINE_STACK_PRIOR[e]?.[stack] ?? 'none']));
+    if (score > 0 && (best === null || score > best.score)) { best = { stack, score }; }
+  }
+  if (best === null) { return null; }
+  const stack = best.stack;
+  const enginesConsidered = connected
+    .map((engine) => ({ engine, strength: ENGINE_STACK_PRIOR[engine]?.[stack] ?? 'none' }))
+    .filter((e): e is { engine: EngineId; strength: 'strong' | 'adequate' } => e.strength !== 'none')
+    .sort((a, b) => STRENGTH_SCORE[b.strength] - STRENGTH_SCORE[a.strength]);
+  return { source: 'prior', stack, label: PRIOR_LABEL, confidence: 'low', enginesConsidered, minPerGroup: MIN_GROUP_N };
+}
 
 /** 95% Wilson score interval for `successes` of `n`. `n = 0` gives [0, 1]. */
 export function wilsonInterval(successes: number, n: number, z = WILSON_Z): { lower: number; upper: number } {
@@ -141,6 +242,7 @@ export function recommendStack(
   connected: readonly EngineId[],
   detectedStack: StackId | null,
   legacyExcluded = 0,
+  opts: { building?: BuildingKind } = {},
 ): StackRecommendation {
   const conn = new Set(connected);
   const tasks = new Map<string, { engine: EngineId; stack: StackId; n: number; completed: number }>();
@@ -186,6 +288,10 @@ export function recommendStack(
   const eligible = stats.filter((s) => s.eligible).sort(compareGroups);
 
   if (eligible.length === 0) {
+    // Nothing measured yet: general model strengths, when nothing was detected and a
+    // connected engine has any; a detected stack stays primary and the prior only annotates.
+    const prior = priorPick(connected, opts.building);
+    if (detectedStack === null && prior !== null) { return prior; }
     return {
       source: 'static-default',
       stack: detectedStack ?? STATIC_DEFAULT_STACK,
@@ -195,6 +301,7 @@ export function recommendStack(
       recordedTasks,
       excludedNoStack,
       minPerGroup: MIN_GROUP_N,
+      ...(detectedStack !== null && prior !== null && prior.stack !== detectedStack ? { priorSuggests: prior.stack } : {}),
     };
   }
 

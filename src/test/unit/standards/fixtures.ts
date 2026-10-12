@@ -54,7 +54,7 @@ export function promote(profile: StandardsProfile, ...rules: StandardsRuleId[]):
 /** A totals object with every count zero except the ones given. */
 export function totalsOf(over: Partial<StandardsTotals>): StandardsTotals {
   return {
-    passed: 0, noFindings: 0, failed: 0, advisory: 0, notChecked: 0, blockingNotChecked: 0,
+    passed: 0, noFindings: 0, failed: 0, advisory: 0, notChecked: 0, notConfigured: 0, blockingNotChecked: 0,
     findings: 0, advisoryFindings: 0, notCheckedFiles: 0, ...over,
   };
 }

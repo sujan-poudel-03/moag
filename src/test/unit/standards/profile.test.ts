@@ -18,6 +18,7 @@ import {
   ruleSeverity,
   renderPlannerStandards,
   renderStandardsText,
+  renderStandardsTextDetailed,
   validateProfile,
   validateProvenance,
 } from '../../../standards/profile';
@@ -26,6 +27,7 @@ import { STACK_IDS } from '../../../server/stacks';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
 import { sampleProfile } from './fixtures';
 import { templateDesign } from '../../../standards/design';
+import { RULEBOOK_KEYS } from '../../../standards/rulebook';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -682,7 +684,15 @@ describe('standards profile — design system', () => {
       'static-web': '8cf1c7272bec606ccbbb47d8d78d56ad01a4a0405076a5f20de5dd30050e8a76',
       'other': '283607246295933a1eaece32a470b77d5b52f71b8f9b44cbf438cfa0ee910817',
     };
-    for (const stack of STACK_IDS) { assert.equal(profileHash(BUILT_IN_PROFILES[stack]), pinnedBuiltIn[stack], stack); }
+    // The built-ins now carry the Project Rulebook defaults (an intended change: a new project's
+    // proposal has them). Everything else in them is untouched: without those sections each
+    // still hashes to its pin. The pre-rulebook built-ins themselves are pinned whole in
+    // legacy-profiles.test.ts.
+    for (const stack of STACK_IDS) {
+      const withoutRulebook = { ...BUILT_IN_PROFILES[stack] } as Record<string, unknown>;
+      for (const key of RULEBOOK_KEYS) { delete withoutRulebook[key]; }
+      assert.equal(profileHash(withoutRulebook as unknown as StandardsProfile), pinnedBuiltIn[stack], stack);
+    }
   });
 
   it('accepts a template design, keeps it verbatim, and the hash covers it', () => {
@@ -755,5 +765,119 @@ describe('standards profile — design system', () => {
     assert.deepEqual(withD.ok ? withD.provenance.design : null, { tag: 'detected', evidence: 'src/theme.css' });
     assert.equal(validateProvenance({ ...full, design: { tag: 'guessed', evidence: '' } }).ok, false);
     assert.equal(validateProvenance({ ...full, designer: { tag: 'assumed', evidence: '' } }).ok, false);
+  });
+});
+
+// ─── Project Rulebook sections ───
+
+describe('standards profile — Project Rulebook sections', () => {
+  const full = (): StandardsProfile => ({
+    ...sampleProfile(),
+    practice: { todoNeedsIssue: true, noDebugStatements: true, guidance: ['Never swallow an error; add context when rethrowing'] },
+    testPolicy: { requirementReference: true, guidance: ['Test the failure path of every requirement'] },
+    security: { guidance: ['Validate every input at the boundary'] },
+    accessibility: { imgAlt: true, htmlLang: true, guidance: ['Every control is reachable by keyboard'] },
+    apiData: { migrationsGlob: 'prisma/migrations/**', guidance: ['Config comes from the environment; .env is never committed'] },
+    docsGit: { changelogPath: 'CHANGELOG.md', guidance: ['Keep the README current'] },
+    performance: { guidance: ['Keep the main bundle under 200 KB'] },
+  });
+  const errorsOf = (v: ReturnType<typeof validateProfile>): string => (v.ok ? '' : v.errors.join('\n'));
+
+  it('a profile with every section round-trips through the validator without loss', () => {
+    const v = validateProfile(full());
+    assert.ok(v.ok, errorsOf(v));
+    assert.deepEqual(v.profile, full());
+  });
+
+  it('a section is all-or-nothing: missing keys, unknown keys and non-booleans are errors', () => {
+    const v = validateProfile({ ...sampleProfile(), practice: {} });
+    assert.equal(v.ok, false);
+    assert.match(errorsOf(v), /profile\.practice\.todoNeedsIssue: missing/);
+    assert.match(errorsOf(v), /profile\.practice\.noDebugStatements: missing/);
+    assert.match(errorsOf(v), /profile\.practice\.guidance: missing/);
+    assert.match(errorsOf(validateProfile({ ...sampleProfile(), security: { guidance: [], extra: 1 } })), /profile\.security: unknown key "extra"/);
+    assert.match(errorsOf(validateProfile({ ...sampleProfile(), accessibility: { imgAlt: 'yes', htmlLang: true, guidance: [] } })),
+      /profile\.accessibility\.imgAlt: expected true or false/);
+  });
+
+  it('13 guidance entries in one section are refused; a changelog path must stay inside the repository', () => {
+    const many = validateProfile({ ...sampleProfile(), performance: { guidance: Array.from({ length: 13 }, (_, i) => `Item ${i}`) } });
+    assert.match(errorsOf(many), /profile\.performance\.guidance: 13 entries; the limit is 12/);
+    for (const bad of ['/etc/CHANGELOG', '../CHANGELOG.md', 'C:\\x\\CHANGELOG.md']) {
+      assert.equal(validateProfile({ ...sampleProfile(), docsGit: { changelogPath: bad, guidance: [] } }).ok, false, bad);
+    }
+    assert.ok(validateProfile({ ...sampleProfile(), docsGit: { changelogPath: '', guidance: [] } }).ok, 'an empty changelog path means "not checked"');
+  });
+
+  it('testing/requirement-reference cannot be promoted yet; it can be advisory', () => {
+    const v = validateProfile({ ...full(), severity: { 'testing/requirement-reference': 'blocking' } });
+    assert.match(errorsOf(v), /testing\/requirement-reference can't be blocking yet: the check before the ship gate can't read requirement ids/);
+    assert.ok(validateProfile({ ...full(), severity: { 'testing/requirement-reference': 'advisory', 'data/migration-edited': 'blocking' } }).ok);
+  });
+
+  it('a credential in guidance is refused like anywhere else in a profile', () => {
+    const v = validateProfile({ ...sampleProfile(), security: { guidance: ['use sk-abcdefghijklmnopqrstuvwx'] } });
+    assert.match(errorsOf(v), /profile\.security\.guidance\[0\]: looks like an API key/);
+  });
+
+  it('checked items render in full under "(MOAG checks these)"; guidance under "(guidance — not checked)"', () => {
+    const text = renderStandardsText(full(), 4);
+    assert.match(text, /### Coding practice \(MOAG checks these\)\n- Every TODO or FIXME comment cites an issue/);
+    assert.match(text, /### Security \(MOAG checks these\)\n- Never add a \.env file/);
+    assert.match(text, /### API and data \(MOAG checks these\)\n- Never edit or delete a committed migration \(prisma\/migrations\/\*\*\)/);
+    assert.match(text, /### Coding practice \(guidance — not checked\)\n- Never swallow an error/);
+    assert.match(text, /### Performance \(guidance — not checked\)\n- Keep the main bundle under 200 KB/);
+    assert.equal(renderStandardsTextDetailed(full(), 4).guidanceCut.length, 0);
+  });
+
+  it('guidance is cut first, item by item, and the cut is named; checked items stay; never over the cap', () => {
+    const p = full();
+    p.freeText = Array.from({ length: 50 }, () => 'x'.repeat(48)).join('\n');
+    for (const key of ['practice', 'testPolicy', 'security', 'accessibility', 'apiData', 'docsGit', 'performance'] as const) {
+      (p[key] as { guidance: string[] }).guidance = Array.from({ length: 12 }, (_, i) => `${key} guidance line ${i} `.padEnd(120, '.'));
+    }
+    const v = validateProfile(p);
+    assert.ok(v.ok, errorsOf(v));
+    const out = renderStandardsTextDetailed(p, 4);
+    assert.ok(out.guidanceCut.length > 0);
+    assert.ok(out.text.length <= MAX_STANDARDS_PROMPT_CHARS, `${out.text.length}`);
+    assert.match(out.text, new RegExp(`- …${out.guidanceCut.length} guidance items? not shown \\(cut to fit\\)`));
+    assert.match(out.text, /### Coding practice \(MOAG checks these\)/);
+    assert.match(out.text, /### Project rules\n> x/, 'free text keeps its room before guidance');
+    for (const cut of out.guidanceCut) { assert.ok(!out.text.includes(cut), 'a cut item is not in the text'); }
+  });
+
+  it('checked lines alone over the cap are refused at validation', () => {
+    const p = full();
+    p.structure.allowedTopLevel = Array.from({ length: 50 }, (_, i) => `top-level-entry-${i}-`.padEnd(70, 'x'));
+    const v = validateProfile(p);
+    assert.equal(v.ok, false);
+    assert.match(errorsOf(v), /the structured rules render to \d+ characters; the limit for the text every prompt carries is 4000/);
+  });
+
+  it('the planner gets one summary line per section, not the guidance blocks', () => {
+    const planner = renderPlannerStandards(full(), 4);
+    assert.doesNotMatch(planner, /\(guidance — not checked\)/);
+    assert.match(planner, /### Rulebook guidance \(not checked\)\n- Coding practice: Never swallow an error/);
+    const lines = planner.split('\n').filter((l) => /^- (Coding practice|Testing|Security|Accessibility|API and data|Docs and git|Performance): /.test(l));
+    assert.equal(lines.length, 7);
+    assert.ok(lines.every((l) => l.length <= 160));
+    assert.ok(planner.length <= MAX_STANDARDS_PLANNER_CHARS);
+  });
+
+  it('provenance validates with and without the rulebook fields', () => {
+    const base = Object.fromEntries(PROVENANCE_FIELDS.map((f) => [f, { tag: 'assumed', evidence: '' }]));
+    assert.ok(validateProvenance(base).ok);
+    const v = validateProvenance({ ...base, practice: { tag: 'detected', evidence: 'x' }, docsGit: { tag: 'detected', evidence: 'CHANGELOG.md' } });
+    assert.ok(v.ok);
+    assert.deepEqual((v as { provenance: Record<string, unknown> }).provenance.docsGit, { tag: 'detected', evidence: 'CHANGELOG.md' });
+    assert.equal(validateProvenance({ ...base, practice: { tag: 'guessed', evidence: '' } }).ok, false);
+  });
+
+  it('a profile without any section has no rulebook text', () => {
+    const p = sampleProfile();
+    assert.equal(renderStandardsTextDetailed(p, 2).text, renderStandardsText(p, 2));
+    assert.deepEqual(renderStandardsTextDetailed(p, 2).guidanceCut, []);
+    assert.doesNotMatch(renderPlannerStandards(p, 2), /MOAG checks these|guidance — not checked|Rulebook guidance/);
   });
 });

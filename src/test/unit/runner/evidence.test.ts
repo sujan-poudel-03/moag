@@ -195,6 +195,37 @@ describe('evidence — standards input', () => {
     assert.deepEqual(input, { baseRef: null, files: [], existingDirs: [], topLevel: [], goModulePath: null });
   });
 
+  it('lists the deleted files and where each renamed file came from; requirement ids pass through', async function () {
+    this.timeout(15_000);
+    const dir = makeTempDir('moag-std-deleted-');
+    let input: StandardsCheckInput;
+    let head: string | null;
+    try {
+      seedRepo(dir, {
+        'db/migrate/001_init.sql': 'create table a (id int);\n',
+        'db/migrate/002_more.sql': 'create table b (id int);\nalter table b add c int;\n',
+        '.moag/state.json': '{}\n',
+      });
+      head = await captureHeadRef(dir);
+      fs.rmSync(path.join(dir, 'db', 'migrate', '001_init.sql'));
+      fs.rmSync(path.join(dir, '.moag', 'state.json'));
+      fs.mkdirSync(path.join(dir, 'db', 'old'));
+      execFileSync('git', ['mv', 'db/migrate/002_more.sql', 'db/old/002_more.sql'], { cwd: dir });
+      input = await collectStandardsInput(dir, head, { requirementIds: ['R-1', 'R-2'] });
+    } catch (err) {
+      if (isSpawnEperm(err)) { this.skip(); return; }
+      throw err;
+    }
+    assert.deepEqual(input.deletedFiles, ['db/migrate/001_init.sql'], '.moag is never listed');
+    const moved = fileOf(input, 'db/old/002_more.sql');
+    assert.equal(moved.status, 'renamed');
+    assert.equal(moved.renamedFrom, 'db/migrate/002_more.sql');
+    assert.deepEqual(input.requirementIds, ['R-1', 'R-2']);
+    // Outside a repository nothing is listed: a rule about deleted files is not checked.
+    const none = await collectStandardsInput(makeTempDir('moag-std-nogit2-'), null);
+    assert.equal(none.deletedFiles, undefined);
+  });
+
   it('designPaths: reads each design file, marks a missing one, skips an oversized one — even with no diff', async function () {
     this.timeout(15_000);
     const dir = makeTempDir('moag-std-design-');
@@ -657,9 +688,9 @@ describe('evidence — standards input', () => {
         assert.equal(row?.result, 'not-checked', rule);
         assert.match(row?.reason ?? '', /Git rendered no diff for this changed file/, rule);
       }
-      // "No nested repository" passes and the marker scan found no marker; neither says anything
-      // about what the files hold, and both files are listed as not checked.
-      assert.deepEqual(report.rules.filter((r) => r.result === 'passed').map((r) => r.rule), ['structure/nested-repository', 'exemption/newly-generated']);
+      // "No nested repository" passes, the marker scan found no marker and no path is a .env
+      // file; none says anything about what the files hold, and both files are listed as not checked.
+      assert.deepEqual(report.rules.filter((r) => r.result === 'passed').map((r) => r.rule), ['structure/nested-repository', 'exemption/newly-generated', 'security/env-file']);
       assert.deepEqual(report.notCheckedFiles, [{ file: 'new.js', reason }, { file: 'src/a.js', reason }]);
       assert.equal(report.totals.notCheckedFiles, 2);
       assert.equal(report.totals.blockingNotChecked, 0, 'no line rule blocks by default');

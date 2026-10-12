@@ -16,7 +16,7 @@
 import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { isDeepStrictEqual } from 'util';
 import { URL } from 'url';
 import { DEPENDENCY_EVENT_NAMES, ENGINE_IDS, EngineId, Plan, PlanFilePlaylist, SEMVER_BUMPS, StandardsCheckCounts, TaskStatus, TaskType } from '../models/types';
@@ -28,6 +28,9 @@ import { describeInstallRule } from '../runner/dependency-install';
 import { latestRequirements, requirementStatuses } from '../models/requirement-trace';
 import { formatVersionLabel, collectReservedRequirementIds, computeLatestDiff, recommendBump } from '../models/requirements';
 import { writeFileAtomicSync } from '../utils/file-io';
+import {
+  CHANGED_FILES_FILE, ChangedFilesBaseKind, ChangedFilesDoc, ChangedFilesNotCollected, collectChangedFiles, parseChangedFilesDoc,
+} from './changed-files';
 import { ServerConfig, isPathInside } from './config';
 import { AuditLog, AuditInput, AuditQuery, AUDIT_ACTIONS, AUDIT_MAX_PAGE } from './audit';
 import { UserStore, UserRecord, toPublicUser, LastAdminError, UsernameTakenError, InvalidUserInputError, UserNotFoundError } from './users';
@@ -42,7 +45,7 @@ import {
 } from './http-kit';
 import { obj, str, opt, nullable, num, bool, oneOf, engineId as engineIdV, bump as bumpV, stack as stackV, roles as rolesV, parseBody, ValidationError, Validator } from './validate';
 import {
-  ProjectStore, ProjectRecord, ProjectInputError, intakeProject, ExecFn, ProjectIntakeInput, resolveProjectPath,
+  ProjectStore, ProjectRecord, ProjectInputError, intakeProject, ExecFn, gitTopLevel, ProjectIntakeInput, resolveProjectPath, planNewRepo,
   buildRepoListing, detectRepoEngineConfig, gitHead,
 } from './projects';
 import { ProjectStateStore, PlanReview, RunRecord, RunStatus, ProjectState, StandardsReportPhase } from './project-state';
@@ -53,7 +56,7 @@ import { SecretStore, NoMasterKeyError, isKeyedEngine, API_KEY_RE } from './secr
 import { EngineStatusCache, buildEngineRows, PROBE_TIMEOUT_MS } from './engines';
 import { OutcomeStore } from './outcomes';
 import { StackId } from './stacks';
-import { recommendStack, detectStackFromRepo } from './stack-recommendation';
+import { recommendStack, detectStackFromRepo, isBuildingKind, BUILDING_KINDS } from './stack-recommendation';
 import { RunJob, PlanJob, ProbeJob, WorkerEvent, mergeRunViews } from './worker-protocol';
 import {
   savePrdVersion, overrideBump, mergeRunSnapshot, validatePendingPlaylist, pendingPlaylistEngineErrors, contentHash, SERVER_FORBIDDEN_ENGINES, appendShipGate,
@@ -67,10 +70,13 @@ import {
   enforcementReview, standardsChangeAudit, designReview,
 } from './standards-store';
 import {
-  MAX_STANDARDS_COMMANDS, MAX_STANDARDS_COMMAND_CHARS, MAX_STANDARDS_FREE_TEXT_CHARS, PROVENANCE_FIELDS, ProvenanceField,
+  MAX_STANDARDS_COMMANDS, MAX_STANDARDS_COMMAND_CHARS, MAX_STANDARDS_FREE_TEXT_CHARS, PROVENANCE_FIELDS, OPTIONAL_PROVENANCE_FIELDS, ProvenanceField,
   DEFAULT_RULE_SEVERITY, STANDARDS_RULE_IDS, StandardsProfile, StandardsProvenance, renderPlannerStandards, renderStandardsText,
-  isScannerRule, ruleSeverity, validateProfile,
+  isScannerRule, ruleSeverity, validateProfile, renderStandardsTextDetailed, profileHash,
+  MAX_STANDARDS_PROMPT_CHARS, MAX_STANDARDS_PLANNER_CHARS,
 } from '../standards/profile';
+import { MAX_RULEBOOK_GUIDANCE_ENTRIES, RULEBOOK_KEYS, RulebookSections, hasRulebook, rulebookAdditions } from '../standards/rulebook';
+import { rulebookView } from '../standards/rulebook-view';
 import { DesignFileConflictError, writeDesignFiles } from '../standards/local-store';
 import type { StandardsJobFile } from '../standards/local-store';
 import {
@@ -122,6 +128,7 @@ export const ROUTES: readonly RouteSpec[] = Object.freeze([
   { method: 'POST', path: '/api/projects', action: 'project.create', mutating: true, auth: 'session' },
   // Before `/api/projects/:id`: the router takes the first match.
   { method: 'GET', path: '/api/projects/recommendation', action: null, mutating: false, auth: 'session' },
+  { method: 'GET', path: '/api/projects/folder-check', action: 'project.create', mutating: false, auth: 'session' },
   { method: 'GET', path: '/api/projects/:id', action: null, mutating: false, auth: 'session' },
   { method: 'PATCH', path: '/api/projects/:id', action: 'project.update', mutating: true, auth: 'session' },
   { method: 'GET', path: '/api/projects/:id/prd', action: null, mutating: false, auth: 'session' },
@@ -249,6 +256,18 @@ const SESSION_ACTIONS: readonly ServerAction[] = ['project.create', 'users.manag
 /** Job-manager slot used by the engine probe (not a project id: route params cannot contain `_`). */
 export const PROBE_JOB_ID = '__engine-probe';
 
+/**
+ * What the new-project form's folder check answers: one status per refusal POST /api/projects can make.
+ * With `mode=new` (a new empty project) the folder must not be a repository yet: `will-create` (it
+ * does not exist, the server creates it), `empty-folder` (it exists and is empty, it is used), or
+ * `not-empty`; the path refusals are the same.
+ */
+export const FOLDER_CHECK_STATUSES = [
+  'ok', 'path-not-found', 'not-a-git-repo', 'not-repo-root', 'workspace-registered', 'workspace-nested', 'invalid-path', 'root-missing',
+  'will-create', 'empty-folder', 'not-empty',
+] as const;
+export type FolderCheckStatus = typeof FOLDER_CHECK_STATUSES[number];
+
 /** Closed server enumerations the front-end builds its selects from (never a hard-coded copy). */
 const SESSION_META = Object.freeze({
   engines: SERVER_ENGINES,
@@ -296,7 +315,7 @@ const S = {
 /** The profile sections a version is compared by for its "changed from vN" markers. */
 const STANDARDS_SECTIONS: readonly (keyof StandardsProfile)[] = [
   'stackTemplateId', 'repoState', 'structure', 'frontend', 'backend', 'naming', 'comments', 'testing',
-  'commands', 'builtInRuleIds', 'freeText', 'severity', 'design',
+  'commands', 'builtInRuleIds', 'freeText', 'severity', 'design', ...RULEBOOK_KEYS,
 ];
 
 /** How long a computed design-system suggestion is reused for one project. */
@@ -328,8 +347,12 @@ const createProjectV: Validator<ProjectIntakeInput> = (v, field) => {
   } else if (src && typeof src === 'object' && (src as { kind?: unknown }).kind === 'clone') {
     const c = obj({ kind: oneOf(['clone'] as const), url: str(1, 2048), dirName: str(1, 64) })(src, 'source');
     source = { kind: 'clone', url: c.url, dirName: c.dirName };
+  } else if (src && typeof src === 'object' && (src as { kind?: unknown }).kind === 'new') {
+    // A brand-new project: the server creates the folder and an empty repository in it.
+    const s = obj({ kind: oneOf(['new'] as const), path: str(1, 1024) })(src, 'source');
+    source = { kind: 'new', path: s.path };
   } else {
-    throw new ValidationError('source.kind', 'expected "path" or "clone"');
+    throw new ValidationError('source.kind', 'expected "path", "clone" or "new"');
   }
   return {
     name: base.name, source, stack: base.stack, defaultEngine: base.defaultEngine,
@@ -613,6 +636,8 @@ export function createApp(deps: AppDeps): App {
     return {
       ...r,
       view,
+      // Read only for a run at its gate, so a project listing stays cheap.
+      ...(r.status === 'awaiting-approval' ? { changedFiles: changedFilesView(project.id, r) } : {}),
       startedByName: usernameOf(r.startedBy),
       stoppedByName: usernameOf(r.stoppedBy),
       gateDecisions: (r.gateDecisions ?? []).map((d) => ({ ...d, byName: usernameOf(d.by) })),
@@ -755,6 +780,31 @@ export function createApp(deps: AppDeps): App {
     return value;
   };
 
+  /** The prompt and planner text a job file carries for a version, and the guidance cut to fit. */
+  const renderedFor = (profile: StandardsProfile, version: number): { promptText: string; plannerText: string; guidanceCut: string[] } => {
+    const rendered = renderStandardsTextDetailed(profile, version);
+    return { promptText: rendered.text, plannerText: renderPlannerStandards(profile, version), guidanceCut: rendered.guidanceCut };
+  };
+
+  /**
+   * The rulebook sections to suggest for a project whose standards in effect have none: its
+   * stack's defaults (plus accessibility with a user interface). Deterministic and read from
+   * nothing but the profile; cached per project for a minute like the design suggestion,
+   * because the screen polls.
+   */
+  const rulebookSuggestionCache = new Map<string, { at: number; key: string; value: { sections: RulebookSections; evidence: string } }>();
+  const rulebookSuggestionFor = (p: ProjectRecord, profile: StandardsProfile): { sections: RulebookSections; evidence: string } | null => {
+    const at = Date.now();
+    const key = `${p.stack}\u0000${profileHash(profile)}`;
+    const cached = rulebookSuggestionCache.get(p.id);
+    if (cached && cached.key === key && at - cached.at < DESIGN_SUGGESTION_TTL_MS) { return cached.value; }
+    const sections = rulebookAdditions(p.stack, profile);
+    if (Object.keys(sections).length === 0) { return null; }
+    const value = { sections, evidence: `${p.stack} defaults` };
+    rulebookSuggestionCache.set(p.id, { at, key, value });
+    return value;
+  };
+
   const standardsDto = (p: ProjectRecord, u: UserRecord) => {
     const view = standardsView(p.id);
     const actor = actorOf(u);
@@ -795,6 +845,11 @@ export function createApp(deps: AppDeps): App {
           // carry this version's content hash as `acknowledgedEnforcementHash`.
           designChanged: design,
           inEffect: v.version === view.effective?.version,
+          // The Project Rulebook as the reviewer reads it: what MOAG checks, what is guidance only.
+          rulebook: rulebookView(v.profile, v.version),
+          // Exactly the text a job file carries for this version (approving it approves these),
+          // and the guidance items cut to fit it.
+          ...renderedFor(v.profile, v.version),
           // Verbatim, exactly as a worker would run them: approving the version approves these.
           commands: v.profile.commands.map((c) => ({ label: c.label, run: c.run })),
           // Which rules stop a release under this version, and which only report.
@@ -826,7 +881,13 @@ export function createApp(deps: AppDeps): App {
         freeTextChars: MAX_STANDARDS_FREE_TEXT_CHARS, commands: MAX_STANDARDS_COMMANDS,
         commandChars: MAX_STANDARDS_COMMAND_CHARS, versions: MAX_STANDARDS_VERSIONS,
         designDocChars: MAX_DESIGN_DOC_CHARS, designTokensChars: MAX_DESIGN_TOKENS_CHARS,
+        guidanceEntries: MAX_RULEBOOK_GUIDANCE_ENTRIES,
+        promptChars: MAX_STANDARDS_PROMPT_CHARS, plannerChars: MAX_STANDARDS_PLANNER_CHARS,
       },
+      // Only for someone who may propose, while the standards in effect predate the Project
+      // Rulebook: the stack's default sections, which a proposal would add.
+      rulebookSuggestion: canPropose && view.effective && !hasRulebook(view.effective.profile)
+        ? rulebookSuggestionFor(p, view.effective.profile) : null,
       // The template design system for this project's stack (null when the stack has none):
       // what the editor fills in when a proposer ticks "This project has a user interface".
       designTemplate: templateDesign(p.stack, kit),
@@ -889,8 +950,14 @@ export function createApp(deps: AppDeps): App {
    * - one at a path an earlier run's approved design wrote at its start — a run's (or a
    *   person's) edit of MOAG's own file, reverted with a backup and an audit entry.
    * Anything else is a file MOAG never adopted — a user's — and is never replaced.
+   *
+   * A run in `excluded` (see {@link frozenAtApprovalRunIds}) never counts as an earlier run
+   * that wrote a path: its standards were frozen when its ship was approved, long after it
+   * started, so nothing was written at its start.
    */
-  const designFileMayBeReplaced = (versions: readonly StandardsVersionRecord[], runs: readonly RunRecord[], rel: string, current: string): boolean => {
+  const designFileMayBeReplaced = (
+    versions: readonly StandardsVersionRecord[], runs: readonly RunRecord[], rel: string, current: string, excluded: ReadonlySet<string>,
+  ): boolean => {
     const norm = (t: string): string => t.replace(/\r\n?/g, '\n');
     const filesOf = (v: StandardsVersionRecord): Array<[string, string]> => {
       const d = v.profile.design;
@@ -898,8 +965,42 @@ export function createApp(deps: AppDeps): App {
     };
     const approved = versions.filter((v) => v.status === 'approved');
     if (approved.some((v) => filesOf(v).some(([p, c]) => p === rel && norm(c) === norm(current)))) { return true; }
-    const ranWith = new Set(runs.map((r) => r.standardsVersion).filter((n): n is number => typeof n === 'number'));
+    const ranWith = new Set(runs.filter((r) => !excluded.has(r.id))
+      .map((r) => r.standardsVersion).filter((n): n is number => typeof n === 'number'));
     return approved.some((v) => ranWith.has(v.version) && filesOf(v).some(([p]) => p === rel));
+  };
+
+  /**
+   * The runs whose standards were frozen at their ship approval, not at their start. The
+   * record says so when it carries `standardsFrozenAt`. An older record with a standards
+   * version and an approve decision is ambiguous: the gate.approve audit entry flagged
+   * `standardsFrozenAtApproval` decides. When the audit cannot be read, every ambiguous run
+   * is counted in — more files are refused (409), none is overwritten.
+   */
+  const frozenAtApprovalRunIds = (projectId: string, runs: readonly RunRecord[]): Set<string> => {
+    const out = new Set<string>();
+    const ambiguous = new Set<string>();
+    for (const r of runs) {
+      if (r.standardsFrozenAt === 'gate-approval') { out.add(r.id); continue; }
+      if (r.standardsFrozenAt === 'start') { continue; }
+      if (r.standardsVersion !== undefined && (r.gateDecisions ?? []).some((d) => d.action === 'approve')) { ambiguous.add(r.id); }
+    }
+    if (ambiguous.size === 0) { return out; }
+    try {
+      let before: number | undefined;
+      for (;;) {
+        const page = audit.query({ action: 'gate.approve', projectId, limit: AUDIT_MAX_PAGE, ...(before !== undefined ? { before } : {}) });
+        for (const e of page) {
+          const after = (e.after ?? {}) as { runId?: unknown; standardsFrozenAtApproval?: unknown };
+          if (typeof after.runId === 'string' && ambiguous.has(after.runId) && after.standardsFrozenAtApproval === true) { out.add(after.runId); }
+        }
+        if (page.length < AUDIT_MAX_PAGE) { break; }
+        before = Math.min(...page.map((e) => e.seq));
+      }
+    } catch {
+      for (const id of ambiguous) { out.add(id); }
+    }
+    return out;
   };
 
   /**
@@ -960,10 +1061,13 @@ export function createApp(deps: AppDeps): App {
       const untouched = !!auto && auto.provenance?.[field] !== undefined && isDeepStrictEqual(at(profile, field), at(auto.profile, field));
       provenance[field] = untouched ? { ...auto!.provenance[field] } : { ...entered };
     }
-    // The design system's provenance follows the same rule, and exists only with a design.
-    if (profile.design) {
-      const untouched = !!auto && auto.provenance?.design !== undefined && isDeepStrictEqual(profile.design, auto.profile.design);
-      provenance.design = untouched ? { ...auto!.provenance.design! } : { ...entered };
+    // The design system's and each rulebook section's provenance follow the same rule, and
+    // exist only with the matching part of the profile.
+    for (const field of OPTIONAL_PROVENANCE_FIELDS) {
+      if (profile[field] === undefined) { continue; }
+      const kept = auto?.provenance?.[field];
+      const untouched = !!auto && kept !== undefined && isDeepStrictEqual(profile[field], auto.profile[field]);
+      provenance[field] = untouched && kept ? { ...kept } : { ...entered };
     }
     return provenance;
   };
@@ -1244,6 +1348,51 @@ export function createApp(deps: AppDeps): App {
     }
   };
 
+  /**
+   * Collect the files a run halted at its ship gate changed since its diff base and write the
+   * list to the run directory. Resolves the list's sha256 for the run record, or why there is
+   * none. Never throws: a failure is logged and recorded, and never fails the run end.
+   */
+  const collectChangedFilesFor = async (project: ProjectRecord, runId: string): Promise<{ sha256: string } | { error: string }> => {
+    try {
+      const st = state.load(project.id);
+      const rec = st.runs.find((x) => x.id === runId);
+      if (!rec || rec.baseRef === undefined) { return { error: 'this run recorded no diff base' }; }
+      const doc = await collectChangedFiles(project.workspacePath, rec.baseRef, deps.exec);
+      if (!doc.collected) {
+        log(`run ${runId}: changed files not collected: ${doc.reason}`);
+        return { error: doc.reason };
+      }
+      // What the base is, for the heading the approver reads (see standardsBaseRef): the last
+      // ship, or — nothing shipped yet — the first run's start. Said only when it is so.
+      const baseKind: ChangedFilesBaseKind | null = rec.baseRef === null ? null
+        : st.lastShipped?.ref ? (st.lastShipped.ref === rec.baseRef ? 'last-shipped' : null)
+          : 'before-first-ship';
+      const json = JSON.stringify(baseKind ? { ...doc, baseKind } : doc);
+      writeFileAtomicSync(path.join(state.runDir(project.id, runId), CHANGED_FILES_FILE), json, 0o600);
+      return { sha256: createHash('sha256').update(json, 'utf8').digest('hex') };
+    } catch (err) {
+      log(`run ${runId}: changed files not collected: ${(err as Error).message}`);
+      return { error: 'the list could not be written' };
+    }
+  };
+
+  /** The changed-files list of a run halted at its gate, as the approver is shown it. */
+  const changedFilesView = (projectId: string, r: RunRecord): ChangedFilesDoc | ChangedFilesNotCollected => {
+    if (r.changedFilesSha256 === undefined) {
+      return { collected: false, reason: r.changedFilesError ?? (r.baseRef === undefined ? 'this run recorded no diff base' : 'the list was not collected') };
+    }
+    try {
+      const json = fs.readFileSync(path.join(state.runDir(projectId, r.id), CHANGED_FILES_FILE), 'utf-8');
+      if (createHash('sha256').update(json, 'utf8').digest('hex') !== r.changedFilesSha256) {
+        return { collected: false, reason: 'the stored list was changed after it was collected' };
+      }
+      return parseChangedFilesDoc(JSON.parse(json)) ?? { collected: false, reason: 'the stored list could not be read' };
+    } catch {
+      return { collected: false, reason: 'the stored list could not be read' };
+    }
+  };
+
   const onRunEnd = (projectId: string, runId: string, snapshotPath: string, seg: { jobId: () => string | null; stack: StackId; engine: EngineId; since: string }) => (end: JobEnd): void => {
     const jobId = seg.jobId();
     if (jobId) { runJobContexts.delete(jobId); }
@@ -1310,10 +1459,21 @@ export function createApp(deps: AppDeps): App {
       // every later check diff against the empty tree until the next ship. The previous base
       // stays, so the next diff covers this ship's work again — more is checked, never less.
       if (shippedAt && !shippedRef) { log(`run ${runId}: shipped, but HEAD could not be read; the standards base was not moved`); }
+      // The approver reads what the run changed before approving: collected here, under the
+      // project lock (no approval can interleave), by the server from the workspace. The
+      // file's hash lives on the record, so a list rewritten in the run directory is refused.
+      const changed = end.status === 'awaiting-approval' && project
+        ? await collectChangedFilesFor(project, runId)
+        : null;
       state.update(projectId, (s) => {
         if (shippedAt && shippedRef) { s.lastShipped = { ref: shippedRef, runId, at: shippedAt }; }
         const r = s.runs.find((x) => x.id === runId);
         if (!r) { return; }
+        if (changed) {
+          delete r.changedFilesSha256;
+          delete r.changedFilesError;
+          if ('sha256' in changed) { r.changedFilesSha256 = changed.sha256; } else { r.changedFilesError = changed.error; }
+        }
         r.status = end.status as RunStatus;
         r.exitCode = end.exitCode;
         if (standardsProblem) {
@@ -1474,12 +1634,20 @@ export function createApp(deps: AppDeps): App {
     sendJson(ctx.res, 201, { user: toPublicUser(u) });
   };
 
+  /** The projects root as the server resolves it: its real path, else the configured value. */
+  const rootShown = (): string => {
+    try { return fs.realpathSync.native(config.projectsRoot); } catch { return config.projectsRoot; }
+  };
+
   H['GET /api/session'] = async (ctx) => {
     if (ctx.user && ctx.session) {
       sendJson(ctx.res, 200, {
         user: toPublicUser(ctx.user), csrfToken: ctx.session.csrfToken, mustChangePassword: ctx.user.mustChangePassword,
         allowedActions: allowedActions(actorOf(ctx.user), SESSION_ACTIONS),
-        meta: SESSION_META,
+        // Only someone who may create a project is told where projects live on the server.
+        meta: allowedActions(actorOf(ctx.user), ['project.create']).includes('project.create')
+          ? { ...SESSION_META, projectsRoot: rootShown() }
+          : SESSION_META,
       });
       return;
     }
@@ -1777,11 +1945,24 @@ export function createApp(deps: AppDeps): App {
     let repoDir: string | null = null;
     const projectId = q.get('projectId');
     const relPath = q.get('path');
+    const buildingRaw = q.get('building');
+    if (buildingRaw !== null && buildingRaw !== '' && !isBuildingKind(buildingRaw)) {
+      throw new ValidationError('building', `must be one of ${BUILDING_KINDS.join(', ')}`);
+    }
+    const building = buildingRaw !== null && isBuildingKind(buildingRaw) ? buildingRaw : undefined;
+    // A folder the form has not got right yet is not an error here: the suggestion is still
+    // given, and says the repository was not checked.
+    let detectionSkipped = false;
     if (projectId !== null) {
       if (!PARAM_RE.test(projectId)) { throw new ValidationError('projectId', 'has an invalid format'); }
       repoDir = requireWorkspace(getProject(projectId));
     } else if (relPath !== null && relPath.trim() !== '') {
-      repoDir = resolveProjectPath(config.projectsRoot, relPath);
+      try {
+        repoDir = resolveProjectPath(config.projectsRoot, relPath);
+      } catch (err) {
+        if (!(err instanceof ProjectInputError)) { throw err; }
+        detectionSkipped = true;
+      }
     }
     const connected = SERVER_ENGINES.filter((e) => engineAvailable(e) === true);
     const evidence = outcomes.readAll();
@@ -1789,10 +1970,69 @@ export function createApp(deps: AppDeps): App {
     // "recommend" when they agree with it, compare stacks, and complete well.
     const detected = repoDir ? detectStackFromRepo(repoDir) : null;
     sendJson(ctx.res, 200, {
-      recommendation: recommendStack(evidence.records, connected, detected),
+      recommendation: recommendStack(evidence.records, connected, detected, 0, building ? { building } : {}),
       connectedEngines: connected,
       enginesCheckedAt: engineCache.snapshot().checkedAt,
+      detectionSkipped,
     });
+  };
+
+  /**
+   * Read-only check of a "folder on the server" while the new-project form is filled in: the
+   * same resolution and the same refusals as POST /api/projects, as one status the form can
+   * explain, with the full path the folder resolves to. Always 200. Never names a path
+   * outside the projects root. Creating the project validates again.
+   */
+  H['GET /api/projects/folder-check'] = async (ctx) => {
+    const rel = ctx.url.searchParams.get('path') ?? '';
+    const send = (status: FolderCheckStatus, fullPath: string | null, extra: { topLevelRel?: string | null; reason?: string } = {}): void => {
+      sendJson(ctx.res, 200, { status, fullPath, ...extra });
+    };
+    let rootReal: string | null = null;
+    try { rootReal = fs.realpathSync.native(config.projectsRoot); } catch { /* root-missing, below */ }
+    const segments = rel.split(/[\\/]+/).filter((seg) => seg !== '' && seg !== '.');
+    if (ctx.url.searchParams.get('mode') === 'new') {
+      // A new empty project: the checks createEmptyRepo makes, with nothing created.
+      try {
+        const plan = planNewRepo(config.projectsRoot, rel, projects);
+        send(plan.firstNew === null ? 'empty-folder' : 'will-create', plan.predicted);
+      } catch (err) {
+        if (!(err instanceof ProjectInputError)) { throw err; }
+        const inside = rootReal !== null ? path.resolve(rootReal, ...segments) : null;
+        switch (err.code) {
+          case 'dest-not-empty': case 'not-a-directory': send('not-empty', inside); return;
+          case 'root-missing': send('root-missing', null); return;
+          case 'workspace-registered': send('workspace-registered', inside); return;
+          case 'workspace-nested': send('workspace-nested', inside); return;
+          default: send('invalid-path', null, { reason: err.message }); return;
+        }
+      }
+      return;
+    }
+    let dir: string;
+    try {
+      dir = resolveProjectPath(config.projectsRoot, rel, (p) => projects.isWorkspaceRegistered(p));
+    } catch (err) {
+      if (!(err instanceof ProjectInputError)) { throw err; }
+      const inside = rootReal !== null ? path.resolve(rootReal, ...segments) : null;
+      switch (err.code) {
+        case 'path-not-found': send('path-not-found', inside); return;
+        case 'root-missing': send('root-missing', null); return;
+        case 'workspace-registered': send('workspace-registered', inside); return;
+        default: send('invalid-path', null, { reason: err.message }); return;
+      }
+    }
+    if (projects.nestedWorkspaceOwner(dir)) { send('workspace-nested', dir); return; }
+    const top = await gitTopLevel(dir, deps.exec);
+    if (top === null) { send('not-a-git-repo', dir); return; }
+    const same = (a: string, b: string): boolean => (process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b);
+    if (!same(top, dir)) {
+      const fromRoot = rootReal !== null ? path.relative(rootReal, top) : '';
+      const inRoot = fromRoot !== '' && !fromRoot.startsWith('..') && !path.isAbsolute(fromRoot);
+      send('not-repo-root', dir, { topLevelRel: inRoot ? fromRoot.split(path.sep).join('/') : null });
+      return;
+    }
+    send('ok', dir);
   };
 
   H['GET /api/projects/:id'] = async (ctx) => {
@@ -2254,10 +2494,11 @@ export function createApp(deps: AppDeps): App {
       let designReplaced: string[] = [];
       if (frozen.profile.design) {
         const versions = standardsView(p.id).versions;
+        const excluded = frozenAtApprovalRunIds(p.id, st.runs);
         try {
           designReplaced = writeDesignFiles(workspace, frozen.profile.design, {
             backupDir: path.join(state.runDir(p.id, runId), DESIGN_BACKUP_DIR),
-            mayReplace: (rel, current) => designFileMayBeReplaced(versions, st.runs, rel, current),
+            mayReplace: (rel, current) => designFileMayBeReplaced(versions, st.runs, rel, current, excluded),
           }).replaced;
         } catch (err) {
           if (err instanceof DesignFileConflictError) {
@@ -2273,7 +2514,10 @@ export function createApp(deps: AppDeps): App {
       const run: RunRecord = {
         id: runId, planId: review.id, status: 'running', startedBy: ctx.user!.id, startedAt: now().toISOString(),
         versionCreatedAt: review.forVersionCreatedAt, stack: p.stack, segments: 1,
-        standardsVersion: frozen.version, standardsHash: frozen.contentHash, baseRef,
+        standardsVersion: frozen.version, standardsHash: frozen.contentHash, baseRef, standardsFrozenAt: 'start',
+        ...(designReplaced.length > 0
+          ? { designFilesReplaced: designReplaced, designBackupDir: `runs/${runId}/${DESIGN_BACKUP_DIR}` }
+          : {}),
       };
       const dir = state.runDir(p.id, run.id);
       writeFileAtomicSync(path.join(dir, 'plan.json'), JSON.stringify(dehydratePlan(canonical), null, 2), 0o600);
@@ -2404,6 +2648,7 @@ export function createApp(deps: AppDeps): App {
         run.standardsVersion = effectiveStandards.version;
         run.standardsHash = effectiveStandards.contentHash;
         run.baseRef = legacyRunBaseRef(st, run.startedAt);
+        run.standardsFrozenAt = 'gate-approval';
       }
       writeFileAtomicSync(snapshotPath, JSON.stringify(dehydratePlan(snapshot), null, 2), 0o600);
       spawnRunSegment(p, run, review, remaining, workspace);

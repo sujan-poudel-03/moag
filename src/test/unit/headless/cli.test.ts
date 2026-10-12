@@ -2035,8 +2035,11 @@ describe('headless CLI: moag standards', () => {
     assert.equal(await run(checkCli(clean, quiet), ['check', '--no-commands', '--cwd', workspace()]), 6);
     assert.deepEqual(quiet.gates, []);
     assert.match(out, /Rules not checked \(not a pass\):\n(.*\n)*?!! BLOCKING RULE NOT CHECKED {2}command: npm run lint — Commands were not run/);
-    // Two: the command, and the unconfigured design-system row (this profile has no design).
-    assert.match(out, /^0 passed · .* · 2 rules not checked \(1 blocking\) · /m);
+    // One: the command. Rules this profile does not configure (the design system, the rulebook
+    // sections) are "not configured", never "not checked".
+    assert.match(out, /^0 passed · .* · 1 rule not checked \(1 blocking\) · /m);
+    assert.match(out, /^Not configured in this profile:$/m);
+    assert.match(out, /^[1-9]\d* rules? not configured in this profile \(not a gap in this check\)$/m);
     assert.match(err, /^1 blocking rule or command was not checked — that is not a pass\.$/m);
   });
 

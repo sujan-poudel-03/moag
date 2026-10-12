@@ -2,7 +2,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import {
-  latestRequirements, taggedTasks, recordGateResults, recordCommit, stampRelease, requirementStatuses, standardsGateCommand,
+  latestRequirements, taggedTasks, verifiedRequirementIds, recordGateResults, recordCommit, stampRelease, requirementStatuses, standardsGateCommand,
   isStandardsGateCommand, standardsGateWord, standardsOpenText, STANDARDS_GATE_COMMAND,
   MAX_TRACE_COMMITS, MAX_TRACE_RELEASES, MAX_TRACE_GATES,
 } from '../../../models/requirement-trace';
@@ -52,6 +52,20 @@ describe('requirement-trace — queries', () => {
       task('rel', ['R-1'], TaskStatus.Completed, 'release'),
     ]);
     assert.deepEqual(taggedTasks(plan, 'R-1').map(t => t.id), ['t-1']);
+  });
+
+  it('verifiedRequirementIds leaves out a requirement whose tasks all went out in its last release', () => {
+    const plan = planWith([
+      task('t-1', ['R-1'], TaskStatus.Completed),
+      task('t-2', ['R-2'], TaskStatus.Completed),
+    ]);
+    assert.deepEqual(verifiedRequirementIds(plan), ['R-1', 'R-2'], 'nothing released: every tagged id');
+    recordGateResults(plan, pass, AT);
+    stampRelease(plan, 'v1.0.0', AT);
+    assert.deepEqual(verifiedRequirementIds(plan), [], 'all shipped in v1: no id is this check\'s subject');
+    // v2: a new task for R-3, and a new task that reworks shipped R-1.
+    plan.playlists[0].tasks.push(task('t-3', ['R-3'], TaskStatus.Pending), task('t-4', ['R-1'], TaskStatus.Pending));
+    assert.deepEqual(verifiedRequirementIds(plan), ['R-1', 'R-3'], 'R-2 shipped untouched; R-1 is back in with t-4');
   });
 });
 

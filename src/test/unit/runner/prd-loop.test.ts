@@ -63,6 +63,8 @@ interface LoopHarness {
   gateEnvs: () => Array<Record<string, string> | undefined>;
   /** Arguments of every collectStandardsInput call, in order. */
   standardsCalls: () => Array<{ cwd: string; baseRef: string | null; probeDirs: string[] }>;
+  /** The requirement ids each collectStandardsInput call was given, in order. */
+  standardsRequirementIds: () => Array<string[] | undefined>;
 }
 
 /** "This repository has no browser test tooling at all." */
@@ -87,15 +89,17 @@ function loadLoop(opts: EvidenceStubOptions = {}): LoopHarness {
   const gateCalls: string[] = [];
   const gateEnvs: Array<Record<string, string> | undefined> = [];
   const standardsCalls: Array<{ cwd: string; baseRef: string | null; probeDirs: string[] }> = [];
+  const standardsRequirementIds: Array<string[] | undefined> = [];
   const sequence = opts.changedFilesSequence ?? [['src/a.ts']];
 
   const evidenceStub = {
     captureBaseRef: async () => (opts.baseRef === undefined ? 'base-ref' : opts.baseRef),
     captureHeadRef: async () => 'head-ref',
-    collectStandardsInput: async (cwd: string, baseRef: string | null, o: { probeDirs?: string[] }) => {
+    collectStandardsInput: async (cwd: string, baseRef: string | null, o: { probeDirs?: string[]; requirementIds?: string[] }) => {
       const inputs = opts.standardsInputs ?? [];
       const input = inputs[Math.min(standardsCalls.length, inputs.length - 1)];
       standardsCalls.push({ cwd, baseRef, probeDirs: o?.probeDirs ?? [] });
+      standardsRequirementIds.push(o?.requirementIds);
       return input ?? { baseRef: null, files: [], existingDirs: [], topLevel: [], goModulePath: null };
     },
     collectDiffEvidence: async () => {
@@ -149,6 +153,7 @@ function loadLoop(opts: EvidenceStubOptions = {}): LoopHarness {
     gateCalls: () => gateCalls,
     gateEnvs: () => gateEnvs,
     standardsCalls: () => standardsCalls,
+    standardsRequirementIds: () => standardsRequirementIds,
   };
 }
 
@@ -1282,7 +1287,10 @@ describe('createPrdLoop — standards gate', () => {
     assert.deepEqual(loop.standardsCalls(), []);
     assert.ok(report.standards);
     assert.ok(report.standards.rules.length > 1);
-    assert.ok(report.standards.rules.every((r) => r.result === 'not-checked' && r.reason === 'The status gate failed first'));
+    // Every rule the profile configures carries the reason; one it does not stays "not configured".
+    assert.ok(report.standards.rules.every((r) => r.result === 'not-checked'
+      && (r.unconfigured === true ? r.reason === 'Not configured in this profile' : r.reason === 'The status gate failed first')));
+    assert.ok(report.standards.rules.some((r) => r.reason === 'The status gate failed first'));
     assert.deepEqual(report.gates, []);
   });
 
@@ -1294,7 +1302,7 @@ describe('createPrdLoop — standards gate', () => {
 
     assert.equal(report.failedGate, 'change');
     assert.deepEqual(loop.standardsCalls(), []);
-    assert.ok(report.standards!.rules.every((r) => r.reason === 'The change gate failed first'));
+    assert.ok(report.standards!.rules.every((r) => r.reason === (r.unconfigured === true ? 'Not configured in this profile' : 'The change gate failed first')));
   });
 
   it('S9. a failed repo gate leaves the profile commands not-checked and stays a command failure', async () => {
@@ -1646,9 +1654,10 @@ describe('createPrdLoop — standards gate', () => {
     assert.equal(report.passed, true);
     // Written where the static check ran, ahead of the commands — but only after they all ran.
     assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0], ['npm run lint', 0]]);
-    const counts = { advisoryFindings: 1, notCheckedRules: 2, notCheckedFiles: 1 };
+    // The default profile's TODO rule (Project Rulebook) cannot read the .rs file either: three rules left open.
+    const counts = { advisoryFindings: 1, notCheckedRules: 3, notCheckedFiles: 1 };
     assert.deepEqual(report.gates[0].standardsCounts, counts, 'a command ran: no "no blocking rules" marker');
-    assert.match(report.gates[0].output, /^Project standards: nothing blocking \(1 advisory finding, 2 rules not checked, 1 file not checked\)\./);
+    assert.match(report.gates[0].output, /^Project standards: nothing blocking \(1 advisory finding, 3 rules not checked, 1 file not checked\)\./);
     assert.match(report.gates[0].output, /Files not checked \(1\) — nothing in them counts towards "no findings":\n- src\/engine\.rs — not checked \(No checker for \.rs files\)/);
     assert.ok(report.gates.slice(1).every((g) => g.standardsCounts === undefined), 'only the standards row carries them');
     // The row describes the finished check: the command it waited for is in the report it was written from.
@@ -1674,7 +1683,7 @@ describe('createPrdLoop — standards gate', () => {
 
     assert.equal(report.passed, true);
     assert.deepEqual(report.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0], ['npm run lint', 0]]);
-    assert.deepEqual(report.gates[0].standardsCounts, { advisoryFindings: 0, notCheckedRules: 3, notCheckedFiles: 1 },
+    assert.deepEqual(report.gates[0].standardsCounts, { advisoryFindings: 0, notCheckedRules: 4, notCheckedFiles: 1 },
       'and it says, beside the result, how much was not read');
     assert.equal(report.standards!.totals.noFindings > 0, true);
   });
@@ -1713,7 +1722,34 @@ describe('createPrdLoop — standards gate', () => {
     assert.deepEqual(rb.gates.map((g) => [g.command, g.exitCode]), [['moag:standards v3', 0], ['npm test', 0], ['npm run lint', 0]]);
     assert.deepEqual(release(b), { shipped: ['R-1'], version: 3 });
     assert.deepEqual(b.requirementTrace!.find((r) => r.id === 'R-1')!.releases.at(-1)!.standardsCounts,
-      { advisoryFindings: 0, notCheckedRules: 3, notCheckedFiles: 1 });
+      // The credential scan and the default profile's TODO rule could not read the unread file either.
+      { advisoryFindings: 0, notCheckedRules: 5, notCheckedFiles: 1 });
+  });
+
+  it('S30. the standards check is given the requirement ids this pass records gate results for', async () => {
+    const plan = makePlan({ prdVersions: [{ version: '1.0.0', text: '## Requirements\n- [R-1] login\n- [R-2] logout', createdAt: '2026-10-01T00:00:00.000Z' }] });
+    plan.playlists[0].tasks[0].requirementIds = ['R-2', 'R-1'];
+    const loop = loadLoop({ standardsInputs: [CLEAN] });
+    await loop.createPrdLoop(baseConfig(withStandards(profile())), makeDeps(plan, { runEngine: async () => engineResult(PASS_VERDICT) }).deps).run();
+    assert.deepEqual(loop.standardsRequirementIds(), [['R-1', 'R-2']]);
+    const untagged = loadLoop({ standardsInputs: [CLEAN] });
+    await untagged.createPrdLoop(baseConfig(withStandards(profile())), makeDeps(makePlan(), { runEngine: async () => engineResult(PASS_VERDICT) }).deps).run();
+    assert.deepEqual(untagged.standardsRequirementIds(), [[]], 'no tagged task: no id, and the rule says it was not checked');
+  });
+
+  it('S30b. a v2 verification gives the standards check only the ids its own tasks verify, never shipped v1 ids', async () => {
+    const plan = makePlan({ prdVersions: [{ version: '2.0.0', text: '## Requirements\n- [R-1] login\n- [R-2] logout\n- [R-3] reset', createdAt: '2026-10-01T00:00:00.000Z' }] });
+    const v1 = plan.playlists[0].tasks[0];
+    v1.requirementIds = ['R-1', 'R-2'];
+    // v1 shipped: both requirements went out with the task that implemented them.
+    plan.requirementTrace = ['R-1', 'R-2'].map((id) => ({
+      id, taskIds: [v1.id], commits: [], gates: [],
+      releases: [{ releaseTag: 'v1.0.0', prdVersion: '1.0.0', at: '2026-10-02T00:00:00.000Z', taskIds: [v1.id] }],
+    }));
+    plan.playlists[0].tasks.push({ ...v1, id: 'v2-task', name: 'v2', requirementIds: ['R-3'] });
+    const loop = loadLoop({ standardsInputs: [CLEAN] });
+    await loop.createPrdLoop(baseConfig(withStandards(profile())), makeDeps(plan, { runEngine: async () => engineResult(PASS_VERDICT) }).deps).run();
+    assert.deepEqual(loop.standardsRequirementIds(), [['R-3']]);
   });
 
   it('S28. a profile with no command and no promoted rule may ship, stamped "no blocking rules configured" and never as passed', async () => {

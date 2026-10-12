@@ -71,7 +71,11 @@ describe('verification report — standards section', () => {
     assert.match(html, /1 blocking rule or command was not checked\.<\/strong> That is not a pass/);
     assert.doesNotMatch(html, /No blocking rules configured/, 'this profile has a blocking set');
     assert.match(html, /Promoted to blocking: layering\/imports, comment-policy\/banned-phrase\.<\/strong> Scanner rules are heuristic/);
-    assert.match(html, /\d+ passed · \d+ no findings · 2 blocking · 2 advisory with findings \(2 findings\) · \d+ rules? not checked · 1 file not checked · 3 findings/);
+    assert.match(html, /\d+ passed · \d+ no findings · 2 blocking · 2 advisory with findings \(2 findings\) · 2 rules not checked · 8 not configured · 1 file not checked · 3 findings/);
+    // Rules the profile does not configure are named apart, never among the rules not checked.
+    assert.match(html, /<h2>Rules not checked — not a pass \(2\)<\/h2>/);
+    assert.match(html, /<h2>Not configured — this profile does not configure these rules \(8\)<\/h2>/);
+    assert.doesNotMatch(between(notChecked, RULES_NOT_CHECKED, 'Not configured —'), /a11y\/img-alt|Not configured in this profile/);
   });
 
   it('no rule MOAG decides itself is ever said to have passed or failed', () => {

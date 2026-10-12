@@ -13,7 +13,7 @@
 import { DependencyEvent, EngineResult, Plan, Playlist, Task, TaskStatus } from '../models/types';
 import { DependencyInstallSettings, ensureDependencies } from './dependency-install';
 import * as nodeFs from 'fs';
-import { recordGateResults, standardsGateCommand } from '../models/requirement-trace';
+import { recordGateResults, standardsGateCommand, verifiedRequirementIds } from '../models/requirement-trace';
 import { commandFactId, recordFact } from './knowledge';
 import { decisionFor, park, ParkReason } from './park-queue';
 import {
@@ -375,6 +375,9 @@ export function createPrdLoop(cfg: PrdLoopConfig, deps: PrdLoopDeps): PrdLoopCon
           const input = await collectStandardsInput(cfg.cwd, std.baseRef, {
             probeDirs: std.profile.structure.requiredDirs,
             designPaths: std.profile.design ? [std.profile.design.docPath, std.profile.design.tokensPath] : undefined,
+            // The requirement ids this pass verifies: the ones its tasks cite, less any whose
+            // tasks all shipped already — a shipped v1 id is not the subject of a v2 check.
+            requirementIds: verifiedRequirementIds(deps.plan),
           });
           const checked = checkStandards(std.profile, input);
           checked.version = std.version;

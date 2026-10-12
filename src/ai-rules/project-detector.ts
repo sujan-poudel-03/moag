@@ -426,7 +426,95 @@ export interface ConventionDetection {
    * document, and whether it serves pages (index.html). Absent when none of them was found.
    */
   designSources?: DesignSources;
+  /** A changelog git tracks at the root (CHANGELOG.md, CHANGELOG, HISTORY.md). Tracked files only. */
+  changelog?: Detected<string>;
+  /** The first migrations directory git tracks a file under (prisma/migrations, alembic/versions, …). */
+  migrationsDir?: Detected<string>;
+  /** A tracked `.env.example`: the project documents its environment without committing it. */
+  envExample?: Detected<string>;
+  /** A tracked commit-message convention config (commitlint, commitizen). */
+  commitConvention?: Detected<string>;
+  /**
+   * Type checkers and audit tools a file in the repository itself declares — a config file,
+   * a dependency, a pre-commit hook, a go.mod `tool` directive, a build plugin — each with
+   * the file that declares it (see {@link detectDeclaredTools}). Never inferred from the stack
+   * alone. Absent when none is declared.
+   */
+  declaredTools?: DetectedConfig[];
 }
+
+/**
+ * The tool ids {@link ConventionDetection.declaredTools} can hold. `govulncheck-tool` is a
+ * go.mod `tool` directive (`go tool govulncheck`), `govulncheck-run` a tools.go import pinned
+ * by go.mod (`go run`); `mvnw` and `gradlew` are tracked wrappers a Java command goes through.
+ */
+export const DECLARED_TOOL_IDS = [
+  'mypy', 'pyright', 'pip-audit', 'govulncheck-tool', 'govulncheck-run', 'dependency-check-maven', 'dependency-check-gradle',
+  'mvnw', 'gradlew',
+] as const;
+
+const GOVULNCHECK = 'golang.org/x/vuln/cmd/govulncheck';
+
+/**
+ * The type checkers and audit tools the repository declares, from the files `present` admits
+ * (tracked ones, when git's listing is known) and `read` reads (capped):
+ * - mypy: `mypy.ini`, `.mypy.ini`, `[tool.mypy]` in pyproject.toml, `[mypy]` in setup.cfg;
+ * - pyright: `pyrightconfig.json`, `[tool.pyright]` in pyproject.toml;
+ * - pip-audit: a `pip-audit` dependency (a requirements file line, a quoted entry or a Poetry
+ *   key in pyproject.toml, a Pipfile key) or a `pip-audit` pre-commit hook;
+ * - govulncheck: a go.mod `tool` directive for it, or a tracked tools.go that imports it;
+ * - OWASP dependency-check: its Maven plugin in pom.xml, or its Gradle plugin id.
+ * A mention anywhere else — a comment, a README — declares nothing.
+ */
+export function detectDeclaredTools(present: (name: string) => boolean, read: (name: string) => string | null): DetectedConfig[] {
+  const out: DetectedConfig[] = [];
+  const text = (name: string): string => (present(name) ? read(name) ?? '' : '');
+  const add = (tool: typeof DECLARED_TOOL_IDS[number], file: string): void => {
+    if (!out.some((d) => d.tool === tool)) { out.push({ tool, file }); }
+  };
+  const pyproject = text('pyproject.toml');
+  const setupCfg = text('setup.cfg');
+  for (const file of ['mypy.ini', '.mypy.ini']) { if (present(file)) { add('mypy', file); } }
+  if (/^\[tool\.mypy\]/m.test(pyproject)) { add('mypy', 'pyproject.toml'); }
+  if (/^\[mypy\]/m.test(setupCfg)) { add('mypy', 'setup.cfg'); }
+  if (present('pyrightconfig.json')) { add('pyright', 'pyrightconfig.json'); }
+  if (/^\[tool\.pyright\]/m.test(pyproject)) { add('pyright', 'pyproject.toml'); }
+  for (const file of ['requirements.txt', 'requirements-dev.txt', 'dev-requirements.txt', 'requirements_dev.txt']) {
+    if (/^\s*pip[-_]audit\b/im.test(text(file))) { add('pip-audit', file); }
+  }
+  if (/["']pip[-_]audit\b/i.test(pyproject) || /^\s*pip[-_]audit\s*=/im.test(pyproject)) { add('pip-audit', 'pyproject.toml'); }
+  if (/^\s*pip[-_]audit\s*=/im.test(text('Pipfile'))) { add('pip-audit', 'Pipfile'); }
+  if (/^\s*-?\s*id:\s*pip-audit\s*$/m.test(text('.pre-commit-config.yaml'))) { add('pip-audit', '.pre-commit-config.yaml'); }
+
+  const goMod = text('go.mod');
+  const toolBlock = /^tool\s*\(([^)]*)\)/m.exec(goMod);
+  const toolLines = [
+    ...[...goMod.matchAll(/^tool\s+(\S+)\s*$/gm)].map((m) => m[1]),
+    ...(toolBlock ? toolBlock[1].split('\n').map((l) => l.trim()) : []),
+  ];
+  if (toolLines.includes(GOVULNCHECK)) { add('govulncheck-tool', 'go.mod'); }
+  if (goMod !== '' && new RegExp(`^\\s*_\\s+"${GOVULNCHECK.replace(/[./]/g, '\\$&')}"`, 'm').test(text('tools.go'))) {
+    add('govulncheck-run', 'tools.go');
+  }
+
+  if (/<artifactId>\s*dependency-check-maven\s*<\/artifactId>/.test(text('pom.xml'))) { add('dependency-check-maven', 'pom.xml'); }
+  for (const file of ['build.gradle', 'build.gradle.kts']) {
+    const gradle = text(file);
+    if (/\bid\s*\(?\s*["']org\.owasp\.dependencycheck["']/.test(gradle) || /apply\s+plugin:\s*["']org\.owasp\.dependencycheck["']/.test(gradle)) {
+      add('dependency-check-gradle', file);
+    }
+  }
+  if (present('mvnw')) { add('mvnw', 'mvnw'); }
+  if (present('gradlew')) { add('gradlew', 'gradlew'); }
+  return out;
+}
+
+/** Root-level changelogs, in preference order. */
+const CHANGELOG_FILES = ['CHANGELOG.md', 'CHANGELOG', 'HISTORY.md'];
+/** Where each common migration tool keeps its migrations, in preference order. */
+const MIGRATION_DIRS = ['prisma/migrations', 'alembic/versions', 'db/migrate', 'src/main/resources/db/migration', 'Migrations'];
+/** Commit-message convention configs at the root. */
+const COMMIT_CONVENTION_FILE = /^(?:commitlint\.config\.[cm]?[jt]s|\.commitlintrc(?:\.(?:json|ya?ml|[cm]?js|ts))?|\.czrc)$/;
 
 const MAX_WALK_DEPTH = 8;
 const MAX_WALK_ENTRIES = 20_000;
@@ -998,6 +1086,9 @@ export function detectProjectConventions(cwd: string, opts: ConventionDetectionO
     const pyproject = (present('pyproject.toml') ? readCapped(cwd, 'pyproject.toml', MAX_MANIFEST_BYTES) : null) ?? '';
     if (/^\[tool\.ruff\b/m.test(pyproject)) { out.lintConfigs.push({ tool: 'ruff', file: 'pyproject.toml' }); }
     if (/^\[tool\.black\b/m.test(pyproject)) { out.formatConfigs.push({ tool: 'black', file: 'pyproject.toml' }); }
+    // Type checkers and audit tools: only those a file in the repository declares.
+    const declared = detectDeclaredTools(present, (name) => readCapped(cwd, name, MAX_MANIFEST_BYTES));
+    if (declared.length > 0) { out.declaredTools = declared; }
 
     // ── Scripts (names only) ──
     // A script that runs nothing (empty, or npm init's "no test specified") is not listed:
@@ -1006,6 +1097,21 @@ export function detectProjectConventions(cwd: string, opts: ConventionDetectionO
       const scripts = pkg.scripts;
       const names = Object.keys(scripts).filter((name) => SAFE_SCRIPT_NAME.test(name) && isRealScriptBody(scripts[name])).slice(0, 100);
       if (names.length > 0) { out.scripts = { value: names, evidence: 'package.json' }; }
+    }
+
+    // ── Docs, data and git conventions (Project Rulebook): tracked files only ──
+    // Adopted into a proposal as what the repository already does, so an untracked file —
+    // a local note, build output — never is.
+    if (tracked.ok && trackedSet) {
+      const changelog = CHANGELOG_FILES.find((name) => trackedSet.has(name));
+      if (changelog) { out.changelog = { value: changelog, evidence: changelog }; }
+      for (const dir of MIGRATION_DIRS) {
+        const proof = tracked.files.find((f) => f.startsWith(`${dir}/`));
+        if (proof) { out.migrationsDir = { value: dir, evidence: proof }; break; }
+      }
+      if (trackedSet.has('.env.example')) { out.envExample = { value: '.env.example', evidence: '.env.example' }; }
+      const convention = tracked.files.find((f) => !f.includes('/') && COMMIT_CONVENTION_FILE.test(f));
+      if (convention) { out.commitConvention = { value: convention, evidence: convention }; }
     }
 
     // ── Framework, test runner, component library ──

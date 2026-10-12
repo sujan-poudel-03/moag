@@ -9,7 +9,7 @@
 // are filtered to plain path segments and fixed labels before they reach the
 // profile, and the finished proposal must pass the same validator as user input.
 
-import type { ConventionDetection, DesignSources } from '../ai-rules/project-detector';
+import type { ConventionDetection, DECLARED_TOOL_IDS, DesignSources } from '../ai-rules/project-detector';
 import { BUILT_IN_RULES } from '../ai-rules/built-in-rules';
 import { StackId, isStackId } from '../server/stacks';
 import { builtInProfile } from './built-in-profiles';
@@ -37,6 +37,7 @@ import {
   StandardsProvenance,
   validateProfile,
 } from './profile';
+import { MAX_RULEBOOK_GUIDANCE_ENTRIES, RULEBOOK_KEYS, rulebookAdditions } from './rulebook';
 
 export interface StandardsProposal {
   profile: StandardsProfile;
@@ -116,7 +117,7 @@ function noCommandsNote(stack: StackId): string {
  * script body is never copied, and no command is proposed for a tool nothing in the
  * repository configures. Every command is shown verbatim and needs a reviewer's approval.
  */
-function proposeCommands(detection: ConventionDetection): { commands: StandardsProfile['commands']; evidence: string | null } {
+function proposeCommands(detection: ConventionDetection, platform: NodeJS.Platform = process.platform): { commands: StandardsProfile['commands']; evidence: string | null } {
   const commands: StandardsProfile['commands'] = [];
   let evidence: string | null = null;
   const add = (label: string, run: string, file: string): void => {
@@ -126,6 +127,8 @@ function proposeCommands(detection: ConventionDetection): { commands: StandardsP
   };
   const lintConfig = (tool: string) => detection.lintConfigs.find((f) => f.tool === tool);
   const formatConfig = (tool: string) => detection.formatConfigs.find((f) => f.tool === tool);
+  // Type checkers and audit tools the repository itself declares; none is ever assumed.
+  const declared = (tool: typeof DECLARED_TOOL_IDS[number]) => (detection.declaredTools ?? []).find((d) => d.tool === tool);
 
   const scripts = detection.scripts?.value ?? [];
   const scriptFile = detection.scripts?.evidence ?? 'package.json';
@@ -151,6 +154,9 @@ function proposeCommands(detection: ConventionDetection): { commands: StandardsP
   // Tests after the style checks. The detector lists a `test` script only when it runs
   // something, never npm init's "no test specified" placeholder.
   if (scripts.includes('test')) { add('Test', 'npm test', scriptFile); }
+  // The project's own audit script, last: at the command limit it is the first left out.
+  // It needs the network, and like every command it blocks once a reviewer approves it.
+  if (scripts.includes('audit')) { add('Audit', 'npm run audit', scriptFile); }
   if (stack === 'python') {
     const ruff = lintConfig('ruff');
     const flake8 = lintConfig('flake8');
@@ -158,9 +164,22 @@ function proposeCommands(detection: ConventionDetection): { commands: StandardsP
     if (ruff) { add('Lint', 'ruff check .', ruff.file); }
     else if (flake8) { add('Lint', 'flake8', flake8.file); }
     if (black) { add('Format', 'black --check .', black.file); }
+    // A type checker only where its own config declares it: mypy.ini / [tool.mypy] / [mypy], pyrightconfig.json / [tool.pyright].
+    const mypy = declared('mypy');
+    const pyright = declared('pyright');
+    if (mypy) { add('Typecheck', 'mypy .', mypy.file); }
+    else if (pyright) { add('Typecheck', 'pyright', pyright.file); }
     // pytest is proposed only where a file proves it: pytest.ini, conftest.py, or a
     // manifest that depends on it (the detector's own evidence).
     if (detection.testRunner?.value === 'pytest') { add('Test', 'pytest', detection.testRunner.evidence); }
+    // pip-audit only where the repository depends on it or runs it as a pre-commit hook. It needs the network.
+    // It must audit the project, not the server's own environment: the project's requirements file, or
+    // the project itself (`.`) for pyproject.toml / setup.py.
+    const pipAudit = declared('pip-audit');
+    const pyManifest = detection.stack?.evidence;
+    if (pipAudit && pyManifest) {
+      add('Audit', pyManifest === 'requirements.txt' ? 'pip-audit -r requirements.txt' : 'pip-audit .', pipAudit.file);
+    }
   }
   if (stack === 'go') {
     const goMod = detection.stack?.evidence ?? 'go.mod';
@@ -169,9 +188,25 @@ function proposeCommands(detection: ConventionDetection): { commands: StandardsP
     if (golangci) { add('Lint', 'golangci-lint run', golangci.file); }
     // go.mod makes `go test ./...` the module's test command, with no further guess.
     add('Test', 'go test ./...', goMod);
+    // govulncheck only where the module declares it: a go.mod `tool` directive, or a tools.go
+    // import whose version go.mod pins. Never a bare `govulncheck` that may not be installed.
+    const tool = declared('govulncheck-tool');
+    const run = declared('govulncheck-run');
+    if (tool) { add('Audit', 'go tool govulncheck ./...', tool.file); }
+    else if (run) { add('Audit', 'go run golang.org/x/vuln/cmd/govulncheck ./...', run.file); }
   }
-  // Java and .NET get no test command: the wrapper (mvnw, gradlew) or the project file a
-  // test run needs is not something the detection proves, so nothing is guessed.
+  // Java: the OWASP dependency-check plugin, where the build declares it, through the tracked
+  // wrapper when there is one. Still no test command: nothing the detection reads proves one.
+  if (stack === 'java') {
+    const maven = declared('dependency-check-maven');
+    const gradle = declared('dependency-check-gradle');
+    // Gate commands run through the platform shell: cmd.exe on Windows cannot run `./mvnw`.
+    const win = platform === 'win32';
+    if (maven) { add('Audit', `${declared('mvnw') ? (win ? 'mvnw.cmd' : './mvnw') : 'mvn'} dependency-check:check`, maven.file); }
+    else if (gradle) { add('Audit', `${declared('gradlew') ? (win ? 'gradlew.bat' : './gradlew') : 'gradle'} dependencyCheckAnalyze`, gradle.file); }
+  }
+  // .NET gets no test command: the project file a test run needs is not something the
+  // detection proves, so nothing is guessed.
   if (stack === 'dotnet') {
     const editorconfig = formatConfig('editorconfig');
     if (editorconfig) { add('Format', 'dotnet format --verify-no-changes', editorconfig.file); }
@@ -241,13 +276,13 @@ export function proposeProfile(stack: StackId, detection: ConventionDetection): 
   const profile = builtInProfile(stack);
 
   if (detection.sourceFileCount === 0) {
-    const assumed = allAssumed(defaults);
+    const assumed = rulebookAssumed(profile, allAssumed(defaults), defaults);
     assumed.commands = assumedTag(noCommandsNote(stack));
-    return withDesign({ profile, provenance: assumed }, stack, detection);
+    return withRulebook(withDesign({ profile, provenance: assumed }, stack, detection), stack, defaults);
   }
 
   profile.repoState = 'brownfield';
-  const provenance = allAssumed(defaults);
+  const provenance = rulebookAssumed(profile, allAssumed(defaults), defaults);
   const set = (field: ProvenanceField, file: string, note?: string): void => {
     provenance[field] = detectedTag(file, note);
   };
@@ -372,14 +407,78 @@ export function proposeProfile(stack: StackId, detection: ConventionDetection): 
     set('builtInRuleIds', detection.stack.evidence);
   }
 
+  // ── Docs, data and git: adopt what the repository already does ──
+  adoptRulebookConventions(profile, provenance, detection);
+
   const checked = validateProfile(profile);
   if (!checked.ok) {
     // The design is dropped here too: the fallback is the plain built-in profile.
     const fallback = builtInProfile(stack);
     fallback.repoState = 'brownfield';
-    return { profile: fallback, provenance: allAssumed(defaults) };
+    return { profile: fallback, provenance: rulebookAssumed(fallback, allAssumed(defaults), defaults) };
   }
-  return withDesign({ profile: checked.profile, provenance }, stack, detection);
+  return withRulebook(withDesign({ profile: checked.profile, provenance }, stack, detection), stack, defaults);
+}
+
+// ─── Project Rulebook ───
+
+/** `provenance` with an `assumed` entry for each rulebook section `profile` has and it lacks. */
+function rulebookAssumed(profile: StandardsProfile, provenance: StandardsProvenance, evidence: string): StandardsProvenance {
+  for (const key of RULEBOOK_KEYS) {
+    if (profile[key] !== undefined && provenance[key] === undefined) { provenance[key] = assumedTag(evidence); }
+  }
+  return provenance;
+}
+
+/**
+ * What a brownfield repository already does about docs, data and git, adopted into the
+ * proposal from TRACKED files only, each tagged `detected` with the file as evidence: its
+ * changelog becomes the changelog path, its migrations folder the migrations glob, and a
+ * `.env.example` and a commit-message convention become guidance lines.
+ */
+function adoptRulebookConventions(profile: StandardsProfile, provenance: StandardsProvenance, detection: ConventionDetection): void {
+  const docsGit = profile.docsGit ?? { changelogPath: '', guidance: [] };
+  const apiData = profile.apiData ?? { migrationsGlob: '', guidance: [] };
+  const withLine = (lines: string[], line: string): string[] =>
+    (lines.includes(line) || lines.length >= MAX_RULEBOOK_GUIDANCE_ENTRIES ? lines : [...lines, line]);
+  const docsProof: string[] = [];
+  const dataProof: string[] = [];
+  if (detection.changelog && isSafePath(detection.changelog.value)) {
+    profile.docsGit = { ...docsGit, changelogPath: detection.changelog.value };
+    docsProof.push(detection.changelog.evidence);
+  }
+  if (detection.commitConvention && isSafePath(detection.commitConvention.value)) {
+    const current = profile.docsGit ?? docsGit;
+    profile.docsGit = { ...current, guidance: withLine(current.guidance, clip(`Write commit messages the way ${detection.commitConvention.value} requires`)) };
+    docsProof.push(detection.commitConvention.evidence);
+  }
+  if (detection.migrationsDir && isSafePath(detection.migrationsDir.value)) {
+    profile.apiData = { ...apiData, migrationsGlob: `${detection.migrationsDir.value}/**` };
+    dataProof.push(detection.migrationsDir.evidence);
+  }
+  if (detection.envExample) {
+    const current = profile.apiData ?? apiData;
+    profile.apiData = {
+      ...current,
+      guidance: withLine(current.guidance, 'Add every new setting to .env.example with a placeholder value; never commit .env'),
+    };
+    dataProof.push(detection.envExample.evidence);
+  }
+  if (docsProof.length > 0) { provenance.docsGit = detectedTag(docsProof.join(', ')); }
+  if (dataProof.length > 0) { provenance.apiData = detectedTag(dataProof.join(', ')); }
+}
+
+/**
+ * `proposal` with the rulebook sections its stack's defaults would add and it lacks — the
+ * accessibility section once it has a design system or a component kit — each tagged
+ * `assumed`, when the whole still validates.
+ */
+function withRulebook(proposal: StandardsProposal, stack: StackId, evidence: string): StandardsProposal {
+  const additions = rulebookAdditions(stack, proposal.profile);
+  if (Object.keys(additions).length === 0) { return proposal; }
+  const checked = validateProfile({ ...proposal.profile, ...additions });
+  if (!checked.ok) { return proposal; }
+  return { profile: checked.profile, provenance: rulebookAssumed(checked.profile, { ...proposal.provenance }, evidence) };
 }
 
 // ─── Design system ───

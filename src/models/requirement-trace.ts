@@ -88,13 +88,30 @@ function allTasks(plan: Plan): Task[] {
 }
 
 /** Every requirement ID cited by a non-release task. */
-function taggedIds(plan: Plan): string[] {
+export function taggedIds(plan: Plan): string[] {
   const ids = new Set<string>();
   for (const t of allTasks(plan)) {
     if (t.type === 'release') { continue; }
     for (const id of t.requirementIds ?? []) { ids.add(id); }
   }
   return [...ids].sort(byIdNumber);
+}
+
+/**
+ * The requirement IDs a verification of `plan` is about: every ID cited by a non-release
+ * task, except one whose tagged tasks ALL went out in its last release. A shipped v1
+ * requirement whose tasks the v2 work did not add to is not this check's subject, so a rule
+ * that asks each verified requirement to be named in a test file this change touched must
+ * not ask it of R-1 again. A task added for the ID since its release brings it back in.
+ * With no release recorded this is {@link taggedIds}.
+ */
+export function verifiedRequirementIds(plan: Plan): string[] {
+  return taggedIds(plan).filter((id) => {
+    const record = plan.requirementTrace?.find(r => r.id === id);
+    const last = record && record.releases.length > 0 ? record.releases[record.releases.length - 1] : undefined;
+    if (!last) { return true; }
+    return !taggedTasks(plan, id).every(t => last.taskIds.includes(t.id));
+  });
 }
 
 /**

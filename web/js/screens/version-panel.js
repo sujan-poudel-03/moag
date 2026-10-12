@@ -44,17 +44,25 @@ export function standardsBlockedCard(projectId, standards) {
       h('a', { href: `/p/${encodeURIComponent(projectId)}/standards`, dataset: { link: '' }, class: 'btn btn-secondary' }, 'Open standards')));
 }
 
-/** A capped list with "Show all N". */
-export function cappedList(items, renderItem) {
+/**
+ * A capped list with "Show all N". After "Show all", focus moves to the first newly revealed
+ * item, so a keyboard user carries on where the list was cut.
+ */
+export function cappedList(items, renderItem, cap = LIST_CAP) {
   const ul = h('ul', { class: 'diff-list' });
   const renderUpTo = (n) => {
     while (ul.firstChild) { ul.removeChild(ul.firstChild); }
     for (const it of items.slice(0, n)) { ul.appendChild(renderItem(it)); }
     if (items.length > n) {
-      ul.appendChild(h('li', null, h('button', { type: 'button', class: 'btn-link', on: { click: () => renderUpTo(items.length) } }, `Show all ${items.length}`)));
+      const showAll = () => {
+        renderUpTo(items.length);
+        const first = ul.children[n];
+        if (first) { first.setAttribute('tabindex', '-1'); first.focus(); }
+      };
+      ul.appendChild(h('li', null, h('button', { type: 'button', class: 'btn-link', on: { click: showAll } }, `Show all ${items.length}`)));
     }
   };
-  renderUpTo(LIST_CAP);
+  renderUpTo(cap);
   return ul;
 }
 

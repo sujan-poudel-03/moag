@@ -9,6 +9,9 @@
 
 const m = (text, actions = []) => ({ text, actions });
 
+/** C99b: the backup line of a design revert whose backup directory was not recorded. */
+const STR_C99B = 'Backup: not recorded.';
+
 export const STR = Object.freeze({
   C1: m('No projects yet. A project connects MOAG to one git repository.', ['route:/projects/new']),
   C1b: m('No projects yet. Ask a product owner to create one.'),
@@ -82,7 +85,7 @@ export const STR = Object.freeze({
   /** @param {number} planV @param {number} nowV */
   C38: (planV, nowV) => m(`Standards v${nowV} was approved after this plan was generated under v${planV}. The run will use v${nowV}.`),
   C39: m('This run had no standards version. Its plan was approved before the project had standards, so nothing was checked and no version is recorded on the trace.'),
-  C40: m('Not checked means MOAG could not decide the rule for these files, or the profile does not configure it. It is not a pass.'),
+  C40: m('Not checked means MOAG could not decide the rule for these files, or the change gave it nothing to judge. It is not a pass.'),
   /** @param {number} rules @param {number} findings */
   C41: (rules, findings) => m(`Standards stopped the release: ${rules} blocking rule${rules === 1 ? '' : 's'} or command${rules === 1 ? '' : 's'}, ${findings} finding${findings === 1 ? '' : 's'}. Nothing was marked shipped.`, ['control:view-standards-report']),
   /** @param {number} n @param {number} cap */
@@ -133,6 +136,74 @@ export const STR = Object.freeze({
   C73: (n, tokens) => m(`It includes a design system with ${tokens} token${tokens === 1 ? '' : 's'}; every agent task builds against it.`),
   /** @param {string} rule the scanner rule being made blocking */
   C54: (rule) => m(`Heuristic rule. As a blocking rule, ${rule} can stop correct code and can miss real violations. Prefer a command (a linter, formatter or test) for anything that must stop a release.`),
+
+  // ─── Item 1: the new-project form's Folder field ───
+  C74: m('Git repository found. Ready to create the project.'),
+  /** @param {string} root the projects root */
+  C75: (root) => m(`This folder doesn't exist under ${root}. Choose Start a new empty project to have the server create it, or Clone from URL.`),
+  C76: m('This folder exists but is not a git repository. Run git init in it on the server, or choose another folder.'),
+  /** @param {string|null} top the repository's top-level folder relative to the projects root, or null when it is outside the root */
+  C77: (top) => m(top
+    ? `This folder is inside the git repository ${top}, not its top level.`
+    : 'This folder is inside a git repository whose top level is outside the projects root. Choose another folder.', top ? ['control:use-top-level'] : []),
+  C78: m('Another project already uses this folder.'),
+  C79: m('This folder is inside another project\'s folder. Choose a folder that no project contains.'),
+  /** @param {string} abs what was typed @param {string} rel what it was converted to */
+  C80: (abs, rel) => m(`Converted ${abs} to ${rel}.`),
+  /** @param {string} rel what an absolute path inside the root will be saved as */
+  C80b: (rel) => m(`Will be saved as ${rel}. Folders are named relative to the projects root.`),
+  C81: m('That is the projects root itself. Name a folder inside it, for example acme-checkout.'),
+  /** @param {string} value what was typed @param {string} root the projects root */
+  C82: (value, root) => m(`${value} is not inside the projects root ${root}. Type the folder's name relative to that root, for example acme-checkout.`),
+  C83: m('Couldn\'t check this folder right now. The server checks it again when you create the project.'),
+  C83b: m('Filled from the name. Edit to choose another folder.'),
+  /** @param {string} root the projects root */
+  C84: (root) => m(`The projects root ${root} doesn't exist on the server. Ask an admin to create it.`),
+  C84b: m('not shown by this server'),
+
+  // ─── Item 2: the cold-start stack suggestion ───
+  /** @param {number} n tasks an engine and stack need before measured results replace the suggestion */
+  C86: (n) => m(`This suggestion comes from a fixed table of what each engine is generally good at, maintained by MOAG and the same on every server. It is not measured. Once one engine and stack have ${n} finished tasks on this server, measured results replace it.`),
+  C87: m('Repository not checked: the folder isn\'t valid yet.'),
+  C88: m('Couldn\'t load a stack suggestion. Choose a stack below.', ['control:retry-recommendation']),
+
+  // ─── Item 3: the Project Rulebook ───
+  /** The heading suffix of every guidance list, verbatim as in the prompt (`### <Section> (guidance — not checked)`). */
+  C89: m('(guidance — not checked)'),
+  /** @param {number} c checked items @param {number} g guidance items */
+  C90: (c, g) => m(`Rulebook: ${c} checked · ${g} guidance (not checked).`),
+  /** @param {number} cut guidance items cut @param {number} limit the prompt limit in characters */
+  C91: (cut, limit) => m(`Agents receive at most ${limit.toLocaleString('en-US')} characters of standards. ${cut} guidance item${cut === 1 ? ' was' : 's were'} cut to fit and ${cut === 1 ? 'is' : 'are'} not sent to agents; ${cut === 1 ? 'it is' : 'they are'} marked below.`),
+  /** @param {string} stack the project's stack */
+  C92: (stack) => m(`This version predates the full Project Rulebook: coding practice, security, accessibility, API and data, docs and git, and performance are not part of it. Propose the ${stack} defaults to add them; a reviewer approves them like any other change.`, ['control:propose-rulebook']),
+  C93: m('Checked on every run, whatever the version says: no .env file is added, and no credential-shaped value is on an added line. Findings are advisory unless promoted.'),
+  /** @param {number} c checked items @param {number} g guidance items */
+  C94: (c, g) => m(`${c} rules are checked; ${g} guidance items are given to agents and not checked.`),
+
+  // ─── Items 4–5: the ship gate (changed files, design revert) ───
+  /** @param {string} base the first 12 characters of the diff base commit */
+  C95: (base) => m(`Since ${base}. MOAG's own .moag/ folder is not listed.`),
+  C95b: m('Since the empty tree: this is the first run, so every file counts as added. MOAG\'s own .moag/ folder is not listed.'),
+  C96: m('Changed files: not collected for this run.'),
+  C97: m('No files changed since the diff base. The tasks before the gate left the repository as it was.'),
+  /** @param {number} shown @param {number} total */
+  C98: (shown, total) => m(`Listing ${shown} of ${total} files. The rest are not listed here.`),
+  /** @param {string} paths the reverted design files, comma-separated @param {string|null} dir where they were kept, or null */
+  C99: (paths, dir) => m(`Reverted to the approved design: ${paths}. ${dir ? `Backup: ${dir}.` : STR_C99B} These files had changed since an earlier run wrote them, so this run started from the approved version.`),
+  C99b: m(STR_C99B),
+
+  // ─── Round 2: rules a profile does not configure ───
+  C100: m('This standards version does not configure these rules, so MOAG did not run them. That is not a gap in this check and not a pass: add them in Standards to have them checked.'),
+  /** @param {string} base the first 12 characters of the last shipped commit */
+  C101: (base) => m(`Everything changed since commit ${base}, where the project stood when it last shipped. A ship does not commit by itself, so the list also holds shipped work that was never committed, and the work of any earlier run that was not shipped. MOAG's own .moag/ folder is not listed.`),
+  /** @param {string} base the first 12 characters of the commit the project's first run started at */
+  C102: (base) => m(`Since the project's first run started (${base}). Nothing has shipped yet, so the list holds the work of every earlier run. MOAG's own .moag/ folder is not listed.`),
+
+  // ─── Round 2: a brand-new project from the web ───
+  C103: m('New folder. The server creates it, runs git init and makes an empty first commit.'),
+  C104: m('This folder exists and is empty. The server runs git init in it and makes an empty first commit.'),
+  C105: m('This folder already exists and is not empty. Choose a new folder name, or choose Folder on the server to add it as a repository.'),
+  C106: m('The server creates this folder inside its projects root, e.g. acme-checkout, and starts an empty git repository in it.'),
 });
 
 /** Copy for a failed request whose server message should be shown as-is. */

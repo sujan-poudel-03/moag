@@ -18,12 +18,16 @@ import {
   standardsBlocked,
   isBlockingNotChecked,
   ruleOutcomeLabel,
+  groupStandardsRules,
+  standardsCheckCounts,
+  BINARY_NOT_READ,
 } from '../../../standards/checker';
 import { templateDesign } from '../../../standards/design';
 import { MAX_GLOB_WILDCARDS, globToRegExp, isUnder, matchesAny } from '../../../standards/glob';
-import { RULE_RESULTS, STANDARDS_RULE_IDS, StandardsProfile, StandardsRuleId } from '../../../standards/profile';
+import { RULE_RESULTS, STANDARDS_RULE_IDS, StandardsProfile, StandardsRuleId, ruleConfigured } from '../../../standards/profile';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
 import { promote, sampleProfile, totalsOf } from './fixtures';
+import { RULEBOOK_KEYS } from '../../../standards/rulebook';
 
 /** A file whose every line was added. */
 function added(path: string, lines: string[]): StandardsCheckFile {
@@ -49,9 +53,16 @@ function findingsFor(report: StandardsReport, rule: StandardsRuleId): Array<{ fi
   return report.findings.filter((f) => f.rule === rule).map((f) => ({ file: f.file, line: f.line }));
 }
 
+/** The `other` built-in without its Project Rulebook sections: nothing configured but the comment policy. */
+function bareOther(): StandardsProfile {
+  const p = JSON.parse(JSON.stringify(BUILT_IN_PROFILES.other)) as Record<string, unknown>;
+  for (const key of RULEBOOK_KEYS) { delete p[key]; }
+  return p as unknown as StandardsProfile;
+}
+
 /** A profile with only the comment policy configured. */
 function commentsOnly(over: Partial<StandardsProfile['comments']> = {}): StandardsProfile {
-  const p = JSON.parse(JSON.stringify(BUILT_IN_PROFILES.other)) as StandardsProfile;
+  const p = bareOther();
   p.comments = { ...p.comments, bannedPhrases: ['as an AI'], ...over };
   return p;
 }
@@ -107,27 +118,33 @@ describe('standards checker — report shape', () => {
     assert.equal(report.version, null);
     assert.equal(report.baseRef, 'abc123');
     const t = report.totals;
-    assert.equal(t.passed + t.noFindings + t.failed + t.advisory + t.notChecked, STANDARDS_RULE_IDS.length, 'every row is counted once');
+    assert.equal(t.passed + t.noFindings + t.failed + t.advisory + t.notChecked + t.notConfigured, STANDARDS_RULE_IDS.length, 'every row is counted once');
   });
 
-  it('reports every unconfigured rule as not-checked, never passed', () => {
+  it('reports every unconfigured rule as not configured — never passed, never counted as not checked', () => {
     const p = commentsOnly({ forbidCommentedOutCode: false, bannedPhrases: [] });
     const report = checkStandards(p, input([added('src/a.ts', ['const a = 1;'])]));
-    // Three rules need no configuration: density always has a limit, and a nested repository
-    // and a newly generated file are looked for whatever the profile says.
-    const always = ['comment-policy/density', 'structure/nested-repository', 'exemption/newly-generated'];
+    // Five rules need no configuration: density always has a limit; a nested repository, a
+    // newly generated file, a .env file and a credential are looked for whatever the profile says.
+    const always = ['comment-policy/density', 'structure/nested-repository', 'exemption/newly-generated', 'security/env-file', 'security/secret-literal'];
     for (const rule of STANDARDS_RULE_IDS) {
       if (always.includes(rule)) { continue; }
       const row = report.rules.find((r) => r.rule === rule)!;
       assert.equal(row.result, 'not-checked', rule);
       assert.equal(row.unconfigured, true, rule);
       assert.match(row.reason ?? '', /Not configured/);
+      assert.equal(ruleOutcomeLabel(row), 'not configured', rule);
     }
     for (const rule of always) { assert.equal(outcome(report, rule as StandardsRuleId).result, 'passed', rule); }
-    // No static rule is counted as passed: all three found nothing, which is not a pass.
+    // No static rule is counted as passed: all five found nothing, which is not a pass.
     assert.equal(report.totals.passed, 0);
-    assert.equal(report.totals.noFindings, 3);
-    assert.equal(report.totals.notChecked, STANDARDS_RULE_IDS.length - 3);
+    assert.equal(report.totals.noFindings, 5);
+    assert.equal(report.totals.notChecked, 0, 'a rule the profile does not configure is no gap in the check');
+    assert.equal(report.totals.notConfigured, STANDARDS_RULE_IDS.length - 5);
+    const groups = groupStandardsRules(report);
+    assert.equal(groups.notChecked.length, 0);
+    assert.equal(groups.notConfigured.length, STANDARDS_RULE_IDS.length - 5);
+    assert.equal(standardsCheckCounts(report).notCheckedRules, 0);
     assert.equal(report.totals.blockingNotChecked, 0, 'not configured is not "could not be read"');
     assert.equal(standardsBlockingEvaluated(report), false, 'nothing blocks by default, so there is no blocking set to vouch for');
     // A promoted rule the profile leaves unconfigured is no gap in the check of the rest.
@@ -140,13 +157,15 @@ describe('standards checker — report shape', () => {
     for (const rule of STANDARDS_RULE_IDS) {
       const row = outcome(report, rule);
       assert.equal(row.result, 'not-checked', rule);
-      // The sample profile has no design system: that rule is simply not configured.
-      if (rule === 'frontend/design-tokens') { assert.equal(row.unconfigured, true); continue; }
+      // The sample profile has no design system and no rulebook: those rules are simply not configured.
+      if (!ruleConfigured(sampleProfile(), rule)) { assert.equal(row.unconfigured, true, rule); continue; }
       assert.match(row.reason ?? '', /No diff could be taken/);
     }
     assert.equal(report.baseRef, null);
     // No rule blocks by default, so nothing blocking went unread; a promoted one would have.
-    assert.deepEqual(report.totals, totalsOf({ notChecked: STANDARDS_RULE_IDS.length }));
+    const unconfigured = STANDARDS_RULE_IDS.filter((r) => !ruleConfigured(sampleProfile(), r)).length;
+    assert.ok(unconfigured > 0);
+    assert.deepEqual(report.totals, totalsOf({ notChecked: STANDARDS_RULE_IDS.length - unconfigured, notConfigured: unconfigured }));
     assert.equal(standardsBlockingEvaluated(report), false);
     assert.equal(standardsBlockingState(report), 'none-configured');
     assert.equal(standardsBlockingState(checkStandards(promote(sampleProfile(), 'structure/required-dirs'), input([], { baseRef: null }))), 'not-checked',
@@ -165,10 +184,11 @@ describe('standards checker — report shape', () => {
       if (treeRules.includes(rule)) { continue; }
       const row = outcome(report, rule);
       assert.equal(row.result, 'not-checked', rule);
-      if (rule === 'frontend/design-tokens') { assert.equal(row.unconfigured, true); continue; }
+      if (!ruleConfigured(sampleProfile(), rule)) { assert.equal(row.unconfigured, true, rule); continue; }
       assert.match(row.reason ?? '', /nothing for this rule to check/, rule);
     }
-    assert.deepEqual(report.totals, totalsOf({ noFindings: 2, notChecked: STANDARDS_RULE_IDS.length - 2 }));
+    const unconfigured = STANDARDS_RULE_IDS.filter((r) => !ruleConfigured(sampleProfile(), r)).length;
+    assert.deepEqual(report.totals, totalsOf({ noFindings: 2, notChecked: STANDARDS_RULE_IDS.length - 2 - unconfigured, notConfigured: unconfigured }));
     assert.equal(standardsBlockingEvaluated(report), false, 'nothing blocking was decided');
   });
 
@@ -333,9 +353,10 @@ describe('standards checker — comment policy', () => {
     ]);
     // (Density is its own rule; this fixture is nearly all comments on purpose.)
     assert.deepEqual(checkStandards(commentsOnly({ maxDensityPct: 100 }), input([file])).findings, []);
-    // The same holds for the profile an admin accepts unread.
+    // The same holds for the profile an admin accepts unread. (Its Project Rulebook TODO rule
+    // rightly reports the bare TODO in this fixture; that is not the comment policy.)
     const builtIn = checkStandards(BUILT_IN_PROFILES['node-ts'], input([file], { topLevel: ['src'] }));
-    assert.deepEqual(builtIn.findings.filter((f) => f.rule !== 'comment-policy/density'), []);
+    assert.deepEqual(builtIn.findings.filter((f) => f.rule !== 'comment-policy/density' && f.rule !== 'practice/todo-without-issue'), []);
   });
 
   it('matches banned phrases on word boundaries: the built-in defaults leave documentation alone', () => {
@@ -577,12 +598,13 @@ describe('standards checker — comment policy', () => {
       assert.match(row.reason ?? '', /No checker for \.rs files \(src\/main\.rs\)/);
     }
     assert.deepEqual(report.findings, []);
-    // The nested-repository and generated-marker scans found nothing; neither says
-    // anything about what the file holds, and the file is listed as not checked.
-    assert.deepEqual(report.rules.filter((r) => r.result === 'passed').map((r) => r.rule), ['structure/nested-repository', 'exemption/newly-generated']);
+    // The nested-repository, generated-marker, .env and credential scans found nothing; none
+    // of them reads the code as code, and the file is listed as not checked.
+    assert.deepEqual(report.rules.filter((r) => r.result === 'passed').map((r) => r.rule),
+      ['structure/nested-repository', 'exemption/newly-generated', 'security/env-file', 'security/secret-literal']);
     assert.deepEqual(report.notCheckedFiles, [{ file: 'src/main.rs', reason: 'No checker for .rs files' }]);
     assert.equal(report.totals.notCheckedFiles, 1);
-    assert.equal(report.totals.noFindings, 2, 'the two scans that do not read the file\'s lines');
+    assert.equal(report.totals.noFindings, 4, 'the four scans that do not read the file as code');
     assert.equal(report.totals.passed, 0);
     assert.equal(report.totals.blockingNotChecked, 0, 'every comment rule is advisory by default');
     const promoted = checkStandards(promote(commentsOnly(), 'comment-policy/banned-phrase'), input([added('src/main.rs', ['// foo();', 'fn main() {}'])]));
@@ -1032,12 +1054,19 @@ describe('standards checker — skipped, capped and parsed reports', () => {
     const report = skippedStandardsReport(sampleProfile(), 4, 'abc', 'The change gate failed first');
     assert.equal(report.version, 4);
     assert.equal(report.rules.length, STANDARDS_RULE_IDS.length + 1);
-    assert.ok(report.rules.every((r) => r.result === 'not-checked' && r.reason === 'The change gate failed first'));
+    // A rule the profile configures carries the skip's reason; one it does not stays "not configured".
+    for (const r of report.rules) {
+      assert.equal(r.result, 'not-checked');
+      const configured = r.rule === 'command' || ruleConfigured(sampleProfile(), r.rule);
+      assert.equal(r.reason, configured ? 'The change gate failed first' : 'Not configured in this profile', r.rule);
+      assert.equal(r.unconfigured === true, !configured, r.rule);
+    }
     assert.deepEqual(report.rules[report.rules.length - 1],
       { rule: 'command', severity: 'blocking', result: 'not-checked', reason: 'The change gate failed first', command: 'npm run lint' });
     assert.ok(report.rules.every((r) => r.severity === 'blocking' || r.severity === 'advisory'), 'every row says how severe it is');
     // The command is blocking and did not run: unevaluated blocking evidence, counted as such.
-    assert.deepEqual(report.totals, totalsOf({ notChecked: STANDARDS_RULE_IDS.length + 1, blockingNotChecked: 1 }));
+    const unconfigured = STANDARDS_RULE_IDS.filter((r) => !ruleConfigured(sampleProfile(), r)).length;
+    assert.deepEqual(report.totals, totalsOf({ notChecked: STANDARDS_RULE_IDS.length + 1 - unconfigured, notConfigured: unconfigured, blockingNotChecked: 1 }));
     assert.equal(standardsBlockingEvaluated(report), false, 'a skipped check evaluated nothing');
     assert.equal(standardsBlockingState(report), 'not-checked');
   });
@@ -1063,6 +1092,29 @@ describe('standards checker — skipped, capped and parsed reports', () => {
     report.rules.push(commandRow({ result: 'passed', command: 'npm run lint', exitCode: 0, tail: 'ok' }));
     report.totals = { ...report.totals, passed: report.totals.passed + 1 };
     assert.deepEqual(parseStandardsReport(JSON.parse(JSON.stringify(report))), report);
+  });
+
+  it('parseStandardsReport reads a report stored before "not configured" existed by its reason', () => {
+    const report = checkStandards(sampleProfile(), input([added('src/a.ts', ['export {};'])]));
+    const unconfigured = report.rules.filter((r) => r.unconfigured === true).length;
+    assert.ok(unconfigured > 0);
+    // The legacy shape: no flag, every unconfigured rule counted among the rules not checked.
+    const legacy = JSON.parse(JSON.stringify(report)) as StandardsReport;
+    for (const r of legacy.rules) { delete r.unconfigured; }
+    legacy.totals = { ...legacy.totals, notChecked: legacy.totals.notChecked + unconfigured };
+    delete (legacy.totals as Partial<StandardsReport['totals']>).notConfigured;
+    const parsed = parseStandardsReport(legacy)!;
+    assert.equal(parsed.totals.notConfigured, unconfigured);
+    assert.equal(parsed.totals.notChecked, report.totals.notChecked);
+    assert.equal(parsed.rules.filter((r) => r.unconfigured === true).length, unconfigured);
+    // An undecided row, or a command, is never read as "not configured", whatever its reason says.
+    const forged = parseStandardsReport({ ...legacy, rules: [
+      { rule: 'naming/files', result: 'not-checked', undecided: true, reason: 'Not configured in this profile' },
+      { rule: 'command', result: 'not-checked', reason: 'Not configured in this profile', command: 'npm test' },
+    ] })!;
+    assert.equal(forged.totals.notConfigured, 0);
+    assert.equal(forged.totals.notChecked, 2);
+    assert.equal(forged.totals.blockingNotChecked, 2, 'both stay unevaluated blocking rows');
   });
 
   it('parseStandardsReport rejects malformed payloads instead of throwing', () => {
@@ -1294,5 +1346,241 @@ describe('standards checker — frontend/design-tokens', () => {
   it('a vendored UI file is left out', () => {
     const report = run(designed(), [added('vendor/lib/a.css', ['.a { color: #fff; }'])]);
     assert.deepEqual(findingsFor(report, RULE), []);
+  });
+
+  describe('only style-shaped text is read as a colour or a length', () => {
+    /** The design profile with test files and one backend layer declared. */
+    function scoped(): StandardsProfile {
+      const p = designed();
+      p.testing.fileGlobs = ['**/*.test.ts'];
+      p.backend.layers = [{ name: 'server', globs: ['src/server/**'] }];
+      return p;
+    }
+
+    it('an issue reference, a selector, a test file and a backend file are no findings', () => {
+      const report = run(scoped(), [
+        added('src/ui/x.ts', ['// see below', 'const msg = \'fixes #123\';', 'document.querySelector(\'#abc\');']),
+        added('src/ui/View.tsx', ['export const V = () => { document.querySelector("#abc"); return <p>Issue #123</p>; };']),
+        added('src/ui/x.test.ts', ['const s = { color: \'#fff\' };']),
+        added('src/server/x.ts', ['const s = { color: \'#fff\', padding: \'12px\' };']),
+      ]);
+      assert.deepEqual(findingsFor(report, RULE), []);
+    });
+
+    it('prose with a colon is not a CSS declaration: only a real property name (or a custom property) is read', () => {
+      const prose = run(scoped(), [
+        added('src/ui/p.ts', [
+          'const a = \'Issue: #123\';',
+          'const b = "Ref: #abc, see PR";',
+          'const c = `Step 2: wait 3px later`;',
+          'const d = \'Note: rgb( is not a colour here\';',
+        ]),
+      ]);
+      assert.deepEqual(findingsFor(prose, RULE), []);
+      const css = run(scoped(), [
+        added('src/ui/q.ts', [
+          'el.style.cssText = \'background-color: #123\';',
+          'el.style.cssText = \'--brand: #abcdef\';',
+          'el.style.cssText = \'margin-top: 4px\';',
+        ]),
+      ]);
+      assert.deepEqual(findingsFor(css, RULE).map((f) => f.line), [1, 2, 3]);
+    });
+
+    it('a style object, a styled template, a css template and JSX colour attributes are findings', () => {
+      const report = run(scoped(), [
+        added('src/ui/a.ts', ['export const s = { color: \'#fff\' };']),
+        added('src/ui/b.ts', ['export const B = styled.div`color:#fff`;']),
+        added('src/ui/c.ts', ['export const c = css`padding: 12px`;']),
+        added('src/ui/d.css', ['.d { color: #fff; }']),
+        added('src/ui/e.html', ['<p style="color: #fff">x</p>']),
+        added('src/ui/F.jsx', ['export const F = () => <div style={{color:\'#fff\'}} />;']),
+        added('src/ui/G.tsx', ['export const G = () => <div style={{color:\'#fff\'}} />;']),
+        added('src/ui/H.tsx', ['export const H = () => <path fill="#ff0000" />;']),
+        added('src/ui/i.ts', ['el.style.cssText = \'border: 1px solid #333\';']),
+      ]);
+      assert.deepEqual([...new Set(findingsFor(report, RULE).map((f) => f.file))].sort(), [
+        'src/ui/F.jsx', 'src/ui/G.tsx', 'src/ui/H.tsx', 'src/ui/a.ts', 'src/ui/b.ts', 'src/ui/c.ts', 'src/ui/d.css', 'src/ui/e.html', 'src/ui/i.ts',
+      ].sort());
+    });
+
+    it('a change of only a test file and a backend file is out of scope: only the design files decide, nothing is undecided', () => {
+      const report = run(scoped(), [
+        added('src/ui/x.test.ts', ['const s = { color: \'#fff\' };']),
+        added('src/server/x.ts', ['const s = { color: \'#fff\' };']),
+      ]);
+      assert.deepEqual(findingsFor(report, RULE), []);
+      assert.equal(row(report).result, 'passed', 'the intact design files are the evidence');
+      assert.equal(row(report).undecided, undefined);
+      assert.doesNotMatch(row(report).reason ?? '', /x\.test\.ts|server\/x\.ts/);
+      const unread = checkStandards(scoped(), input([added('src/server/x.ts', ['const s = { color: \'#fff\' };'])]));
+      assert.doesNotMatch(row(unread).reason ?? '', /server\/x\.ts/, 'only the unread design files are named');
+    });
+
+    it('a script file with no style-shaped line is not evidence by itself', () => {
+      const report = checkStandards(scoped(), input([added('src/ui/plain.ts', ['export const n = 1;'])], {
+        designFiles: [],
+      }));
+      assert.equal(row(report).result, 'not-checked');
+    });
+  });
+});
+
+// ─── Project Rulebook rules ───
+
+describe('standards checker — Project Rulebook rules', () => {
+  /** The `other` built-in with the rulebook sections given. */
+  function withRulebook(over: Partial<StandardsProfile>): StandardsProfile {
+    return { ...bareOther(), ...over };
+  }
+  const rowOf = (report: StandardsReport, rule: StandardsRuleId): StandardsRuleOutcome => report.rules.find((r) => r.rule === rule)!;
+  const practice = withRulebook({ practice: { todoNeedsIssue: true, noDebugStatements: true, guidance: [] } });
+
+  it('practice/todo-without-issue: a TODO citing #12, JIRA-4 or a link is fine; a bare TODO or FIXME is a finding', () => {
+    const report = checkStandards(practice, input([added('src/a.ts', [
+      '// TODO #12 handle retries',
+      '// TODO JIRA-4 split this',
+      '// FIXME see https://example.com/issues/9',
+      '// TODO handle retries',
+      'const s = "TODO in a string";',
+      '/* FIXME later */',
+    ])]));
+    assert.deepEqual(findingsFor(report, 'practice/todo-without-issue'), [{ file: 'src/a.ts', line: 4 }, { file: 'src/a.ts', line: 6 }]);
+    assert.equal(ruleOutcomeLabel(rowOf(report, 'practice/todo-without-issue')), 'findings');
+    assert.equal(rowOf(report, 'practice/todo-without-issue').severity, 'advisory');
+  });
+
+  it('practice/todo-without-issue: unconfigured is "not configured"; a file that cannot be lexed is not checked', () => {
+    const off = checkStandards(bareOther(), input([added('src/a.ts', ['// TODO x'])]));
+    assert.equal(rowOf(off, 'practice/todo-without-issue').unconfigured, true);
+    const unread = checkStandards(practice, input([{ path: 'src/big.ts', status: 'added', addedLines: [], content: null, skipped: 'File is larger than 512 KB' }]));
+    assert.equal(rowOf(unread, 'practice/todo-without-issue').result, 'not-checked');
+    assert.match(rowOf(unread, 'practice/todo-without-issue').reason ?? '', /File is larger than 512 KB \(src\/big\.ts\)/);
+  });
+
+  it('practice/debug-statement: debugger in code and breakpoint() in Python are findings; in a string or another language they are not', () => {
+    const report = checkStandards(practice, input([
+      added('src/a.ts', ['const s = "debugger";', 'debugger;', 'if (x) { debugger;', '}']),
+      added('tool/b.py', ['x = "breakpoint()"', 'breakpoint()', 'import pdb; pdb.set_trace()']),
+      added('src/c.go', ['debugger']),
+    ]));
+    assert.deepEqual(findingsFor(report, 'practice/debug-statement'), [
+      { file: 'src/a.ts', line: 2 }, { file: 'src/a.ts', line: 3 }, { file: 'tool/b.py', line: 2 }, { file: 'tool/b.py', line: 3 },
+    ]);
+    const goOnly = checkStandards(practice, input([added('src/c.go', ['package c'])]));
+    assert.equal(rowOf(goOnly, 'practice/debug-statement').result, 'not-checked', 'a Go file is out of scope: nothing judged');
+  });
+
+  it('security/env-file: a .env or .env.local is a finding; .env.example is not; checked without any configuration', () => {
+    const report = checkStandards(BUILT_IN_PROFILES.other, input([
+      added('.env.example', ['API_KEY=']), added('.env.local', ['API_KEY=x']), added('config/.env', ['A=1']),
+    ], { topLevel: [] }));
+    assert.deepEqual(findingsFor(report, 'security/env-file'), [{ file: '.env.local', line: 1 }, { file: 'config/.env', line: 1 }]);
+    assert.equal(rowOf(report, 'security/env-file').unconfigured, undefined);
+    assert.equal(ruleOutcomeLabel(rowOf(checkStandards(BUILT_IN_PROFILES.other, input([added('src/a.ts', ['x'])])), 'security/env-file')), 'no findings');
+  });
+
+  it('security/secret-literal: a credential on an added line is a finding that never repeats the value', () => {
+    const key = `sk-${'a1B2c3D4e5F6g7H8'.repeat(2)}`;
+    const report = checkStandards(BUILT_IN_PROFILES.other, input([
+      added('src/a.ts', ['const ok = 1;', `const k = "${key}";`]),
+      modified('src/b.ts', [`const old = "${key}";`, 'const n = 2;'], [2]),
+    ]));
+    assert.deepEqual(findingsFor(report, 'security/secret-literal'), [{ file: 'src/a.ts', line: 2 }]);
+    const f = report.findings.find((x) => x.rule === 'security/secret-literal')!;
+    assert.equal(f.message, 'Credential-shaped value (an API key (sk-…)). The value is not shown.');
+    assert.ok(!JSON.stringify(report).includes(key), 'the key appears nowhere in the report');
+  });
+
+  it('security/secret-literal: a binary file is out of scope; an oversize file is not checked', () => {
+    const binary = checkStandards(BUILT_IN_PROFILES.other, input([{ path: 'img/a.png', status: 'added', addedLines: [], content: null, skipped: BINARY_NOT_READ }]));
+    assert.equal(rowOf(binary, 'security/secret-literal').result, 'not-checked');
+    assert.equal(rowOf(binary, 'security/secret-literal').undecided, undefined, 'out of scope, not undecided');
+    const big = checkStandards(BUILT_IN_PROFILES.other, input([{ path: 'src/big.ts', status: 'added', addedLines: [], content: null, skipped: 'File is larger than 512 KB' }]));
+    assert.equal(rowOf(big, 'security/secret-literal').undecided, true);
+  });
+
+  it('a11y/img-alt and a11y/html-lang: HTML pages only; a .tsx file is out of scope', () => {
+    const p = withRulebook({ accessibility: { imgAlt: true, htmlLang: true, guidance: [] } });
+    const report = checkStandards(p, input([
+      added('web/index.html', ['<html>', '<body>', '<img src="a.png" alt="Logo">', '<img src="b.png">', '<img', '  src="c.png">', '</body></html>']),
+      added('web/ok.html', ['<html lang="en">', '<img src="a.png" alt="">', '</html>']),
+      modified('web/old.htm', ['<img src="x.png">', '<img src="y.png">'], [2]),
+      added('src/App.tsx', ['export const A = () => <img src="x.png" />;']),
+    ]));
+    assert.deepEqual(findingsFor(report, 'a11y/img-alt'), [{ file: 'web/index.html', line: 4 }, { file: 'web/index.html', line: 5 }, { file: 'web/old.htm', line: 2 }]);
+    assert.deepEqual(findingsFor(report, 'a11y/html-lang'), [{ file: 'web/index.html', line: 1 }]);
+    const tsxOnly = checkStandards(p, input([added('src/App.tsx', ['export const A = () => <img src="x.png" />;'])]));
+    assert.equal(rowOf(tsxOnly, 'a11y/img-alt').result, 'not-checked');
+    assert.equal(rowOf(tsxOnly, 'a11y/html-lang').result, 'not-checked');
+  });
+
+  it('docs/changelog-updated: a change without the changelog is a finding at its path; with it, no findings; no diff is not checked', () => {
+    const p = withRulebook({ docsGit: { changelogPath: 'CHANGELOG.md', guidance: [] } });
+    const missing = checkStandards(p, input([added('src/a.ts', ['x'])]));
+    assert.deepEqual(findingsFor(missing, 'docs/changelog-updated'), [{ file: 'CHANGELOG.md', line: 1 }]);
+    const present = checkStandards(p, input([added('src/a.ts', ['x']), modified('CHANGELOG.md', ['# Changes', '- x'], [2])]));
+    assert.equal(ruleOutcomeLabel(rowOf(present, 'docs/changelog-updated')), 'no findings');
+    const noBase = checkStandards(p, input([added('src/a.ts', ['x'])], { baseRef: null }));
+    assert.equal(rowOf(noBase, 'docs/changelog-updated').result, 'not-checked');
+    assert.equal(rowOf(checkStandards(BUILT_IN_PROFILES.other, input([added('src/a.ts', ['x'])])), 'docs/changelog-updated').unconfigured, true);
+  });
+
+  it('every new rule is advisory: findings never stop the ship unless promoted, and a promoted one does', () => {
+    const report = checkStandards(practice, input([added('src/a.ts', ['// TODO x', 'debugger;']), added('.env', ['A=1'])], { topLevel: [] }));
+    assert.equal(standardsBlocked(report), false);
+    assert.equal(standardsBlocked(checkStandards(promote(practice, 'practice/todo-without-issue'), input([added('src/a.ts', ['// TODO x'])]))), true);
+  });
+});
+
+// ─── Project Rulebook rules that need new evidence: deleted files, requirement ids ───
+
+describe('standards checker — migrations and requirement references', () => {
+  function withRulebook(over: Partial<StandardsProfile>): StandardsProfile {
+    return { ...bareOther(), ...over };
+  }
+  const rowOf = (report: StandardsReport, rule: StandardsRuleId): StandardsRuleOutcome => report.rules.find((r) => r.rule === rule)!;
+  const migrations = withRulebook({ apiData: { migrationsGlob: 'db/migrate/**', guidance: [] } });
+
+  it('data/migration-edited: an edited, deleted or moved-away migration is a finding; an added one is not', () => {
+    const report = checkStandards(migrations, input([
+      modified('db/migrate/002.sql', ['create table b (id int);', 'alter table b add c int;'], [2]),
+      added('db/migrate/004.sql', ['create table d (id int);']),
+      { path: 'db/old/003.sql', status: 'renamed', renamedFrom: 'db/migrate/003.sql', addedLines: [], content: 'x' },
+    ], { deletedFiles: ['db/migrate/001.sql', 'src/gone.ts'] }));
+    assert.deepEqual(findingsFor(report, 'data/migration-edited'), [
+      { file: 'db/migrate/001.sql', line: 1 }, { file: 'db/migrate/002.sql', line: 1 }, { file: 'db/old/003.sql', line: 1 },
+    ]);
+    const fresh = checkStandards(migrations, input([added('db/migrate/004.sql', ['create table d (id int);'])], { deletedFiles: [] }));
+    assert.equal(ruleOutcomeLabel(rowOf(fresh, 'data/migration-edited')), 'no findings');
+  });
+
+  it('data/migration-edited: deleted files not listed is "not checked"; unconfigured is "not configured"', () => {
+    const unlisted = checkStandards(migrations, input([added('db/migrate/004.sql', ['x'])]));
+    assert.equal(rowOf(unlisted, 'data/migration-edited').result, 'not-checked');
+    assert.match(rowOf(unlisted, 'data/migration-edited').reason ?? '', /the deleted files were not listed/);
+    assert.equal(rowOf(checkStandards(BUILT_IN_PROFILES.other, input([], { deletedFiles: [] })), 'data/migration-edited').unconfigured, true);
+  });
+
+  const traced = withRulebook({ testPolicy: { requirementReference: true, guidance: [] } });
+  traced.testing.fileGlobs = ['test/**/*.test.js'];
+
+  it('testing/requirement-reference: an id named in a changed test file is fine; one named nowhere is a finding; R-1 never matches R-10', () => {
+    const report = checkStandards(traced, input([
+      added('test/a.test.js', ['// covers R-10 and R-2', 'it("R-2 works", () => {});']),
+      added('src/a.js', ['// R-1 is implemented here']),
+    ], { requirementIds: ['R-1', 'R-2', 'R-10'] }));
+    assert.deepEqual(findingsFor(report, 'testing/requirement-reference'), [{ file: 'requirement R-1', line: 1 }]);
+    assert.match(report.findings.find((f) => f.rule === 'testing/requirement-reference')!.message, /Requirement R-1 is not named in any test file/);
+  });
+
+  it('testing/requirement-reference: no ids, or an unread test file, is not checked — never a pass', () => {
+    const noIds = checkStandards(traced, input([added('test/a.test.js', ['x'])]));
+    assert.equal(rowOf(noIds, 'testing/requirement-reference').result, 'not-checked');
+    assert.match(rowOf(noIds, 'testing/requirement-reference').reason ?? '', /no requirement ids were given to this check/);
+    const unread = checkStandards(traced, input([{ path: 'test/big.test.js', status: 'added', addedLines: [], content: null, skipped: 'File is larger than 512 KB' }],
+      { requirementIds: ['R-1'] }));
+    assert.equal(rowOf(unread, 'testing/requirement-reference').undecided, true);
+    assert.deepEqual(findingsFor(unread, 'testing/requirement-reference'), []);
   });
 });

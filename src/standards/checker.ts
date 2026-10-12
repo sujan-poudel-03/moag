@@ -20,9 +20,10 @@
 // reported exactly like a failed blocking one — file, line, rule — but only a
 // blocking failure stops a release. Heuristics inform; they never block on a guess.
 //
-// "Not checked" is never a pass. A rule that is not configured, that met a file
-// it could not decide, or that found nothing in the diff to judge says so with a
-// reason and is left out of the passed total. An empty diff therefore passes
+// "Not checked" is never a pass. A rule that met a file it could not decide, or that
+// found nothing in the diff to judge, says so with a reason and is left out of the
+// passed total. A rule the profile does not configure is neither: it is "not configured",
+// counted apart (`totals.notConfigured`), and is no gap in a check. An empty diff therefore passes
 // nothing: work committed before the base ref is outside the check, not cleared by it.
 //
 // Exemptions are visible. Every changed file the line rules did not read — vendored,
@@ -43,7 +44,9 @@ import {
   STANDARDS_RULE_IDS,
   StandardsProfile,
   StandardsRuleId,
+  credentialShapeIn,
   isScannerRule,
+  ruleConfigured,
   ruleSeverity,
 } from './profile';
 
@@ -59,6 +62,8 @@ export interface StandardsCheckFile {
    * added or altered are in `addedLines`; a pure rename has none.
    */
   status: 'added' | 'modified' | 'renamed';
+  /** For a `renamed` file, the path it had at the base. Absent when not known. */
+  renamedFrom?: string;
   /** 1-based numbers of the lines this change added, ascending. */
   addedLines: number[];
   /** The full new file, or null when it was not read. */
@@ -151,6 +156,16 @@ export interface StandardsCheckInput {
    * `skipped` when it could not be read. Absent when they were not read at all.
    */
   designFiles?: StandardsDesignFile[];
+  /**
+   * Paths the base had and the tree no longer has (`.moag/` excluded). Absent when they were
+   * not listed: a rule about deleted files is then not checked.
+   */
+  deletedFiles?: string[];
+  /**
+   * The requirement ids this check verifies (R-1, R-2, …). Absent or empty when the caller
+   * had none to give: the rule that each is named in a test file is then not checked.
+   */
+  requirementIds?: string[];
 }
 
 /** One design-system file as the evidence collector read it from the workspace. */
@@ -215,7 +230,13 @@ export interface StandardsTotals {
   failed: number;
   /** Advisory rules with findings. Reported, counted, never blocking. */
   advisory: number;
+  /** Rules the profile configures (and commands) that ended not checked. Never a pass. */
   notChecked: number;
+  /**
+   * Rules the profile does not configure at all. Not a gap in a check and not a pass:
+   * shown apart as "not configured", never among the rules not checked.
+   */
+  notConfigured: number;
   /** Blocking rules and commands the profile configures that ended not checked. Anything above zero stops a release. */
   blockingNotChecked: number;
   /** The true number of findings, blocking and advisory, even when the list itself was capped. */
@@ -250,7 +271,14 @@ const MAX_REPORT_RULES = 40;
 const MAX_REPORT_TEXT_CHARS = 500;
 const MAX_REPORT_PATH_CHARS = 1_000;
 
-const NOT_CONFIGURED = 'Not configured in this profile';
+/** The reason on every row the profile does not configure; also how a report stored before `unconfigured` existed is read. */
+export const NOT_CONFIGURED = 'Not configured in this profile';
+/**
+ * The reason {@link applyProfileSeverity} writes in place of {@link NOT_CONFIGURED} on a row the
+ * reader does NOT take as unconfigured, so no later reader (the web card, a re-parse) can read
+ * the old text as "not configured" while the gate counts the row as not checked.
+ */
+export const CONFIGURED_NOT_CHECKED = 'Not checked: reported as not configured, but the profile this run uses does not confirm it';
 const NO_DIFF = 'No diff could be taken (not a git repository, or the base ref is unknown)';
 const NOTHING_TO_CHECK = 'The diff holds nothing for this rule to check';
 /**
@@ -315,7 +343,7 @@ export function standardsBlockingEvaluated(report: StandardsReport): boolean {
 export function standardsCheckCounts(report: StandardsReport): StandardsCheckCounts {
   return {
     advisoryFindings: report.totals.advisoryFindings,
-    notCheckedRules: report.rules.filter((r) => r.result === 'not-checked' && r.unconfigured !== true).length,
+    notCheckedRules: report.rules.filter((r) => r.result === 'not-checked' && !isNotConfigured(r)).length,
     notCheckedFiles: report.totals.notCheckedFiles,
     // Said only when it is so: the check had nothing that could stop a release.
     ...(standardsBlockingState(report) === 'none-configured' ? { noBlockingRules: true as const } : {}),
@@ -323,14 +351,15 @@ export function standardsCheckCounts(report: StandardsReport): StandardsCheckCou
 }
 
 /** How a rule's outcome is worded for a reader. The stored result is never shown as-is. */
-export type RuleOutcomeLabel = 'passed' | 'failed' | 'no findings' | 'findings' | 'not checked';
+export type RuleOutcomeLabel = 'passed' | 'failed' | 'no findings' | 'findings' | 'not checked' | 'not configured';
 
 /**
  * The words for one row. "passed" / "failed" only for a profile command; every rule MOAG
  * decides itself says "no findings" / "findings" — finding nothing is not proof that
- * nothing is there.
+ * nothing is there. A rule the profile does not configure is "not configured".
  */
-export function ruleOutcomeLabel(row: Pick<StandardsRuleOutcome, 'rule' | 'result'>): RuleOutcomeLabel {
+export function ruleOutcomeLabel(row: Pick<StandardsRuleOutcome, 'rule' | 'result' | 'unconfigured'>): RuleOutcomeLabel {
+  if (isNotConfigured(row)) { return 'not configured'; }
   if (row.result === 'not-checked') { return 'not checked'; }
   if (isScannerRule(row.rule)) { return row.result === 'failed' ? 'findings' : 'no findings'; }
   return row.result;
@@ -361,17 +390,27 @@ export function standardsBlocked(report: StandardsReport): boolean {
   return report.rules.some((r) => r.result === 'failed' && severityOf(r) === 'blocking');
 }
 
-/** The report's rows in the three groups every surface shows: Blocking, Advisory, Not checked. */
+/** A row for a rule the profile does not configure: "not configured", never "not checked". */
+export function isNotConfigured(row: Pick<StandardsRuleOutcome, 'result' | 'unconfigured'>): boolean {
+  return row.result === 'not-checked' && row.unconfigured === true;
+}
+
+/**
+ * The report's rows in the groups every surface shows: Blocking, Advisory, Not checked —
+ * and, apart from them, Not configured (rules the profile does not configure; no gap).
+ */
 export function groupStandardsRules(report: StandardsReport): {
   blocking: StandardsRuleOutcome[]; advisory: StandardsRuleOutcome[]; notChecked: StandardsRuleOutcome[];
+  notConfigured: StandardsRuleOutcome[];
 } {
   const decided = report.rules.filter((r) => r.result !== 'not-checked');
   return {
     blocking: decided.filter((r) => severityOf(r) === 'blocking'),
     advisory: decided.filter((r) => severityOf(r) === 'advisory'),
     // Blocking rules and commands that were not checked come first: they are the ones a reader must see.
-    notChecked: report.rules.filter((r) => r.result === 'not-checked')
+    notChecked: report.rules.filter((r) => r.result === 'not-checked' && !isNotConfigured(r))
       .sort((a, b) => Number(isBlockingNotChecked(b)) - Number(isBlockingNotChecked(a))),
+    notConfigured: report.rules.filter(isNotConfigured),
   };
 }
 
@@ -960,13 +999,15 @@ function importSpecifiers(ext: string, code: string): ImportRead | null {
 
 // ─── Frontend design tokens ───
 
-/** UI files whose added lines are scanned for raw colours and lengths. */
-const DESIGN_SCAN_EXTENSIONS = new Set(['css', 'html', 'htm', 'jsx', 'tsx']);
+/** UI files whose added lines are scanned whole for raw colours and lengths. */
+const DESIGN_SCAN_EXTENSIONS = new Set(['css', 'html', 'htm']);
 /**
- * Script files whose string and template literals are scanned (styled-components, Emotion,
- * style objects): only the literal text, never the code around it. JSX/TSX are scanned whole.
+ * Script files (JSX/TSX included) whose STYLE-SHAPED literal text is scanned: a styled or css
+ * tagged template, a string assigned to a style key, a colour attribute in JSX, or a literal
+ * that reads as a CSS declaration. Code, issue references (`#123`) and selectors
+ * (`querySelector('#id')`) are never read as colours.
  */
-const DESIGN_LITERAL_EXTENSIONS = new Set(['ts', 'mts', 'cts', 'js', 'mjs', 'cjs']);
+const DESIGN_LITERAL_EXTENSIONS = new Set(['ts', 'mts', 'cts', 'js', 'mjs', 'cjs', 'jsx', 'tsx']);
 /** UI files no scanner here reads: a change to one leaves the rule undecided. */
 const DESIGN_UNREADABLE_EXTENSIONS = new Set(['vue', 'svelte', 'scss', 'sass', 'less']);
 /** At-rule lines whose lengths are breakpoints or conditions, not styling. */
@@ -982,52 +1023,109 @@ function designNormalised(text: string): string {
 /** Deepest nesting of template literals and `${…}` expressions followed; deeper text is skipped. */
 const MAX_LITERAL_NESTING = 32;
 
+/** A tag that makes a template literal CSS: styled-components, Emotion, Linaria and the like. */
+const STYLE_TAG = /(?:^|[^\w$.])(?:css|keyframes|createGlobalStyle|injectGlobal|styled(?:\.[A-Za-z]+|\([^)]*\))(?:\.attrs\([^)]*\))?)\s*$/;
+/** Code before a string literal that assigns it to a style key (`color: '#fff'`, `"marginTop": "4px"`). */
+const STYLE_KEY_PREFIX = /(?:^|[{,\s])['"]?(?:color|background(?:-?color)?|border(?:-?(?:top|right|bottom|left))?(?:-?color)?|outline(?:-?color)?|fill|stroke|box-?shadow|text-?shadow|caret-?color|accent-?color|stop-?color|(?:margin|padding|gap|width|height|top|left|right|bottom|font-?size|line-?height|border-?radius)(?:-?\w+)?)['"]?\s*:\s*$/i;
+/** Code before a string literal that is a colour attribute in JSX (`fill="#fff"`, `color={'#fff'}`). */
+const STYLE_ATTR_PREFIX = /(?:^|[\s{])(?:color|fill|stroke|stopColor|floodColor)=\s*\{?\s*$/;
 /**
- * The text inside string and template literals on each line of lexed (comment-free) JS/TS
- * code — where styled-components, Emotion and inline style objects keep their CSS — with
- * `${…}` expressions left out. A template literal is followed across lines; a quoted string
- * ends at its line. Only the literal text is scanned in a plain `.js`/`.ts` file, so code such
- * as a `#private` field is never read as a colour. Heuristic: a regular expression literal
- * holding a quote can misplace one line's boundaries; the rule is advisory unless promoted.
+ * The CSS properties whose value can hold a raw colour or length, and custom properties
+ * (`--brand: #333`). A declaration is read only under one of these names: `'Issue: #123'`
+ * or `'Note: 3px later'` is prose with a colon, not CSS.
  */
-function literalTextByLine(lines: readonly string[]): string[] {
-  const out: string[] = [];
-  // Open template literals ('tpl') and `${` expressions (their own `{` depth) around this point.
-  const stack: Array<'tpl' | { depth: number }> = [];
+const CSS_STYLE_PROPERTY = String.raw`(?:--[a-z0-9-]+|color|background(?:-color|-image)?|border(?:-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)?(?:-(?:color|width|radius))?|border-(?:top|bottom)-(?:left|right)-radius|border-radius|outline(?:-color|-width|-offset)?|fill|stroke(?:-width)?|box-shadow|text-shadow|caret-color|accent-color|column-rule(?:-color)?|text-decoration(?:-color)?|stop-color|flood-color|(?:margin|padding|inset)(?:-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)?|gap|row-gap|column-gap|(?:min-|max-)?(?:width|height)|top|right|bottom|left|font(?:-size)?|line-height|letter-spacing|word-spacing|text-indent|flex-basis|grid-template-(?:columns|rows))`;
+/** Literal text that itself reads as a CSS declaration with a raw value (`'color: #fff'`, `'border: 1px solid #333'`). */
+const CSS_DECLARATION_TEXT = new RegExp(
+  String.raw`(?:^|[;{\s])${CSS_STYLE_PROPERTY}\s*:\s*[^;{}]*(?:#[0-9a-f]{3,8}\b|rgba?\(|hsla?\(|\d(?:px|rem|em)\b)`, 'i');
+
+/** One run of literal text on one line, and whether its context makes it style. */
+interface LiteralSegment {
+  text: string;
+  style: boolean;
+}
+
+/**
+ * The runs of text inside string and template literals on each line of lexed (comment-free)
+ * JS/TS code, with `${…}` expressions left out, each marked with whether its context makes it
+ * style: a template literal whose tag is a CSS tag, or a string literal whose code prefix on
+ * the line is a style key or a JSX colour attribute. A template literal is followed across
+ * lines; a quoted string ends at its line. Heuristic: a regular expression literal holding a
+ * quote can misplace one line's boundaries, and a tag on the line before its backtick is not
+ * seen; the rule is advisory unless promoted.
+ */
+function literalSegmentsByLine(lines: readonly string[]): LiteralSegment[][] {
+  const out: LiteralSegment[][] = [];
+  // Open template literals (and whether each is style) and `${` expressions (their own `{` depth).
+  const stack: Array<{ tpl: true; style: boolean } | { tpl: false; depth: number }> = [];
   for (const line of lines) {
-    let text = '';
+    const segs: LiteralSegment[] = [];
     let quote: string | null = null;
+    // A template literal still open from an earlier line continues here.
+    const open = stack[stack.length - 1];
+    let cur: LiteralSegment = { text: '', style: open !== undefined && open.tpl ? open.style : false };
+    const flush = (): void => {
+      if (cur.text.length > 0) { segs.push(cur); }
+      cur = { text: '', style: false };
+    };
     for (let i = 0; i < line.length; i++) {
       const ch = line[i];
       const top = stack[stack.length - 1];
       if (quote !== null) {
-        if (ch === '\\') { text += line.slice(i, i + 2); i++; continue; }
-        if (ch === quote) { quote = null; text += ' '; continue; }
-        text += ch;
+        if (ch === '\\') { cur.text += line.slice(i, i + 2); i++; continue; }
+        if (ch === quote) { quote = null; flush(); continue; }
+        cur.text += ch;
         continue;
       }
-      if (top === 'tpl') {
-        if (ch === '\\') { text += line.slice(i, i + 2); i++; continue; }
-        if (ch === '`') { stack.pop(); text += ' '; continue; }
+      if (top !== undefined && top.tpl) {
+        if (ch === '\\') { cur.text += line.slice(i, i + 2); i++; continue; }
+        if (ch === '`') { stack.pop(); flush(); continue; }
         if (ch === '$' && line[i + 1] === '{') {
-          if (stack.length < MAX_LITERAL_NESTING) { stack.push({ depth: 0 }); }
-          text += ' ';
+          flush();
+          if (stack.length < MAX_LITERAL_NESTING) { stack.push({ tpl: false, depth: 0 }); }
           i++;
           continue;
         }
-        text += ch;
+        cur.text += ch;
         continue;
       }
-      if (ch === '\'' || ch === '"') { quote = ch; continue; }
-      if (ch === '`') { if (stack.length < MAX_LITERAL_NESTING) { stack.push('tpl'); } continue; }
-      if (top !== undefined) {
-        if (ch === '{') { top.depth++; }
-        else if (ch === '}') { if (top.depth === 0) { stack.pop(); } else { top.depth--; } }
+      if (ch === '\'' || ch === '"') {
+        const prefix = line.slice(0, i);
+        quote = ch;
+        cur = { text: '', style: STYLE_KEY_PREFIX.test(prefix) || STYLE_ATTR_PREFIX.test(prefix) };
+        continue;
+      }
+      if (ch === '`') {
+        const style = STYLE_TAG.test(line.slice(0, i));
+        if (stack.length < MAX_LITERAL_NESTING) { stack.push({ tpl: true, style }); }
+        cur = { text: '', style };
+        continue;
+      }
+      if (top !== undefined && !top.tpl) {
+        if (ch === '{') { top.depth++; continue; }
+        if (ch !== '}') { continue; }
+        if (top.depth > 0) { top.depth--; continue; }
+        stack.pop();
+        const outer = stack[stack.length - 1];
+        if (outer !== undefined && outer.tpl) { cur = { text: '', style: outer.style }; }
       }
     }
-    out.push(text);
+    flush();
+    out.push(segs);
   }
   return out;
+}
+
+/**
+ * Per line, only the style-shaped literal text of lexed JS/TS/JSX/TSX code (see
+ * {@link literalSegmentsByLine}), plus any literal that itself reads as a CSS declaration with
+ * a raw value. Empty for a line with none.
+ */
+function styleTextByLine(codeLines: readonly string[]): string[] {
+  return literalSegmentsByLine(codeLines).map((segs) => segs
+    .filter((seg) => seg.style || CSS_DECLARATION_TEXT.test(seg.text))
+    .map((seg) => seg.text)
+    .join(' '));
 }
 
 /** True when `code` holds a raw length other than 0 and 1px. */
@@ -1074,8 +1172,11 @@ function checkDesignTokens(profile: StandardsProfile, input: StandardsCheckInput
   }
 
   const kit = knownComponentKit(profile.frontend.componentKit);
+  const layerGlobs = profile.backend.layers.flatMap((l) => l.globs);
   for (const f of files) {
     if (f.path === tokensPath || f.path === docPath) { continue; }
+    // Tests and backend code are not UI: out of scope, so neither evidence nor "not checked".
+    if (matchesAny(f.path, profile.testing.fileGlobs) === true || matchesAny(f.path, layerGlobs) === true) { continue; }
     const inScope = f.file.content === null || f.file.status !== 'modified' || f.file.addedLines.length > 0;
     if (!inScope) { continue; }
     const literalOnly = DESIGN_LITERAL_EXTENSIONS.has(f.ext);
@@ -1092,11 +1193,14 @@ function checkDesignTokens(profile: StandardsProfile, input: StandardsCheckInput
 
     // ── Raw colours and lengths ──
     if (DESIGN_SCAN_EXTENSIONS.has(f.ext) || literalOnly) {
-      log.saw(rule);
-      const literals = literalOnly && f.lex.ok ? literalTextByLine(f.lex.lines.map((l) => l.code)) : null;
+      // A stylesheet or page with added lines is evidence; a script only where it holds style.
+      let sawStyle = !literalOnly;
+      const styled = literalOnly && f.lex.ok ? styleTextByLine(f.lex.lines.map((l) => l.code)) : null;
       for (const n of f.file.addedLines) {
-        const text = literals ? literals[n - 1] : f.lex.ok ? f.lex.lines[n - 1]?.code : f.raw[n - 1];
-        if (text === undefined || DESIGN_AT_RULE.test(text)) { continue; }
+        const text = styled ? styled[n - 1] : f.lex.ok ? f.lex.lines[n - 1]?.code : f.raw[n - 1];
+        if (text === undefined || (styled !== null && text.trim() === '')) { continue; }
+        sawStyle = true;
+        if (DESIGN_AT_RULE.test(text)) { continue; }
         const code = text.replace(DESIGN_VAR_CALL, '');
         if (BUILTIN_PATTERNS['hex-color'].test(code) || BUILTIN_PATTERNS['css-color-function'].test(code)) {
           log.findIn(rule, f, n, `Raw colour; use a design token from ${tokensPath}`);
@@ -1105,6 +1209,7 @@ function checkDesignTokens(profile: StandardsProfile, input: StandardsCheckInput
           log.findIn(rule, f, n, `Raw length; use a spacing, radius or type token from ${tokensPath}`);
         }
       }
+      if (sawStyle) { log.saw(rule); }
     }
 
     // ── Component kit ──
@@ -1830,6 +1935,243 @@ function checkComments(profile: StandardsProfile, files: Prepared[], log: RuleLo
   }
 }
 
+// ─── Project Rulebook: coding practice ───
+
+/** A TODO or FIXME marker in a comment. */
+const TODO_MARKER = /\b(?:TODO|FIXME)\b/;
+/** What makes a TODO cite an issue: `#123`, a link, or a tracker key such as `ABC-123`. */
+const ISSUE_REFERENCE = /#\d+\b|[a-z][a-z0-9+.-]*:\/\/\S+|\b[A-Z][A-Z0-9]+-\d+\b/;
+/** A `debugger` statement on its own, in lexed JS/TS code with its literals blanked. */
+const JS_DEBUGGER = /(?:^|[;{}]\s*)debugger\s*;?\s*$/;
+/** A Python breakpoint left in: `breakpoint()`, `pdb.set_trace()`, `ipdb.set_trace()`. */
+const PY_BREAKPOINT = /\b(?:breakpoint\s*\(|(?:i?pdb)\.set_trace\s*\()/;
+
+/**
+ * Coding practice MOAG can decide from a line: a TODO or FIXME comment on an added line cites
+ * an issue (`practice/todo-without-issue`), and no debugger statement or Python breakpoint is
+ * left on an added line (`practice/debug-statement`, JS family and Python only — other files
+ * are out of scope for it). Advisory unless a profile promotes them.
+ */
+function checkPractice(profile: StandardsProfile, files: Prepared[], log: RuleLog): void {
+  const todoRule = 'practice/todo-without-issue';
+  const debugRule = 'practice/debug-statement';
+  const todo = !!profile.practice?.todoNeedsIssue;
+  const debug = !!profile.practice?.noDebugStatements;
+  if (!todo) { log.notConfigured(todoRule); }
+  if (!debug) { log.notConfigured(debugRule); }
+  if (!todo && !debug) { return; }
+  for (const f of files) {
+    if (!f.isSource || (f.file.addedLines.length === 0 && f.file.content !== null)) { continue; }
+    const debugScope = JS_EXTENSIONS.has(f.ext) || f.ext === 'py';
+    const rules: StandardsRuleId[] = [...(todo ? [todoRule] : []), ...(debug && debugScope ? [debugRule] : [])] as StandardsRuleId[];
+    if (rules.length === 0) { continue; }
+    if (f.leftOut) { log.leftOut(f, ...rules); continue; }
+    if (!f.lex.ok) {
+      for (const rule of rules) { log.undecided(rule, `${f.lex.reason} (${f.path})`); }
+      continue;
+    }
+    log.saw(...rules);
+    for (const n of f.file.addedLines) {
+      const l = f.lex.lines[n - 1];
+      if (!l) { continue; }
+      if (todo && l.comment !== '' && TODO_MARKER.test(l.comment) && !ISSUE_REFERENCE.test(l.comment)) {
+        log.findIn(todoRule, f, n, 'TODO or FIXME without an issue reference; cite one (#123, ABC-123 or a link) or do the work now');
+      }
+      if (debug && debugScope) {
+        const code = withoutLiterals(l.code);
+        if (f.ext === 'py' ? PY_BREAKPOINT.test(code) : JS_DEBUGGER.test(code.trim())) {
+          log.findIn(debugRule, f, n, 'Debugger statement left in the code; remove it');
+        }
+      }
+    }
+  }
+}
+
+// ─── Project Rulebook: security ───
+
+/** What evidence.ts records for a file it did not read because it is binary. */
+export const BINARY_NOT_READ = 'Binary content';
+/** A `.env` file: `.env` or `.env.<anything>`, except an example, sample or template. */
+const ENV_FILE = /^\.env(?:\..+)?$/;
+const ENV_EXAMPLE = /\.(?:example|sample|template)$/i;
+
+/**
+ * Checked on every run, whatever the profile holds: no `.env` file is added or changed in the
+ * repository (`security/env-file`), and no added line of any read file holds a
+ * credential-shaped value (`security/secret-literal` — the finding names the shape, never the
+ * value). A binary file is out of scope for the second; any other unread file leaves it
+ * undecided. Advisory unless a profile promotes them.
+ */
+function checkSecurity(files: Prepared[], log: RuleLog): void {
+  const envRule = 'security/env-file';
+  const secretRule = 'security/secret-literal';
+  if (files.length > 0) { log.saw(envRule); }
+  for (const f of files) {
+    const name = f.path.split('/').pop() ?? '';
+    if (ENV_FILE.test(name) && !ENV_EXAMPLE.test(name)) {
+      log.findIn(envRule, f, 1, `${f.path} is a .env file; keep it out of the repository (commit a .env.example with placeholders instead)`);
+    }
+    if (f.file.content === null) {
+      if (f.file.skipped !== BINARY_NOT_READ) { log.undecided(secretRule, `${f.file.skipped ?? 'File could not be read'} (${f.path})`); }
+      continue;
+    }
+    if (f.file.addedLines.length === 0) { continue; }
+    if (f.leftOut) { log.leftOut(f, secretRule); continue; }
+    log.saw(secretRule);
+    for (const n of f.file.addedLines) {
+      const shape = credentialShapeIn(f.raw[n - 1] ?? '');
+      if (shape) { log.findIn(secretRule, f, n, `Credential-shaped value (${shape}). The value is not shown.`); }
+    }
+  }
+}
+
+// ─── Project Rulebook: accessibility ───
+
+const HTML_IMG = /<img\b[^>]*>/gi;
+const HTML_ROOT = /<html\b[^>]*>/gi;
+
+/** The 1-based line `index` falls on in `text`. */
+function lineAt(text: string, index: number): number {
+  let n = 1;
+  for (let i = 0; i < index; i++) { if (text.charCodeAt(i) === 0x0a) { n++; } }
+  return n;
+}
+
+/**
+ * Accessibility minimums MOAG can read in an HTML page: every `<img>` that starts on an added
+ * line has an `alt` attribute (`a11y/img-alt`, `.html` and `.htm`), and the `<html>` element
+ * of a new page, or one on an added line, declares `lang` (`a11y/html-lang`, `.html`). Other
+ * files are out of scope for both. Advisory unless a profile promotes them.
+ */
+function checkA11y(profile: StandardsProfile, files: Prepared[], log: RuleLog): void {
+  const altRule = 'a11y/img-alt';
+  const langRule = 'a11y/html-lang';
+  const alt = !!profile.accessibility?.imgAlt;
+  const lang = !!profile.accessibility?.htmlLang;
+  if (!alt) { log.notConfigured(altRule); }
+  if (!lang) { log.notConfigured(langRule); }
+  for (const f of files) {
+    const rules = [
+      ...(alt && (f.ext === 'html' || f.ext === 'htm') ? [altRule] : []),
+      ...(lang && f.ext === 'html' ? [langRule] : []),
+    ] as StandardsRuleId[];
+    if (rules.length === 0 || (f.file.addedLines.length === 0 && f.file.content !== null)) { continue; }
+    if (f.leftOut) { log.leftOut(f, ...rules); continue; }
+    if (f.file.content === null) {
+      for (const rule of rules) { log.undecided(rule, `${f.file.skipped ?? 'File could not be read'} (${f.path})`); }
+      continue;
+    }
+    log.saw(...rules);
+    const text = f.file.content.replace(/\r\n?/g, '\n');
+    const added = new Set(f.file.addedLines);
+    if (rules.includes(altRule)) {
+      for (const m of text.matchAll(HTML_IMG)) {
+        const n = lineAt(text, m.index ?? 0);
+        if (added.has(n) && !/\balt\s*=/i.test(m[0])) { log.findIn(altRule, f, n, 'Image without alt text; add alt="…" (alt="" for a decorative image)'); }
+      }
+    }
+    if (rules.includes(langRule)) {
+      for (const m of text.matchAll(HTML_ROOT)) {
+        const n = lineAt(text, m.index ?? 0);
+        if ((added.has(n) || f.file.status === 'added') && !/\blang\s*=/i.test(m[0])) {
+          log.findIn(langRule, f, n, 'The page does not declare its language; add lang="…" to <html>');
+        }
+      }
+    }
+  }
+}
+
+// ─── Project Rulebook: docs and git ───
+
+/**
+ * The changelog is updated by a change that changes anything else (`docs/changelog-updated`):
+ * when the diff holds a path other than MOAG's own and the design files, the changelog must be
+ * among the changed files. A finding at the changelog path otherwise. Advisory unless promoted.
+ */
+function checkChangelog(profile: StandardsProfile, input: StandardsCheckInput, files: Prepared[], log: RuleLog): void {
+  const rule = 'docs/changelog-updated';
+  const changelog = profile.docsGit?.changelogPath ? normalizePath(profile.docsGit.changelogPath) : '';
+  if (!changelog) { log.notConfigured(rule); return; }
+  if (input.baseRef === null) { return; }
+  const own = new Set([profile.design?.docPath, profile.design?.tokensPath].filter((p): p is string => !!p).map(normalizePath));
+  const counted = files.filter((f) => !own.has(f.path) && f.path !== '.moag' && !f.path.startsWith('.moag/'));
+  if (counted.length === 0) { return; }
+  log.saw(rule);
+  if (!counted.some((f) => f.path === changelog)) {
+    log.find(rule, changelog, 1, `This change does not update ${changelog}; record what changed there`);
+  }
+}
+
+// ─── Project Rulebook: API and data ───
+
+/**
+ * A committed migration is never edited or deleted (`data/migration-edited`): a file under the
+ * profile's migrations glob that this change modified, renamed away or deleted is a finding;
+ * one it added is fine. Not checked when the deleted files were not listed. Advisory unless
+ * a profile promotes it.
+ */
+function checkMigrations(profile: StandardsProfile, input: StandardsCheckInput, files: Prepared[], log: RuleLog): void {
+  const rule = 'data/migration-edited';
+  const glob = profile.apiData?.migrationsGlob ?? '';
+  if (!glob) { log.notConfigured(rule); return; }
+  if (input.baseRef === null) { return; }
+  if (input.deletedFiles === undefined) { log.undecided(rule, 'Not checked: the deleted files were not listed'); return; }
+  const isMigration = (p: string): boolean | null => matchesAny(normalizePath(p), [glob]);
+  if (isMigration('x') === null) { log.undecided(rule, `The migrations pattern could not be read (${glob.slice(0, 80)})`); return; }
+  for (const f of files) {
+    if (f.file.origin !== undefined) { continue; }
+    const from = f.file.renamedFrom;
+    if (isMigration(f.path) === true) {
+      log.saw(rule);
+      if (f.file.status === 'modified') { log.findIn(rule, f, 1, 'A committed migration was edited; add a new migration instead'); }
+    }
+    if (f.file.status === 'renamed' && from !== undefined && isMigration(from) === true) {
+      log.saw(rule);
+      log.findIn(rule, f, 1, `A committed migration was moved here from ${normalizePath(from)}; add a new migration instead`);
+    }
+  }
+  for (const gone of input.deletedFiles) {
+    if (isMigration(gone) !== true) { continue; }
+    log.saw(rule);
+    log.find(rule, normalizePath(gone), 1, 'A committed migration was deleted; add a new migration that reverses it instead');
+  }
+}
+
+// ─── Project Rulebook: testing ───
+
+/** `text` with every regular-expression metacharacter escaped. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Every requirement this check verifies is named in a test file the change touched
+ * (`testing/requirement-reference`): for each id, the changed files matching the profile's
+ * test globs are searched for it as a whole token — `R-1` never matches `R-10`. An id named
+ * in none is a finding. Not checked when no ids were given (the check before the ship gate
+ * has none), when the profile names no test files, or when a changed test file was not read.
+ * Advisory, and cannot be promoted until the check before the gate is given the ids.
+ */
+function checkRequirementReferences(profile: StandardsProfile, input: StandardsCheckInput, files: Prepared[], log: RuleLog): void {
+  const rule = 'testing/requirement-reference';
+  if (!profile.testPolicy?.requirementReference) { log.notConfigured(rule); return; }
+  if (input.baseRef === null) { return; }
+  const ids = [...new Set(input.requirementIds ?? [])];
+  if (ids.length === 0) { log.undecided(rule, 'not checked: no requirement ids were given to this check'); return; }
+  if (profile.testing.fileGlobs.length === 0) { log.undecided(rule, 'not checked: the profile names no test files (testing.fileGlobs)'); return; }
+  const tests = files.filter((f) => matchesAny(f.path, profile.testing.fileGlobs) === true);
+  const unread = tests.filter((f) => f.file.content === null);
+  for (const f of unread) { log.undecided(rule, `${f.file.skipped ?? 'File could not be read'} (${f.path})`); }
+  if (unread.length > 0) { return; }
+  log.saw(rule);
+  for (const id of ids) {
+    const named = new RegExp(`(?<![\\w-])${escapeRegExp(id)}(?![\\w-])`);
+    if (!tests.some((f) => named.test(f.file.content ?? ''))) {
+      log.find(rule, `requirement ${id}`, 1, `Requirement ${id} is not named in any test file this change touched`);
+    }
+  }
+}
+
 // ─── Public API ───
 
 /**
@@ -1848,7 +2190,8 @@ export function computeTotals(
     noFindings: clean.filter((r) => isScannerRule(r.rule)).length,
     failed: failed.filter((r) => severityOf(r) === 'blocking').length,
     advisory: failed.filter((r) => severityOf(r) === 'advisory').length,
-    notChecked: rules.filter((r) => r.result === 'not-checked').length,
+    notChecked: rules.filter((r) => r.result === 'not-checked' && !isNotConfigured(r)).length,
+    notConfigured: rules.filter(isNotConfigured).length,
     blockingNotChecked: rules.filter(isBlockingNotChecked).length,
     findings,
     advisoryFindings: Math.min(advisoryFindings, findings),
@@ -1892,6 +2235,12 @@ export function checkStandards(profile: StandardsProfile, input: StandardsCheckI
   checkNaming(profile, files, log);
   checkComments(profile, files, log);
   checkNewlyGenerated(files, log);
+  checkPractice(profile, files, log);
+  checkSecurity(files, log);
+  checkA11y(profile, files, log);
+  checkChangelog(profile, input, files, log);
+  checkMigrations(profile, input, files, log);
+  checkRequirementReferences(profile, input, files, log);
 
   const rules = STANDARDS_RULE_IDS.map((rule) => log.outcome(rule));
   const findings = [...log.findings].sort((a, b) =>
@@ -1912,22 +2261,40 @@ export function checkStandards(profile: StandardsProfile, input: StandardsCheckI
 export function skippedStandardsReport(
   profile: StandardsProfile, version: number | null, baseRef: string | null, reason: string,
 ): StandardsReport {
+  // A rule the profile does not configure stays "not configured": the skip opened no gap there.
   const rules: StandardsRuleOutcome[] = [
-    ...STANDARDS_RULE_IDS.map((rule) => ({ rule, severity: ruleSeverity(profile, rule), result: 'not-checked' as const, reason })),
+    ...STANDARDS_RULE_IDS.map((rule): StandardsRuleOutcome => (!ruleConfigured(profile, rule)
+      ? { rule, severity: ruleSeverity(profile, rule), result: 'not-checked', unconfigured: true, reason: NOT_CONFIGURED }
+      : { rule, severity: ruleSeverity(profile, rule), result: 'not-checked', reason })),
     ...profile.commands.map((c) => commandRow({ result: 'not-checked', reason, command: c.run })),
   ];
   return { version, baseRef, rules, findings: [], notCheckedFiles: [], totals: computeTotals(rules, 0) };
 }
 
+
 /**
- * A copy of `report` whose severities come from `profile` — or, with no profile, with
- * every rule blocking. For a report that crossed a process boundary: the reader, not the
- * sender, decides what can stop a release. Totals are recomputed to match.
+ * A copy of `report` whose severities, and whether each rule is configured at all, come
+ * from `profile` — or, with no profile, with every rule blocking and none "not configured".
+ * For a report that crossed a process boundary: the reader, not the sender, decides what
+ * can stop a release, so a payload's own `unconfigured` claim is never taken on trust (a
+ * configured, promoted rule that arrived marked "not configured" would otherwise stop
+ * nothing). A refused claim's {@link NOT_CONFIGURED} reason is replaced with
+ * {@link CONFIGURED_NOT_CHECKED}, so the text agrees with the flag. Totals are recomputed to match.
  */
-export function applyProfileSeverity(report: StandardsReport, profile: Pick<StandardsProfile, 'severity'> | null): StandardsReport {
+export function applyProfileSeverity(report: StandardsReport, profile: StandardsProfile | null): StandardsReport {
   const of = (rule: StandardsRuleOutcome['rule']): RuleSeverity =>
     (rule === 'command' || profile === null ? 'blocking' : ruleSeverity(profile, rule));
-  const rules = report.rules.map((r) => ({ ...r, severity: of(r.rule) }));
+  const rules = report.rules.map((r): StandardsRuleOutcome => {
+    const out: StandardsRuleOutcome = { ...r, severity: of(r.rule) };
+    delete out.unconfigured; // the payload's claim; re-derived below
+    if (profile !== null && r.rule !== 'command' && r.result === 'not-checked' && !ruleConfigured(profile, r.rule)) {
+      out.unconfigured = true;
+    } else if (out.reason === NOT_CONFIGURED) {
+      // The claim was refused: the text must not keep saying it (see CONFIGURED_NOT_CHECKED).
+      out.reason = CONFIGURED_NOT_CHECKED;
+    }
+    return out;
+  });
   const findings = report.findings.map((f) => ({ ...f, severity: of(f.rule) }));
   // The advisory count follows the new severities. Only the listed findings can be sorted
   // again; when the list was capped, the unlisted remainder is counted as advisory only
@@ -1994,8 +2361,10 @@ export function parseStandardsReport(raw: unknown): StandardsReport | null {
     const out: StandardsRuleOutcome = { rule: r.rule as StandardsRuleOutcome['rule'], severity, result: r.result as RuleResult };
     if (r.undecided === true && out.result === 'not-checked') { out.undecided = true; }
     // Only a static rule can be "not configured"; a command the profile lists always is.
-    if (r.unconfigured === true && out.result === 'not-checked' && out.rule !== 'command' && out.undecided !== true) { out.unconfigured = true; }
     const reason = text(r.reason, MAX_REPORT_TEXT_CHARS);
+    // A report stored before the flag existed is read by its reason, which said the same thing.
+    const saysUnconfigured = r.unconfigured === true || reason === NOT_CONFIGURED;
+    if (saysUnconfigured && out.result === 'not-checked' && out.rule !== 'command' && out.undecided !== true) { out.unconfigured = true; }
     const command = text(r.command, MAX_REPORT_TEXT_CHARS);
     if (reason !== undefined) { out.reason = reason; }
     if (command !== undefined) { out.command = command; }

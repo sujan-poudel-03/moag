@@ -23,6 +23,7 @@
 
 import { STACK_IDS, StackId } from '../server/stacks';
 import { StandardsProfile } from './profile';
+import { rulebookDefaults } from './rulebook';
 
 /** Default comment policy: at most 30% comment lines once a file gains 20 or more lines. */
 export const DEFAULT_MAX_COMMENT_DENSITY_PCT = 30;
@@ -119,6 +120,8 @@ function base(stack: StackId): StandardsProfile {
     commands: [],
     builtInRuleIds: [],
     freeText: '',
+    // The Project Rulebook: what MOAG checks and the guidance agents follow (see rulebook.ts).
+    ...rulebookDefaults(stack),
   };
 }
 

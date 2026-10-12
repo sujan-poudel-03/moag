@@ -27,6 +27,7 @@ import { ProposeInput, StandardsStore, StandardsVersionRecord } from '../../../s
 import { readStandardsJobFile } from '../../../standards/local-store';
 import type { StandardsProfile, StandardsRuleId } from '../../../standards/profile';
 import type { DesignSystem } from '../../../standards/design';
+import type { ExecFileAsyncOptions, ExecFileAsyncResult } from '../../../utils/exec-file';
 
 export const PASSWORD = 'Correct-Horse-Battery-9';
 /** The commit the stubbed git reports as HEAD of every fixture workspace. */
@@ -127,6 +128,11 @@ export async function startHarness(over: {
   profileDesign?: DesignSystem;
   /** What `git rev-parse HEAD` answers for a workspace (default: {@link FAKE_HEAD}); null = no commits. */
   gitHead?: () => string | null;
+  /**
+   * Answers a git call before the stand-in does: return a result to use it, undefined to fall
+   * through (e.g. a real git for `diff` and `ls-files` in a test of the gate's changed files).
+   */
+  exec?: (cmd: string, args: string[], opts?: ExecFileAsyncOptions) => Promise<ExecFileAsyncResult | undefined>;
 } = {}): Promise<Harness> {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-app-'));
   const dataDir = path.join(tmp, 'data');
@@ -176,7 +182,7 @@ export async function startHarness(over: {
     verifyPassword: async (pw, stored) => { verifyCount++; return verifyPassword(pw, stored); },
     // `rev-parse --show-toplevel` answers the `-C` dir itself: every fixture folder is a repo root.
     // `rev-parse HEAD` answers a fixed commit (or fails, for a repository with no commits).
-    exec: async (_cmd, args) => args.includes('HEAD') ? headAnswer() : ({
+    exec: async (cmd, args, opts) => (over.exec ? await over.exec(cmd, args, opts) : undefined) ?? (args.includes('HEAD') ? headAnswer() : {
       exitCode: 0, stdout: args.includes('--show-toplevel') ? `${args[args.indexOf('-C') + 1]}\n` : 'true\n', stderr: '', timedOut: false,
     }),
     log: () => { /* quiet */ },
@@ -228,7 +234,9 @@ export async function startHarness(over: {
           // Node does not chunk-encode DELETE bodies by default; frame them like a browser does.
           headers['Content-Length'] = String(Buffer.byteLength(payload));
         }
-        const req = http.request(`${h.url}${p}`, { method, headers }, (res) => {
+        // A fresh connection per request: Node's default agent keeps sockets alive, and under load
+        // a reused socket can race the server's 5 s keep-alive close and fail with ECONNRESET.
+        const req = http.request(`${h.url}${p}`, { method, headers, agent: false }, (res) => {
           const chunks: Buffer[] = [];
           res.on('data', (c) => chunks.push(c));
           res.on('end', () => {

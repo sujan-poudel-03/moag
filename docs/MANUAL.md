@@ -347,8 +347,12 @@ When there is a design system, every task prompt also carries a
 `## Design System` block (at most 2,000 characters) right after the
 standards: where the two files are, the rules, and the tokens. The planner gets
 a short summary. Verification adds the advisory rule `frontend/design-tokens`:
-a raw colour or length on an added line of a CSS, HTML, JSX or TSX file, or
-inside a string or template literal of a JS/TS file (not the tokens file), an
+a raw colour or length on an added line of a CSS or HTML file, or in the
+style-shaped text of a JS/TS/JSX/TSX file (a `css`/`styled` template, a string
+assigned to a style key such as `color:`, a JSX `fill=`/`color=` attribute, or a
+literal that reads as a CSS declaration — not an issue reference like
+`#123` or a selector like `querySelector('#id')`; test files and backend layers
+are out of scope; never the tokens file), an
 import of another known UI kit than the approved one, or
 a DESIGN.md or tokens file that no longer matches the approved one is a
 finding. Like every MOAG scan it says "findings" or "no findings", never
@@ -385,10 +389,14 @@ placeholders only (`// rest of the code`, `// your code here`,
 `... existing code ...`). It holds no "as an AI" phrase and nothing else that
 ordinary prose contains; add your own phrases to the profile if you want them.
 
+**Not configured is not "not checked".** A rule your standards do not
+configure (no naming rules, no design system, no changelog path, …) is shown
+as *not configured*, in its own group, and is not counted among the rules not
+checked: it is no gap in the check, and no pass either.
+
 **Not checked is not a pass.** A rule is reported as not checked, with its
 reason, when:
 
-- it is not configured;
 - it met a file MOAG could not read with certainty (an unsupported language, an
   unterminated string, a file over 512 KB, a changed file whose diff git did not
   render);
@@ -457,6 +465,36 @@ New files are found honouring `.gitignore` only. A file you hide with
 
 A standards file that exists but is invalid stops the task with an error naming
 the file. It is never read as "no standards".
+
+### The Project Rulebook
+
+The standards also carry the rules a professional codebase expects, as seven
+optional sections of the same profile: **coding practice**, **testing policy**,
+**security**, **accessibility**, **API and data**, **docs and git** and
+**performance**. Each holds the few things MOAG can check reliably and one-line
+**guidance** that every task prompt carries under
+`### <Section> (guidance — not checked)` — never checked, and labelled so
+everywhere. What MOAG checks (all advisory unless you promote them): a
+TODO/FIXME cites an issue; no `debugger` or `breakpoint()` is left in; no
+`.env` file and no credential-shaped value is added (these two run on every
+check, whatever the profile says, and a credential finding never repeats the
+value); HTML images have alt text and pages declare a language; the changelog
+changes with the code (once you name it); a committed migration is never
+edited or deleted (once you name the folder); and each requirement id is named
+in a test file (off by default) — checked at verification only, which is why
+that one cannot be made blocking yet. A new profile starts from the stack's defaults (the
+dependency audit — `npm audit --audit-level=high`, `pip-audit`,
+`govulncheck ./...` — is named as guidance, not added as a command), and
+`moag standards propose` adopts a tracked changelog, migrations folder,
+`.env.example` and commit-message config it finds. Guidance is cut before free
+text when the standards would pass 4,000 characters, and a cut says so. A
+profile without the sections reads and renders exactly as before.
+
+On the hosted server the ship gate also shows the approver **which files the
+run changed** since its diff base (with `+`/`−` line counts, capped at 500 rows,
+`.moag/` never listed) and says when a run's start **reverted a design file**
+to the approved content and where the backup went. See docs/server.md → What the
+approver sees at the ship gate.
 
 Locally there is no approval step: the workspace is yours. `moag standards
 propose --write` creates the file from what the repository looks like, and you

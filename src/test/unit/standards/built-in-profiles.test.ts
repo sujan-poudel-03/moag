@@ -10,7 +10,11 @@ import {
   DEFAULT_MIN_ADDED_LINES,
   builtInProfile,
 } from '../../../standards/built-in-profiles';
-import { MAX_STANDARDS_PROMPT_CHARS, STANDARDS_RULE_IDS, isScannerRule, renderStandardsText, ruleSeverity, validateProfile } from '../../../standards/profile';
+import {
+  MAX_STANDARDS_PLANNER_CHARS, MAX_STANDARDS_PROMPT_CHARS, STANDARDS_RULE_IDS, isScannerRule, renderPlannerStandards, renderStandardsText,
+  renderStandardsTextDetailed, ruleSeverity, validateProfile,
+} from '../../../standards/profile';
+import { RULEBOOK_KEYS, plannerSummaryLines } from '../../../standards/rulebook';
 import { SCAFFOLD_FIXTURES, ScaffoldFixture } from './scaffold-fixtures';
 
 /** Every string anywhere inside `value`. */
@@ -297,5 +301,48 @@ describe('standards — built-in profiles never block a mainstream scaffold', ()
     assert.ok(validateProfile(p).ok);
     const gradle = SCAFFOLD_FIXTURES.find((f) => f.name.startsWith('Gradle (gradle init'))!;
     assert.equal(standardsBlocked(checkStandards(p, inputFor(gradle))), true);
+  });
+});
+
+// ─── Project Rulebook defaults ───
+
+describe('built-in profiles — Project Rulebook defaults', () => {
+  for (const stack of STACK_IDS) {
+    it(`${stack}: valid, fits the prompt with no guidance cut, one planner line per section, nothing blocking`, () => {
+      const p = BUILT_IN_PROFILES[stack];
+      const v = validateProfile(p);
+      assert.ok(v.ok, v.ok ? '' : v.errors.join('; '));
+      const rendered = renderStandardsTextDetailed(p, 999_999);
+      assert.ok(rendered.text.length <= MAX_STANDARDS_PROMPT_CHARS, `${rendered.text.length}`);
+      assert.deepEqual(rendered.guidanceCut, []);
+      const planner = renderPlannerStandards(p, 999_999);
+      assert.ok(planner.length <= MAX_STANDARDS_PLANNER_CHARS, `${planner.length}`);
+      const present = RULEBOOK_KEYS.filter((k) => p[k] !== undefined);
+      assert.equal(plannerSummaryLines(p).length, present.length);
+      assert.ok(present.includes('practice') && present.includes('security'), 'every stack has coding practice and security');
+      for (const rule of STANDARDS_RULE_IDS.filter(isScannerRule)) { assert.equal(ruleSeverity(p, rule), 'advisory', rule); }
+      for (const key of present) {
+        const lines = p[key]!.guidance;
+        assert.ok(lines.length >= 2 && lines.length <= 4, `${key}: ${lines.length} guidance lines`);
+        assert.ok(lines.every((l) => l.length <= 120), key);
+      }
+      assert.equal(p.practice!.todoNeedsIssue, true);
+      // Off for every stack until the pre-gate check is given requirement ids (deferred D1);
+      // on, it would read "not checked" at every hosted ship gate.
+      assert.equal(p.testPolicy?.requirementReference, stack === 'other' ? undefined : false);
+      assert.equal(p.testPolicy !== undefined, stack !== 'other');
+      assert.equal(p.accessibility?.imgAlt ?? false, stack === 'static-web');
+    });
+  }
+
+  it('names each stack\'s dependency audit as guidance, never as a command', () => {
+    const audit: Record<string, RegExp> = {
+      'node-ts': /npm audit --audit-level=high/, python: /pip-audit/, go: /govulncheck/, dotnet: /dotnet list package --vulnerable/,
+    };
+    for (const [stack, re] of Object.entries(audit)) {
+      const p = BUILT_IN_PROFILES[stack as StackId];
+      assert.ok(p.security!.guidance.some((g) => re.test(g)), stack);
+      assert.ok(!p.commands.some((c) => re.test(c.run)), stack);
+    }
   });
 });

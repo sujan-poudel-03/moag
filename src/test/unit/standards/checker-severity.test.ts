@@ -28,6 +28,9 @@ import {
   standardsBlockingEvaluated,
   standardsBlockingState,
   standardsCheckCounts,
+  applyProfileSeverity,
+  NOT_CONFIGURED,
+  CONFIGURED_NOT_CHECKED,
 } from '../../../standards/checker';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
 import {
@@ -230,7 +233,9 @@ describe('standards severity — the three groups every surface shows', () => {
     assert.ok(groups.blocking.every((r) => r.severity === 'blocking' && r.result !== 'not-checked'));
     assert.ok(groups.advisory.every((r) => r.severity === 'advisory' && r.result !== 'not-checked'));
     assert.ok(groups.advisory.some((r) => r.rule === 'naming/files' && r.result === 'failed'));
-    assert.equal(groups.blocking.length + groups.advisory.length + groups.notChecked.length, report.rules.length);
+    assert.equal(groups.blocking.length + groups.advisory.length + groups.notChecked.length + groups.notConfigured.length, report.rules.length);
+    assert.ok(groups.notConfigured.length > 0 && groups.notConfigured.every((r) => r.unconfigured === true));
+    assert.ok(groups.notChecked.every((r) => r.unconfigured !== true), 'a rule the profile does not configure is not "not checked"');
 
     const unread = groups.notChecked.filter(isUnreadBlocking).map((r) => r.rule);
     assert.deepEqual(unread.sort(), ['comment-policy/banned-phrase', 'layering/imports']);
@@ -278,6 +283,45 @@ describe('standards severity — reports that cross a process boundary', () => {
     assert.ok(parsed);
     assert.ok(parsed.rules.every((r) => r.unconfigured === undefined));
     assert.equal(standardsBlockingEvaluated(parsed), false);
+  });
+
+  it('the reader re-derives "not configured" from its own profile: a configured, promoted rule claimed unconfigured still blocks', () => {
+    const base = { version: 1, baseRef: 'abc', findings: [] };
+    // naming/files is configured in the sample profile and promoted here; frontend/design-tokens is not configured.
+    const frozen = promote(sampleProfile(), 'naming/files');
+    for (const claim of [{ unconfigured: true, reason: 'whatever' }, { reason: NOT_CONFIGURED }]) {
+      const parsed = parseStandardsReport({ ...base, rules: [
+        { rule: 'naming/files', severity: 'advisory', result: 'not-checked', ...claim },
+        { rule: 'frontend/design-tokens', result: 'not-checked', reason: 'no flag at all' },
+      ] });
+      assert.ok(parsed);
+      assert.equal(parsed.rules[0].unconfigured, true, 'the payload claims it');
+      const report = applyProfileSeverity(parsed, frozen);
+      const naming = report.rules.find((r) => r.rule === 'naming/files');
+      assert.equal(naming?.unconfigured, undefined, 'the claim is ignored');
+      assert.notEqual(naming?.reason, NOT_CONFIGURED, 'nor does the text keep saying "not configured"');
+      if (claim.reason === NOT_CONFIGURED) { assert.equal(naming?.reason, CONFIGURED_NOT_CHECKED); }
+      // A re-read of the stored row agrees: the text no longer makes it "not configured".
+      const reread = parseStandardsReport(JSON.parse(JSON.stringify(report)));
+      assert.equal(reread?.rules.find((r) => r.rule === 'naming/files')?.unconfigured, undefined);
+      assert.equal(naming?.severity, 'blocking');
+      assert.ok(naming && isBlockingNotChecked(naming));
+      assert.equal(report.totals.blockingNotChecked, 1);
+      assert.equal(standardsBlockingEvaluated(report), false, 'an unevaluated blocking rule is no pass');
+      assert.equal(report.rules.find((r) => r.rule === 'frontend/design-tokens')?.unconfigured, true,
+        'a rule the frozen profile does not configure is "not configured" whatever the payload says');
+    }
+  });
+
+  it('with no profile to re-derive from, no row is "not configured": every not-checked rule counts against the gate', () => {
+    const parsed = parseStandardsReport({ version: 1, baseRef: 'abc', findings: [], rules: [
+      { rule: 'frontend/design-tokens', result: 'not-checked', unconfigured: true, reason: NOT_CONFIGURED },
+    ] });
+    assert.ok(parsed);
+    const report = applyProfileSeverity(parsed, null);
+    assert.equal(report.rules[0].unconfigured, undefined);
+    assert.equal(report.rules[0].reason, CONFIGURED_NOT_CHECKED, 'the refused "not configured" text is replaced');
+    assert.equal(report.totals.blockingNotChecked, 1);
   });
 
   it('the not-checked files are bounded and their true count is kept, never taken as less than what is listed', () => {
@@ -1024,7 +1068,7 @@ describe('standards checker — an exemption the change wrote for itself is neve
       { file: 'src/tool.rb', reason: 'No checker for .rb files' },
       { file: 'vendor/acme/lib.go', reason: 'vendored code' },
     ]);
-    assert.equal(report.totals.noFindings, 2, 'the generated-marker scan, which did read both files, and the nested-repository scan');
+    assert.equal(report.totals.noFindings, 4, 'the generated-marker, .env and credential scans, which did read the files, and the nested-repository scan');
     // A data file is out of scope for the line rules, not skipped by them: it is not listed.
     const data = checkStandards(commentsOnly(), input([added('package.json', ['{}']), clean()]));
     assert.deepEqual(data.notCheckedFiles, []);

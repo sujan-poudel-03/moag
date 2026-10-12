@@ -11,12 +11,17 @@ import * as vm from 'vm';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
 import {
   checkStandards, commandRow, recountTotals, ruleOutcomeLabel, standardsBlockingState, StandardsCheckInput, StandardsReport,
+  parseStandardsReport, applyProfileSeverity,
 } from '../../../standards/checker';
-import { DEFAULT_RULE_SEVERITY, STANDARDS_RULE_IDS, StandardsProfile, isScannerRule, validateProfile } from '../../../standards/profile';
+import {
+  DEFAULT_RULE_SEVERITY, STANDARDS_RULE_IDS, StandardsProfile, isScannerRule, renderPlannerStandards, renderStandardsText, validateProfile,
+} from '../../../standards/profile';
 import { promote, sampleProfile } from '../standards/fixtures';
 import { templateDesign } from '../../../standards/design';
 import { STANDARDS_GATE_COMMAND, isStandardsGateCommand, standardsGateCommand, standardsGateWord } from '../../../models/requirement-trace';
 import { gateStatus } from '../../../ui/standards-report-html';
+import { rulebookView } from '../../../standards/rulebook-view';
+import { FakeEl, fakeDomStubs, root } from './web-vm';
 
 const WEB = path.resolve(__dirname, '..', '..', '..', '..', 'web', 'js');
 
@@ -233,8 +238,9 @@ describe('web standards editor — rule severity survives an edit and can be cha
     }
 
     // Shown at the top of the card, outside every collapsed before/after.
-    // The design-system change block sits right under it, un-collapsed too.
-    assert.match(raw, /v\.status === 'pending' \|\| v\.inEffect \? enforcementNote\(v\) : null,\n\s+v\.status === 'pending' \|\| v\.inEffect \? designNote\(v\) : null,\n\s+sectionsView\(v, baseRecord, state\.dto\.limits\),/);
+    // The design-system change block sits right under it, un-collapsed too; then the Project
+    // Rulebook (what is checked and what is guidance), before the raw sections.
+    assert.match(raw, /v\.status === 'pending' \|\| v\.inEffect \? enforcementNote\(v\) : null,\n\s+v\.status === 'pending' \|\| v\.inEffect \? designNote\(v\) : null,\n\s+suggestRulebook,\n\s+rulebookBlock\(v, [^\n]+\),\n\s+sectionsView\(v, baseRecord, state\.dto\.limits\),/);
     const note = raw.slice(raw.indexOf('function enforcementNote'), raw.indexOf('/** One read-only section of a version'));
     assert.ok(note.length > 0 && !note.includes('details'), 'never inside a <details>');
     assert.match(note, /STR\.C55\(set\.comparedTo\)\.text/);
@@ -388,13 +394,13 @@ describe('web run screen — the standards report keeps Blocking, Advisory and N
     findings: unknown[];
     notCheckedFiles: Array<{ file: string; reason: string }>;
     totals: {
-      passed: number; noFindings: number; failed: number; advisory: number; notChecked: number; blockingNotChecked: number;
+      passed: number; noFindings: number; failed: number; advisory: number; notChecked: number; notConfigured: number; blockingNotChecked: number;
       findings: number; advisoryFindings: number; notCheckedFiles: number; noBlockingRules: boolean;
     };
   }
   const run = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map }, ['asStandardsReport', 'ruleOutcome']) as {
     asStandardsReport: (data: unknown) => ReportView | null;
-    ruleOutcome: (row: { rule: string; result: string; severity?: string }) => { label: string };
+    ruleOutcome: (row: { rule: string; result: string; severity?: string; unconfigured?: boolean }) => { label: string };
   };
 
   const input = (files: StandardsCheckInput['files']): StandardsCheckInput =>
@@ -598,6 +604,56 @@ describe('web run screen — the standards report keeps Blocking, Advisory and N
     assert.equal(run.ruleOutcome({ rule: 'naming/files', result: 'passed' }).label, 'No findings');
     assert.equal(run.ruleOutcome({ rule: 'naming/files', result: 'failed', severity: 'advisory' }).label, 'Findings');
     assert.equal(run.ruleOutcome({ rule: 'command', result: 'passed' }).label, 'Passed');
+    const unconfigured = { rule: 'naming/files', result: 'not-checked', unconfigured: true } as const;
+    assert.equal(run.ruleOutcome(unconfigured).label.toLowerCase(), ruleOutcomeLabel(unconfigured));
+    assert.equal(run.ruleOutcome(unconfigured).label, 'Not configured');
+  });
+
+  it('counts the rules a profile does not configure apart: "not configured", never among the rules not checked', () => {
+    const report = checkStandards(sampleProfile(), input([{ path: 'src/a.ts', status: 'added', addedLines: [1], content: 'export {};' }]));
+    const view = plain(run.asStandardsReport(JSON.parse(JSON.stringify(report))))!;
+    assert.ok(report.totals.notConfigured > 0);
+    assert.equal(view.totals.notConfigured, report.totals.notConfigured);
+    assert.equal(view.totals.notChecked, report.totals.notChecked);
+    // A report stored before severities and the flag existed carries only the reason: it is read the same way.
+    const legacy = JSON.parse(JSON.stringify(report)) as StandardsReport;
+    for (const r of legacy.rules) { delete r.unconfigured; delete (r as { severity?: unknown }).severity; }
+    const old = plain(run.asStandardsReport(legacy))!;
+    assert.deepEqual([old.totals.notChecked, old.totals.notConfigured], [report.totals.notChecked, report.totals.notConfigured]);
+    // A command never is "not configured", whatever its reason says.
+    const command = plain(run.asStandardsReport({ rules: [
+      { rule: 'command', result: 'not-checked', reason: 'Not configured in this profile', command: 'npm test' },
+    ], findings: [] }))!;
+    assert.deepEqual([command.totals.notConfigured, command.totals.notChecked, command.totals.blockingNotChecked], [0, 1, 1]);
+  });
+
+  it('a row the server refused as "not configured" (severity, no flag, the old reason) is a blocking rule not checked, as the gate counts it', () => {
+    // (a) a configured, promoted rule whose payload claimed "not configured"; (b) no frozen profile, so every row is blocking.
+    const { standardsBadge: badgeOf } = loadWebModule('screens/run.js', { ...DOM_STUBS, Set, Map }, ['standardsBadge']) as
+      { standardsBadge: (t: unknown) => { text: string } };
+    const parsed = parseStandardsReport({ version: 1, baseRef: 'abc', findings: [], rules: [
+      { rule: 'naming/files', severity: 'advisory', result: 'not-checked', unconfigured: true, reason: 'Not configured in this profile' },
+    ] })!;
+    for (const report of [applyProfileSeverity(parsed, promote(sampleProfile(), 'naming/files')), applyProfileSeverity(parsed, null)]) {
+      assert.equal(report.totals.blockingNotChecked, 1, 'the server counts it against the gate');
+      // What the card is sent: the stored row, and the same row as an older server stored it (reason kept, flag gone).
+      const stored = JSON.parse(JSON.stringify(report)) as StandardsReport;
+      const olderServer = JSON.parse(JSON.stringify(report)) as StandardsReport;
+      olderServer.rules[0].reason = 'Not configured in this profile';
+      for (const sent of [stored, olderServer]) {
+        const view = plain(run.asStandardsReport(sent))!;
+        assert.deepEqual([view.totals.notConfigured, view.totals.notChecked, view.totals.blockingNotChecked], [0, 1, 1]);
+        assert.equal(view.totals.noBlockingRules, false, 'never "no blocking rules configured" while the gate refuses');
+        assert.notEqual(run.ruleOutcome(sent.rules[0]).label, 'Not configured');
+        assert.equal(plain(badgeOf(run.asStandardsReport(JSON.parse(JSON.stringify(sent)))!.totals)).text, '✗ 1 BLOCKING NOT CHECKED');
+      }
+    }
+  });
+
+  it('the card lists the rules a profile does not configure in their own group, and the tally says so apart', () => {
+    const source = fs.readFileSync(path.join(WEB, 'screens', 'run.js'), 'utf-8');
+    assert.match(source, /`Not configured {2}\$\{notConfiguredRows\.length\}`/, 'the card lists them in their own group');
+    assert.match(source, /t\.notConfigured > 0 \? `\$\{t\.notConfigured\} not configured`/, 'and the tally says so apart');
   });
 
   it('the listed files are kept, a claimed count below what is listed is not believed, and an old report has none', () => {
@@ -816,5 +872,107 @@ describe('web run screen — design gate text', () => {
     assert.deepEqual(clean, { kind: 'muted', text: 'Design system v4: no design findings.' });
     assert.equal(run.designGateText({}, report([]), { version: 4 }), null);
     for (const res of [adv, blk, clean]) { assert.equal(/\bpassed\b/.test(res!.text), false, 'never "passed"'); }
+  });
+});
+
+// ─── Project Rulebook: the block on every version, and the editor's sections ───
+
+describe('web standards — Project Rulebook', () => {
+  const web = loadWebModule('screens/standards.js', { ...fakeDomStubs(), Map }, ['toForm', 'fromForm', 'rulebookBlock', 'ERROR_FIELDS']) as {
+    toForm: (p: unknown) => Record<string, unknown>;
+    fromForm: (v: unknown, s: unknown) => { profile: Record<string, unknown>; errors: Record<string, string> };
+    rulebookBlock: (v: unknown, opts?: Record<string, unknown>) => FakeEl | null;
+    ERROR_FIELDS: Array<[string, string]>;
+  };
+  const full = (): StandardsProfile => ({
+    ...sampleProfile(),
+    practice: { todoNeedsIssue: true, noDebugStatements: false, guidance: ['Never swallow an error'] },
+    testPolicy: { requirementReference: true, guidance: [] },
+    security: { guidance: ['Validate every input'] },
+    accessibility: { imgAlt: false, htmlLang: true, guidance: ['Keyboard access'] },
+    apiData: { migrationsGlob: 'db/migrate/**', guidance: [] },
+    docsGit: { changelogPath: '', guidance: ['Keep the README current'] },
+    performance: { guidance: ['No N+1 queries'] },
+  });
+  /** A version as the server describes it. */
+  const versionOf = (profile: StandardsProfile, extra: Record<string, unknown> = {}) => ({
+    version: 3, profile, severity: {}, rulebook: rulebookView(profile, 3),
+    promptText: renderStandardsText(profile, 3), plannerText: renderPlannerStandards(profile, 3), guidanceCut: [], ...extra,
+  });
+
+  it('every section round-trips through the form; a blank section is left out, not sent empty', () => {
+    const source = full();
+    const built = web.fromForm(web.toForm(source), source);
+    assert.deepEqual(plain(built.errors), {});
+    // testPolicy has a ticked check and no guidance; docsGit has guidance and no path: both kept.
+    assert.deepEqual(plain(built.profile), plain(source));
+    const vals = web.toForm(source);
+    vals.perfGuidance = '';
+    vals.migrationsGlob = '';
+    assert.equal('performance' in plain(web.fromForm(vals, source).profile), false);
+    assert.equal('apiData' in plain(web.fromForm(vals, source).profile), false);
+    const none = web.fromForm(web.toForm(sampleProfile()), sampleProfile()).profile;
+    assert.ok(!['practice', 'testPolicy', 'security', 'accessibility', 'apiData', 'docsGit', 'performance'].some((k) => k in plain(none)));
+  });
+
+  it('the block says what is checked and what is guidance, by label, with the exact prompt in a disclosure', () => {
+    const el = root(web.rulebookBlock(versionOf(full())));
+    const text = el.textContent;
+    assert.match(text, /Rulebook: \d+ checked · \d+ guidance \(not checked\)\./);
+    assert.match(text, /Coding practice \(guidance — not checked\)/);
+    assert.match(text, /CHECKED.*TODO and FIXME comments cite an issue/);
+    assert.ok(el.all().some((e) => e.className.includes('badge-muted') && e.textContent === 'GUIDANCE'));
+    assert.ok(el.all().some((e) => e.className.includes('badge-info') && e.textContent === 'CHECKED'));
+    // The changelog path is unset: its check is listed as guidance, with what switches it on.
+    assert.match(text, /GUIDANCE.*The changelog is updated in a run that ships a version○ Checked once a changelog path is set\./);
+    assert.match(text, /What agents receive {2}[\d,]+ \/ 4,000/);
+    assert.match(text, /Planner summary {2}[\d,]+ \/ 6,000/);
+    const pre = el.all().filter((e) => e.tag === 'pre');
+    assert.equal(pre[0].textContent, renderStandardsText(full(), 3));
+    assert.equal(pre[0].getAttribute('tabindex'), '0');
+  });
+
+  it('a legacy version: "Not part of this version", the always-on checks under Security, and no disclosures from an older server', () => {
+    const legacy = JSON.parse(JSON.stringify(BUILT_IN_PROFILES.other)) as Record<string, unknown>;
+    for (const key of ['practice', 'testPolicy', 'security', 'accessibility', 'apiData', 'docsGit', 'performance']) { delete legacy[key]; }
+    const v = versionOf(legacy as unknown as StandardsProfile);
+    const text = root(web.rulebookBlock(v)).textContent;
+    assert.match(text, /Security— Not part of this version\./);
+    assert.match(text, /security\/env-file · Advisory · every run/);
+    assert.match(text, /security\/secret-literal · Advisory · every run/);
+    assert.match(text, /Checked on every run, whatever the version says/);
+    const older = root(web.rulebookBlock({ ...v, promptText: undefined, plannerText: undefined }));
+    assert.doesNotMatch(older.textContent, /What agents receive|Planner summary/);
+    assert.equal(web.rulebookBlock({ version: 1, profile: legacy }), null, 'no rulebook in the DTO: nothing rendered');
+  });
+
+  it('cut guidance is marked "not sent to agents"; a long guidance line is shown in full', () => {
+    const long = 'x'.repeat(400);
+    const p = full();
+    p.performance = { guidance: [long] };
+    const v = versionOf(p);
+    (v.rulebook.sections.find((s) => s.key === 'performance')!.guidance[0] as { sent: boolean }).sent = false;
+    const el = root(web.rulebookBlock({ ...v, guidanceCut: [long] }));
+    assert.ok(el.textContent.includes(long), 'never truncated in the UI');
+    assert.match(el.textContent, /not sent to agents \(cut to fit\)/);
+    assert.match(el.textContent, /1 guidance item was cut to fit and is not sent to agents/);
+  });
+
+  it('every rulebook ERROR_FIELDS prefix matches a path the validator really reports', () => {
+    const bad: Record<string, unknown> = {
+      practice: { todoNeedsIssue: 'x', noDebugStatements: 'x', guidance: 'x' },
+      testPolicy: { requirementReference: 'x', guidance: 'x' },
+      security: { guidance: 'x' },
+      accessibility: { imgAlt: 'x', htmlLang: 'x', guidance: 'x' },
+      apiData: { migrationsGlob: 3, guidance: 'x' },
+      docsGit: { changelogPath: '/abs', guidance: 'x' },
+      performance: { guidance: 'x' },
+    };
+    const v = validateProfile({ ...sampleProfile(), ...bad });
+    assert.equal(v.ok, false);
+    const errors = (v as { errors: string[] }).errors;
+    const rulebook = web.ERROR_FIELDS.filter(([prefix]) => /^profile\.(practice|testPolicy|security|accessibility|apiData|docsGit|performance)/.test(prefix));
+    assert.ok(rulebook.length >= 14);
+    for (const [prefix] of rulebook) { assert.ok(errors.some((e) => e.startsWith(prefix)), `${prefix} is a real validator path`); }
   });
 });

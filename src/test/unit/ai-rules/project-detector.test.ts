@@ -7,6 +7,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   detectConventions, detectDesignSources, detectProjectConventions, detectProjectRules, minimalGitEnv, readTrackedFiles,
+  detectDeclaredTools,
 } from '../../../ai-rules/project-detector';
 import { ruleSeverity } from '../../../standards/profile';
 import { proposeProfile } from '../../../standards/propose';
@@ -115,6 +116,28 @@ describe('project detector — detectProjectConventions', () => {
       sourceFileCount: 0, sampleSourceFile: null, sourceFileSample: [], commentDensity: null, suggestedRuleIds: ['builtin-clean-code'],
       trackedTopLevelDirs: null, trackedUnavailable: 'git was not asked which files it tracks',
     });
+  });
+
+  it('detects the changelog, the migrations folder, .env.example and a commit convention — from tracked files only', () => {
+    const files: Record<string, string> = {
+      'package.json': '{}', 'src/a.ts': 'export {};\n', 'HISTORY.md': '# h\n', 'CHANGELOG.md': '# c\n',
+      'alembic/versions/001.py': 'x = 1\n', 'db/migrate/001.rb': 'x\n', '.env.example': 'A=\n', '.czrc': '{}',
+    };
+    const dir = makeRepo('moag-conv-rulebook-', files);
+    const d = detectProjectConventions(dir, { tracked: { ok: true, files: Object.keys(files) } });
+    assert.deepEqual(d.changelog, { value: 'CHANGELOG.md', evidence: 'CHANGELOG.md' }, 'CHANGELOG.md is preferred');
+    assert.deepEqual(d.migrationsDir, { value: 'alembic/versions', evidence: 'alembic/versions/001.py' }, 'the first tool in order');
+    assert.deepEqual(d.envExample, { value: '.env.example', evidence: '.env.example' });
+    assert.deepEqual(d.commitConvention, { value: '.czrc', evidence: '.czrc' });
+    const commitlint = detectProjectConventions(dir, { tracked: { ok: true, files: ['package.json', 'commitlint.config.ts', '.commitlintrc.json'] } });
+    assert.ok(['commitlint.config.ts', '.commitlintrc.json'].includes(commitlint.commitConvention?.value ?? ''));
+    // Untracked or without git's listing: nothing is detected.
+    const untracked = detectProjectConventions(dir, { tracked: { ok: true, files: ['package.json', 'src/a.ts'] } });
+    assert.equal(untracked.changelog, undefined);
+    assert.equal(untracked.migrationsDir, undefined);
+    assert.equal(untracked.envExample, undefined);
+    assert.equal(untracked.commitConvention, undefined);
+    assert.equal(detectProjectConventions(dir).changelog, undefined);
   });
 
   it('samples source file names shallowest first, bounded, and leaves out noise and configuration', function () {
@@ -586,5 +609,32 @@ describe('project detector — detectDesignSources', () => {
 
   it('never throws, even when present() throws', () => {
     assert.deepEqual(detectDesignSources('/nope', () => { throw new Error('boom'); }), { tokens: null, doc: null, ui: null });
+  });
+});
+
+describe('project-detector — declared type checkers and audit tools', () => {
+  const files = (map: Record<string, string>) => ({
+    present: (name: string) => Object.prototype.hasOwnProperty.call(map, name),
+    read: (name: string) => map[name] ?? null,
+  });
+
+  it('lists each tool once, with the file that declares it, and nothing a file merely mentions', () => {
+    const f = files({
+      'mypy.ini': '[mypy]\n', 'pyproject.toml': '[tool.mypy]\n[tool.pyright]\n', 'requirements-dev.txt': 'pip_audit\n',
+      'go.mod': 'module m\ntool golang.org/x/vuln/cmd/govulncheck\n', 'gradlew': '', 'README.md': 'pip-audit mypy govulncheck',
+    });
+    assert.deepEqual(detectDeclaredTools(f.present, f.read), [
+      { tool: 'mypy', file: 'mypy.ini' }, { tool: 'pyright', file: 'pyproject.toml' }, { tool: 'pip-audit', file: 'requirements-dev.txt' },
+      { tool: 'govulncheck-tool', file: 'go.mod' }, { tool: 'gradlew', file: 'gradlew' },
+    ]);
+    assert.deepEqual(detectDeclaredTools(files({ 'README.md': 'mypy' }).present, () => 'mypy pip-audit'), []);
+  });
+
+  it('a file git does not track declares nothing, and a detection without any tool carries no field', () => {
+    const dir = makeRepo('moag-declared-', { 'requirements.txt': 'flask\n', 'mypy.ini': '[mypy]\n', 'app.py': 'x = 1\n' });
+    const untracked = detectProjectConventions(dir, { tracked: { ok: true, files: ['requirements.txt', 'app.py'] } });
+    assert.equal(untracked.declaredTools, undefined);
+    const tracked = detectProjectConventions(dir, { tracked: { ok: true, files: ['requirements.txt', 'app.py', 'mypy.ini'] } });
+    assert.deepEqual(tracked.declaredTools, [{ tool: 'mypy', file: 'mypy.ini' }]);
   });
 });

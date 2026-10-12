@@ -8,7 +8,9 @@ import { startHarness, Harness, Resp } from './app-harness';
 import { migrateStandards, proposeAutomatic } from '../../../server/standards-store';
 import {
   DEFAULT_RULE_SEVERITY, MAX_STANDARDS_FREE_TEXT_CHARS, STANDARDS_RULE_IDS, profileHash, severityChangesBetween,
+  renderPlannerStandards, renderStandardsText,
 } from '../../../standards/profile';
+import { RULEBOOK_KEYS } from '../../../standards/rulebook';
 import { sampleProfile } from '../standards/fixtures';
 import { templateDesign } from '../../../standards/design';
 import * as fs from 'fs';
@@ -846,6 +848,40 @@ describe('standards API — design system', function () {
     const id = (r.body.project as { id: string }).id;
     const got = await h.request('GET', `/api/projects/${id}/standards`, { as: 'po' });
     assert.equal((got.body.standards as Record<string, unknown>).designTemplate, null);
+  });
+
+  it('each version carries its rulebook view, and the exact prompt and planner text a job file would carry', async () => {
+    const s = await get();
+    const v1 = versions(s)[0];
+    const rulebook = v1.rulebook as { sections: Array<{ key: string; present: boolean; checked: Array<{ rule?: string }> }>; counts: { checked: number } };
+    assert.ok(rulebook.sections.find((x) => x.key === 'practice')!.present, 'a new project is proposed with the rulebook');
+    assert.ok(rulebook.counts.checked > 0);
+    assert.equal(v1.promptText, renderStandardsText(v1.profile, v1.version));
+    assert.equal(v1.plannerText, renderPlannerStandards(v1.profile, v1.version));
+    assert.deepEqual(v1.guidanceCut, []);
+    assert.equal((s.limits as Record<string, number>).guidanceEntries, 12);
+    assert.equal(s.rulebookSuggestion, null, 'nothing in effect yet');
+  });
+
+  it('rulebookSuggestion: offered to a proposer while the version in effect predates the rulebook; never to a reviewer', async () => {
+    const v1 = versions(await get())[0];
+    assert.equal((await approve(1, v1.contentHash)).status, 200);
+    assert.equal((await get('po')).rulebookSuggestion, null, 'v1 has the rulebook');
+    const legacy = { ...v1.profile } as Record<string, unknown>;
+    for (const key of RULEBOOK_KEYS) { delete legacy[key]; }
+    const created = await h.request('POST', `${base()}/versions`, { as: 'po', body: { profile: legacy, baseVersion: 1 } });
+    assert.equal(created.status, 201, created.raw);
+    const v2 = versions(await get()).find((v) => v.version === 2)!;
+    assert.equal((await approve(2, v2.contentHash)).status, 200);
+    const asPo = await get('po');
+    const suggestion = asPo.rulebookSuggestion as { sections: Record<string, unknown>; evidence: string } | null;
+    assert.ok(suggestion);
+    assert.equal(suggestion!.evidence, 'node-ts defaults');
+    assert.deepEqual(Object.keys(suggestion!.sections).sort(), ['apiData', 'docsGit', 'performance', 'practice', 'security', 'testPolicy']);
+    assert.equal((await get('reviewer')).rulebookSuggestion, null);
+    const legacyView = versions(asPo).find((v) => v.version === 2)!.rulebook as { sections: Array<{ key: string; present: boolean; checked: Array<{ rule?: string; alwaysOn?: boolean }> }> };
+    assert.ok(legacyView.sections.every((x) => !x.present));
+    assert.deepEqual(legacyView.sections.find((x) => x.key === 'security')!.checked.map((c) => c.rule), ['security/env-file', 'security/secret-literal']);
   });
 
   it('designSuggestion appears only for a proposer, once the standards in effect have no design and the workspace shows a UI', async () => {

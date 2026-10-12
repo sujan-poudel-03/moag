@@ -7,10 +7,13 @@ import * as path from 'path';
 import {
   recommendStack, wilsonInterval, detectStackFromRepo, OutcomeLike, StaticRecommendation, MeasuredRecommendation,
   INSUFFICIENT_LABEL, DETECTED_LABEL, STATIC_LABEL, MIN_GROUP_N, MIN_RECOMMEND_LOWER,
-  SINGLE_STACK_LABEL, POOR_COMPLETION_LABEL, DETECTED_DIFFERS_LABEL,
+  SINGLE_STACK_LABEL, POOR_COMPLETION_LABEL, DETECTED_DIFFERS_LABEL, PriorRecommendation, PRIOR_LABEL, ENGINE_STACK_PRIOR,
+  BUILDING_KINDS, BuildingKind, isBuildingKind,
 } from '../../../server/stack-recommendation';
+import { STACK_IDS } from '../../../server/stacks';
+import { SERVER_FORBIDDEN_ENGINES } from '../../../server/prd-ops';
 import { OutcomeStore, OUTCOMES_FILE } from '../../../server/outcomes';
-import { EngineId } from '../../../models/types';
+import { ENGINE_IDS, EngineId } from '../../../models/types';
 import { startHarness, Harness, approvedProject, waitFor } from './app-harness';
 
 const CONNECTED: EngineId[] = ['claude', 'codex'];
@@ -34,8 +37,16 @@ describe('stack recommendation (pure)', () => {
     assert.ok(half.lower < 0.5 && half.upper > 0.5);
   });
 
-  it('an empty data set gives source static-default with NO numeric rate fields', () => {
+  // Intended change (cold-start prior): with engines connected that have a prior, an empty
+  // data set now gives the prior; with none connected it is still the static default.
+  it('an empty data set with connected engines gives the prior, never a number', () => {
     const r = recommendStack([], CONNECTED, null);
+    assert.equal(r.source, 'prior');
+    assert.doesNotMatch(JSON.stringify(r), /rate|score|wilson|lower|upper|percent|accuracy|recordedTasks/i);
+  });
+
+  it('an empty data set with no connected engine gives source static-default with NO numeric rate fields', () => {
+    const r = recommendStack([], [], null);
     assert.equal(r.source, 'static-default');
     assert.deepEqual(Object.keys(r).sort(), STATIC_KEYS);
     const s = r as StaticRecommendation;
@@ -56,7 +67,8 @@ describe('stack recommendation (pure)', () => {
       ...tasks('claude', 'cobol', 5, 0),
       ...tasks('claude', 'go', 3, 0),
     ];
-    const r = recommendStack(records, CONNECTED, null, 7) as StaticRecommendation;
+    // Engines with no prior, so the static default (which carries the counts) answers.
+    const r = recommendStack(records.map((x) => ({ ...x, engine: 'ollama' })), ['ollama'], null, 7) as StaticRecommendation;
     assert.equal(r.source, 'static-default');
     assert.equal(r.excludedNoStack, 40 + 5 + 7);
     assert.equal(r.recordedTasks, 3);
@@ -67,7 +79,8 @@ describe('stack recommendation (pure)', () => {
   const weakRunnerUp = (): OutcomeLike[] => tasks('codex', 'java', 6, 6);
 
   it('n = 9 is insufficient; n = 10 with a comparison is low', () => {
-    assert.equal(recommendStack(tasks('claude', 'go', 9, 0), CONNECTED, null).source, 'static-default');
+    assert.equal(recommendStack(tasks('claude', 'go', 9, 0), CONNECTED, null).source, 'prior', 'nothing measured yet: the prior');
+    assert.equal(recommendStack(tasks('claude', 'go', 9, 0), CONNECTED, 'go').source, 'static-default');
     const r = recommendStack([...tasks('claude', 'go', 10, 0), ...weakRunnerUp()], CONNECTED, null) as MeasuredRecommendation;
     assert.equal(r.source, 'measured');
     assert.equal(r.state, 'recommended');
@@ -184,9 +197,10 @@ describe('stack recommendation (pure)', () => {
   });
 
   it('disconnected engines are ignored', () => {
-    const r = recommendStack(tasks('gemini', 'go', 80, 0), CONNECTED, null);
+    const r = recommendStack(tasks('gemini', 'go', 80, 0), CONNECTED, 'go');
     assert.equal(r.source, 'static-default');
     assert.equal((r as StaticRecommendation).recordedTasks, 0);
+    assert.equal(recommendStack(tasks('gemini', 'go', 80, 0), CONNECTED, null).source, 'prior', 'unmeasured on connected engines');
     const m = recommendStack([...tasks('gemini', 'go', 80, 0), ...tasks('claude', 'python', 10, 0)], CONNECTED, null) as MeasuredRecommendation;
     assert.equal(m.stack, 'python');
     assert.ok(m.groups.every((g) => g.engine !== 'gemini'));
@@ -198,7 +212,7 @@ describe('stack recommendation (pure)', () => {
       ...tasks('claude', 'go', 20, 0, { taskType: 'check' }),
       null as unknown as OutcomeLike, 42 as unknown as OutcomeLike, { kind: 'task' },
     ], CONNECTED, null);
-    assert.equal(r.source, 'static-default');
+    assert.equal(r.source, 'prior', 'not evidence: nothing was measured');
   });
 
   it('blocked tasks count against the group', () => {
@@ -245,10 +259,91 @@ describe('stack recommendation (pure)', () => {
       assert.equal(r.stack, 'go');
       assert.equal(r.defaultKind, 'detected');
       assert.equal(r.defaultLabel, DETECTED_LABEL);
-      assert.deepEqual(Object.keys(r).sort(), STATIC_KEYS);
+      assert.deepEqual(Object.keys(r).sort(), [...STATIC_KEYS, 'priorSuggests'].sort(), 'the prior would pick another stack: said beside it');
+      assert.equal(r.priorSuggests, 'node-ts');
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('stack recommendation — cold-start prior (general model strengths)', () => {
+  const SERVER = ENGINE_IDS.filter((e) => !SERVER_FORBIDDEN_ENGINES.includes(e));
+
+  it('has an entry for every engine × stack, and `other` is never a strength', () => {
+    for (const engine of ENGINE_IDS) {
+      for (const stack of STACK_IDS) {
+        assert.ok(['strong', 'adequate', 'none'].includes(ENGINE_STACK_PRIOR[engine][stack]), `${engine} × ${stack}`);
+      }
+      assert.equal(ENGINE_STACK_PRIOR[engine].other, 'none');
+    }
+    for (const engine of SERVER) { assert.ok(ENGINE_STACK_PRIOR[engine], engine); }
+    for (const engine of ['copilot', 'custom', 'ollama'] as EngineId[]) {
+      assert.ok(STACK_IDS.every((s) => ENGINE_STACK_PRIOR[engine][s] === 'none'), engine);
+    }
+  });
+
+  it('the prior is ordinal only: no rate, interval, sample or task count; LOW confidence; the exact label', () => {
+    const r = recommendStack([], ['claude'], null) as PriorRecommendation;
+    assert.equal(r.source, 'prior');
+    assert.deepEqual(Object.keys(r).sort(), ['confidence', 'enginesConsidered', 'label', 'minPerGroup', 'source', 'stack']);
+    assert.equal(r.label, PRIOR_LABEL);
+    assert.equal(r.label, 'based on general model strengths — not yet measured on this server');
+    assert.equal(r.confidence, 'low');
+    assert.equal(r.stack, 'node-ts');
+    assert.deepEqual(r.enginesConsidered, [{ engine: 'claude', strength: 'strong' }]);
+    assert.doesNotMatch(JSON.stringify(r), /rate|wilson|recordedTasks|percent|accuracy/i);
+  });
+
+  it('switches to measured at MIN_GROUP_N: one short of it is the prior, at it the measured path is unchanged', () => {
+    const before = recommendStack([...tasks('claude', 'go', MIN_GROUP_N - 1, 0), ...tasks('codex', 'java', MIN_GROUP_N - 1, 0)], CONNECTED, null);
+    assert.equal(before.source, 'prior');
+    const at = recommendStack([...tasks('claude', 'go', MIN_GROUP_N, 0), ...tasks('codex', 'java', 6, 6)], CONNECTED, null) as MeasuredRecommendation;
+    assert.equal(at.source, 'measured');
+    assert.equal(at.stack, 'go', 'measured, whatever the prior would say');
+  });
+
+  it('only ollama connected, or nothing connected: the static default (no engine has a prior)', () => {
+    assert.equal(recommendStack([], ['ollama'], null).source, 'static-default');
+    assert.equal(recommendStack([], [], null).source, 'static-default');
+  });
+
+  it('a detected stack stays primary: static, with priorSuggests only when the prior differs', () => {
+    const differs = recommendStack([], CONNECTED, 'java') as StaticRecommendation;
+    assert.equal(differs.source, 'static-default');
+    assert.equal(differs.stack, 'java');
+    assert.equal(differs.priorSuggests, 'node-ts');
+    const same = recommendStack([], CONNECTED, 'node-ts') as StaticRecommendation;
+    assert.equal('priorSuggests' in same, false);
+  });
+
+  it('"what are you building" narrows the candidates; ties keep candidate order', () => {
+    const cases: Array<[EngineId[], BuildingKind | undefined, string]> = [
+      [['claude'], undefined, 'node-ts'],
+      [['claude'], 'web-app', 'node-ts'],
+      [['claude'], 'api', 'node-ts'],
+      [['claude'], 'cli', 'python'],
+      [['claude'], 'static-site', 'static-web'],
+      [['gemini'], undefined, 'python'],
+      [['gemini'], 'web-app', 'python'],
+      [['gemini'], 'cli', 'python'],
+      [['codex'], 'static-site', 'static-web'],
+      [['gemini', 'claude'], 'cli', 'python'],
+    ];
+    for (const [connected, building, stack] of cases) {
+      const r = recommendStack([], connected, null, 0, building ? { building } : {}) as PriorRecommendation;
+      assert.equal(r.source, 'prior', `${connected.join('+')} ${building}`);
+      assert.equal(r.stack, stack, `${connected.join('+')} ${building}`);
+    }
+    assert.deepEqual([...BUILDING_KINDS], ['web-app', 'api', 'cli', 'static-site']);
+    assert.ok(BUILDING_KINDS.every((k) => isBuildingKind(k)));
+    assert.equal(isBuildingKind('mobile'), false);
+  });
+
+  it('engines considered lists every connected engine with a strength for the stack, strongest first', () => {
+    const r = recommendStack([], ['gemini', 'claude', 'ollama'], null) as PriorRecommendation;
+    assert.equal(r.stack, 'node-ts');
+    assert.deepEqual(r.enginesConsidered, [{ engine: 'claude', strength: 'strong' }, { engine: 'gemini', strength: 'adequate' }]);
   });
 });
 

@@ -10,6 +10,7 @@ import {
   standardsBlockingState,
 } from '../../../standards/checker';
 import { builtInProfile } from '../../../standards/built-in-profiles';
+import { RULEBOOK_KEYS } from '../../../standards/rulebook';
 import { enforcementChangesBetween, enforcementFieldsChanged, severityChangesBetween, validateProfile } from '../../../standards/profile';
 import { parseRequirements } from '../../../models/requirements';
 
@@ -196,11 +197,14 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     assert.deepEqual(greenfield.standardsProfile?.profile.structure.requiredDirs, []);
     assert.deepEqual(greenfield.standardsProfile?.profile.commands, [{ label: 'Test', run: 'npm test' }]);
 
-    // brownfield-moag: the built-in node-ts profile, as brownfield, plus the one command that makes its blocking path real.
+    // brownfield-moag: the built-in node-ts profile as it was before the Project Rulebook (its hash is
+    // pinned in legacy-profiles.test.ts), as brownfield, plus the one command that makes its blocking path real.
     const brownfield = parseScenario(path.join(SCENARIOS, 'brownfield-moag', 'scenario.json'));
     assert.equal(brownfield.standardsProfile?.file, path.join(SCENARIOS, 'brownfield-moag', 'standards.json'));
+    const preRulebook = builtInProfile('node-ts') as unknown as Record<string, unknown>;
+    for (const key of RULEBOOK_KEYS) { delete preRulebook[key]; }
     assert.deepEqual(brownfield.standardsProfile?.profile,
-      { ...builtInProfile('node-ts'), repoState: 'brownfield', commands: [{ label: 'Compile', run: 'npm run compile' }] });
+      { ...preRulebook, repoState: 'brownfield', commands: [{ label: 'Compile', run: 'npm run compile' }] });
     assert.ok(brownfield.gateCommands.includes('npm run compile'), 'the command is one the scenario already allows');
 
     const violation = parseScenario(path.join(SCENARIOS, 'standards-violation', 'scenario.json'));
@@ -254,16 +258,18 @@ describe('bench scenarios shipped in bench/scenarios', () => {
     assert.match(lines[3], /^\s*\/\/ const cached = cache\.get\(text\);$/);
     assert.match(lines[5], /^\s*\/\/ \.\.\. rest of the code \.\.\.$/, 'an unmistakable truncation placeholder, not a sentence');
     assert.deepEqual(report.totals, {
-      passed: 0, noFindings: 7, failed: 0, advisory: 2, notChecked: 3, blockingNotChecked: 0, findings: 2, advisoryFindings: 2, notCheckedFiles: 0,
+      // The always-on .env and credential scans add two "no findings". Every rule this profile leaves unconfigured is
+      // "not configured" — counted apart, never among the rules not checked.
+      passed: 0, noFindings: 9, failed: 0, advisory: 2, notChecked: 0, notConfigured: 10, blockingNotChecked: 0, findings: 2, advisoryFindings: 2, notCheckedFiles: 0,
     });
     assert.equal(standardsBlocked(report), false, 'no scan blocks: on the static half alone this would ship');
     assert.deepEqual(promotedScannerRules(report), []);
     // Everything else about the fixture conforms — the lint script it adds included.
-    for (const rule of ['structure/required-dirs', 'structure/top-level', 'structure/placement', 'naming/files', 'comment-policy/density']) {
+    for (const rule of ['structure/required-dirs', 'structure/top-level', 'structure/placement', 'naming/files', 'comment-policy/density', 'security/env-file', 'security/secret-literal']) {
       assert.equal(report.rules.find((r) => r.rule === rule)?.result, 'passed', rule);
     }
     // Unconfigured rules say so; they are never counted as passed.
-    for (const rule of ['frontend/raw-pattern', 'frontend/design-tokens', 'layering/imports']) {
+    for (const rule of ['frontend/raw-pattern', 'frontend/design-tokens', 'layering/imports', 'practice/todo-without-issue', 'practice/debug-statement', 'a11y/img-alt', 'a11y/html-lang', 'docs/changelog-updated', 'data/migration-edited', 'testing/requirement-reference']) {
       assert.equal(report.rules.find((r) => r.rule === rule)?.result, 'not-checked', rule);
     }
   });

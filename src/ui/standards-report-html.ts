@@ -155,7 +155,8 @@ export function verificationGateRows(gates: readonly GateRowInput[]): string {
 /**
  * The "Project standards" section of the verification report, or '' when the run had no
  * standards. Four groups, in this order and never merged: Blocking, Advisory, Rules not
- * checked, Files not checked. A blocking rule that could not read a changed file is called
+ * checked, Files not checked — with the rules the profile does not configure named apart
+ * as "not configured", never counted among the rules not checked. A blocking rule that could not read a changed file is called
  * out above all of them, and so is a scanner rule the project promoted to blocking.
  */
 export function standardsReportSection(report: StandardsReport | null): string {
@@ -182,10 +183,14 @@ export function standardsReportSection(report: StandardsReport | null): string {
     ? '<p class="meta">Every rule was checked.</p>'
     : `<ul>${groups.notChecked.map((row) =>
       `<li>${isBlockingNotChecked(row) ? '<strong>Blocking rule, not checked:</strong> ' : ''}<code>${escapeHtml(ruleName(row))}</code> — ${escapeHtml(row.reason ?? 'no reason given')}</li>`).join('')}</ul>`;
+  // Rules the profile does not configure: listed apart, never as a gap in the check.
+  const notConfigured = groups.notConfigured.length === 0 ? '' :
+    `<h2>Not configured — this profile does not configure these rules (${groups.notConfigured.length})</h2>
+  <p class="meta">${groups.notConfigured.map((row) => `<code>${escapeHtml(ruleName(row))}</code>`).join(', ')}</p>`;
 
   return `<div class="section">
   <h2>${escapeHtml(title)}</h2>
-  <p class="meta">${t.passed} passed · ${t.noFindings} no findings · ${t.failed} blocking · ${t.advisory} advisory with findings (${t.advisoryFindings} finding${t.advisoryFindings === 1 ? '' : 's'}) · ${t.notChecked} rule${t.notChecked === 1 ? '' : 's'} not checked · ${t.notCheckedFiles} file${t.notCheckedFiles === 1 ? '' : 's'} not checked · ${t.findings} finding${t.findings === 1 ? '' : 's'}</p>
+  <p class="meta">${t.passed} passed · ${t.noFindings} no findings · ${t.failed} blocking · ${t.advisory} advisory with findings (${t.advisoryFindings} finding${t.advisoryFindings === 1 ? '' : 's'}) · ${t.notChecked} rule${t.notChecked === 1 ? '' : 's'} not checked · ${t.notConfigured ?? 0} not configured · ${t.notCheckedFiles} file${t.notCheckedFiles === 1 ? '' : 's'} not checked · ${t.findings} finding${t.findings === 1 ? '' : 's'}</p>
   ${unreadNote}
   ${noBlockingNote}
   ${promotedNote}
@@ -197,6 +202,7 @@ export function standardsReportSection(report: StandardsReport | null): string {
   ${findingList(advisoryFindings)}
   <h2>Rules not checked — not a pass (${groups.notChecked.length})</h2>
   ${notChecked}
+  ${notConfigured}
   <h2>Files not checked — nothing in them counts towards "no findings" (${t.notCheckedFiles})</h2>
   ${notCheckedFileList(report)}
 </div>`;

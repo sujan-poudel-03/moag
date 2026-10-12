@@ -29,6 +29,7 @@ import { readStandardsJobFile } from '../../../standards/local-store';
 import { profileHash, renderPlannerStandards, renderStandardsText } from '../../../standards/profile';
 import { sampleProfile } from '../standards/fixtures';
 import { templateDesign } from '../../../standards/design';
+import { execFileAsync, ExecFileAsyncOptions } from '../../../utils/exec-file';
 
 describe('server app', function () {
   this.timeout(20000);
@@ -1753,7 +1754,9 @@ describe('server app', function () {
     // The report reached the run: totals on the record, the full report in the run dir.
     assert.deepEqual({ ...run.standardsSummary, at: '' }, {
       // One blocking failure (the promoted rule) and one blocking row not checked (the command that never ran).
-      phase: 'verify', version: 1, passed: 0, noFindings: 1, failed: 1, advisory: 0, notChecked: 2, blockingNotChecked: 1,
+      // layering/imports arrived as not checked, but the frozen profile does not configure it: the server,
+      // not the report, decides that, so it is "not configured".
+      phase: 'verify', version: 1, passed: 0, noFindings: 1, failed: 1, advisory: 0, notChecked: 1, notConfigured: 1, blockingNotChecked: 1,
       findings: 1, advisoryFindings: 0, notCheckedFiles: 1, at: '',
     });
     assert.equal(JSON.stringify(h.state.load(projectId)).includes('api/cart'), false, 'findings never enter state.json');
@@ -2384,6 +2387,7 @@ describe('server app', function () {
     assert.equal(after.standardsHash, run.standardsHash);
     assert.equal(typeof after.standardsHash, 'string');
     assert.equal(after.standardsFrozenAtApproval, true);
+    assert.equal(run.standardsFrozenAt, 'gate-approval', 'the record says so too');
   });
 
   it('a run that started under standards: the gate.approve audit carries its version and hash, and freezes nothing', async () => {
@@ -2439,14 +2443,21 @@ describe('server app', function () {
     // A report whose claimed totals lie is recounted from its rows, and its command tail is bounded.
     w.line(standardsLine({
       phase: 'pre-gate',
-      rules: [{ rule: 'naming/files', result: 'not-checked', reason: 'Not configured in this profile' }, { rule: 'command', result: 'failed', command: 'npm run lint', exitCode: 2, tail: 'x'.repeat(5000) }],
+      rules: [
+        { rule: 'naming/files', result: 'not-checked', reason: 'Not configured in this profile' },
+        { rule: 'frontend/design-tokens', result: 'not-checked', reason: 'Not configured in this profile' },
+        { rule: 'command', result: 'failed', command: 'npm run lint', exitCode: 2, tail: 'x'.repeat(5000) },
+      ],
       findings: [], totals: { passed: 99, failed: 0, notChecked: 0, findings: 0 },
     }));
     await waitFor(() => h.state.load(projectId).runs[0].standardsSummary !== undefined);
     const summary = h.state.load(projectId).runs[0].standardsSummary!;
-    assert.deepEqual([summary.phase, summary.passed, summary.failed, summary.notChecked], ['pre-gate', 0, 1, 1]);
+    // Whether a rule is configured is decided by the frozen profile, never by the report: naming/files
+    // is configured there, so its "not configured" reason is ignored and it counts as not checked;
+    // the design-tokens rule is not configured there, so it is "not configured" whatever it says.
+    assert.deepEqual([summary.phase, summary.passed, summary.failed, summary.notChecked, summary.notConfigured], ['pre-gate', 0, 1, 1, 1]);
     const stored = JSON.parse(fs.readFileSync(reportFile, 'utf-8'));
-    assert.equal(stored.report.rules[1].tail.length, 2000);
+    assert.equal(stored.report.rules[2].tail.length, 2000);
   });
 
   it('a red gate never ships, even when the segment exits 0', async () => {
@@ -3221,16 +3232,23 @@ describe('server app', function () {
     assert.equal((await h.request('GET', '/api/projects/recommendation')).status, 401);
   });
 
-  it('recommendation: repo markers of a chosen folder or a project give the "detected" default; escapes are refused', async () => {
+  // Intended change (cold-start prior): a folder that does not resolve is no longer a 4xx.
+  // The suggestion is still given, the repository is not read, and the response says so.
+  it('recommendation: repo markers of a chosen folder or a project give the "detected" default; escapes are never read', async () => {
     fs.writeFileSync(path.join(h.root, 'other', 'go.mod'), 'module x');
     const r = await h.request('GET', '/api/projects/recommendation?path=other', { as: 'po' });
     assert.equal(r.status, 200, r.raw);
     assert.equal((r.body.recommendation as { stack: string }).stack, 'go');
     assert.equal((r.body.recommendation as { defaultKind: string }).defaultKind, 'detected');
-    for (const bad of ['..', '../..', '/etc', 'missing-folder']) {
+    assert.equal(r.body.detectionSkipped, false);
+    for (const bad of ['..', '../..', '/etc', '/projects', 'missing-folder']) {
       const x = await h.request('GET', `/api/projects/recommendation?path=${encodeURIComponent(bad)}`, { as: 'po' });
-      assert.ok(x.status >= 400 && x.status < 500, `${bad} → ${x.status}`);
+      assert.equal(x.status, 200, `${bad} → ${x.status}`);
+      assert.equal(x.body.detectionSkipped, true, bad);
+      assert.notEqual((x.body.recommendation as { defaultKind?: string }).defaultKind, 'detected', `${bad}: nothing was read`);
     }
+    assert.equal((await h.request('GET', '/api/projects/recommendation?building=mobile', { as: 'po' })).status, 400);
+    assert.equal((await h.request('GET', '/api/projects/recommendation?building=cli', { as: 'po' })).status, 200);
     const id = await newProject();
     fs.writeFileSync(path.join(h.root, 'acme', 'pyproject.toml'), '');
     const byProject = await h.request('GET', `/api/projects/recommendation?projectId=${id}`, { as: 'reviewer' });
@@ -3697,6 +3715,97 @@ describe('server app — design system at run start', function () {
     assert.equal(after.designBackupDir, `runs/${runId}/${DESIGN_BACKUP_DIR}`);
   });
 
+  describe('a run whose standards were frozen at its ship approval never counts as one that wrote a design file', () => {
+    /** A first run that wrote the design files and ended, then a user's own tokens file at that path. */
+    const firstRunThenUserFile = async (): Promise<{ projectId: string; planId: string; firstId: string; tokensFull: string; theirs: string }> => {
+      h = await startHarness({ profileDesign: DESIGN });
+      const { projectId, planId } = await approvedProject(h);
+      const first = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+      assert.equal(first.status, 202, first.raw);
+      const firstId = (first.body.run as { id: string }).id;
+      assert.equal(h.state.load(projectId).runs[0].standardsFrozenAt, 'start', 'a new run records when its standards were frozen');
+      assert.equal((await h.request('POST', `/api/projects/${projectId}/runs/${firstId}/stop`, { as: 'reviewer', body: {} })).status, 202);
+      h.workers.at(-1)!.exit(1);
+      await waitFor(() => h.state.load(projectId).runs[0].status === 'stopped');
+      const tokensFull = path.join(h.root, 'acme', ...DESIGN.tokensPath.split('/'));
+      const theirs = ':root { --brand: #123456; }\n';
+      fs.writeFileSync(tokensFull, theirs);
+      return { projectId, planId, firstId, tokensFull, theirs };
+    };
+    /** Turn the first run into a legacy run approved at its gate, with or without the record marker. */
+    const asLegacyApproved = (projectId: string, marker: boolean): void => {
+      h.state.update(projectId, (s) => {
+        const r = s.runs[0];
+        if (marker) { r.standardsFrozenAt = 'gate-approval'; } else { delete r.standardsFrozenAt; }
+        r.gateDecisions = [{ action: 'approve', by: h.accounts.approver.id, at: new Date().toISOString() }];
+      });
+    };
+    const refused = async (projectId: string, planId: string, tokensFull: string, theirs: string): Promise<void> => {
+      const runsBefore = h.state.load(projectId).runs.length;
+      const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+      assert.equal(r.status, 409, r.raw);
+      assert.equal(r.body.error, 'design-file-conflict');
+      assert.equal(fs.readFileSync(tokensFull, 'utf-8'), theirs, 'the file is untouched');
+      assert.equal(h.state.load(projectId).runs.length, runsBefore, 'no run was recorded');
+    };
+
+    it('marked on the record: the start is refused 409 and the file is untouched', async () => {
+      const { projectId, planId, tokensFull, theirs } = await firstRunThenUserFile();
+      asLegacyApproved(projectId, true);
+      await refused(projectId, planId, tokensFull, theirs);
+    });
+
+    it('an older record without the marker: the gate.approve audit flag decides, and the start is refused', async () => {
+      const { projectId, planId, firstId, tokensFull, theirs } = await firstRunThenUserFile();
+      asLegacyApproved(projectId, false);
+      h.audit.append({
+        actorUserId: h.accounts.approver.id, actorUsername: 'approver', action: 'gate.approve', projectId, target: 'Ship approval',
+        after: { runId: firstId, taskId: 't-gate', standardsVersion: 1, standardsFrozenAtApproval: true },
+      });
+      await refused(projectId, planId, tokensFull, theirs);
+    });
+
+    it('an older record whose audit cannot be read: every ambiguous run is counted in, so the start is refused, never an overwrite', async () => {
+      const { projectId, planId, tokensFull, theirs } = await firstRunThenUserFile();
+      asLegacyApproved(projectId, false);
+      const original = h.audit.query.bind(h.audit);
+      h.audit.query = () => { throw new Error('audit unreadable'); };
+      try {
+        await refused(projectId, planId, tokensFull, theirs);
+      } finally {
+        h.audit.query = original;
+      }
+    });
+
+    it('an older record approved without freezing (no audit flag) still counts: the file is reverted', async () => {
+      const { projectId, planId, tokensFull } = await firstRunThenUserFile();
+      asLegacyApproved(projectId, false);
+      const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+      assert.equal(r.status, 202, r.raw);
+      assert.equal(fs.readFileSync(tokensFull, 'utf-8'), DESIGN.tokens);
+    });
+
+    it('a normal run that wrote the file: reverted, and the run record and DTO name the files and the backup', async () => {
+      const { projectId, planId, tokensFull } = await firstRunThenUserFile();
+      const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+      assert.equal(r.status, 202, r.raw);
+      const runId = (r.body.run as { id: string }).id;
+      assert.equal(fs.readFileSync(tokensFull, 'utf-8'), DESIGN.tokens);
+      const rec = h.state.load(projectId).runs.find((x) => x.id === runId)!;
+      assert.deepEqual(rec.designFilesReplaced, [DESIGN.tokensPath]);
+      assert.equal(rec.designBackupDir, `runs/${runId}/${DESIGN_BACKUP_DIR}`);
+      const dto = r.body.run as { designFilesReplaced?: string[]; designBackupDir?: string; standardsFrozenAt?: string };
+      assert.deepEqual(dto.designFilesReplaced, [DESIGN.tokensPath]);
+      assert.equal(dto.designBackupDir, `runs/${runId}/${DESIGN_BACKUP_DIR}`);
+      assert.equal(dto.standardsFrozenAt, 'start');
+      // The first run replaced nothing: an old-style record carries none of the fields.
+      const firstDto = ((await h.request('GET', `/api/projects/${projectId}`, { as: 'reviewer' })).body.runs as Array<Record<string, unknown>>)
+        .find((x) => x.id !== runId)!;
+      assert.equal('designFilesReplaced' in firstDto, false);
+      assert.equal('designBackupDir' in firstDto, false);
+    });
+  });
+
   it('a symlinked docs directory refuses the run 409 design-files-unwritable: nothing spawned, no run recorded', async function () {
     h = await startHarness({ profileDesign: DESIGN });
     const { projectId, planId } = await approvedProject(h);
@@ -3743,5 +3852,313 @@ describe('server app — design system at run start', function () {
     const refused = await h.request('POST', `/api/projects/${projectId}/runs/${runId}/gate/approve`, { as: 'approver', body: {} });
     assert.equal(refused.status, 409, refused.raw);
     assert.equal(refused.body.error, 'standards-blocking');
+  });
+});
+
+// ─── The ship gate shows the approver what the run changed ───
+
+describe('server app — changed files at the ship gate', function () {
+  this.timeout(30000);
+  let h: Harness;
+  let head = FAKE_HEAD;
+  afterEach(async () => { await h.close(); });
+
+  /** A real git for the collector's `diff` and `ls-files`; everything else stays the stand-in. */
+  const realDiff = (fail = false) => async (cmd: string, args: string[], opts?: ExecFileAsyncOptions) => {
+    if (!args.includes('diff') && !args.includes('ls-files')) { return undefined; }
+    if (fail) { return { exitCode: 128, stdout: '', stderr: 'fatal: broken', timedOut: false }; }
+    return execFileAsync(cmd, args, opts);
+  };
+
+  /** Commit a base into the workspace, start the run, make the "agent's" change and halt at the gate. */
+  const haltWithChanges = async (opts: { fail?: boolean; noBase?: boolean } = {}): Promise<{ projectId: string; runId: string } | null> => {
+    h = await startHarness({ gitHead: () => head, exec: realDiff(opts.fail) });
+    const { projectId, planId } = await approvedProject(h);
+    const ws = path.join(h.root, 'acme');
+    const git = (...args: string[]): string => execFileSync('git', ['-C', ws, ...args], { encoding: 'utf-8' }).trim();
+    try { git('init', '-q'); } catch (err) {
+      if (/EPERM|ENOENT/.test(String((err as Error).message))) { return null; }
+      throw err;
+    }
+    git('config', 'user.email', 't@example.com');
+    git('config', 'user.name', 'T');
+    git('config', 'core.autocrlf', 'false');
+    fs.writeFileSync(path.join(ws, 'README.md'), '# Acme\n');
+    git('add', 'README.md');
+    git('commit', '-q', '-m', 'base');
+    head = git('rev-parse', 'HEAD');
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    const runId = (r.body.run as { id: string }).id;
+    if (opts.noBase) { h.state.update(projectId, (s) => { delete s.runs[0].baseRef; }); }
+    fs.writeFileSync(path.join(ws, 'README.md'), '# Acme\n\nCheckout.\n');
+    fs.writeFileSync(path.join(ws, 'app.js'), 'a\nb\n');
+    const w = h.workers.at(-1)!;
+    const snapPath = (w.job as { planPath: string }).planPath;
+    const snap = JSON.parse(fs.readFileSync(snapPath, 'utf-8'));
+    const tasks = snap.playlists.at(-1).tasks as Array<{ id: string; name: string; status?: string; dependsOn?: string[] }>;
+    const shipGate = tasks.find((t) => t.name === 'Ship approval')!;
+    for (const t of tasks) { t.status = t.id === shipGate.id ? 'failed' : (t.dependsOn ?? []).includes(shipGate.id) ? 'blocked' : 'completed'; }
+    fs.writeFileSync(snapPath, JSON.stringify(snap));
+    w.line({ event: 'manual-gate', id: shipGate.id, name: shipGate.name });
+    w.exit(3);
+    await waitFor(() => h.state.load(projectId).runs[0].status === 'awaiting-approval', 5000);
+    return { projectId, runId };
+  };
+  const dtoChanged = async (projectId: string): Promise<Record<string, unknown>> =>
+    ((await h.request('GET', `/api/projects/${projectId}`, { as: 'approver' })).body.runs as Array<{ changedFiles: Record<string, unknown> }>)[0].changedFiles;
+
+  it('the run DTO carries the files changed since the run\'s base, collected by the server', async function () {
+    const at = await haltWithChanges();
+    if (!at) { this.skip(); return; }
+    const changed = await dtoChanged(at.projectId);
+    assert.equal(changed.collected, true, JSON.stringify(changed));
+    assert.equal(changed.baseRef, head);
+    assert.equal(changed.total, 2);
+    assert.deepEqual(changed.files, [
+      { path: 'README.md', added: 2, removed: 0, binary: false, untracked: false },
+      { path: 'app.js', added: 2, removed: null, binary: false, untracked: true },
+    ]);
+    assert.deepEqual(changed.totals, { added: 4, removed: 0, binary: 0, hiddenFromGit: 0, uncounted: 0 });
+    // Nothing has shipped: the base is the project's first run, and the list says so.
+    assert.equal(changed.baseKind, 'before-first-ship');
+    const rec = h.state.load(at.projectId).runs[0];
+    assert.match(rec.changedFilesSha256 ?? '', /^[0-9a-f]{64}$/);
+  });
+
+  it('a list rewritten in the run directory after collection is shown as not collected', async function () {
+    const at = await haltWithChanges();
+    if (!at) { this.skip(); return; }
+    const file = path.join(h.state.runDir(at.projectId, at.runId), 'changed-files.json');
+    const doc = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    doc.files = [];
+    doc.total = 0;
+    fs.writeFileSync(file, JSON.stringify(doc));
+    const changed = await dtoChanged(at.projectId);
+    assert.deepEqual(changed, { collected: false, reason: 'the stored list was changed after it was collected' });
+  });
+
+  it('a run recorded without a diff base: not collected, with the reason', async function () {
+    const at = await haltWithChanges({ noBase: true });
+    if (!at) { this.skip(); return; }
+    assert.deepEqual(await dtoChanged(at.projectId), { collected: false, reason: 'this run recorded no diff base' });
+  });
+
+  it('git failing never fails the run end: the run waits at its gate and the error is recorded', async function () {
+    const at = await haltWithChanges({ fail: true });
+    if (!at) { this.skip(); return; }
+    const rec = h.state.load(at.projectId).runs[0];
+    assert.equal(rec.status, 'awaiting-approval');
+    assert.equal(rec.changedFilesError, 'git could not list the changes');
+    assert.equal(rec.changedFilesSha256, undefined);
+    assert.deepEqual(await dtoChanged(at.projectId), { collected: false, reason: 'git could not list the changes' });
+  });
+
+  it('a run that is not at its gate carries no list', async function () {
+    h = await startHarness();
+    const { projectId, planId } = await approvedProject(h);
+    const r = await h.request('POST', `/api/projects/${projectId}/runs`, { as: 'reviewer', body: { planId } });
+    assert.equal(r.status, 202, r.raw);
+    assert.equal('changedFiles' in (r.body.run as Record<string, unknown>), false);
+  });
+});
+
+// ─── New-project form: the projects root and the live folder check ───
+
+describe('server app — projects root and folder check', function () {
+  this.timeout(30000);
+  let h: Harness;
+  afterEach(async () => { await h.close(); });
+  const check = async (value: string, as = 'po') =>
+    h.request('GET', `/api/projects/folder-check?path=${encodeURIComponent(value)}`, { as });
+
+  it('GET /api/session shows the projects root to whoever may create a project, and to nobody else', async () => {
+    h = await startHarness();
+    const po = await h.request('GET', '/api/session', { as: 'po' });
+    assert.equal((po.body.meta as { projectsRoot?: string }).projectsRoot, fs.realpathSync.native(h.root));
+    const reviewer = await h.request('GET', '/api/session', { as: 'reviewer' });
+    assert.equal('projectsRoot' in (reviewer.body.meta as Record<string, unknown>), false);
+    assert.ok(Array.isArray((reviewer.body.meta as { stacks: unknown }).stacks), 'the rest of meta is unchanged');
+  });
+
+  it('answers every status, with the resolved full path and never a path outside the root', async () => {
+    let topOf: (dir: string) => string | null = (dir) => dir;
+    h = await startHarness({
+      exec: async (_cmd, args) => {
+        if (!args.includes('--show-toplevel')) { return undefined; }
+        const top = topOf(args[args.indexOf('-C') + 1]);
+        return top === null ? { exitCode: 128, stdout: '', stderr: 'not a repo', timedOut: false } : { exitCode: 0, stdout: `${top}\n`, stderr: '', timedOut: false };
+      },
+    });
+    const rootReal = fs.realpathSync.native(h.root);
+    fs.mkdirSync(path.join(h.root, 'acme', 'web'), { recursive: true });
+
+    assert.deepEqual((await check('acme')).body, { status: 'ok', fullPath: path.join(rootReal, 'acme') });
+    assert.deepEqual((await check('missing/app')).body, { status: 'path-not-found', fullPath: path.join(rootReal, 'missing', 'app') });
+    const abs = (await check('/projects')).body;
+    assert.equal(abs.status, 'invalid-path');
+    assert.equal(abs.fullPath, null);
+    assert.match(String(abs.reason), /relative to the projects root/);
+    assert.equal((await check('../outside')).body.status, 'invalid-path');
+
+    topOf = () => null;
+    assert.deepEqual((await check('acme')).body, { status: 'not-a-git-repo', fullPath: path.join(rootReal, 'acme') });
+    topOf = () => path.join(rootReal, 'acme');
+    assert.deepEqual((await check('acme/web')).body, { status: 'not-repo-root', fullPath: path.join(rootReal, 'acme', 'web'), topLevelRel: 'acme' });
+    topOf = () => path.dirname(rootReal);
+    assert.deepEqual((await check('acme/web')).body, { status: 'not-repo-root', fullPath: path.join(rootReal, 'acme', 'web'), topLevelRel: null },
+      'a top level outside the root is never named');
+
+    topOf = (dir) => dir;
+    const created = await h.request('POST', '/api/projects', {
+      as: 'po', body: { name: 'Acme', source: { kind: 'path', path: 'acme' }, stack: 'node-ts', defaultEngine: 'claude' },
+    });
+    assert.equal(created.status, 201, created.raw);
+    assert.equal((await check('acme')).body.status, 'workspace-registered');
+    assert.equal((await check('acme/web')).body.status, 'workspace-nested');
+
+    fs.rmSync(h.root, { recursive: true, force: true });
+    assert.deepEqual((await check('x')).body, { status: 'root-missing', fullPath: null });
+  });
+
+  it('is refused to a role that may not create a project', async () => {
+    h = await startHarness();
+    assert.equal((await check('acme', 'reviewer')).status, 403);
+  });
+
+  it('mode=new: will-create, empty-folder or not-empty, the same path refusals, and nothing is created', async () => {
+    h = await startHarness();
+    const rootReal = fs.realpathSync.native(h.root);
+    const checkNew = async (value: string, as = 'po') =>
+      h.request('GET', `/api/projects/folder-check?path=${encodeURIComponent(value)}&mode=new`, { as });
+    assert.deepEqual((await checkNew('fresh/app')).body, { status: 'will-create', fullPath: path.join(rootReal, 'fresh', 'app') });
+    assert.equal(fs.existsSync(path.join(h.root, 'fresh')), false, 'a check creates nothing');
+    fs.mkdirSync(path.join(h.root, 'empty'));
+    assert.deepEqual((await checkNew('empty')).body, { status: 'empty-folder', fullPath: path.join(rootReal, 'empty') });
+    fs.mkdirSync(path.join(h.root, 'full'));
+    fs.writeFileSync(path.join(h.root, 'full', 'x.txt'), 'x');
+    assert.deepEqual((await checkNew('full')).body, { status: 'not-empty', fullPath: path.join(rootReal, 'full') });
+    for (const bad of ['/projects', '../outside', '.', path.join(rootReal, 'fresh')]) {
+      const r = (await checkNew(bad)).body;
+      assert.equal(r.status, 'invalid-path', bad);
+      assert.equal(r.fullPath, null, bad);
+    }
+    assert.equal((await checkNew('fresh', 'reviewer')).status, 403);
+  });
+
+  it('POST /api/projects with source "new" creates an empty repository, registers and audits it', async () => {
+    const calls: string[][] = [];
+    h = await startHarness({
+      exec: async (_cmd, args) => {
+        if (!args.includes('init') && !args.includes('commit')) { return undefined; }
+        calls.push(args);
+        return { exitCode: 0, stdout: '', stderr: '', timedOut: false };
+      },
+    });
+    const body = { name: 'Fresh', source: { kind: 'new', path: 'fresh' }, stack: 'node-ts', defaultEngine: 'claude' };
+    assert.equal((await h.request('POST', '/api/projects', { as: 'reviewer', body })).status, 403, 'a reviewer may not create a project');
+    assert.equal(fs.existsSync(path.join(h.root, 'fresh')), false);
+    const r = await h.request('POST', '/api/projects', { as: 'po', body });
+    assert.equal(r.status, 201, r.raw);
+    assert.deepEqual((r.body.project as { source: unknown }).source, { kind: 'new' });
+    assert.ok(fs.statSync(path.join(h.root, 'fresh')).isDirectory());
+    assert.deepEqual(calls.map((a) => a.includes('init') ? 'init' : 'commit'), ['init', 'commit']);
+    const audit = fs.readFileSync(path.join(h.dataDir, 'audit.jsonl'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l) as Record<string, unknown>);
+    const entry = audit.find((e) => e.action === 'project.create');
+    assert.ok(entry, 'the create is audited');
+    assert.equal((entry.after as { source: string }).source, 'new');
+    // The same folder again is refused: it now belongs to a project.
+    const again = await h.request('POST', '/api/projects', { as: 'po', body: { ...body, name: 'Again' } });
+    assert.equal(again.status, 409, again.raw);
+    const escape = await h.request('POST', '/api/projects', { as: 'po', body: { ...body, source: { kind: 'new', path: '../x' } } });
+    assert.equal(escape.status, 400, escape.raw);
+    assert.equal(escape.body.error, 'invalid-path');
+  });
+
+  it('a folder name with a colon in a later segment is refused at once by the check and the create (no hang)', async () => {
+    const calls: string[][] = [];
+    h = await startHarness({
+      exec: async (_cmd, args) => {
+        if (!args.includes('init') && !args.includes('commit')) { return undefined; }
+        calls.push(args);
+        return { exitCode: 0, stdout: '', stderr: '', timedOut: false };
+      },
+    });
+    for (const bad of ['foo/Q:x', 'foo/C:bar', 'foo:bar']) {
+      const check = await h.request('GET', `/api/projects/folder-check?path=${encodeURIComponent(bad)}&mode=new`, { as: 'po' });
+      assert.equal(check.status, 200, check.raw);
+      assert.equal(check.body.status, 'invalid-path', bad);
+      const r = await h.request('POST', '/api/projects', {
+        as: 'po', body: { name: 'Colon', source: { kind: 'new', path: bad }, stack: 'node-ts', defaultEngine: 'claude' },
+      });
+      assert.equal(r.status, 400, r.raw);
+      assert.equal(r.body.error, 'invalid-path');
+    }
+    assert.deepEqual(calls, [], 'git never ran');
+    assert.equal(fs.existsSync(path.join(h.root, 'foo')), false);
+  });
+
+  it('a name Windows normalises ("...", ".. ", " ..", "team/...", "a.", "a ", "CON") is invalid-path at the check and a 400 at the create; no .git anywhere', async () => {
+    const calls: string[][] = [];
+    h = await startHarness({
+      exec: async (_cmd, args) => {
+        if (!args.includes('init') && !args.includes('commit')) { return undefined; }
+        calls.push(args);
+        return { exitCode: 0, stdout: '', stderr: '', timedOut: false };
+      },
+    });
+    const before = fs.readdirSync(h.root).sort();
+    const gitUpward = (): string[] => {
+      const found: string[] = [];
+      for (let dir = h.root; ; dir = path.dirname(dir)) {
+        if (fs.existsSync(path.join(dir, '.git'))) { found.push(dir); }
+        if (path.dirname(dir) === dir) { return found; }
+      }
+    };
+    const gitBefore = gitUpward();
+    for (const bad of ['...', '.. ', ' ..', 'team/...', 'a.', 'a ', 'CON']) {
+      const check = await h.request('GET', `/api/projects/folder-check?path=${encodeURIComponent(bad)}&mode=new`, { as: 'po' });
+      assert.equal(check.status, 200, check.raw);
+      assert.equal(check.body.status, 'invalid-path', JSON.stringify(bad));
+      const r = await h.request('POST', '/api/projects', {
+        as: 'po', body: { name: 'Dots', source: { kind: 'new', path: bad }, stack: 'node-ts', defaultEngine: 'claude' },
+      });
+      assert.equal(r.status, 400, `${JSON.stringify(bad)}: ${r.raw}`);
+      assert.equal(r.body.error, 'invalid-path');
+    }
+    assert.deepEqual(calls, [], 'git never ran');
+    assert.deepEqual(fs.readdirSync(h.root).sort(), before, 'nothing was left behind');
+    assert.deepEqual(gitUpward(), gitBefore, 'no .git in the root or any parent');
+    const list = await h.request('GET', '/api/projects', { as: 'po' });
+    assert.equal((list.body.projects as unknown[]).length, 0);
+  });
+
+  it('two concurrent POSTs for one new folder: one project, and the loser leaves the winner\'s repository alone', async () => {
+    h = await startHarness({
+      exec: async (_cmd, args) => {
+        if (!args.includes('init') && !args.includes('commit')) { return undefined; }
+        await new Promise((r) => setTimeout(r, 20));
+        if (args.includes('init')) { fs.mkdirSync(path.join(args[args.indexOf('-C') + 1], '.git'), { recursive: true }); }
+        return { exitCode: 0, stdout: '', stderr: '', timedOut: false };
+      },
+    });
+    const body = (name: string) => ({ name, source: { kind: 'new', path: 'team/a' }, stack: 'node-ts', defaultEngine: 'claude' });
+    const [a, b] = await Promise.all([
+      h.request('POST', '/api/projects', { as: 'po', body: body('A') }),
+      h.request('POST', '/api/projects', { as: 'po', body: body('B') }),
+    ]);
+    assert.deepEqual([a.status, b.status].sort(), [201, 409], `${a.raw} | ${b.raw}`);
+    assert.ok(fs.existsSync(path.join(h.root, 'team', 'a', '.git')));
+    const list = await h.request('GET', '/api/projects', { as: 'po' });
+    assert.equal((list.body.projects as unknown[]).length, 1);
+  });
+
+  it('POST /api/projects still refuses "/projects" with 400 invalid-path', async () => {
+    h = await startHarness();
+    const r = await h.request('POST', '/api/projects', {
+      as: 'po', body: { name: 'Acme', source: { kind: 'path', path: '/projects' }, stack: 'node-ts', defaultEngine: 'claude' },
+    });
+    assert.equal(r.status, 400, r.raw);
+    assert.equal(r.body.error, 'invalid-path');
   });
 });

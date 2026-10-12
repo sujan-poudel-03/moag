@@ -16,7 +16,7 @@ import { analyzeProject } from '../context/project-analyzer';
 import { killProcess, SPAWN_DETACHED } from '../utils/process-kill';
 import { readImportPathScopes } from './import-paths';
 import { trackChildProcess } from '../utils/child-tracker';
-import { VENDOR_MANIFESTS } from '../standards/checker';
+import { BINARY_NOT_READ, VENDOR_MANIFESTS } from '../standards/checker';
 import type { StandardsCheckFile, StandardsCheckInput, StandardsDesignFile, WorkspacePackage } from '../standards/checker';
 import type { StandardsCheckCounts } from '../models/types';
 import { StandardsGateWord, isStandardsGateCommand, standardsGateWord, standardsOpenText } from '../models/requirement-trace';
@@ -676,6 +676,11 @@ export interface StandardsInputOptions {
    * it with the approved content. Absent: the checker is told nothing about them.
    */
   designPaths?: string[];
+  /**
+   * The requirement ids this check verifies, handed to the checker as `requirementIds` for
+   * the rule that each is named in a test file. Absent: that rule is not checked.
+   */
+  requirementIds?: string[];
 }
 
 /**
@@ -808,7 +813,7 @@ function readForStandards(cwd: string, rel: string): { content: string | null; s
     if (!stat.isFile()) { return { content: null, skipped: 'Not a regular file' }; }
     if (stat.size > MAX_STANDARDS_FILE_BYTES) { return { content: null, skipped: 'File is larger than 512 KB' }; }
     const buffer = fs.readFileSync(full);
-    if (buffer.includes(0)) { return { content: null, skipped: 'Binary content' }; }
+    if (buffer.includes(0)) { return { content: null, skipped: BINARY_NOT_READ }; }
     return { content: buffer.toString('utf-8') };
   } catch {
     return { content: null, skipped: 'File could not be read' };
@@ -879,6 +884,8 @@ interface NameStatus {
   pureRenames: Set<string>;
   /** New path → the path the file had at the base, for every rename. */
   renamedFrom: Map<string, string>;
+  /** Paths the base had and the tree no longer has. */
+  deleted: Set<string>;
 }
 
 /** Parse `git diff --name-status -z` (renames on). */
@@ -886,6 +893,7 @@ function parseNameStatus(status: string): NameStatus {
   const changed = new Map<string, StandardsCheckFile['status']>();
   const pureRenames = new Set<string>();
   const renamedFrom = new Map<string, string>();
+  const deleted = new Set<string>();
   const parts = status.split('\0');
   for (let i = 0; i < parts.length;) {
     const code = parts[i].trim();
@@ -902,10 +910,11 @@ function parseNameStatus(status: string): NameStatus {
     }
     const file = parts[i + 1];
     i += 2;
-    if (!file || code.startsWith('D')) { continue; }
+    if (!file) { continue; }
+    if (code.startsWith('D')) { deleted.add(file); continue; }
     changed.set(file, code.startsWith('A') ? 'added' : 'modified');
   }
-  return { changed, pureRenames, renamedFrom };
+  return { changed, pureRenames, renamedFrom, deleted };
 }
 
 /** Parse a JSON file of at most {@link MAX_MANIFEST_BYTES}; undefined when absent, null when unreadable. */
@@ -1106,7 +1115,11 @@ export async function collectStandardsInput(
 ): Promise<StandardsCheckInput> {
   const input = await collectDiffInput(cwd, baseRef, opts);
   // Read whether or not a diff could be taken: the design files are facts about the tree.
-  return opts.designPaths ? { ...input, designFiles: readDesignFiles(cwd, opts.designPaths) } : input;
+  return {
+    ...input,
+    ...(opts.designPaths ? { designFiles: readDesignFiles(cwd, opts.designPaths) } : {}),
+    ...(opts.requirementIds ? { requirementIds: [...opts.requirementIds] } : {}),
+  };
 }
 
 /**
@@ -1235,7 +1248,7 @@ async function collectDiffInput(
     return unavailable;
   }
 
-  const { changed, pureRenames } = parseNameStatus(status);
+  const { changed, pureRenames, renamedFrom, deleted } = parseNameStatus(status);
   const raw = parseRawDiff(rawDiff ?? '');
   // Repositories inside this one, by the state of the tree as it stands. No base ref enters
   // into it: whether a gitlink was added by this change or years ago, its files were not read.
@@ -1370,10 +1383,16 @@ async function collectDiffInput(
     // Never throws.
   }
 
+  // Where each renamed file came from, for the rules that care what a file was at the base.
+  for (const f of files) {
+    const from = f.origin === undefined && f.status === 'renamed' ? renamedFrom.get(f.path) : undefined;
+    if (from !== undefined) { f.renamedFrom = from; }
+  }
   const topLevel = (tree ?? '').split('\0').filter((f) => f.length > 0);
   const vendorRoots = recognisedVendorRoots(cwd, files.map((f) => f.path));
   return {
     baseRef: base, files, existingDirs, topLevel, goModulePath,
+    deletedFiles: [...deleted].filter((f) => !isMoagOutput(f)).sort(),
     nestedRepos: [...nestedRepos].filter((dir) => !isMoagOutput(dir)).sort(),
     submodules: [...submodules].filter((dir) => !isMoagOutput(dir)).sort(),
     vendorRoots,
@@ -1467,7 +1486,7 @@ async function collectOtherVersions(
     const content = await runGit([...quiet, 'show', show(w.file)], cwd, { raw: true });
     if (content === null || patch === null) { out.push(unread(notRead)); continue; }
     if (content.length > MAX_STANDARDS_FILE_BYTES) { out.push(unread('File is larger than 512 KB')); continue; }
-    if (content.includes('\0')) { out.push(unread('Binary content')); continue; }
+    if (content.includes('\0')) { out.push(unread(BINARY_NOT_READ)); continue; }
     const entry = rendered.get(w.file);
     if (names.pureRenames.has(w.file) && (!entry || entry.hunks === 0)) {
       // Every byte was matched to a file that existed at the base: nothing in it is new.

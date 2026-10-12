@@ -9,9 +9,10 @@ import { detectProjectConventions } from '../../../ai-rules/project-detector';
 import { STACK_IDS, StackId } from '../../../server/stacks';
 import { BUILT_IN_PROFILES } from '../../../standards/built-in-profiles';
 import { checkStandards } from '../../../standards/checker';
-import { PROVENANCE_FIELDS, checkDesign, STANDARDS_RULE_IDS, isScannerRule, ruleSeverity, validateProfile, validateProvenance } from '../../../standards/profile';
+import { renderStandardsTextDetailed, OPTIONAL_PROVENANCE_FIELDS, PROVENANCE_FIELDS, checkDesign, STANDARDS_RULE_IDS, isScannerRule, ruleSeverity, validateProfile, validateProvenance } from '../../../standards/profile';
 import { EVIDENCE_NOTE_SEPARATOR, StandardsProposal, detectedStackId, proposeProfile } from '../../../standards/propose';
 import { makeRepo } from '../ai-rules/fixtures';
+import { RULEBOOK_KEYS } from '../../../standards/rulebook';
 import { ADOPTED_TOKENS_NOTE_HEADING, MAX_DESIGN_DOC_CHARS, MAX_DESIGN_TOKENS_CHARS, templateDesign, withAdoptedTokensNote } from '../../../standards/design';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -98,9 +99,19 @@ function assertWellFormed(dir: string, proposal: StandardsProposal): void {
   assert.ok(profile.ok, JSON.stringify(profile));
   const provenance = validateProvenance(proposal.provenance);
   assert.ok(provenance.ok, JSON.stringify(provenance));
-  // `design` is there exactly when the profile has a design system.
-  const expectedKeys = [...PROVENANCE_FIELDS, ...(proposal.profile.design ? ['design'] : [])];
+  // `design` and each rulebook section are there exactly when the profile has that part.
+  const optional = OPTIONAL_PROVENANCE_FIELDS.filter((f) => proposal.profile[f] !== undefined);
+  const expectedKeys = [...PROVENANCE_FIELDS, ...optional];
   assert.deepEqual(Object.keys(proposal.provenance).sort(), expectedKeys.sort());
+  for (const field of optional) {
+    const entry = proposal.provenance[field]!;
+    assert.ok(entry.evidence.length > 0, `${field} has evidence`);
+    if (entry.tag === 'detected') {
+      for (const file of evidenceFile(entry.evidence).split(', ')) {
+        assert.ok(fs.existsSync(path.join(dir, ...file.split('/'))), `${field}: detected evidence "${file}" names a file that exists`);
+      }
+    }
+  }
   for (const field of PROVENANCE_FIELDS) {
     const entry = proposal.provenance[field];
     assert.ok(entry.evidence.length > 0, `${field} has evidence`);
@@ -536,6 +547,55 @@ describe('standards proposal — the project\'s own test command blocks by defau
     assert.deepEqual(commandsFor('dotnet', REPOS.dotnet).profile.commands, []);
   });
 
+  const runs = (p: StandardsProposal): string[] => p.profile.commands.map((c) => c.run);
+  const PY = { 'requirements.txt': 'flask\n', 'app/main.py': 'value = 1\n' };
+
+  it('python: a type checker and pip-audit only where the repository declares them', () => {
+    assert.deepEqual(runs(commandsFor('python', { ...PY, 'mypy.ini': '[mypy]\nstrict = True\n' })), ['mypy .']);
+    assert.deepEqual(runs(commandsFor('python', { ...PY, 'pyproject.toml': '[project]\nname = "app"\n\n[tool.mypy]\nstrict = true\n' })), ['mypy .']);
+    assert.deepEqual(runs(commandsFor('python', { ...PY, 'setup.cfg': '[metadata]\nname = app\n\n[mypy]\nstrict = True\n' })), ['mypy .']);
+    assert.deepEqual(runs(commandsFor('python', { ...PY, 'pyrightconfig.json': '{}' })), ['pyright']);
+    assert.deepEqual(runs(commandsFor('python', { ...PY, 'requirements-dev.txt': 'pytest\npip-audit==2.7\n', 'conftest.py': '' })),
+      ['pytest', 'pip-audit -r requirements.txt'], 'tests first, the networked audit last; it audits the project, not the server');
+    assert.deepEqual(runs(commandsFor('python', { ...PY, 'pyproject.toml': '[project]\nname = "app"\n[project.optional-dependencies]\ndev = ["pip-audit>=2"]\n' })),
+      ['pip-audit .'], 'a pyproject project is audited as the project itself');
+    assert.deepEqual(runs(commandsFor('python', { ...PY, '.pre-commit-config.yaml': 'repos:\n  - repo: https://github.com/pypa/pip-audit\n    rev: v2.7.3\n    hooks:\n      - id: pip-audit\n' })),
+      ['pip-audit -r requirements.txt']);
+    const audit = commandsFor('python', { ...PY, 'requirements-dev.txt': 'pip-audit\n' }).profile.commands;
+    assert.deepEqual(audit, [{ label: 'Audit', run: 'pip-audit -r requirements.txt' }]);
+    // A mention is not a declaration: a comment, a README, an unrelated package.
+    assert.deepEqual(runs(commandsFor('python', {
+      ...PY, 'requirements.txt': 'flask\n# run pip-audit before release\n', 'README.md': 'Use mypy and pip-audit.\n', 'requirements-dev.txt': 'mypy-extensions\n',
+    })), [], 'nothing declared: nothing proposed');
+  });
+
+  it('go: govulncheck only where go.mod or tools.go declares it; go vet stays first', () => {
+    const MAIN = { 'main.go': 'package main\n\nfunc main() {}\n' };
+    assert.deepEqual(runs(commandsFor('go', { ...MAIN, 'go.mod': 'module example.com/app\n\ngo 1.24\n\ntool golang.org/x/vuln/cmd/govulncheck\n' })),
+      ['go vet ./...', 'go test ./...', 'go tool govulncheck ./...']);
+    assert.deepEqual(runs(commandsFor('go', { ...MAIN, 'go.mod': 'module example.com/app\n\ngo 1.24\n\ntool (\n\tgolang.org/x/tools/cmd/stringer\n\tgolang.org/x/vuln/cmd/govulncheck\n)\n' })),
+      ['go vet ./...', 'go test ./...', 'go tool govulncheck ./...']);
+    assert.deepEqual(runs(commandsFor('go', {
+      ...MAIN, 'go.mod': 'module example.com/app\n\nrequire golang.org/x/vuln v1.1.0\n',
+      'tools.go': '//go:build tools\n\npackage tools\n\nimport (\n\t_ "golang.org/x/vuln/cmd/govulncheck"\n)\n',
+    })), ['go vet ./...', 'go test ./...', 'go run golang.org/x/vuln/cmd/govulncheck ./...']);
+    assert.deepEqual(runs(commandsFor('go', { ...MAIN, 'go.mod': 'module example.com/app\n// we should add govulncheck\n' })),
+      ['go vet ./...', 'go test ./...'], 'a comment declares nothing');
+  });
+
+  it('java: the OWASP dependency-check plugin the build declares, through the tracked wrapper', () => {
+    const POM = '<project><build><plugins><plugin><groupId>org.owasp</groupId><artifactId>dependency-check-maven</artifactId></plugin></plugins></build></project>';
+    assert.deepEqual(commandsFor('java', { 'pom.xml': POM, 'src/main/java/App.java': 'class App {}\n' }).profile.commands,
+      [{ label: 'Audit', run: 'mvn dependency-check:check' }]);
+    assert.deepEqual(runs(commandsFor('java', { 'pom.xml': POM, mvnw: '#!/bin/sh\n', 'src/main/java/App.java': 'class App {}\n' })),
+      [`${process.platform === 'win32' ? 'mvnw.cmd' : './mvnw'} dependency-check:check`], 'cmd.exe cannot run ./mvnw');
+    assert.deepEqual(runs(commandsFor('java', {
+      'build.gradle.kts': 'plugins {\n  java\n  id("org.owasp.dependencycheck") version "9.0.9"\n}\n', gradlew: '#!/bin/sh\n', 'src/main/java/App.java': 'class App {}\n',
+    })), [`${process.platform === 'win32' ? 'gradlew.bat' : './gradlew'} dependencyCheckAnalyze`]);
+    assert.deepEqual(runs(commandsFor('java', { 'pom.xml': '<project><!-- dependency-check-maven later --></project>', 'src/main/java/App.java': 'class App {}\n' })),
+      [], 'a comment declares nothing');
+  });
+
   function commandsFor(stack: StackId, files: Record<string, string>): StandardsProposal {
     const dir = makeRepo('moag-prop-tests-', files);
     const proposal = proposeProfile(stack, detectTracked(dir));
@@ -833,4 +893,81 @@ describe('standards proposal — design system', () => {
       assert.deepEqual(proposeProfile(stack, detectTracked(dir)), proposal);
     });
   }
+});
+
+// ─── Project Rulebook: a brownfield proposal adopts what the repository already does ───
+
+describe('standards proposal — Project Rulebook', () => {
+  const RULEBOOK_REPO: Record<string, string> = {
+    'package.json': JSON.stringify({ devDependencies: { typescript: '5' }, scripts: { lint: 'eslint .', test: 'mocha', typecheck: 'tsc', audit: 'npm audit --audit-level=high' } }),
+    'tsconfig.json': '{}',
+    'src/index.ts': TS_SOURCE,
+    'CHANGELOG.md': '# Changes\n',
+    'prisma/migrations/001_init/migration.sql': 'create table a (id int);\n',
+    '.env.example': 'API_URL=\n',
+    'commitlint.config.js': 'module.exports = { extends: [] };\n',
+  };
+
+  it('adopts the changelog, the migrations folder, .env.example and the commit convention, each detected with its file', () => {
+    const dir = makeRepo('moag-prop-rulebook-', RULEBOOK_REPO);
+    const proposal = proposeProfile('node-ts', detectTracked(dir));
+    assertWellFormed(dir, proposal);
+    const p = proposal.profile;
+    assert.equal(p.docsGit?.changelogPath, 'CHANGELOG.md');
+    assert.ok(p.docsGit?.guidance.includes('Write commit messages the way commitlint.config.js requires'));
+    assert.equal(p.apiData?.migrationsGlob, 'prisma/migrations/**');
+    assert.ok(p.apiData?.guidance.some((g) => g.includes('.env.example')));
+    assert.equal(proposal.provenance.docsGit?.tag, 'detected');
+    assert.equal(proposal.provenance.docsGit?.evidence, 'CHANGELOG.md, commitlint.config.js');
+    assert.equal(proposal.provenance.apiData?.tag, 'detected');
+    assert.match(proposal.provenance.apiData?.evidence ?? '', /^prisma\/migrations\/001_init\/migration\.sql, \.env\.example$/);
+    assert.equal(proposal.provenance.practice?.tag, 'assumed', 'a section nothing proved is a default');
+    // The audit script is proposed last, after lint, typecheck and test.
+    assert.deepEqual(p.commands.map((c) => c.run), ['npm run lint', 'npm run typecheck', 'npm test', 'npm run audit']);
+    // Nothing the rulebook adds blocks.
+    for (const rule of STANDARDS_RULE_IDS.filter(isScannerRule)) { assert.equal(ruleSeverity(p, rule), 'advisory', rule); }
+  });
+
+  it('a file git does not track is never adopted', () => {
+    const dir = makeRepo('moag-prop-rulebook-untracked-', RULEBOOK_REPO);
+    const tracked = everyFile(dir).filter((f) => f !== 'CHANGELOG.md' && !f.startsWith('prisma/') && f !== '.env.example' && f !== 'commitlint.config.js');
+    const proposal = proposeProfile('node-ts', detectProjectConventions(dir, { tracked: { ok: true, files: tracked } }));
+    assert.equal(proposal.profile.docsGit?.changelogPath, '');
+    assert.equal(proposal.profile.apiData?.migrationsGlob, '');
+    assert.equal(proposal.provenance.docsGit?.tag, 'assumed');
+    // Without git's listing nothing is adopted either.
+    const noGit = proposeProfile('node-ts', detectProjectConventions(dir));
+    assert.equal(noGit.profile.docsGit?.changelogPath, '');
+  });
+
+  it('the audit script is the first command left out at the limit of six', () => {
+    const dir = makeRepo('moag-prop-rulebook-limit-', {
+      ...RULEBOOK_REPO,
+      'package.json': JSON.stringify({
+        devDependencies: { typescript: '5' },
+        scripts: { lint: 'eslint .', 'format:check': 'prettier -c .', typecheck: 'tsc', test: 'mocha', audit: 'npm audit' },
+      }),
+      '.prettierrc': '{}',
+      '.stylelintrc.json': '{}',
+    });
+    const runs = proposeProfile('node-ts', detectTracked(dir)).profile.commands.map((c) => c.run);
+    assert.ok(runs.length <= 6);
+    assert.equal(runs[runs.length - 1], 'npm run audit', 'still fits here, and last');
+  });
+
+  it('greenfield: the built-in sections, all assumed; a UI adds the accessibility section', () => {
+    const plain = proposeProfile('python', detectTracked(makeRepo('moag-prop-rulebook-green-', {})));
+    assert.deepEqual(Object.keys(plain.profile).filter((k) => (RULEBOOK_KEYS as readonly string[]).includes(k)).sort(),
+      ['apiData', 'docsGit', 'performance', 'practice', 'security', 'testPolicy']);
+    assert.equal(plain.provenance.security?.tag, 'assumed');
+    assert.equal(plain.profile.accessibility, undefined, 'no user interface, no accessibility section');
+    const ui = proposeProfile('node-ts', detectTracked(makeRepo('moag-prop-rulebook-ui-', {
+      'package.json': JSON.stringify({ dependencies: { react: '18', '@mui/material': '5' } }),
+      'src/App.tsx': 'export const App = () => null;\n',
+    })));
+    assert.ok(ui.profile.accessibility, 'a component kit or design system brings the accessibility section');
+    assert.equal(ui.profile.accessibility?.imgAlt, false, 'JSX is not checked: guidance only outside a static site');
+    assert.equal(ui.provenance.accessibility?.tag, 'assumed');
+    assert.deepEqual(renderStandardsTextDetailed(ui.profile, 1).guidanceCut, [], 'it fits the prompt');
+  });
 });

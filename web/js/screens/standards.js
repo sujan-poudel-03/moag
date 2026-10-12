@@ -37,6 +37,13 @@ const SECTIONS = [
   ['naming', 'Naming'],
   ['comments', 'Comment policy'],
   ['testing', 'Testing'],
+  ['practice', 'Coding practice'],
+  ['testPolicy', 'Testing policy'],
+  ['security', 'Security'],
+  ['accessibility', 'Accessibility'],
+  ['apiData', 'API and data'],
+  ['docsGit', 'Docs and git'],
+  ['performance', 'Performance'],
   ['severity', 'What blocks a release'],
   ['commands', 'Commands'],
   ['builtInRuleIds', 'Built-in rules'],
@@ -57,6 +64,15 @@ const RULE_LABELS = {
   'comment-policy/banned-phrase': 'No banned placeholder phrases',
   'comment-policy/density': 'Comment density stays under the limit',
   'exemption/newly-generated': 'No file newly marked as generated',
+  'practice/todo-without-issue': 'TODO and FIXME comments cite an issue',
+  'practice/debug-statement': 'No debugger statements left in code',
+  'security/env-file': 'No .env file is added to the repository',
+  'security/secret-literal': 'No credential-shaped value on an added line',
+  'a11y/img-alt': 'Images in HTML pages have alt text',
+  'a11y/html-lang': 'HTML pages declare a language',
+  'docs/changelog-updated': 'The changelog is updated in a run that ships a version',
+  'data/migration-edited': 'Committed migrations are never edited or deleted',
+  'testing/requirement-reference': 'Each requirement (R-n) is named in a test file',
 };
 const SEVERITY_WORDS = { blocking: 'Blocking', advisory: 'Advisory' };
 
@@ -78,6 +94,13 @@ const isScannerRule = (rule) => scannerRules.includes(rule);
 const count = (n) => Number(n || 0).toLocaleString('en-US');
 const list = (v) => (Array.isArray(v) ? v : []);
 const joined = (v) => list(v).join(', ');
+const onOff = (v) => (v === true ? 'Checked' : 'Off');
+
+/** The Project Rulebook sections of a profile, in order. Each is absent — never empty — when a version does not have it. */
+const RULEBOOK_KEYS = ['practice', 'testPolicy', 'security', 'accessibility', 'apiData', 'docsGit', 'performance'];
+/** The prompt limits, for an older server that does not send them in `limits`. */
+const PROMPT_LIMIT = 4000;
+const PLANNER_LIMIT = 6000;
 
 /** The severity of every rule under `profile`: its override where it has one, else the default. */
 function resolvedSeverity(profile) {
@@ -222,6 +245,56 @@ function sectionRows(profile, key) {
         { label: 'Test files', value: joined(t.fileGlobs), prov: 'testing' },
         { label: 'Notes', value: t.notes || '', prov: 'testing' },
       ];
+    }
+    case 'practice': {
+      const x = p.practice || null;
+      if (!x) { return []; }
+      return [
+        { label: 'TODO and FIXME cite an issue', value: onOff(x.todoNeedsIssue), prov: 'practice' },
+        { label: 'No debugger statements', value: onOff(x.noDebugStatements), prov: 'practice' },
+        { label: 'Guidance (not checked)', value: list(x.guidance).join('\n'), prov: 'practice' },
+      ];
+    }
+    case 'testPolicy': {
+      const x = p.testPolicy || null;
+      if (!x) { return []; }
+      return [
+        { label: 'Each requirement named in a test', value: onOff(x.requirementReference), prov: 'testPolicy' },
+        { label: 'Guidance (not checked)', value: list(x.guidance).join('\n'), prov: 'testPolicy' },
+      ];
+    }
+    case 'security': {
+      const x = p.security || null;
+      return x ? [{ label: 'Guidance (not checked)', value: list(x.guidance).join('\n'), prov: 'security' }] : [];
+    }
+    case 'accessibility': {
+      const x = p.accessibility || null;
+      if (!x) { return []; }
+      return [
+        { label: 'Images have alt text', value: onOff(x.imgAlt), prov: 'accessibility' },
+        { label: 'Pages declare a language', value: onOff(x.htmlLang), prov: 'accessibility' },
+        { label: 'Guidance (not checked)', value: list(x.guidance).join('\n'), prov: 'accessibility' },
+      ];
+    }
+    case 'apiData': {
+      const x = p.apiData || null;
+      if (!x) { return []; }
+      return [
+        { label: 'Migrations folder', value: x.migrationsGlob || '', prov: 'apiData' },
+        { label: 'Guidance (not checked)', value: list(x.guidance).join('\n'), prov: 'apiData' },
+      ];
+    }
+    case 'docsGit': {
+      const x = p.docsGit || null;
+      if (!x) { return []; }
+      return [
+        { label: 'Changelog', value: x.changelogPath || '', prov: 'docsGit' },
+        { label: 'Guidance (not checked)', value: list(x.guidance).join('\n'), prov: 'docsGit' },
+      ];
+    }
+    case 'performance': {
+      const x = p.performance || null;
+      return x ? [{ label: 'Guidance (not checked)', value: list(x.guidance).join('\n'), prov: 'performance' }] : [];
     }
     case 'severity': {
       const severity = resolvedSeverity(p);
@@ -373,7 +446,7 @@ function designSectionView(version, marker) {
   }
   const tokens = list(d.tokens);
   return h('div', null,
-    h('h3', { class: 'section-header' }, 'Design system', marker),
+    h('h3', { class: 'section-header', dataset: { focus: 'design-system' } }, 'Design system', marker),
     h('p', { class: 'muted' }, STR.C68.text),
     designSummary(d, { provenance: (f) => provenanceTag(version, f), inRun: STR.C71(d.docPath, d.tokensPath).text }),
     d.tokensListable === false
@@ -439,9 +512,82 @@ function sectionsView(version, baseRecord, limits) {
   const changedKeys = baseRecord && version.changedFrom ? list(version.changedFrom.sections) : [];
   // The design section is left out — not shown empty — when neither this version nor its base has one.
   const hasDesign = !!(version.profile && version.profile.design) || !!(baseRecord && baseRecord.profile && baseRecord.profile.design);
-  const shown = SECTIONS.filter(([k]) => k !== 'design' || hasDesign);
+  // So is a rulebook section neither has: the Rulebook block above already says it is not part of the version.
+  const has = (key) => !!(version.profile && version.profile[key]) || !!(baseRecord && baseRecord.profile && baseRecord.profile[key]);
+  const shown = SECTIONS.filter(([k]) => (k === 'design' ? hasDesign : RULEBOOK_KEYS.includes(k) ? has(k) : true));
   const ordered = [...shown.filter(([k]) => changedKeys.includes(k)), ...shown.filter(([k]) => !changedKeys.includes(k))];
   return ordered.map(([key, title]) => sectionView(version, key, title, baseRecord, limits));
+}
+
+// ─── Project Rulebook block ───
+
+/** One CHECKED item: what it checks, then the rule id (or the command) and whether it blocks. */
+function checkedItem(item, severity) {
+  if (item.kind === 'command') {
+    return h('li', null, badge('CHECKED', 'info'), ' ', `${item.label} passes`,
+      h('div', { class: 'muted' }, h('span', { class: 'diff-id' }, `command: ${item.label}`), ' · Blocking'));
+  }
+  const label = RULE_LABELS[item.rule] || item.rule;
+  const sev = SEVERITY_WORDS[severity[item.rule] || item.severity] || SEVERITY_WORDS[item.severity] || 'Advisory';
+  return h('li', null, badge('CHECKED', 'info'), ' ', label,
+    h('div', { class: 'muted' }, h('span', { class: 'diff-id' }, item.rule), ` · ${sev}`, item.alwaysOn ? ' · every run' : ''));
+}
+
+/**
+ * The Project Rulebook of a version, as the server described it (`version.rulebook`): per
+ * section what MOAG checks and what is guidance only — labelled, never by colour alone — and
+ * the exact text agents and the planner receive. Null for an older server's DTO.
+ * `opts.changedKeys` marks sections that changed; `opts.focusDesign` links accessibility to
+ * the design system; `opts.limits` carries the prompt limits.
+ */
+export function rulebookBlock(version, opts = {}) {
+  const rb = version && version.rulebook;
+  if (!rb || !Array.isArray(rb.sections)) { return null; }
+  const severity = version.severity || {};
+  const changed = list(opts.changedKeys);
+  const counts = rb.counts || { checked: 0, guidance: 0 };
+  const promptLimit = Number(opts.limits && opts.limits.promptChars) || PROMPT_LIMIT;
+  const plannerLimit = Number(opts.limits && opts.limits.plannerChars) || PLANNER_LIMIT;
+  const cut = list(version.guidanceCut);
+  const n = version.version;
+
+  const sectionEl = (s) => {
+    const marker = changed.includes(s.key) && opts.baseVersion ? changeMarker(opts.baseVersion) : null;
+    const checked = list(s.checked);
+    const guidance = list(s.guidance);
+    const notYet = list(s.notYetChecked);
+    const always = checked.some((c) => c.alwaysOn);
+    return h('div', null,
+      h('h3', { class: 'section-header' }, s.title, marker),
+      s.present ? null : h('p', { class: 'muted' }, '— Not part of this version.'),
+      checked.length > 0 ? [
+        h('h4', { class: 'section-header' }, `Checked  ${checked.length}`),
+        always ? h('p', { class: 'muted' }, STR.C93.text) : null,
+        h('ul', { class: 'diff-list', 'aria-label': `${s.title}, checked` }, checked.map((c) => checkedItem(c, severity))),
+      ] : null,
+      s.present ? [
+        h('h4', { class: 'section-header' }, `${s.title} ${STR.C89.text}  ${guidance.length + notYet.length}`),
+        guidance.length + notYet.length === 0 ? h('p', { class: 'muted' }, '— None.') : h('ul', { class: 'diff-list', 'aria-label': `${s.title}, guidance, not checked` },
+          guidance.map((g) => h('li', null, badge('GUIDANCE', 'muted'), ' ', g.text,
+            g.sent === false ? h('div', { class: 'muted' }, glyph('○'), ' not sent to agents (cut to fit)') : null)),
+          notYet.map((x) => h('li', null, badge('GUIDANCE', 'muted'), ' ', x.text, h('div', { class: 'muted' }, glyph('○'), ' ', x.hint)))),
+        s.key === 'accessibility' && opts.focusDesign
+          ? h('button', { type: 'button', class: 'btn-link', on: { click: opts.focusDesign } }, 'View design system') : null,
+      ] : null);
+  };
+
+  const preview = (summary, text, label) => h('details', { class: 'diff-group' },
+    h('summary', null, summary),
+    h('pre', { class: 'tail', tabindex: '0', 'aria-label': label }, text));
+  return h('div', { class: 'rulebook' },
+    h('p', { class: 'muted' }, STR.C90(counts.checked, counts.guidance).text),
+    rb.sections.filter((s) => s.applicable !== false).map(sectionEl),
+    typeof version.promptText === 'string' ? [
+      cut.length > 0 ? h('p', { class: 'text-warning' }, glyph('⚠'), ' ', STR.C91(cut.length, promptLimit).text) : null,
+      preview(`What agents receive  ${count(version.promptText.length)} / ${count(promptLimit)}`, version.promptText, `Standards text agents receive, v${n}`),
+    ] : null,
+    typeof version.plannerText === 'string'
+      ? preview(`Planner summary  ${count(version.plannerText.length)} / ${count(plannerLimit)}`, version.plannerText, `Planner summary, v${n}`) : null);
 }
 
 // ─── Edit form: profile ⇄ field values ───
@@ -498,7 +644,59 @@ function toForm(profile) {
     designTokensPath: (p.design && p.design.tokensPath) || '',
     designTokens: (p.design && p.design.tokens) || '',
     designDoc: (p.design && p.design.doc) || '',
+    ...rulebookToForm(p),
   };
+}
+
+/** The rulebook fields of the form. A section the profile lacks shows empty and unticked. */
+function rulebookToForm(p) {
+  const lines = (v) => list(v).join('\n');
+  const practice = p.practice || {};
+  const testPolicy = p.testPolicy || {};
+  const accessibility = p.accessibility || {};
+  const apiData = p.apiData || {};
+  const docsGit = p.docsGit || {};
+  return {
+    practiceTodo: practice.todoNeedsIssue === true,
+    practiceDebug: practice.noDebugStatements === true,
+    practiceGuidance: lines(practice.guidance),
+    testRequirementRef: testPolicy.requirementReference === true,
+    testGuidance: lines(testPolicy.guidance),
+    securityGuidance: lines((p.security || {}).guidance),
+    a11yImgAlt: accessibility.imgAlt === true,
+    a11yHtmlLang: accessibility.htmlLang === true,
+    a11yGuidance: lines(accessibility.guidance),
+    migrationsGlob: apiData.migrationsGlob || '',
+    apiGuidance: lines(apiData.guidance),
+    changelogPath: docsGit.changelogPath || '',
+    docsGuidance: lines(docsGit.guidance),
+    perfGuidance: lines((p.performance || {}).guidance),
+  };
+}
+
+/**
+ * The rulebook sections from the form. A section with no ticked check, no setting and no
+ * guidance is left out — absent, never empty — so a blank section never enters a version.
+ */
+function rulebookFromForm(vals) {
+  const out = {};
+  const put = (key, section, filled) => { if (filled) { out[key] = section; } };
+  const g = (key) => linesOf(vals[key]);
+  const practice = { todoNeedsIssue: vals.practiceTodo === true, noDebugStatements: vals.practiceDebug === true, guidance: g('practiceGuidance') };
+  put('practice', practice, practice.todoNeedsIssue || practice.noDebugStatements || practice.guidance.length > 0);
+  const testPolicy = { requirementReference: vals.testRequirementRef === true, guidance: g('testGuidance') };
+  put('testPolicy', testPolicy, testPolicy.requirementReference || testPolicy.guidance.length > 0);
+  const security = { guidance: g('securityGuidance') };
+  put('security', security, security.guidance.length > 0);
+  const accessibility = { imgAlt: vals.a11yImgAlt === true, htmlLang: vals.a11yHtmlLang === true, guidance: g('a11yGuidance') };
+  put('accessibility', accessibility, accessibility.imgAlt || accessibility.htmlLang || accessibility.guidance.length > 0);
+  const apiData = { migrationsGlob: String(vals.migrationsGlob || '').trim(), guidance: g('apiGuidance') };
+  put('apiData', apiData, apiData.migrationsGlob !== '' || apiData.guidance.length > 0);
+  const docsGit = { changelogPath: String(vals.changelogPath || '').trim(), guidance: g('docsGuidance') };
+  put('docsGit', docsGit, docsGit.changelogPath !== '' || docsGit.guidance.length > 0);
+  const performance = { guidance: g('perfGuidance') };
+  put('performance', performance, performance.guidance.length > 0);
+  return out;
 }
 
 const linesOf = (text) => String(text || '').split('\n').map((l) => l.trim()).filter(Boolean);
@@ -591,6 +789,7 @@ function fromForm(vals, source) {
     commands,
     builtInRuleIds: linesOf(vals.builtInRuleIds),
     freeText: vals.freeText,
+    ...rulebookFromForm(vals),
   };
   // Severity is sent as overrides only. An override the source already spelled out is kept as
   // written, so an edit that touches no severity leaves this part of the profile byte-identical;
@@ -635,6 +834,16 @@ const ERROR_FIELDS = [
   ['profile.design.docPath', 'designDocPath'], ['profile.design.tokensPath', 'designTokensPath'],
   ['profile.design.tokens', 'designTokens'], ['profile.design.doc', 'designDoc'],
   ['profile.design', 'designDoc'],
+  // Project Rulebook: each field, then the section as a whole (a missing key, an unknown one).
+  ['profile.practice.todoNeedsIssue', 'practiceTodo'], ['profile.practice.noDebugStatements', 'practiceDebug'],
+  ['profile.practice', 'practiceGuidance'],
+  ['profile.testPolicy.requirementReference', 'testRequirementRef'], ['profile.testPolicy', 'testGuidance'],
+  ['profile.security', 'securityGuidance'],
+  ['profile.accessibility.imgAlt', 'a11yImgAlt'], ['profile.accessibility.htmlLang', 'a11yHtmlLang'],
+  ['profile.accessibility', 'a11yGuidance'],
+  ['profile.apiData.migrationsGlob', 'migrationsGlob'], ['profile.apiData', 'apiGuidance'],
+  ['profile.docsGit.changelogPath', 'changelogPath'], ['profile.docsGit', 'docsGuidance'],
+  ['profile.performance', 'perfGuidance'],
 ];
 
 // ─── Screen ───
@@ -678,8 +887,13 @@ export async function render(app, params, view) {
   /** Start an edit from version `v`, or from a blank profile when the project has no version at all. */
   const startEdit = (v, extra) => {
     const profile = v ? v.profile : blankProfile(state.dto.stack);
-    // `extra.design`: a suggested design system merged into the draft, so it starts dirty.
-    const start = extra && extra.design ? { ...profile, design: extra.design } : profile;
+    // `extra.design` / `extra.rulebook`: a suggested design system or rulebook sections merged
+    // into the draft, so it starts dirty.
+    const start = {
+      ...profile,
+      ...(extra && extra.design ? { design: extra.design } : {}),
+      ...(extra && extra.rulebook ? extra.rulebook : {}),
+    };
     drafts.set(projectId, { from: v ? v.version : null, baseVersion: latestNumber(), profile, vals: toForm(start) });
     renderAll(true);
   };
@@ -715,7 +929,9 @@ export async function render(app, params, view) {
     ? { contentHash: v.contentHash, acknowledgedEnforcementHash: v.contentHash } : { contentHash: v.contentHash });
 
   const approve = async (v, acknowledged) => {
-    const ok = await confirmDialog({ title: 'Approve these standards?', text: STR.C32(v.version, list(v.commands).length).text + designConfirmText(v), confirmLabel: 'Approve standards' });
+    const rb = v.rulebook && v.rulebook.counts;
+    const rulebookText = rb ? ` ${STR.C94(Number(rb.checked) || 0, Number(rb.guidance) || 0).text}` : '';
+    const ok = await confirmDialog({ title: 'Approve these standards?', text: STR.C32(v.version, list(v.commands).length).text + designConfirmText(v) + rulebookText, confirmLabel: 'Approve standards' });
     if (!ok) { return; }
     const r = await app.api('POST', `${api}/versions/${encodeURIComponent(v.version)}/approve`, decisionBody(v, acknowledged));
     if (!r.ok) { await decisionRefused(r); return; }
@@ -845,6 +1061,20 @@ export async function render(app, params, view) {
           type: 'button', class: 'btn btn-secondary', on: { click: () => startEdit(v, { design: suggestion.design }) },
         }, 'Propose a design system')))
       : null;
+    // A version in effect that predates the Project Rulebook: offer the stack's default sections.
+    const rulebookSuggestion = state.dto.rulebookSuggestion;
+    const suggestRulebook = v.inEffect && rulebookSuggestion && rulebookSuggestion.sections && canPropose()
+      && !RULEBOOK_KEYS.some((k) => profile[k] !== undefined)
+      ? h('div', { class: ['card', 'card-info'], role: 'note' },
+        h('p', null, STR.C92(state.dto.stack).text),
+        h('div', { class: 'form-actions' }, h('button', {
+          type: 'button', class: 'btn btn-secondary', on: { click: () => startEdit(v, { rulebook: rulebookSuggestion.sections }) },
+        }, 'Propose rulebook additions')))
+      : null;
+    const focusDesign = () => {
+      const target = el.querySelector('[data-focus="design-system"]');
+      if (target) { target.setAttribute('tabindex', '-1'); target.focus(); }
+    };
     const kind = v.status === 'pending' ? 'card-warning' : v.inEffect ? 'card-success' : '';
     const el = h('section', { class: ['card', kind], 'aria-label': `Standards version ${v.version}` },
       h('div', { class: 'card-head' }, heading, h('span', { class: 'header-spacer' }), statusBadge(v)),
@@ -853,6 +1083,8 @@ export async function render(app, params, view) {
       // Un-collapsed and above every section: what approving this version changes about enforcement.
       v.status === 'pending' || v.inEffect ? enforcementNote(v) : null,
       v.status === 'pending' || v.inEffect ? designNote(v) : null,
+      suggestRulebook,
+      rulebookBlock(v, { changedKeys, baseVersion: baseRecord ? baseRecord.version : null, limits: state.dto.limits, focusDesign: profile.design ? focusDesign : null }),
       sectionsView(v, baseRecord, state.dto.limits),
       footer);
     return { el, heading };
@@ -953,6 +1185,13 @@ export async function render(app, params, view) {
     const area = (rows = 3) => h('textarea', { rows, spellcheck: 'false' });
     const text = () => h('input', { type: 'text', maxlength: 200 });
     const group = (legend, ...children) => h('fieldset', { class: 'field card' }, h('legend', null, legend), children);
+    /** A rulebook section's fieldset: its legend carries the section's provenance tag. */
+    const rulebookGroup = (legend, provField, ...children) => h('fieldset', { class: 'field card' },
+      h('legend', null, legend, provenanceTag(source, provField)), children);
+    /** A section's guidance, one item per line: shown to agents and the reviewer, never checked. */
+    const guidanceArea = (key) => bind(key, `Guidance ${STR.C89.text}`, area(4), {
+      hint: `One item per line, up to ${Number(limits.guidanceEntries) || 12}. Shown to agents and the reviewer; never checked. Cut first when the standards exceed ${count(Number(limits.promptChars) || PROMPT_LIMIT)} characters.`,
+    });
 
     // Repository state (radio pair).
     const radio = (value, label) => {
@@ -985,9 +1224,11 @@ export async function render(app, params, view) {
     const sourceSeverity = resolvedSeverity(source.profile);
     const severityRows = Object.keys(severityDefaults).map((rule, i) => {
       const id = `severity-${i}`;
+      // The requirement-reference rule can't be blocking yet: the check before the gate has no ids.
+      const notYetBlocking = rule === 'testing/requirement-reference';
       const select = h('select', { id },
-        ['blocking', 'advisory'].map((kind) => h('option', { value: kind },
-          `${SEVERITY_WORDS[kind]}${severityDefaults[rule] === kind ? ' (default)' : ''}`)));
+        ['blocking', 'advisory'].map((kind) => h('option', { value: kind, disabled: notYetBlocking && kind === 'blocking' },
+          `${SEVERITY_WORDS[kind]}${severityDefaults[rule] === kind ? ' (default)' : ''}${notYetBlocking && kind === 'blocking' ? ' (not available yet)' : ''}`)));
       select.value = vals.severity[rule];
       const changed = h('span', { class: 'muted' });
       // Shown the moment a scanner rule is set to blocking, and while it stays so.
@@ -1195,7 +1436,34 @@ export async function render(app, params, view) {
       group('Testing',
         bind('runner', 'Runner', text(), { prov: 'testing' }),
         bind('fileGlobs', 'Test files', area(2), { hint: 'One glob per line.' }),
-        bind('testingNotes', 'Notes', text())),
+        bind('testingNotes', 'Notes', text()),
+        bind('testRequirementRef', 'Each requirement (R-n) must be named in a test file (checked)', h('input', { type: 'checkbox' }),
+          { prov: 'testPolicy', hint: 'Checked when the run verifies. Before the ship gate it shows "not checked": that check has no requirement ids.' }),
+        guidanceArea('testGuidance')),
+      rulebookGroup('Coding practice', 'practice',
+        h('p', { class: 'hint' }, 'Checked by MOAG when ticked. Advisory unless "What blocks a release" promotes them.'),
+        bind('practiceTodo', 'TODO and FIXME comments cite an issue (checked)', h('input', { type: 'checkbox' })),
+        bind('practiceDebug', 'No debugger statements left in code (checked)', h('input', { type: 'checkbox' })),
+        guidanceArea('practiceGuidance')),
+      rulebookGroup('Security', 'security',
+        h('p', { class: 'hint' }, STR.C93.text),
+        guidanceArea('securityGuidance'),
+        h('p', { class: 'hint' }, 'A dependency audit runs as a command. Add it under Commands.')),
+      rulebookGroup('Accessibility', 'accessibility',
+        bind('a11yImgAlt', 'Images in HTML pages have alt text (checked)', h('input', { type: 'checkbox' })),
+        bind('a11yHtmlLang', 'HTML pages declare a language (checked)', h('input', { type: 'checkbox' })),
+        guidanceArea('a11yGuidance')),
+      rulebookGroup('API and data', 'apiData',
+        bind('migrationsGlob', 'Migrations folder', h('input', { type: 'text', maxlength: 200, class: 'mono', placeholder: 'prisma/migrations/**' }),
+          { hint: 'Set it to check that committed migrations are never edited.' }),
+        guidanceArea('apiGuidance')),
+      rulebookGroup('Docs and git', 'docsGit',
+        bind('changelogPath', 'Changelog path', h('input', { type: 'text', maxlength: 200, class: 'mono', placeholder: 'CHANGELOG.md' }),
+          { hint: 'Set it to check the changelog is updated in a run that ships a version.' }),
+        guidanceArea('docsGuidance')),
+      rulebookGroup('Performance', 'performance',
+        h('p', { class: 'hint' }, 'Budgets are checked only by a command (bundle size, Lighthouse CI, benchmarks). Add one under Commands.'),
+        guidanceArea('perfGuidance')),
       severityRows.length > 0 ? h('fieldset', { class: 'field card' },
         h('legend', null, 'What blocks a release'),
         h('p', { class: 'hint' }, STR.C47.text),

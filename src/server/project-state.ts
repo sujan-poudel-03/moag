@@ -98,6 +98,27 @@ export interface RunRecord {
   baseRef?: string | null;
   /** Totals of the latest standards report the worker sent (the full report is in the run dir). */
   standardsSummary?: RunStandardsSummary;
+  /**
+   * Design files this run's start reverted to the approved content (repository-relative).
+   * Absent when it replaced none, and on runs recorded before this was kept.
+   */
+  designFilesReplaced?: string[];
+  /** Where the replaced files were kept, relative to the project's data directory (`runs/<id>/design-replaced`). */
+  designBackupDir?: string;
+  /**
+   * When `standardsVersion` was frozen onto the run: at its start, or when the ship of a run
+   * that started before standards existed was approved. Absent on runs recorded before this
+   * was kept — the gate.approve audit entry then tells (`standardsFrozenAtApproval`).
+   */
+  standardsFrozenAt?: 'start' | 'gate-approval';
+  /**
+   * sha256 of the run directory's `changed-files.json`, written by the server when the run
+   * halted at its ship gate. The run directory is writable by the agent: a list whose hash
+   * no longer matches is shown as not collected.
+   */
+  changedFilesSha256?: string;
+  /** Why no changed-files list was collected at the gate. */
+  changedFilesError?: string;
 }
 
 /** When in a run a standards report was produced. */
@@ -115,8 +136,10 @@ export interface RunStandardsSummary {
   failed: number;
   /** Advisory rules with findings: reported, never blocking. Absent on summaries written before severities existed. */
   advisory?: number;
-  /** Rules that could not be decided. Never counted as passed. */
+  /** Rules the profile configures that could not be decided. Never counted as passed. */
   notChecked: number;
+  /** Rules the profile does not configure: no gap, never "not checked". Absent on older summaries. */
+  notConfigured?: number;
   /** Blocking rules and commands that ended not checked: any above zero stops a ship. Absent on older summaries. */
   blockingNotChecked?: number;
   findings: number;
