@@ -18,6 +18,8 @@ import {
   wireEvents,
 } from '../../../headless/cli';
 import * as sinon from 'sinon';
+import type { ChildProcess } from 'child_process';
+import type { IncomingMessage, ServerResponse } from 'http';
 import { loadPlan } from '../../../models/plan';
 import { Plan, TaskStatus } from '../../../models/types';
 import { parseStandardsReport } from '../../../standards/checker';
@@ -897,6 +899,24 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     assert.ok(!spoolText.includes(SECRET));
   });
 
+  it('run-started carries branch: null for moag run, and the given branch from a direct runAfterWiring call', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const cli = loadCli();
+    const env = { APPDATA: configDir, XDG_CONFIG_HOME: configDir };
+    await cli.cmdRun(parseArgs(['run', planFile, '--cwd', dir]), ctxFor('ok', { env, closeDeadlineMs: 50 }));
+    const byHand = stdoutEvents().find((e) => e.event === 'run-started')!;
+    assert.ok('branch' in byHand);
+    assert.equal(byHand.branch, null);
+
+    lines = [];
+    const ctx = ctxFor('ok', { env, closeDeadlineMs: 50 });
+    const events = cli.wireEvents(ctx.runner);
+    const plan = loadPlan(planFile);
+    const code = await cli.runAfterWiring(parseArgs(['run', planFile, '--cwd', dir]), ctx, plan, planFile, events, { branch: 'moag/x' });
+    assert.equal(code, 0);
+    assert.equal(stdoutEvents().find((e) => e.event === 'run-started')!.branch, 'moag/x');
+  });
+
   it('buildRunMeta: package.json name, else the folder name; tasks flattened in plan order', () => {
     const { buildRunMeta } = loadCli();
     const dir = fs.realpathSync(tmpDir());
@@ -906,6 +926,219 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     assert.equal(buildRunMeta(plan, dir).project, '@acme/app');
     fs.writeFileSync(path.join(dir, 'package.json'), '{broken');
     assert.equal(buildRunMeta(plan, dir).project, path.basename(dir));
+  });
+});
+
+// ─── moag daemon — the ONOSOO command poller ───
+
+describe('headless CLI: moag daemon with ONOSOO', function () {
+  this.timeout(30_000);
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const proxyquire = require('proxyquire').noCallThru();
+  const KEY = 'onosoo_live_' + 'Q'.repeat(43);
+  const BASE = 'http://127.0.0.1:54321';
+
+  function loadCli(daemonCalls: unknown[] = []) {
+    return proxyquire('../../../headless/cli', {
+      './daemon': { runDaemon: async (cfg: unknown) => { daemonCalls.push(cfg); return 0; } },
+      '../github/issue-sync': { fetchOpenIssues: () => [], newIssuesToTasks: () => [], reportIssueResult: () => undefined },
+      '../adapters/index': { setCeilingGuard: () => undefined },
+    });
+  }
+
+  function recorder() {
+    const calls: Array<{ url: string; headers: Record<string, string>; body: Record<string, unknown> }> = [];
+    const http = async (req: { url: string; headers: Record<string, string>; body: string }) => {
+      calls.push({ url: req.url, headers: req.headers, body: JSON.parse(req.body) });
+      return req.url.endsWith('/commands/poll')
+        ? { status: 200, body: JSON.stringify({ commands: [] }) }
+        : { status: 200, body: JSON.stringify({ acked: {} }) };
+    };
+    return { calls, http };
+  }
+
+  const ctxWith = (relayDeps: Record<string, unknown>) => ({
+    runner: { on: () => undefined, stop: () => undefined },
+    vscode: { workspace: { getConfiguration: () => ({ get: <T>(_k: string, d: T) => d, update: async () => undefined }) } },
+    TaskStatus, loadPlan, relayDeps,
+  });
+
+  async function until(cond: () => boolean, ms = 10_000): Promise<void> {
+    const t0 = Date.now();
+    while (!cond()) {
+      if (Date.now() - t0 > ms) { throw new Error('timed out waiting'); }
+      await new Promise((r) => setTimeout(r, 20));
+    }
+  }
+
+  it('a real key-only `moag daemon` process stays up, reports capabilities and keeps polling; SIGTERM reports remote_start:false', async function () {
+    this.timeout(240_000);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const http = require('http');
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { spawn } = require('child_process');
+    const seen: Array<{ url: string; auth: string; body: Record<string, unknown> }> = [];
+    const server = http.createServer((req: IncomingMessage, res: ServerResponse) => {
+      let body = '';
+      req.on('data', (c: Buffer) => { body += c.toString(); });
+      req.on('end', () => {
+        let parsed: Record<string, unknown> = {};
+        try { parsed = JSON.parse(body); } catch { /* ignore */ }
+        seen.push({ url: String(req.url ?? ''), auth: String(req.headers.authorization ?? ''), body: parsed });
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(String(req.url).endsWith('/commands/poll') ? { commands: [] } : { acked: {} }));
+      });
+    });
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+    const port = (server.address() as { port: number }).port;
+    const dir = fs.realpathSync(tmpDir());
+    const configDir = fs.realpathSync(tmpDir());
+    const nodeFlags = ['--no-experimental-strip-types', '--no-experimental-detect-module']
+      .filter((f) => process.allowedNodeEnvironmentFlags.has(f));
+    let child: ChildProcess;
+    try {
+      child = spawn(process.execPath, [...nodeFlags, '-r', 'ts-node/register', path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'daemon', '--cwd', dir], {
+        cwd: path.join(__dirname, '..', '..', '..', '..'),
+        env: {
+          ...process.env, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: `http://127.0.0.1:${port}`, APPDATA: configDir, XDG_CONFIG_HOME: configDir,
+          TS_NODE_TRANSPILE_ONLY: 'true',
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (err) {
+      server.close();
+      if (err instanceof Error && /spawn EPERM/i.test(err.message)) { this.skip(); }
+      throw err;
+    }
+    let exited: number | null = null;
+    let stderrText = '';
+    child.stderr?.on('data', (c: Buffer) => { stderrText += c.toString(); });
+    child.on('exit', (code: number | null) => { exited = code ?? -1; });
+    try {
+      const polls = (): number => seen.filter((s) => s.url.endsWith('/commands/poll')).length;
+      // Start-up (ts-node compiling the CLI) can be slow; then two polls 5 s apart.
+      await until(() => polls() >= 2 || exited !== null, 200_000);
+      assert.equal(exited, null, `the daemon exited (${exited}): ${stderrText.slice(-500)}`);
+      await new Promise((r) => setTimeout(r, 1_000));
+      assert.equal(exited, null, 'still alive');
+      assert.ok(seen.some((s) => s.body.capabilities !== undefined), 'capabilities were sent');
+      assert.ok(polls() >= 2);
+      assert.ok(seen.every((s) => s.auth === `Bearer ${KEY}`));
+      assert.ok(seen.every((s) => !('heartbeat' in s.body)));
+      child.kill('SIGTERM');
+      await until(() => exited !== null, 30_000);
+      if (process.platform !== 'win32') {
+        // Windows has no SIGTERM handler: kill() ends the process outright.
+        const last = seen.filter((s) => s.body.capabilities !== undefined).pop()!;
+        assert.equal((last.body.capabilities as { remote_start: boolean }).remote_start, false);
+        assert.equal(exited, 0);
+      }
+    } finally {
+      if (exited === null) { child.kill('SIGKILL'); }
+      server.close();
+    }
+  });
+
+  it('a second stop signal during the shutdown wait exits 130 after releasing the lock', async () => {
+    const dir = fs.realpathSync(tmpDir());
+    const configDir = fs.realpathSync(tmpDir());
+    // A slow capabilities reply keeps the first close() waiting.
+    let releaseCaps: () => void = () => undefined;
+    const calls: string[] = [];
+    const http = async (req: { url: string; body: string }) => {
+      calls.push(req.url);
+      if (req.url.endsWith('/events') && JSON.parse(req.body).capabilities?.remote_start === false && calls.length > 2) {
+        await new Promise<void>((r) => { releaseCaps = r; });
+      }
+      return req.url.endsWith('/commands/poll') ? { status: 200, body: '{"commands":[]}' } : { status: 200, body: '{"acked":{}}' };
+    };
+    let stop: (() => void) | null = null;
+    const exits: number[] = [];
+    const stdoutWrite = sinon.stub(process.stdout, 'write').returns(true);
+    try {
+      const done = loadCli().cmdDaemon(parseArgs(['daemon', '--cwd', dir]), ctxWith({
+        env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: BASE },
+        http, closeDeadlineMs: 50, stderr: () => undefined,
+        onDaemonStop: (fn: () => void) => { stop = fn; },
+        exit: (code: number) => { exits.push(code); },
+      }));
+      assert.ok(stop, 'the stop handler is registered before the host starts');
+      await until(() => calls.some((u) => u.endsWith('/commands/poll')));
+      assert.ok(fs.existsSync(path.join(configDir, 'moag', 'remote', 'daemon.lock')));
+      (stop as unknown as () => void)();
+      await new Promise((r) => setTimeout(r, 50));
+      (stop as unknown as () => void)();
+      assert.deepEqual(exits, [130]);
+      assert.ok(!fs.existsSync(path.join(configDir, 'moag', 'remote', 'daemon.lock')), 'the lock was released before exiting');
+      releaseCaps();
+      await done;
+    } finally {
+      stdoutWrite.restore();
+    }
+  });
+
+  it('no key and no daemon.json: exit 2 as before, and no request', async () => {
+    const dir = fs.realpathSync(tmpDir());
+    const configDir = fs.realpathSync(tmpDir());
+    const { calls, http } = recorder();
+    const errWrite = sinon.stub(process.stderr, 'write').returns(true);
+    try {
+      const code = await loadCli().cmdDaemon(parseArgs(['daemon', '--cwd', dir]), ctxWith({ env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir }, http }));
+      assert.equal(code, 2);
+    } finally { errWrite.restore(); }
+    assert.equal(calls.length, 0);
+  });
+
+  it('no key with a daemon.json: the issue loop runs exactly as before, and no request', async () => {
+    const dir = fs.realpathSync(tmpDir());
+    const configDir = fs.realpathSync(tmpDir());
+    fs.mkdirSync(path.join(dir, '.moag'));
+    fs.writeFileSync(path.join(dir, '.moag', 'daemon.json'), JSON.stringify({ repo: 'o/r', maxTicks: 1 }));
+    const daemonCalls: unknown[] = [];
+    const { calls, http } = recorder();
+    const code = await loadCli(daemonCalls).cmdDaemon(parseArgs(['daemon', '--cwd', dir]), ctxWith({ env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir }, http }));
+    assert.equal(code, 0);
+    assert.equal(daemonCalls.length, 1);
+    assert.equal(calls.length, 0);
+  });
+
+  it('a key only in the environment: bearer on every request, gone from process.env, and shutdown reports remote_start: false', async () => {
+    const saved = { ...process.env };
+    const dir = fs.realpathSync(tmpDir());
+    const configDir = fs.realpathSync(tmpDir());
+    const cli = loadCli();
+    const { calls, http } = recorder();
+    let stop: (() => void) | null = null;
+    const stdoutWrite = sinon.stub(process.stdout, 'write').returns(true);
+    try {
+      process.env.MOAG_ONOSOO_KEY = KEY;
+      process.env.MOAG_ONOSOO_URL = BASE;
+      process.env.APPDATA = configDir;
+      process.env.XDG_CONFIG_HOME = configDir;
+      cli.captureRelayEnv(process.env);
+      assert.equal(process.env.MOAG_ONOSOO_KEY, undefined);
+
+      const done = cli.cmdDaemon(parseArgs(['daemon', '--cwd', dir]), ctxWith({
+        http, closeDeadlineMs: 50, stderr: () => undefined, onDaemonStop: (fn: () => void) => { stop = fn; },
+      }));
+      await until(() => calls.some((c) => c.url.endsWith('/commands/poll')));
+      assert.ok(calls.every((c) => c.headers.Authorization === `Bearer ${KEY}`));
+      assert.ok(calls.every((c) => !('heartbeat' in c.body)), 'the daemon never sends a heartbeat field');
+      assert.equal(process.env.MOAG_ONOSOO_KEY, undefined);
+      const firstCaps = calls.find((c) => c.body.capabilities)!.body.capabilities as { remote_start: boolean };
+      assert.equal(firstCaps.remote_start, false, 'no projects.json / no isolation here: remote start is off');
+
+      (stop as unknown as () => void)();
+      assert.equal(await done, 0);
+      const last = calls[calls.length - 1];
+      assert.equal((last.body.capabilities as { remote_start: boolean }).remote_start, false);
+      assert.ok(!fs.readdirSync(dir).length, 'nothing written under the workspace');
+    } finally {
+      stdoutWrite.restore();
+      for (const k of Object.keys(process.env)) { if (!(k in saved)) { delete process.env[k]; } }
+      Object.assign(process.env, saved);
+    }
   });
 });
 

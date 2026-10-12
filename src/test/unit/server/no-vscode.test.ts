@@ -203,3 +203,29 @@ describe('ONOSOO relay modules never load vscode', function () {
     assert.equal((WORKER_ONLY_EVENTS as readonly string[]).includes('run-meta'), false);
   });
 });
+
+// ─── ONOSOO stage 2: the command poller and remote runs (daemon and child) never load vscode ───
+
+const HEADLESS = path.join(SRC, 'headless');
+const REMOTE_MODULES = ['onosoo-control.ts', 'onosoo-commands.ts', 'onosoo-projects.ts'];
+const remoteFiles = fs.readdirSync(HEADLESS)
+  .filter((n) => REMOTE_MODULES.includes(n) || (n.startsWith('remote-') && n.endsWith('.ts')))
+  .map((n) => path.join(HEADLESS, n));
+
+describe('ONOSOO remote-work modules never load vscode', function () {
+  this.timeout(20000);
+
+  it('finds the stage-2 modules (non-vacuous)', () => {
+    for (const name of [...REMOTE_MODULES, 'remote-audit.ts', 'remote-branch.ts', 'remote-child.ts', 'remote-commands.ts',
+      'remote-isolation.ts', 'remote-ledger.ts', 'remote-runs.ts', 'remote-supervisor.ts']) {
+      assert.ok(remoteFiles.some((f) => path.basename(f) === name), name);
+    }
+  });
+
+  for (const file of remoteFiles) {
+    it(`headless/${path.basename(file)} reaches no vscode import at load time`, () => {
+      const offenders = [...reachable(file)].filter((f) => importsVscode(fs.readFileSync(f, 'utf-8')));
+      assert.deepEqual(offenders.map((f) => path.relative(SRC, f)), []);
+    });
+  }
+});

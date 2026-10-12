@@ -78,6 +78,11 @@
  *          else $XDG_CONFIG_HOME, else ~/.config. It also keeps the generated device_id; the
  *          spool lives beside it. Nothing relay-related is ever written under the workspace.
  *          No key: no request, no spool, no timer. Relay trouble never changes an exit code.
+ *
+ * ONOSOO remote work (`daemon`): with a device key, `moag daemon` also polls ONOSOO for stop /
+ *          retry / approve / skip / start-run commands — with a key alone (no daemon.json) that
+ *          poller is all it runs. Remote runs execute as a separate runner account through sudo,
+ *          Linux only; setup, projects.json and the files kept are in docs/onosoo-remote.md.
  */
 
 import * as fs from 'fs';
@@ -106,7 +111,7 @@ import { STACK_IDS, isStackId } from '../server/stacks';
 import type { Plan } from '../models/types';
 import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
-import { resolveOnosooConfig } from './onosoo-config';
+import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
 import { OnosooRelay, RelayHttpClient, RunMeta } from './onosoo-relay';
 
@@ -310,6 +315,10 @@ export interface RelayDeps {
   stderr?: (s: string) => void;
   isPidAlive?: (pid: number) => boolean;
   closeDeadlineMs?: number;
+  /** `moag daemon` only: register a callback that stops the daemon (tests use it instead of a signal). */
+  onDaemonStop?: (stop: () => void) => void;
+  /** `moag daemon` only: how a second stop signal exits (process.exit in production). */
+  exit?: (code: number) => void;
 }
 
 /**
@@ -334,8 +343,12 @@ export function wireRunnerStandards(runner: any, cwd: string, opts: { standards?
   runner.setRunStartHook(() => rememberStandardsBase(cwd, new Date(), captureHeadRef));
 }
 
-/** Shared headless bootstrap. Installs the shim, then loads vscode-dependent modules. */
-async function setup(args: Args): Promise<Ctx> {
+/**
+ * Shared headless bootstrap. Installs the shim, then loads vscode-dependent modules.
+ * `mementoPath` puts the runner's history somewhere other than `<cwd>/.moag` (the remote
+ * child keeps it outside the worktree). Exported for the remote child.
+ */
+export async function setup(args: Args, opts: { mementoPath?: string } = {}): Promise<Ctx> {
   installVscodeShim(args.cwd);
   const { loadPlan } = require('../models/plan');
   const { TaskRunner } = require('../runner/runner');
@@ -349,7 +362,7 @@ async function setup(args: Args): Promise<Ctx> {
   }
   registerAllEngines();
 
-  const memento = new FileMemento(path.join(args.cwd, '.moag', 'headless-state.json'));
+  const memento = new FileMemento(opts.mementoPath ?? path.join(args.cwd, '.moag', 'headless-state.json'));
   const runner = new TaskRunner(new HistoryStore(memento));
   wireRunnerStandards(runner, args.cwd, { standards: !args.noStandards });
   // No runner.dispose() here on purpose: the CLI process is short-lived and
@@ -1003,8 +1016,18 @@ export function buildRunMeta(plan: any, cwd: string): RunMeta {
   return { plan_name: String(plan?.name ?? ''), project, tasks };
 }
 
-/** The body of {@link cmdRun} once events and task reporting are wired. */
-async function runAfterWiring(args: Args, ctx: Ctx, plan: any, planPath: string, events: RunnerEventState): Promise<number> {
+/** What a caller other than cmdRun adds to the run: the delivery branch an ONOSOO remote run commits to. */
+export interface RunExtra {
+  branch?: string | null;
+}
+
+/**
+ * The body of {@link cmdRun} once events and task reporting are wired. Exported for the
+ * remote child (`moag remote-child`), which wires its own events and passes its branch.
+ */
+export async function runAfterWiring(
+  args: Args, ctx: Ctx, plan: any, planPath: string, events: RunnerEventState, extra: RunExtra = {},
+): Promise<number> {
   // Captured before the run so --pr can report what the run actually touched.
   const { captureBaseRef } = require('../runner/evidence');
   const prBaseRef = args.pr ? await captureBaseRef(args.cwd) : null;
@@ -1017,7 +1040,8 @@ async function runAfterWiring(args: Args, ctx: Ctx, plan: any, planPath: string,
     const before: string | null = await resolveStandardsBase(args.cwd, undefined, captureHeadRef);
     if (before) { verifyArgs = { ...args, base: before }; }
   }
-  emit({ event: 'run-started', plan: plan.name, planPath, fullAuto: args.fullAuto, engine: plan.defaultEngine });
+  // `branch` is null for a run started by hand; a remote run names the branch it delivers to.
+  emit({ event: 'run-started', plan: plan.name, planPath, fullAuto: args.fullAuto, engine: plan.defaultEngine, branch: extra.branch ?? null });
   // Headless runs do not save the plan, except for requirement trace evidence (commits,
   // release stamps) the run recorded — that is persisted only when it actually changed.
   const persistTrace = !args.prompt && args.planPath ? tracePersister(plan, args.planPath) : (): void => undefined;
@@ -1192,15 +1216,83 @@ async function cmdLoop(args: Args, ctx: Ctx): Promise<number> {
 
 // ─── command: daemon ─────────────────────────────────────────────────────────
 
-async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
+/**
+ * `moag daemon`. With a daemon.json it runs the issue loop as before. With an ONOSOO device
+ * key it also polls ONOSOO for commands (docs/onosoo-remote.md) — and with a key alone, the
+ * poller is all it runs, until a signal stops it. With neither it exits 2, as it always has.
+ * Exported so tests can drive it with fakes.
+ */
+export async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
   const { runDaemon } = require('./daemon');
   const { fetchOpenIssues, newIssuesToTasks, reportIssueResult } = require('../github/issue-sync');
   const { createEmptyPlan, createPlaylist, createTask } = require('../models/plan');
 
+  // The key was captured once, at the top of main(); resolve it here, once, for the poller.
+  const env = ctx.relayDeps?.env ?? relayConfigEnv();
+  const stderr = ctx.relayDeps?.stderr ?? ((s: string): void => { process.stderr.write(s); });
+  const onosoo = resolveOnosooConfig({ env, cwd: args.cwd, stderr });
+
   const configPath = args.configPath ?? path.join(args.cwd, '.moag', 'daemon.json');
-  let config: any;
+  let config: any = null;
   try { config = JSON.parse(fs.readFileSync(configPath, 'utf-8')); }
-  catch (err) { process.stderr.write(`Failed to read daemon config at ${configPath}: ${err instanceof Error ? err.message : String(err)}\n`); return 2; }
+  catch (err) {
+    const missing = (err as NodeJS.ErrnoException).code === 'ENOENT';
+    if (!(missing && onosoo)) {
+      process.stderr.write(`Failed to read daemon config at ${configPath}: ${err instanceof Error ? err.message : String(err)}\n`);
+      return 2;
+    }
+    config = null; // ONOSOO poller only
+  }
+
+  const host = onosoo ? createDaemonRemoteHost(onosoo, ctx, args, stderr) : null;
+  // The poller's own timers are unref'd, so nothing else holds the process open: this ref'd
+  // interval does, from start until the host has closed (a run finalizing at shutdown included).
+  const keepAlive = host ? setInterval(() => undefined, 60 * 60 * 1000) : null;
+  const closeHost = async (): Promise<void> => {
+    try { await host?.close(); } finally { if (keepAlive) { clearInterval(keepAlive); } }
+  };
+  // Every path to the end awaits the same close (the host's close() is idempotent).
+  let closing: Promise<void> | null = null;
+  const closeOnce = (): Promise<void> => { if (!closing) { closing = closeHost(); } return closing; };
+
+  // Signals are handled from before the host starts. The first one stops cleanly (which can
+  // take minutes while an active run finalizes); a second one during that wait gives up:
+  // the lock is released and the process exits 130.
+  let stopping = false;
+  let signals = 0;
+  let resolveStopped: () => void = () => undefined;
+  const stopped = new Promise<void>((r) => { resolveStopped = r; });
+  const exit = ctx.relayDeps?.exit ?? ((code: number): void => { process.exit(code); });
+  const onSignal = (): Promise<void> => {
+    signals++;
+    if (signals > 1) {
+      try { host?.releaseLock(); } catch { /* best effort */ }
+      exit(130);
+      return closing ?? Promise.resolve();
+    }
+    stopping = true;
+    emit({ event: 'daemon-stopping' });
+    try { ctx.runner.stop(); } catch { /* nothing running */ }
+    resolveStopped();
+    return closeOnce();
+  };
+  process.on('SIGINT', onSignal);
+  process.on('SIGTERM', onSignal);
+  ctx.relayDeps?.onDaemonStop?.(onSignal);
+  const offSignals = (): void => { process.off('SIGINT', onSignal); process.off('SIGTERM', onSignal); };
+
+  if (host) { await host.start(); }
+
+  if (!config) {
+    try {
+      await stopped;
+      await closeOnce();
+    } finally {
+      offSignals();
+      await closeOnce();
+    }
+    return 0;
+  }
 
   if (args.maxTicks) { config.maxTicks = args.maxTicks; }
   if (args.intervalSec && args.intervalSec !== 300) { config.intervalSec = args.intervalSec; }
@@ -1208,15 +1300,6 @@ async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
 
   wireEvents(ctx.runner); // stream task/incident events into the JSONL output
 
-  let stopping = false;
-  // Flip the flag runDaemon polls, then abort whatever the runner is mid-way through.
-  const onSignal = () => {
-    stopping = true;
-    emit({ event: 'daemon-stopping' });
-    ctx.runner.stop();
-  };
-  process.on('SIGINT', onSignal);
-  process.on('SIGTERM', onSignal);
 
   // A breached ceiling must end the daemon, not just the current plan. Without this the
   // budget degrades into a rate limiter that re-trips every tick and never actually halts.
@@ -1232,14 +1315,185 @@ async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
   const { setCeilingGuard } = require('../adapters/index');
   setCeilingGuard(() => !stopping);
 
-  return runDaemon(config, {
-    runner: ctx.runner,
-    TaskStatus: ctx.TaskStatus,
-    fetchOpenIssues, newIssuesToTasks, reportIssueResult,
-    createEmptyPlan, createPlaylist, createTask,
-    emit,
-    sleep,
-    shouldStop: () => stopping,
+  try {
+    return await runDaemon(config, {
+      runner: ctx.runner,
+      TaskStatus: ctx.TaskStatus,
+      fetchOpenIssues, newIssuesToTasks, reportIssueResult,
+      createEmptyPlan, createPlaylist, createTask,
+      emit,
+      sleep,
+      shouldStop: () => stopping,
+    });
+  } finally {
+    offSignals();
+    await closeOnce();
+  }
+}
+
+// ─── ONOSOO remote host (moag daemon) ────────────────────────────────────────
+
+/** How long a probe child, a force-kill or the boot sweep may take. */
+const REMOTE_HELPER_TIMEOUT_MS = 15_000;
+
+/** Run a sudo helper (probe, kill sweep) with a bounded wait; resolves its stdout (capped at 1 MB). */
+function runHelper(command: { command: string; args: string[] }, input: string | null): Promise<string> {
+  const { spawn } = require('child_process');
+  const { childSpawnEnv } = require('./remote-isolation');
+  return new Promise((resolve) => {
+    let out = '';
+    let done = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const finish = (): void => {
+      if (done) { return; }
+      done = true;
+      if (timer) { clearTimeout(timer); }
+      resolve(out);
+    };
+    let proc: any;
+    try {
+      proc = spawn(command.command, command.args, { stdio: ['pipe', 'pipe', 'pipe'], env: childSpawnEnv(process.env), windowsHide: true });
+    } catch {
+      resolve('');
+      return;
+    }
+    timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch { /* gone */ } finish(); }, REMOTE_HELPER_TIMEOUT_MS);
+    timer.unref?.();
+    proc.stdout?.on('data', (c: Buffer) => { if (out.length < 1024 * 1024) { out += c.toString(); } });
+    proc.stderr?.on('data', () => undefined);
+    proc.stdin?.on('error', () => undefined);
+    proc.on('error', finish);
+    proc.on('close', finish);
+    proc.stdin?.end(input === null ? undefined : `${input}\n`);
+  });
+}
+
+/**
+ * The real command host for `moag daemon`: ONOSOO control client, projects.json, the
+ * spend ledger, audit log and run records under the user-level state dir, isolation
+ * probes and remote children through sudo, and one relay per remote run.
+ */
+function createDaemonRemoteHost(
+  cfg: OnosooConfig, ctx: Ctx, args: Args, stderr: (s: string) => void,
+): { start(): Promise<void>; close(): Promise<void>; releaseLock(): void } {
+  const { randomUUID } = require('crypto');
+  const { spawn } = require('child_process');
+  const { OnosooControl } = require('./onosoo-control');
+  const { createCommandHost } = require('./onosoo-commands');
+  const { loadApprovedProjects } = require('./onosoo-projects');
+  const { RemoteAudit } = require('./remote-audit');
+  const { RemoteLedger } = require('./remote-ledger');
+  const { RemoteRuns } = require('./remote-runs');
+  const iso = require('./remote-isolation');
+  const branch = require('./remote-branch');
+  const { RemoteSupervisor } = require('./remote-supervisor');
+
+  const http = ctx.relayDeps?.http;
+  const control = new OnosooControl({ config: cfg, http, stderr });
+  const ledger = new RemoteLedger(cfg.stateDir);
+  const runs = new RemoteRuns(cfg.stateDir);
+  const engineEnv: Record<string, string> = iso.engineEnvFrom(process.env);
+  const redactorFor = (projectPath: string): Redactor =>
+    createRedactor(reportingSecretValues(projectPath, process.env, [cfg.key, ...Object.values(engineEnv)]));
+  const branchPrefix = String(ctx.vscode?.workspace?.getConfiguration?.('agentTaskPlayer')?.get?.('git.branchPrefix', 'moag/') || 'moag/');
+  const cliPath = path.join(__dirname, 'cli.js');
+  const protectedPaths: string[] = iso.protectedStatePaths(cfg.stateDir);
+  const { execFile } = require('child_process');
+  const execFileText = (cmd: string, argv: string[]): Promise<string> => new Promise((resolve, reject) => {
+    execFile(cmd, argv, { timeout: REMOTE_HELPER_TIMEOUT_MS, windowsHide: true }, (err: Error | null, out: string) => (err ? reject(err) : resolve(String(out))));
+  });
+  const { DaemonLock } = require('./remote-lock');
+  const ownUid = typeof process.getuid === 'function' ? process.getuid() : -1;
+  // The runner account's home, learned from the probe, so worktree paths are scrubbed from relayed events.
+  let runnerHome: string | null = null;
+  const runnerUser = (): string | null => loadApprovedProjects(cfg.stateDir).runnerUser;
+
+  return createCommandHost({
+    control,
+    stateDir: cfg.stateDir,
+    loadProjects: () => loadApprovedProjects(cfg.stateDir),
+    platform: process.platform,
+    probe: async (projects: any) => {
+      // MOAG's own checks first: its state must be private, whatever the runner says.
+      const insecure = iso.checkStateSecurity(cfg.stateDir, ownUid);
+      if (insecure) { return { ok: false, reason: insecure }; }
+      const command = iso.childCommand(projects.runnerUser, process.execPath, cliPath);
+      const spec = JSON.stringify({ op: 'probe', protectedPaths, projects: projects.projects.map((p: any) => p.id), engineEnv });
+      const out = iso.parseProbe(await runHelper(command, spec), ownUid, protectedPaths);
+      if (!out.ok) {
+        // Show the exact command, so a sudoers rule can be matched to it character for character.
+        return out.reason === iso.NO_PROBE_ANSWER
+          ? { ok: false, reason: `${out.reason} MOAG ran: ${command.command} ${command.args.join(' ')}` }
+          : out;
+      }
+      const uidProblem = iso.checkRunnerUid(await iso.resolveRunnerUid(projects.runnerUser, execFileText), out.uid, ownUid);
+      if (uidProblem) { return { ok: false, reason: uidProblem }; }
+      if (out.home) { runnerHome = out.home; }
+      return out;
+    },
+    supervisorFactory: (req: any) => new RemoteSupervisor({
+      record: req.record,
+      projectName: req.project.name,
+      specLine: req.specLine,
+      bundle: req.bundle,
+      spawnChild: () => {
+        const c = iso.childCommand(runnerUser(), process.execPath, cliPath);
+        return spawn(c.command, c.args, { detached: true, stdio: ['pipe', 'pipe', 'pipe'], env: iso.childSpawnEnv(process.env), windowsHide: true });
+      },
+      relayFactory: (runId: string) => new OnosooRelay({
+        config: cfg,
+        spool: new OnosooSpool(cfg.stateDir, req.project.path, { isPidAlive: ctx.relayDeps?.isPidAlive }),
+        http,
+        redactor: redactorFor(req.project.path),
+        stderr,
+        runId,
+        cwd: runnerHome ? path.posix.join(runnerHome, '.moag-remote', 'worktrees', runId) : req.project.path,
+        otherHomes: runnerHome ? [runnerHome] : [],
+      }),
+      ledger,
+      runs,
+      tmpDir: path.join(cfg.stateDir, 'remote', 'tmp'),
+      importBranch: (file: string) => branch.importRunBranch(req.project.path, file, req.record.branch, branchPrefix, branch.spawnBranchGit),
+      forceKill: async () => {
+        const user = runnerUser();
+        if (user && user !== 'root') { await runHelper(iso.forceKillCommand(user), null); }
+      },
+      // After every run: nothing the runner account started outlives it.
+      sweep: async () => {
+        const user = runnerUser();
+        if (user && user !== 'root') { await runHelper(iso.forceKillCommand(user), null); }
+      },
+      stderr,
+      onStarted: req.onStarted,
+      onExit: req.onExit,
+    }),
+    exportBundle: (projectPath: string, opts: any) => branch.exportInboundBundle(projectPath, opts, branch.spawnBranchGit),
+    branchExists: (projectPath: string, name: string) => branch.projectHasBranch(projectPath, name, branch.spawnBranchGit),
+    projectBranchTip: (projectPath: string, name: string) => branch.projectBranchTip(projectPath, name, branch.spawnBranchGit),
+    lock: new DaemonLock(cfg.stateDir),
+    ledger,
+    audit: new RemoteAudit(cfg.stateDir),
+    runs,
+    branchPrefix,
+    engineEnv,
+    newRunId: () => randomUUID(),
+    projectDefaultEngine: (p: any) => { try { return readDefaultEngine(p.path) ?? null; } catch { return null; } },
+    drainLeftoverSpool: async () => {
+      const dirs = [args.cwd, ...loadApprovedProjects(cfg.stateDir).projects.map((p: any) => p.path)];
+      for (const dir of dirs) {
+        const relay = new OnosooRelay({
+          config: cfg, spool: new OnosooSpool(cfg.stateDir, dir, { isPidAlive: ctx.relayDeps?.isPidAlive }), http,
+          redactor: redactorFor(dir), stderr, heartbeat: false, closeDeadlineMs: ctx.relayDeps?.closeDeadlineMs,
+        });
+        relay.start();
+        await relay.close();
+      }
+    },
+    killSweep: async (user: string) => { await runHelper(iso.forceKillCommand(user), null); },
+    tighten: () => {
+      for (const problem of iso.tightenStatePermissions(cfg.stateDir)) { stderr(`ONOSOO: could not tighten permissions: ${problem}\n`); }
+    },
+    stderr: (line: string) => stderr(line.endsWith('\n') ? line : `${line}\n`),
   });
 }
 
@@ -1876,6 +2130,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   // Before anything else: no command handler, and nothing any of them spawns, sees the device key.
   captureRelayEnv(process.env);
   const args = parseArgs(argv);
+  // Hidden: the ONOSOO remote child, started by `moag daemon` through sudo (docs/onosoo-remote.md).
+  if (args.command === 'remote-child') {
+    return require('./remote-child').remoteChildMain();
+  }
   if (args.command === 'bench') {
     // No setup() and no shim: the bench drives the hosted server over HTTP and never loads vscode.
     if (args.out === '' || (args.maxUsd !== undefined && Number.isNaN(args.maxUsd))) {

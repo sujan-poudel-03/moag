@@ -164,6 +164,8 @@ export interface RunMeta {
   plan_name: string;
   project: string;
   tasks: Array<{ id: string; name: string }>;
+  /** The branch a remote run delivers to; absent or null for a run started by hand. */
+  branch?: string | null;
 }
 
 /** True when `s` looks like a file-system path rather than a project name. */
@@ -223,7 +225,7 @@ function replacePrefix(text: string, prefix: string, replacement: string): strin
  * else its basename. In any other string, the `cwd` prefix becomes `.` and the
  * home directory prefix `~`; the rest of the text is left alone. Pure.
  */
-export function scrubPaths(s: string, cwd: string | null, home: string | null): string {
+export function scrubPaths(s: string, cwd: string | null, home: string | null, otherHomes: readonly string[] = []): string {
   const whole = s.length > 0 && s.length <= 4096 && !/[\r\n\t]/.test(s) && isAbsoluteAny(s)
     // A posix "path" with spaces is more likely a message that starts with one.
     && (WIN_PATH.test(s) || !/\s/.test(s));
@@ -234,6 +236,10 @@ export function scrubPaths(s: string, cwd: string | null, home: string | null): 
   let out = s;
   if (cwd && !isRoot(cwd)) { out = replacePrefix(out, cwd, '.'); }
   if (home && !isRoot(home)) { out = replacePrefix(out, home, '~'); }
+  // Other accounts' homes (the remote runner's): longest first, so a nested one wins.
+  for (const h of [...otherHomes].sort((a, b) => b.length - a.length)) {
+    if (h && !isRoot(h)) { out = replacePrefix(out, h, '~'); }
+  }
   return out;
 }
 
@@ -251,7 +257,16 @@ export interface OnosooRelayOptions {
   cwd?: string;
   /** The user's home directory, shown as `~`. Defaults to os.homedir(). */
   homedir?: string;
+  /** Use this run id (a daemon-started run's) instead of a fresh one; ignored unless it is a safe id. */
+  runId?: string;
+  /** Send heartbeats while the run is live (default true). The daemon's leftover-spool drain turns them off. */
+  heartbeat?: boolean;
+  /** More home directories to show as `~` (a remote run's runner account). */
+  otherHomes?: string[];
 }
+
+/** Run ids the relay accepts from a caller: the same set the spool accepts as a file name. */
+const RUN_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 
 interface Queued {
   ev: RelayEvent;
@@ -262,7 +277,8 @@ type Next = 'continue' | 'stop' | { waitMs: number };
 
 export class OnosooRelay {
   /** This run's id on the wire; fresh per relay. */
-  readonly runId: string = randomUUID();
+  readonly runId: string;
+  private readonly heartbeatOn: boolean;
 
   private readonly config: OnosooConfig;
   private readonly spool: OnosooSpool;
@@ -273,6 +289,7 @@ export class OnosooRelay {
   private readonly closeDeadlineMs: number;
   private readonly cwd: string | null;
   private readonly home: string | null;
+  private readonly otherHomes: string[];
   private readonly version: string = readMoagVersion();
   private readonly envelopeBytes: number;
 
@@ -297,6 +314,8 @@ export class OnosooRelay {
   private reported = new Set<string>();
 
   constructor(opts: OnosooRelayOptions) {
+    this.runId = typeof opts.runId === 'string' && RUN_ID_RE.test(opts.runId) ? opts.runId : randomUUID();
+    this.heartbeatOn = opts.heartbeat !== false;
     this.config = opts.config;
     this.spool = opts.spool;
     this.http = opts.http ?? defaultHttpClient;
@@ -308,6 +327,7 @@ export class OnosooRelay {
     let home: string | null = opts.homedir ?? null;
     if (home === null) { try { home = os.homedir(); } catch { home = null; } }
     this.home = home || null;
+    this.otherHomes = (opts.otherHomes ?? []).filter((h) => typeof h === 'string' && h.length > 1);
     this.envelopeBytes = Buffer.byteLength(JSON.stringify(this.envelope([])), 'utf-8');
   }
 
@@ -418,7 +438,7 @@ export class OnosooRelay {
 
   /** One string as it may leave the machine: redacted, then path-scrubbed. Throws when redaction does. */
   private scrubString(s: string): string {
-    return scrubPaths(this.redactor.redact(s).text, this.cwd, this.home);
+    return scrubPaths(this.redactor.redact(s).text, this.cwd, this.home, this.otherHomes);
   }
 
   /** Every string in `data`, at any depth, redacted; `{ redaction_failed: true }` when that fails. */
@@ -441,6 +461,7 @@ export class OnosooRelay {
       const all = Array.isArray(meta.tasks) ? meta.tasks : [];
       const tasks = all.slice(0, RUN_META_TASKS).map((t) => ({ id: r(t?.id, 100), name: r(t?.name, 200) }));
       const data: Record<string, unknown> = { plan_name: r(meta.plan_name, 200), project, tasks };
+      if (typeof meta.branch === 'string' && meta.branch.length > 0) { data.branch = r(meta.branch, 255); }
       if (all.length > RUN_META_TASKS) { data.tasks_truncated = true; }
 
       // Keep the data within the per-event cap: drop tasks from the end until it fits.
@@ -673,7 +694,7 @@ export class OnosooRelay {
   /** (Re)start the quiet-period timer; called on start and on every request. */
   private armHeartbeat(): void {
     this.clearHeartbeat();
-    if (this.closed || this.disabled) { return; }
+    if (this.closed || this.disabled || !this.heartbeatOn) { return; }
     this.heartbeatTimer = setTimeout(() => this.onHeartbeat(), HEARTBEAT_MS);
     this.heartbeatTimer.unref?.();
   }

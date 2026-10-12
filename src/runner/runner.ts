@@ -392,6 +392,10 @@ export class TaskRunner {
   private _taskGitRefs = new Map<string, { ref: string; cwd: string }>();
   /** Set once per run when auto-commit is armed; null when delivery is off. */
   private _deliveryBranch: string | null = null;
+  /** A branch the host requires this run to deliver to (setDeliveryBranch); null = derive one. */
+  private _requestedDeliveryBranch: string | null = null;
+  /** When true, a run whose delivery cannot be armed does not start at all. */
+  private _deliveryRequired = false;
   /** Worktrees created for this run; emptied on teardown. */
   /** Task currently executing, so a run-level halt can still name one. */
   private _currentTask: Task | null = null;
@@ -537,6 +541,22 @@ export class TaskRunner {
       if (timer) { clearTimeout(timer); }
       this._taskStartFacts.delete(task.id);
     }
+  }
+
+  /**
+   * Make the next runs deliver to `branch` instead of a derived one. With
+   * `required`, a run whose delivery cannot be armed (auto-commit off, not a repo,
+   * dirty tree, branch failure) emits `error` and never starts. Null clears both.
+   * Used by the ONOSOO remote child; nothing else sets it.
+   */
+  setDeliveryBranch(branch: string | null, opts: { required?: boolean } = {}): void {
+    this._requestedDeliveryBranch = branch;
+    this._deliveryRequired = branch !== null && opts.required === true;
+  }
+
+  /** The branch the current run is delivering to; null when delivery is not armed. */
+  get deliveryBranch(): string | null {
+    return this._deliveryBranch;
   }
 
   setSandboxUrl(url: string | null): void {
@@ -733,7 +753,12 @@ export class TaskRunner {
     this._abortController = new AbortController();
     this.resetRunBudgetTracking();
     this._currentRunId = generateId();
-    await this.armGitDelivery(plan);
+    if (!(await this.armGitDelivery(plan))) {
+      // Required delivery could not be armed: the run never starts (the error is emitted).
+      this._playLock = false;
+      this._abortController = null;
+      return;
+    }
     this.setState(RunnerState.Playing);
 
     try {
@@ -3386,12 +3411,23 @@ export class TaskRunner {
    * Every refusal is a warning, never a failure: delivery being unavailable is
    * not a reason to abandon the work. The run proceeds exactly as it does today
    * and the user keeps their diff.
+   *
+   * The exception is a host that REQUIRED delivery (setDeliveryBranch with
+   * `required`): then a refusal is one `error` and false, and play() does not start.
+   * Resolves true whenever the run may proceed.
    */
-  private async armGitDelivery(plan: Plan): Promise<void> {
+  private async armGitDelivery(plan: Plan): Promise<boolean> {
     this._deliveryBranch = null;
+    const required = this._deliveryRequired;
 
     const cfg = this.getDeliveryConfig();
-    if (!cfg.enabled) { return; }
+    if (!cfg.enabled) {
+      if (required) {
+        this.emit('error', new Error(`Delivery to branch "${this._requestedDeliveryBranch}" is required, but git.autoCommit is off — the run did not start.`));
+        return false;
+      }
+      return true;
+    }
 
     const cwd = this.resolveCwd(undefined);
     const outcome = await prepareBranch(
@@ -3400,13 +3436,16 @@ export class TaskRunner {
       this._currentRunId ?? 'run',
       cfg,
       (args, dir) => this.runGitCommand(args, dir),
+      this._requestedDeliveryBranch ? { branch: this._requestedDeliveryBranch } : {},
     );
 
     if (!outcome.ok) {
-      this.emit('error', new Error(describePrepareFailure(outcome.reason)));
-      return;
+      const message = describePrepareFailure(outcome.reason);
+      this.emit('error', new Error(required ? `${message} The run did not start: it must deliver to "${this._requestedDeliveryBranch}".` : message));
+      return !required;
     }
     this._deliveryBranch = outcome.branch;
+    return true;
   }
 
   /**

@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as os from 'os';
 import {
+  addBranchWorktree,
   createWorktrees,
   describeIsolationFailure,
   isolationRequired,
@@ -144,5 +145,21 @@ describe('worktree — reporting', () => {
         `${r} must say the run continues sequentially`,
       );
     }
+  });
+});
+
+describe('worktree — addBranchWorktree', () => {
+  it('runs git worktree add -B <branch> <path> <startPoint> in the repo', async () => {
+    const { git, calls } = stubGit(OK);
+    const out = await addBranchWorktree('/mirror', '/wt/run-1', 'moag/remote-1', 'deadbeef', git);
+    assert.deepStrictEqual(out, { ok: true, detail: '' });
+    assert.deepStrictEqual(calls, [['worktree', 'add', '-B', 'moag/remote-1', '/wt/run-1', 'deadbeef']]);
+  });
+
+  it('a failed add is ok:false with a readable detail', async () => {
+    const { git } = stubGit({ ...OK, 'worktree add': null });
+    const out = await addBranchWorktree('/mirror', '/wt/run-1', 'moag/remote-1', 'deadbeef', git);
+    assert.strictEqual(out.ok, false);
+    assert.ok(/moag\/remote-1/.test(out.detail));
   });
 });

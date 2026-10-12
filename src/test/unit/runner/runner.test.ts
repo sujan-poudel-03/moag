@@ -2502,6 +2502,96 @@ describe('TaskRunner — task-settled hook', () => {
   });
 });
 
+// ─── Required delivery branch (ONOSOO remote runs) ───
+
+describe('TaskRunner — required delivery branch', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const realDelivery = require('../../../runner/git-delivery');
+
+  function build(prepare: (...args: unknown[]) => Promise<unknown>) {
+    const historyStore = createMockHistoryStore();
+    const mockEngine = createMockEngine();
+    spawnStub = sinon.stub().callsFake(() => createSpawnProc());
+    const prepareCalls: unknown[][] = [];
+    const { TaskRunner } = proxyquire('../../../runner/runner', {
+      'vscode': vscodeMock,
+      '../adapters/index': { getEngine: () => mockEngine },
+      '../context/context-builder': { buildContext: () => '', getContextSettings: () => ({ enabled: false }) },
+      'child_process': { spawn: spawnStub, execSync: sinon.stub() },
+      '../utils/process-kill': { killProcess: sinon.stub(), SPAWN_DETACHED: false },
+      './git-delivery': {
+        ...realDelivery,
+        prepareBranch: (...args: unknown[]) => { prepareCalls.push(args); return prepare(...args); },
+        commitTask: async () => ({ committed: false, reason: 'nothing-to-commit', detail: '' }),
+      },
+    });
+    const runner = new TaskRunner(historyStore);
+    const errors: string[] = [];
+    const started: string[] = [];
+    runner.on('error', (e: Error) => errors.push(e.message));
+    runner.on('task-started', (t: Task) => started.push(t.id));
+    return { runner, errors, started, prepareCalls };
+  }
+
+  const oneTask = (): Plan => {
+    const plan = makePlan();
+    plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+    return plan;
+  };
+
+  afterEach(() => { vscodeMock.clearMockConfig(); sinon.restore(); });
+
+  it('required + not a repo: no task starts, one error, state Idle, and the lock is released', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    const { runner, errors, started } = build(async () => ({ ok: false, reason: 'not-a-repo', detail: 'Not a git work tree.' }));
+    runner.setDeliveryBranch('moag/remote-1', { required: true });
+    await runner.play(oneTask());
+    assert.deepEqual(started, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /moag\/remote-1/);
+    assert.equal(runner.state, RunnerState.Idle);
+    assert.equal(runner.deliveryBranch, null);
+
+    // The lock was released: a second play (requirement cleared) runs.
+    runner.setDeliveryBranch(null);
+    const plan = oneTask();
+    await runner.play(plan);
+    assert.equal(started.length, 1);
+    assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+  });
+
+  it('required + auto-commit off: no task starts, one error', async () => {
+    const { runner, errors, started, prepareCalls } = build(async () => ({ ok: true, branch: 'x', created: false }));
+    runner.setDeliveryBranch('moag/remote-2', { required: true });
+    await runner.play(oneTask());
+    assert.deepEqual(started, []);
+    assert.equal(errors.length, 1);
+    assert.match(errors[0], /git\.autoCommit is off/);
+    assert.equal(prepareCalls.length, 0);
+  });
+
+  it('a set branch is passed to prepareBranch and exposed while the run delivers to it', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    const { runner, started, prepareCalls } = build(async (...args: unknown[]) => ({ ok: true, branch: (args[5] as { branch: string }).branch, created: false }));
+    runner.setDeliveryBranch('moag/remote-3', { required: true });
+    let during: string | null = null;
+    runner.on('task-started', () => { during = runner.deliveryBranch; });
+    await runner.play(oneTask());
+    assert.equal(started.length, 1);
+    assert.deepEqual(prepareCalls[0][5], { branch: 'moag/remote-3' });
+    assert.equal(during, 'moag/remote-3');
+  });
+
+  it('nothing set: today\'s behaviour — a refusal is a warning and the run proceeds', async () => {
+    vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+    const { runner, errors, started, prepareCalls } = build(async () => ({ ok: false, reason: 'dirty-tree', detail: 'dirty' }));
+    await runner.play(oneTask());
+    assert.equal(errors.length, 1);
+    assert.equal(started.length, 1);
+    assert.deepEqual(prepareCalls[0][5], {});
+  });
+});
+
 describe('TaskRunner — automatic dependency installs', () => {
   afterEach(() => {
     sinon.restore();

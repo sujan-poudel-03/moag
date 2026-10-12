@@ -86,13 +86,13 @@ function fixture() {
   return { stateDir, cwd, config, spool };
 }
 
-function mkRelay(client: RelayHttpClient, opts: { redactor?: Redactor; closeDeadlineMs?: number; fx?: ReturnType<typeof fixture>; cwd?: string; homedir?: string } = {}) {
+function mkRelay(client: RelayHttpClient, opts: { redactor?: Redactor; closeDeadlineMs?: number; fx?: ReturnType<typeof fixture>; cwd?: string; homedir?: string; runId?: string; heartbeat?: boolean } = {}) {
   const fx = opts.fx ?? fixture();
   const stderr: string[] = [];
   const spool = fx.spool();
   const relay = new OnosooRelay({
     config: fx.config, spool, http: client, redactor: opts.redactor ?? createRedactor([KEY]),
-    stderr: (s) => stderr.push(s), closeDeadlineMs: opts.closeDeadlineMs, cwd: opts.cwd, homedir: opts.homedir,
+    stderr: (s) => stderr.push(s), closeDeadlineMs: opts.closeDeadlineMs, cwd: opts.cwd, homedir: opts.homedir, runId: opts.runId, heartbeat: opts.heartbeat,
   });
   return { relay, spool, stderr, fx };
 }
@@ -404,6 +404,12 @@ describe('ONOSOO relay — absolute paths are scrubbed from the relay copy', () 
     assert.equal(scrubPaths('relative/path.ts', cwd, home), 'relative/path.ts');
   });
 
+  it('scrubPaths: another account\'s home (the remote runner) becomes ~ too', () => {
+    const out = scrubPaths('cache at /home/moag-runner/.cache/x failed; see /home/me/log', '/home/moag-runner/.moag-remote/worktrees/r1', '/home/me', ['/home/moag-runner']);
+    assert.equal(out, 'cache at ~/.cache/x failed; see ~/log');
+    assert.equal(scrubPaths('/home/moag-runner/.moag-remote/worktrees/r1/src/a.ts', '/home/moag-runner/.moag-remote/worktrees/r1', null, ['/home/moag-runner']), 'src/a.ts');
+  });
+
   it('scrubPaths: Windows paths, case-insensitively, and UNC shares', () => {
     const cwd = 'D:\\Work\\Proj';
     const home = 'C:\\Users\\al';
@@ -485,6 +491,67 @@ describe('ONOSOO relay — run-meta', () => {
     await settle();
     await relay.close();
     assert.deepEqual(calls[0].body.events.map((e) => [e.seq, e.type]), [[1, 'run-started']]);
+  });
+});
+
+describe('ONOSOO relay — daemon options (injected run id, branch, heartbeat off)', () => {
+  it('an injected run id is on every event and every spool line', async () => {
+    const { calls, client } = recorder(() => ({ status: 500, body: '' }));
+    const { relay, spool } = mkRelay(client, { runId: 'run-abc_123', closeDeadlineMs: 50 });
+    assert.equal(relay.runId, 'run-abc_123');
+    relay.start({ plan_name: 'p', project: 'proj', tasks: [] });
+    relay.record(line('run-started'));
+    relay.record(line('state', { state: 'playing' }));
+    await settle();
+    await relay.close();
+    assert.ok(calls.flatMap((c) => c.body.events).every((e) => e.run_id === 'run-abc_123'));
+    const spooled = fs.readFileSync(path.join(spool.dir, 'run-abc_123.jsonl'), 'utf-8').trim().split('\n').slice(1).map((l) => JSON.parse(l));
+    assert.equal(spooled.length, 3);
+    assert.ok(spooled.every((e: RelayEvent) => e.run_id === 'run-abc_123'));
+  });
+
+  for (const bad of ['../escape', '', 'x'.repeat(129), 'has space']) {
+    it(`an unsafe injected id (${JSON.stringify(bad).slice(0, 20)}) falls back to a random one`, () => {
+      const { relay } = mkRelay(recorder().client, { runId: bad });
+      assert.notEqual(relay.runId, bad);
+      assert.match(relay.runId, /^[0-9a-f-]{36}$/);
+    });
+  }
+
+  it('run-meta carries the branch (redacted, capped at 255); no branch key when null', async () => {
+    const { calls, client } = recorder();
+    const { relay } = mkRelay(client);
+    relay.start({ plan_name: 'p', project: 'proj', tasks: [], branch: 'moag/' + 'b'.repeat(300) });
+    await settle();
+    await relay.close();
+    assert.equal((calls[0].body.events[0].data.branch as string).length, 255);
+
+    const other = recorder();
+    const r2 = mkRelay(other.client);
+    r2.relay.start({ plan_name: 'p', project: 'proj', tasks: [], branch: null });
+    await settle();
+    await r2.relay.close();
+    assert.ok(!('branch' in other.calls[0].body.events[0].data));
+  });
+
+  describe('heartbeat: false', () => {
+    let clock: sinon.SinonFakeTimers;
+    beforeEach(() => { clock = sinon.useFakeTimers({ now: 1_000_000, toFake: ['setTimeout', 'clearTimeout', 'Date'] }); });
+    afterEach(() => { clock.restore(); });
+
+    it('sends no heartbeat body, ever', async () => {
+      const { calls, client } = recorder();
+      const { relay } = mkRelay(client, { heartbeat: false });
+      relay.start();
+      await clock.tickAsync(10 * HEARTBEAT_MS);
+      relay.record(line('state', { state: 'idle' }));
+      await clock.tickAsync(10 * HEARTBEAT_MS);
+      assert.ok(calls.length >= 1);
+      assert.ok(calls.every((c) => c.body.heartbeat === undefined));
+      const closing = relay.close();
+      await clock.tickAsync(CLOSE_DEADLINE_MS);
+      await closing;
+    });
   });
 });
 

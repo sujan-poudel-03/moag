@@ -100,6 +100,22 @@ describe('git-delivery — prepareBranch guards', () => {
     assert.ok(!calls.some((c) => c[0] === 'checkout' && c[1] === '-b'));
   });
 
+  it('opts.branch: an existing branch is checked out, not created', async () => {
+    const { git, calls } = stubGit({ ...CLEAN, 'rev-parse --verify': 'abc123' });
+    const out = await prepareBranch('/x', 'Nightly', 'run-1', CFG, git, { branch: 'moag/given-branch' });
+    assert.deepStrictEqual(out, { ok: true, branch: 'moag/given-branch', created: false });
+    assert.ok(calls.some((c) => c[0] === 'rev-parse' && c[3] === 'refs/heads/moag/given-branch'));
+    assert.ok(calls.some((c) => c[0] === 'checkout' && c[1] === 'moag/given-branch'));
+    assert.ok(!calls.some((c) => c[0] === 'checkout' && c[1] === '-b'));
+  });
+
+  it('opts.branch: a missing branch is created under that exact name', async () => {
+    const { git, calls } = stubGit(CLEAN);
+    const out = await prepareBranch('/x', 'Nightly', 'run-1', CFG, git, { branch: 'moag/new-one' });
+    assert.strictEqual((out as { branch: string }).branch, 'moag/new-one');
+    assert.ok(calls.some((c) => c[0] === 'checkout' && c[1] === '-b' && c[2] === 'moag/new-one'));
+  });
+
   it('never pushes', async () => {
     const { git, calls } = stubGit(CLEAN);
     await prepareBranch('/x', 'p', 'r', CFG, git);

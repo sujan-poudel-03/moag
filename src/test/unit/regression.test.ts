@@ -962,7 +962,7 @@ describe('Regression: engine call-site census', () => {
     assert.ok(files.some((f) => relative(f) === 'adapters/engine.ts'), 'scan must reach src/adapters');
   });
 
-  it('holds the engine call-site allowlist at exactly 18 sites, each labelled', () => {
+  it('holds the engine call-site allowlist at exactly 19 sites, each labelled', () => {
     // Every entry is a call site that must carry a costLabel and a reachable
     // AbortSignal. src/adapters/engine.ts is excluded and asserted separately:
     // its single `.runTask(` is the accounting wrapper delegating inward.
@@ -976,11 +976,13 @@ describe('Regression: engine call-site census', () => {
       ['headless/cli.ts', 1],
       // Hosted-server plan generation: costLabel 'plan-generation', signal aborted by IPC stop.
       ['server/run-worker.ts', 1],
+      // ONOSOO remote child plan generation: costLabel 'plan-generation', signal aborted by a stop line or EOF.
+      ['headless/remote-child.ts', 1],
     ]);
     const ACCOUNTING_LAYER = 'adapters/engine.ts';
 
     const expectedTotal = Array.from(ALLOWLIST.values()).reduce((a, b) => a + b, 0);
-    assert.equal(expectedTotal, 18, 'the allowlist itself must total 18');
+    assert.equal(expectedTotal, 19, 'the allowlist itself must total 19');
 
     const found = census(RUN_TASK, productionFiles());
 
@@ -1016,7 +1018,7 @@ describe('Regression: engine call-site census', () => {
     }
 
     const total = Array.from(found.values()).reduce((a, b) => a + b, 0);
-    assert.equal(total, 18, `expected 18 engine call sites outside the accounting layer, found ${total}`);
+    assert.equal(total, 19, `expected 19 engine call sites outside the accounting layer, found ${total}`);
   });
 
   it('has no inline `new AbortController().signal` in production code', () => {

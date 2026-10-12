@@ -136,6 +136,9 @@ export function foreignChanges(porcelain: string): string[] {
  * Refuses on a dirty tree. An agent's commit must contain the agent's work and
  * nothing else — sweeping in whatever the user had open is unrecoverable once
  * it lands in the same commit.
+ *
+ * `opts.branch` names the branch outright (an ONOSOO remote run continuing on a
+ * branch it was given) instead of deriving one from the plan name and run id.
  */
 export async function prepareBranch(
   cwd: string,
@@ -143,6 +146,7 @@ export async function prepareBranch(
   runId: string,
   cfg: DeliveryConfig,
   git: GitRunner,
+  opts: { branch?: string } = {},
 ): Promise<PrepareOutcome> {
   const inside = await git(['rev-parse', '--is-inside-work-tree'], cwd);
   if (inside === null || inside.trim() !== 'true') {
@@ -169,7 +173,7 @@ export async function prepareBranch(
     return { ok: false, reason: 'detached-head', detail: 'HEAD is detached.' };
   }
 
-  const branch = branchNameFor(cfg.branchPrefix, planName, runId);
+  const branch = opts.branch ?? branchNameFor(cfg.branchPrefix, planName, runId);
 
   // Reuse the branch when it already exists (a resumed run), otherwise create it.
   const existing = await git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], cwd);
