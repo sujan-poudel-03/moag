@@ -19,7 +19,10 @@
  *   moag standards check   [--base <ref>] [--no-commands]
  *   moag standards propose [--stack <id>] [--write [--force]]
  *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
+ *   moag host   [run | init | draft <project> | status | stop <env> | remove <env>]
  *
+ * `host`  runs approved project branches as live environments for ONOSOO previews, behind a
+ *          gateway only workspace members get through (src/host/, docs/host-agent.md).
  * `run`   executes a single plan file, or a one-shot prompt (`--prompt`) which is
  *          turned into a single agent task and run through the selected engine.
  * `verify` runs the deterministic PRD gates (status / change / standards / command /
@@ -2131,6 +2134,11 @@ async function cmdConfig(args: Args): Promise<number> {
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
   // Before anything else: no command handler, and nothing any of them spawns, sees the device key.
   captureRelayEnv(process.env);
+  if (argv[0] === 'host') {
+    // No setup() and no shim: the host agent runs environments and a gateway, never the runner.
+    // It reads the device key from the captured snapshot, like the relay.
+    return require('../host/cli').cmdHost(argv.slice(1), relayConfigEnv());
+  }
   const args = parseArgs(argv);
   // Hidden: the ONOSOO remote child, started by `moag daemon` through sudo (docs/onosoo-remote.md).
   if (args.command === 'remote-child') {
@@ -2185,6 +2193,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   }
   process.stderr.write(
     'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench> ...\n' +
+    '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
     '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
     '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
     '                       no standards gate (static rules and profile commands) in verification\n' +
