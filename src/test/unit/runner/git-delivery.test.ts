@@ -145,11 +145,33 @@ describe('git-delivery — commitTask', () => {
     assert.ok(calls.some((c) => c[0] === 'commit' && c[1] === '-m'));
   });
 
-  it('reads the full sha alongside the short one', async () => {
+  it('by default reads only the short sha: no rev-parse HEAD, no fullSha field', async () => {
+    const { git, calls } = stubGit({
+      add: '', 'diff --cached': 'a.ts', commit: 'ok', 'rev-parse --short': 'abc1234', 'rev-parse HEAD': 'a'.repeat(40),
+    });
+    for (const out of [await commitTask(req, git), await commitTask(req, git, {}), await commitTask(req, git, { fullSha: false })]) {
+      assert.deepStrictEqual(out, { committed: true, sha: 'abc1234' });
+      assert.ok(!('fullSha' in out));
+    }
+    assert.ok(!calls.some((c) => c[0] === 'rev-parse' && c[1] === 'HEAD'), 'rev-parse HEAD is never run');
+  });
+
+  it('with { fullSha: true } nothing-to-commit and commit-failed never read a sha', async () => {
+    const empty = stubGit({ add: '', 'diff --cached': '', 'rev-parse HEAD': 'a'.repeat(40) });
+    assert.strictEqual((await commitTask(req, empty.git, { fullSha: true })).committed, false);
+    const failing = stubGit({ add: '', 'diff --cached': 'a.ts', commit: null, 'rev-parse HEAD': 'a'.repeat(40) });
+    const out = await commitTask(req, failing.git, { fullSha: true });
+    assert.deepStrictEqual(out, { committed: false, reason: 'commit-failed', detail: 'git commit failed.' });
+    for (const calls of [empty.calls, failing.calls]) {
+      assert.ok(!calls.some((c) => c[0] === 'rev-parse'), 'no rev-parse after a commit that did not happen');
+    }
+  });
+
+  it('with { fullSha: true } reads the full sha alongside the short one', async () => {
     const { git } = stubGit({
       add: '', 'diff --cached': 'a.ts', commit: 'ok', 'rev-parse --short': 'abc1234', 'rev-parse HEAD': 'a'.repeat(40) + '\n',
     });
-    const out = await commitTask(req, git);
+    const out = await commitTask(req, git, { fullSha: true });
     assert.deepStrictEqual(out, { committed: true, sha: 'abc1234', fullSha: 'a'.repeat(40) });
   });
 
@@ -157,13 +179,13 @@ describe('git-delivery — commitTask', () => {
     const { git } = stubGit({
       add: '', 'diff --cached': 'a.ts', commit: 'ok', 'rev-parse --short': 'abc1234', 'rev-parse HEAD': 'b'.repeat(64),
     });
-    assert.strictEqual((await commitTask(req, git) as { fullSha: string | null }).fullSha, 'b'.repeat(64));
+    assert.strictEqual((await commitTask(req, git, { fullSha: true }) as { fullSha: string | null }).fullSha, 'b'.repeat(64));
   });
 
   for (const [label, reply] of [['unrouted (empty)', ''], ['failed', null], ['garbage', 'not-a-sha'], ['short', 'abc1234']] as Array<[string, string | null]>) {
     it(`fullSha is null when rev-parse HEAD is ${label}`, async () => {
       const { git } = stubGit({ add: '', 'diff --cached': 'a.ts', commit: 'ok', 'rev-parse --short': 'abc1234', 'rev-parse HEAD': reply });
-      const out = await commitTask(req, git);
+      const out = await commitTask(req, git, { fullSha: true });
       assert.strictEqual(out.committed, true);
       assert.strictEqual((out as { sha: string }).sha, 'abc1234');
       assert.strictEqual((out as { fullSha: string | null }).fullSha, null);

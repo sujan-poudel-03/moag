@@ -385,8 +385,10 @@ export function wireEvents(runner: any): RunnerEventState {
   let budgetHit = false;
   runner.on('state-changed', (state: string) => emit({ event: 'state', state }));
   runner.on('task-started', (t: any) => emit({ event: 'task-started', id: t.id, name: t.name }));
-  runner.on('task-completed', (t: any) => emit({ event: 'task-completed', id: t.id, name: t.name }));
-  runner.on('task-failed', (t: any) => emit({ event: 'task-failed', id: t.id, name: t.name }));
+  // The final status says which: task-completed also fires for a Skipped task, task-failed
+  // for a Blocked one (a failed dependency, or failurePolicy "mark-blocked").
+  runner.on('task-completed', (t: any) => emit({ event: 'task-completed', id: t.id, name: t.name, status: t.status }));
+  runner.on('task-failed', (t: any) => emit({ event: 'task-failed', id: t.id, name: t.name, status: t.status }));
   runner.on('task-escalate', (t: any, category: string) => emit({ event: 'task-escalate', id: t.id, name: t.name, category }));
   runner.on('incident', (t: any, summary: string, issueUrl: string | null) => emit({ event: 'incident', id: t.id, name: t.name, summary, issueUrl }));
   runner.on('error', (err: Error) => emit({ event: 'error', message: err.message }));

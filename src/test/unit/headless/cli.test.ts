@@ -763,6 +763,35 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     assert.ok(names.includes('task-error-tail'));
   });
 
+  it('task status: stdout keeps the lowercase TaskStatus; the relay copy uses ONOSOO\'s "Skipped" / "Blocked" spelling', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const { calls, http } = recorder();
+    const runner = new EventEmitter();
+    runner.stop = () => undefined;
+    runner.play = async (plan: Plan) => {
+      const [a, b] = plan.playlists[0].tasks;
+      a.status = TaskStatus.Skipped;
+      runner.emit('task-completed', a, { stdout: '', stderr: 'Skipped: skipIf condition met', exitCode: 0, durationMs: 0 });
+      b.status = TaskStatus.Blocked;
+      runner.emit('task-failed', b, { stdout: '', stderr: 'Blocked: dependency failed', exitCode: 1, durationMs: 0 });
+    };
+    const ctx = {
+      runner,
+      vscode: { workspace: { getConfiguration: () => ({ get: <T>(_k: string, d: T) => d }) } },
+      TaskStatus, loadPlan, relayDeps: { env: envWithKey(configDir), http, closeDeadlineMs: 2000 },
+    };
+    await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]), ctx);
+
+    const out = stdoutEvents().filter((e) => e.event === 'task-completed' || e.event === 'task-failed');
+    assert.deepEqual(out.map((e) => [e.event, e.id, e.status]), [['task-completed', 't-1', 'skipped'], ['task-failed', 't-2', 'blocked']]);
+    const sent = calls.flatMap((c) => c.body.events).filter((e) => e.type === 'task-completed' || e.type === 'task-failed');
+    assert.deepEqual(sent.map((e) => [e.type, e.data.id, e.data.status]), [['task-completed', 't-1', 'Skipped'], ['task-failed', 't-2', 'Blocked']]);
+    // The exact strings on the wire.
+    const raw = calls.map((c) => c.raw).join('\n');
+    assert.ok(raw.includes('"status":"Skipped"') && raw.includes('"status":"Blocked"'));
+    assert.ok(!raw.includes('"status":"skipped"') && !raw.includes('"status":"blocked"'));
+  });
+
   it('seq runs 1, 2, 3 … from run-meta through run-finished and verify-*; run-meta is relay-only (AC4)', async () => {
     const { dir, planFile, configDir } = workspace();
     const { calls, http } = recorder();
@@ -1073,6 +1102,34 @@ describe('headless CLI: moag daemon with ONOSOO', function () {
       assert.ok(!fs.existsSync(path.join(configDir, 'moag', 'remote', 'daemon.lock')), 'the lock was released before exiting');
       releaseCaps();
       await done;
+    } finally {
+      stdoutWrite.restore();
+    }
+  });
+
+  it('a stop signal during the initial boot: the boot finishes, no poll is made, the lock is released and the daemon exits 0', async () => {
+    const dir = fs.realpathSync(tmpDir());
+    const configDir = fs.realpathSync(tmpDir());
+    const { calls, http } = recorder();
+    let stop: (() => void) | null = null;
+    const exits: number[] = [];
+    const lockFile = path.join(configDir, 'moag', 'remote', 'daemon.lock');
+    const stdoutWrite = sinon.stub(process.stdout, 'write').returns(true);
+    try {
+      const done = loadCli().cmdDaemon(parseArgs(['daemon', '--cwd', dir]), ctxWith({
+        env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: BASE },
+        http, closeDeadlineMs: 50, stderr: () => undefined,
+        onDaemonStop: (fn: () => void) => { stop = fn; },
+        exit: (code: number) => { exits.push(code); },
+      }));
+      // cmdDaemon is now awaiting host.start(): the lock is taken and the boot has not finished.
+      assert.ok(stop, 'the stop handler is registered before the host starts');
+      assert.ok(fs.existsSync(lockFile), 'the lock is held while booting');
+      (stop as unknown as () => void)();
+      assert.equal(await done, 0);
+      assert.deepEqual(exits, [], 'a single signal never forces an exit');
+      assert.ok(!calls.some((c) => c.url.endsWith('/commands/poll')), 'a host stopped during boot never polls');
+      assert.ok(!fs.existsSync(lockFile), 'the lock was released');
     } finally {
       stdoutWrite.restore();
     }
@@ -2612,6 +2669,42 @@ describe('headless CLI: wireEvents — dependency installs', () => {
     assert.equal(parsed[1].exitCode, 1);
     assert.equal(parsed[2].note, 'n');
     assert.ok(typeof parsed[0].ts === 'string');
+  });
+});
+
+describe('headless CLI: wireEvents — task outcome lines', () => {
+  it('task-completed and task-failed carry the task\'s final status (Skipped and Blocked included)', () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { EventEmitter } = require('events');
+    const runner = new EventEmitter() as NodeJS.EventEmitter & { stop: () => void };
+    runner.stop = () => undefined;
+    const lines: string[] = [];
+    const write = process.stdout.write.bind(process.stdout);
+    const stub = sinon.stub(process.stdout, 'write').callsFake((chunk: unknown) => {
+      const text = String(chunk);
+      if (text.startsWith('{')) { lines.push(text); return true; }
+      return write(text);
+    });
+    try {
+      wireEvents(runner);
+      runner.emit('task-completed', { id: 'a', name: 'A', status: TaskStatus.Completed }, { stdout: '', stderr: '' });
+      runner.emit('task-completed', { id: 'b', name: 'B', status: TaskStatus.Skipped }, { stdout: '', stderr: '' });
+      runner.emit('task-failed', { id: 'c', name: 'C', status: TaskStatus.Failed }, { stdout: '', stderr: '' });
+      runner.emit('task-failed', { id: 'd', name: 'D', status: TaskStatus.Blocked }, { stdout: '', stderr: '' });
+    } finally {
+      stub.restore();
+    }
+    const parsed = lines.map((l) => {
+      const { ts, ...rest } = JSON.parse(l) as Record<string, unknown>;
+      assert.equal(typeof ts, 'string');
+      return rest;
+    });
+    assert.deepEqual(parsed, [
+      { event: 'task-completed', id: 'a', name: 'A', status: TaskStatus.Completed },
+      { event: 'task-completed', id: 'b', name: 'B', status: TaskStatus.Skipped },
+      { event: 'task-failed', id: 'c', name: 'C', status: TaskStatus.Failed },
+      { event: 'task-failed', id: 'd', name: 'D', status: TaskStatus.Blocked },
+    ]);
   });
 });
 

@@ -428,6 +428,41 @@ describe('ONOSOO command host', () => {
     assert.ok(!fs.existsSync(lock.file), 'released once the boot finished');
   });
 
+  it('close() after a boot that rejected resolves and releases the lock', async () => {
+    const stateDir = tmp();
+    // An unfinished command makes the boot finalize it; the outbox write that follows throws.
+    new RemoteAudit(stateDir).appendOrThrow({ id: 'cut', kind: 'start-run', phase: 'received' });
+    const lock = new DaemonLock(stateDir, { pid: 445, isPidAlive: () => true, procStart: () => null });
+    const h = harness({ stateDir, lock });
+    const original = RemoteAudit.prototype.outboxRemove;
+    RemoteAudit.prototype.outboxRemove = function (): void { throw new Error('EACCES: outbox.json'); };
+    try {
+      await assert.rejects(h.host.start(), /EACCES/);
+      assert.ok(fs.existsSync(lock.file), 'the lock is held after the failed boot');
+      await h.host.close();
+      assert.ok(!fs.existsSync(lock.file), 'close() released the lock');
+      await h.host.close(); // every caller gets the same, resolved promise
+    } finally {
+      RemoteAudit.prototype.outboxRemove = original;
+    }
+  });
+
+  it('close() while a boot is pending that then rejects resolves and releases the lock', async () => {
+    const stateDir = tmp();
+    let failDrain: (e: Error) => void = () => undefined;
+    const lock = new DaemonLock(stateDir, { pid: 446, isPidAlive: () => true, procStart: () => null });
+    const h = harness({ stateDir, lock, drain: () => new Promise<void>((_r, reject) => { failDrain = reject; }) });
+    // drainLeftoverSpool's rejection is swallowed by boot; make loadProjects throw right after it.
+    const starting = h.host.start().then(() => 'resolved', () => 'rejected');
+    await tick();
+    const closing = h.host.close();
+    h.setProjects(null as unknown as ApprovedProjects);
+    failDrain(new Error('drain failed'));
+    await closing;
+    assert.equal(await starting, 'rejected');
+    assert.ok(!fs.existsSync(lock.file), 'released even though the boot rejected');
+  });
+
   it('when the mirror\'s copy is gone the resume fails with a readable message and the parent stays undecided', async () => {
     const h = harness({ branchExists: false, behaviour: 'never' });
     haltedParent(h, { outcome: 'interrupted', exitCode: null });

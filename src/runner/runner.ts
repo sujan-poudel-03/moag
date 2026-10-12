@@ -427,6 +427,8 @@ export class TaskRunner {
   private _taskStartFacts = new Map<string, { headRef: string | null; untrackedAtStart: string[] | null }>();
   /** Bound on one settled-hook call; under STOP_WATCHDOG_MS so a stop can still finish. */
   private static readonly TASK_SETTLED_HOOK_MS = 20_000;
+  /** The signals of settled-hook calls in flight (parallel playlists can have several); stop() aborts them. */
+  private _settledHookAborts = new Set<AbortController>();
   private _pendingScreenshots: string[] = [];
   private _sandboxUrl: string | null = null;
   /** Sink for per-engine-call usage facts (Contribution Ledger). Null = usage recording disabled. */
@@ -497,8 +499,10 @@ export class TaskRunner {
    * Set what happens when a task that reached task-started settles Completed or Failed:
    * the host's chance to record what the task changed (the headless CLI's `task-changes`).
    * Called immediately before task-completed/task-failed, awaited, bounded by
-   * TASK_SETTLED_HOOK_MS (the signal aborts on timeout). A hook that throws or hangs never
-   * changes the task's outcome. With no hook, nothing extra runs at task start or end.
+   * TASK_SETTLED_HOOK_MS (the signal aborts on timeout). stop() also aborts a hook that is
+   * already in flight, so the runner stops waiting for it at once; a hook that starts after
+   * stop() (a task failing because of the stop) still gets the full bound. A hook that
+   * throws or hangs never changes the task's outcome. With no hook, nothing extra runs at task start or end.
    */
   setTaskSettledHook(fn: TaskSettledHook | null): void {
     this._taskSettledHook = fn;
@@ -524,21 +528,25 @@ export class TaskRunner {
       commit,
     };
     const ac = new AbortController();
+    this._settledHookAborts.add(ac);
     let timer: ReturnType<typeof setTimeout> | null = null;
+    let onAbort: (() => void) | null = null;
     try {
       await Promise.race([
         Promise.resolve().then(() => hook(info, ac.signal)),
+        // Resolves on the timeout or on stop(): either way the runner stops waiting.
         new Promise<void>((resolve) => {
-          timer = setTimeout(() => {
-            ac.abort();
-            resolve();
-          }, TaskRunner.TASK_SETTLED_HOOK_MS);
+          onAbort = resolve;
+          ac.signal.addEventListener('abort', onAbort, { once: true });
+          timer = setTimeout(() => ac.abort(), TaskRunner.TASK_SETTLED_HOOK_MS);
         }),
       ]);
     } catch {
       // Reporting must never change a task's outcome.
     } finally {
       if (timer) { clearTimeout(timer); }
+      if (onAbort) { ac.signal.removeEventListener('abort', onAbort); }
+      this._settledHookAborts.delete(ac);
       this._taskStartFacts.delete(task.id);
     }
   }
@@ -875,6 +883,8 @@ export class TaskRunner {
     }
     this.setState(RunnerState.Stopping);
     this._abortController?.abort();
+    // A settled hook in flight must not hold the stop for up to TASK_SETTLED_HOOK_MS.
+    for (const ac of this._settledHookAborts) { ac.abort(); }
 
     if (this._pauseResolve) {
       this._pauseResolve();
@@ -3471,6 +3481,8 @@ export class TaskRunner {
         costUsd: result.tokenUsage?.estimatedCost,
       },
       (args, dir) => this.runGitCommand(args, dir),
+      // The full sha only feeds the task-settled hook; skip the extra git call without one.
+      { fullSha: this._taskSettledHook !== null },
     );
 
     if (outcome.committed) {

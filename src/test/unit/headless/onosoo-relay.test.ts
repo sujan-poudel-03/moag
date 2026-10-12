@@ -11,9 +11,9 @@ import * as path from 'path';
 import * as sinon from 'sinon';
 import {
   BACKOFF_MAX_MS, BACKOFF_START_MS, classify, CLOSE_DEADLINE_MS, defaultHttpClient, HEARTBEAT_MS, MAX_BODY_BYTES, MAX_EVENTS,
-  MAX_EVENT_DATA_BYTES, OnosooRelay, RelayHttpClient, RelayHttpRequest, REQUEST_TIMEOUT_MS, REVOKED_MESSAGE, RunMeta, scrubPaths,
+  MAX_EVENT_DATA_BYTES, MAX_MEMORY_BYTES, OnosooRelay, protocolStatus, REPLAY_MEMORY_BYTES, RelayHttpClient, RelayHttpRequest, REQUEST_TIMEOUT_MS, REVOKED_MESSAGE, RunMeta, scrubPaths,
 } from '../../../headless/onosoo-relay';
-import { OnosooSpool, RelayEvent } from '../../../headless/onosoo-spool';
+import { OnosooSpool, RelayEvent, SPOOL_OWNER_MAX_IDLE_MS } from '../../../headless/onosoo-spool';
 import type { OnosooConfig } from '../../../headless/onosoo-config';
 import { createRedactor, Redactor } from '../../../utils/redact';
 
@@ -181,6 +181,26 @@ describe('ONOSOO relay — wire format', () => {
     assert.equal(body.events[0].run_id, relay.runId);
   });
 
+  it('task-completed / task-failed status goes out in ONOSOO\'s spelling; unknown values and other events are unchanged', async () => {
+    assert.deepEqual(['completed', 'failed', 'skipped', 'blocked', 'running', 'Weird'].map(protocolStatus),
+      ['Completed', 'Failed', 'Skipped', 'Blocked', 'running', 'Weird']);
+    const { calls, client } = recorder();
+    const { relay } = mkRelay(client);
+    relay.start();
+    relay.record(line('task-completed', { id: 'a', name: 'A', status: 'completed' }));
+    relay.record(line('task-completed', { id: 'b', name: 'B', status: 'skipped' }));
+    relay.record(line('task-failed', { id: 'c', name: 'C', status: 'failed' }));
+    relay.record(line('task-failed', { id: 'd', name: 'D', status: 'blocked' }));
+    relay.record(line('task-failed', { id: 'e', name: 'E', status: 'mystery' }));
+    relay.record(line('task-completed', { id: 'f', name: 'F' }));
+    relay.record(line('state', { state: 'idle', status: 'skipped' }));
+    await settle();
+    await relay.close();
+    const sent = calls.flatMap((c) => c.body.events);
+    assert.deepEqual(sent.map((e) => e.data.status), ['Completed', 'Skipped', 'Failed', 'Blocked', 'mystery', undefined, 'skipped']);
+    assert.ok(!('status' in sent[5].data), 'no status is invented');
+  });
+
   it('never relays task-pid or task-output (AC5)', async () => {
     const { calls, client } = recorder();
     const { relay } = mkRelay(client);
@@ -341,6 +361,137 @@ describe('ONOSOO relay — acknowledgement and spool', () => {
     assert.equal(server.contiguous('old-run'), 0, 'the new server never saw 1..30');
     assert.ok(calls.length <= 3, `${calls.length} requests`);
     assert.ok(!fs.existsSync(path.join(spool.dir, 'old-run.jsonl')), 'the drained backlog is removed');
+  });
+
+  it('a backlog over MAX_MEMORY_BYTES replays in chunks: every event once, no gaps, memory never over the ceiling', async function () {
+    this.timeout(120_000);
+    const fx = fixture();
+    // Three dead runs of 85 KB events, ~22 MB in all, opened a day apart (oldest is "run-c").
+    const runs: Array<[string, string]> = [['run-c', '2026-10-01T00:00:00Z'], ['run-a', '2026-10-02T00:00:00Z'], ['run-b', '2026-10-03T00:00:00Z']];
+    const PER_RUN = 90;
+    const pad = 'x'.repeat(85_000);
+    for (const [runId, startedAt] of runs) {
+      const w = new OnosooSpool(fx.stateDir, fx.cwd, { isPidAlive: () => false, now: () => Date.parse(startedAt) });
+      w.openRun(runId);
+      for (let q = 1; q <= PER_RUN; q++) { w.append({ run_id: runId, seq: q, type: 'state', at: startedAt, data: { pad } }); }
+    }
+    const total = PER_RUN * runs.length;
+
+    const server = onosooServer();
+    let relayRef: OnosooRelay | null = null;
+    let peak = 0;
+    const order: string[] = [];
+    const client: RelayHttpClient = async (req) => {
+      const body = JSON.parse(req.body) as Envelope;
+      const mem = (relayRef as unknown as { memBytes: number }).memBytes;
+      peak = Math.max(peak, mem);
+      for (const e of body.events) { if (!order.includes(e.run_id)) { order.push(e.run_id); } }
+      return server.respond(body);
+    };
+    const { relay, spool } = mkRelay(client, { fx, closeDeadlineMs: 60_000, heartbeat: false });
+    relayRef = relay;
+    const loads = sinon.spy(spool, 'loadReplayable');
+    relay.start();
+    const delivered = (): number => runs.reduce((n, [r]) => n + server.contiguous(r), 0);
+    const until = Date.now() + 90_000;
+    while (delivered() < total && Date.now() < until) { await settle(5); }
+    await relay.close();
+
+    assert.ok(loads.callCount >= 2, `the backlog came in ${loads.callCount} loads`);
+    for (const call of loads.getCalls()) {
+      const opts = call.args[1] as { budgetBytes: number };
+      assert.ok(opts.budgetBytes <= REPLAY_MEMORY_BYTES, 'every load is within the replay half of the ceiling');
+    }
+    assert.ok(peak <= REPLAY_MEMORY_BYTES, `replay memory peaked at ${peak} bytes`);
+    for (const [runId] of runs) {
+      assert.equal(server.contiguous(runId), PER_RUN, `${runId}: no gaps`);
+      for (let q = 1; q <= PER_RUN; q++) { assert.equal(server.received.get(`${runId}:${q}`), 1, `${runId}:${q} delivered once`); }
+    }
+    assert.deepEqual(order, ['run-c', 'run-a', 'run-b'], 'oldest run first');
+    assert.ok(!fs.readdirSync(spool.dir).some((n) => n.startsWith('run-')), 'every drained run file is removed');
+  });
+
+  it('replay-too-large: an event over the replay budget is skipped with one stderr line and quarantined; newer runs still go out', async function () {
+    this.timeout(60_000);
+    const fx = fixture();
+    const big = new OnosooSpool(fx.stateDir, fx.cwd, { isPidAlive: () => false, now: () => Date.parse('2026-10-01T00:00:00Z') });
+    big.openRun('big-run');
+    big.append({ run_id: 'big-run', seq: 1, type: 'state', at: 'a', data: { n: 1 } });
+    big.append({ run_id: 'big-run', seq: 2, type: 'state', at: 'a', data: { pad: 'x'.repeat(REPLAY_MEMORY_BYTES + 1) } });
+    big.append({ run_id: 'big-run', seq: 3, type: 'state', at: 'a', data: { n: 3 } });
+    const newer = new OnosooSpool(fx.stateDir, fx.cwd, { isPidAlive: () => false, now: () => Date.parse('2026-10-02T00:00:00Z') });
+    newer.openRun('newer-run');
+    for (let q = 1; q <= 2; q++) { newer.append({ run_id: 'newer-run', seq: q, type: 'state', at: 'b', data: { n: q } }); }
+
+    const { calls, client, server } = recorder();
+    const { relay, spool, stderr } = mkRelay(client, { fx, heartbeat: false });
+    relay.start();
+    await settle(30);
+    await relay.close();
+
+    const sent = calls.flatMap((c) => c.body.events).map((e) => `${e.run_id}:${e.seq}`);
+    assert.deepEqual(sent, ['big-run:1', 'big-run:3', 'newer-run:1', 'newer-run:2'], 'the oversized event never goes out; nothing waits behind it');
+    assert.equal(server.received.get('big-run:2'), undefined);
+    const lines = stderr.filter((s) => s.includes('too large to resend'));
+    assert.equal(lines.length, 1, stderr.join(''));
+    assert.ok(!stderr.some((s) => s.includes('could not be read')));
+    const rejected = fs.readFileSync(spool.rejectedFile('big-run'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(rejected.map((r) => [r.event.seq, r.reason]), [[2, 'too_large']]);
+    assert.ok(!fs.existsSync(path.join(spool.dir, 'big-run.jsonl')), 'the run is dropped once the rest is acked');
+    assert.ok(!fs.existsSync(path.join(spool.dir, 'newer-run.jsonl')));
+  });
+
+  it('a run file removed by another process mid-replay drops its cursor: replay ends quietly, no warning', async function () {
+    this.timeout(60_000);
+    const fx = fixture();
+    const w = new OnosooSpool(fx.stateDir, fx.cwd, { isPidAlive: () => false });
+    w.openRun('gone-run');
+    const pad = 'x'.repeat(85_000);
+    // ~11 MB: more than one replay chunk (8 MiB).
+    for (let q = 1; q <= 130; q++) { w.append({ run_id: 'gone-run', seq: q, type: 'state', at: 'a', data: { pad } }); }
+    const file = path.join(w.dir, 'gone-run.jsonl');
+
+    const { calls, client } = recorder((_r, body) => {
+      if (fs.existsSync(file)) { fs.rmSync(file); } // another process cleaned it up
+      return ackAll(body);
+    });
+    const { relay, spool, stderr } = mkRelay(client, { fx, heartbeat: false });
+    const loads = sinon.spy(spool, 'loadReplayable');
+    const internals = relay as unknown as { replayPending: boolean; replayCursors: Map<string, unknown> };
+    relay.start();
+    assert.equal(internals.replayPending, true, 'the first chunk did not hold the whole run');
+    await settle(60);
+    await relay.close();
+
+    assert.ok(loads.callCount >= 2, 'the next chunk was asked for');
+    assert.equal(internals.replayPending, false);
+    assert.equal(internals.replayCursors.has('gone-run'), false, 'the stale cursor is gone');
+    assert.deepEqual(stderr, [], 'no too-large / unreadable warning');
+    assert.ok(calls.length > 0);
+  });
+
+  it('replay stops at half the memory ceiling, so a live run with replay at its budget stays in memory (not spool-only)', async () => {
+    const fx = fixture();
+    // A dead run of ~17 MB: over the whole ceiling, so a full-ceiling replay would leave no room.
+    const w = new OnosooSpool(fx.stateDir, fx.cwd, { isPidAlive: () => false });
+    w.openRun('old-run');
+    const pad = 'x'.repeat(85_000);
+    for (let q = 1; q <= 200; q++) { w.append({ run_id: 'old-run', seq: q, type: 'state', at: '2026-10-01T00:00:00Z', data: { pad } }); }
+    // The server never answers: nothing drains, so memory only grows.
+    const { relay } = mkRelay(async () => new Promise<Reply>(() => undefined), { fx, closeDeadlineMs: 10, heartbeat: false });
+    const internals = relay as unknown as { memBytes: number; spoolOnly: boolean; queue: Array<{ ev: RelayEvent }> };
+    relay.start();
+    const replayed = internals.memBytes;
+    assert.ok(replayed <= REPLAY_MEMORY_BYTES, `replay holds ${replayed} bytes`);
+    assert.ok(replayed > REPLAY_MEMORY_BYTES - 100_000, 'replay is at its budget (within one event)');
+
+    // ~4 MB of live events: they would have overflowed a full 16 MiB replay.
+    for (let i = 0; i < 45; i++) { relay.record(line('task-started', { id: `t${i}`, name: 'y'.repeat(85_000) })); }
+    assert.equal(internals.spoolOnly, false, 'the live run is not spool-only');
+    const live = internals.queue.filter((q) => q.ev.run_id === relay.runId);
+    assert.equal(live.length, 45, 'every live event is queued in memory');
+    assert.ok(internals.memBytes <= MAX_MEMORY_BYTES);
+    await relay.close();
   });
 
   it('a 400 quarantines the batch, marks it acked, prints one line, and sending continues', async () => {
@@ -583,6 +734,25 @@ describe('ONOSOO relay — failure handling (fake timers)', () => {
     assert.equal(calls.length, n);
   });
 
+  it('a quiet live run keeps its spool file fresh (touched with each heartbeat), so it is never taken for a dead run', async () => {
+    const { client } = recorder();
+    const { relay, spool } = mkRelay(client);
+    relay.start();
+    const file = path.join(spool.dir, `${relay.runId}.jsonl`);
+    const size = fs.statSync(file).size;
+    // Three hours of quiet (fake clock): only heartbeats go out, nothing is appended.
+    for (let i = 0; i < 180; i++) {
+      await clock.tickAsync(HEARTBEAT_MS);
+      // The touch uses the relay's clock: the mtime follows it, never more than two heartbeats behind.
+      const lag = Date.now() - fs.statSync(file).mtimeMs;
+      assert.ok(lag >= -1000 && lag <= 2 * HEARTBEAT_MS, `after ${i + 1} min the file was ${lag} ms stale`);
+    }
+    assert.equal(fs.statSync(file).size, size, 'touched, not written');
+    const closing = relay.close();
+    await clock.tickAsync(0);
+    await closing;
+  });
+
   it('5xx backs off 5, 10, 20 … capped at 300 s, printing one line per kind', async () => {
     const { calls, client } = recorder(() => ({ status: 503, body: '' }));
     const { relay, stderr } = mkRelay(client);
@@ -675,6 +845,39 @@ describe('ONOSOO relay — failure handling (fake timers)', () => {
       assert.ok(fs.existsSync(path.join(spool.dir, `${relay.runId}.jsonl`)), 'events stay on disk');
     });
   }
+
+  it('after a 401 the relay keeps touching its spool file, so another loader still sees a live owner after 15 min of quiet', async () => {
+    const { calls, client } = recorder(() => ({ status: 401, body: '' }));
+    const { relay, spool, fx } = mkRelay(client);
+    relay.start();
+    relay.record(line('state', { state: 'playing' }));
+    await clock.tickAsync(0);
+    assert.equal(calls.length, 1, 'the 401 disabled the relay');
+    const file = path.join(spool.dir, `${relay.runId}.jsonl`);
+    for (let i = 0; i < 15; i++) { await clock.tickAsync(60_000); }
+    assert.equal(calls.length, 1, 'still nothing sent');
+    const age = Date.now() - fs.statSync(file).mtimeMs;
+    assert.ok(age >= 0 && age < SPOOL_OWNER_MAX_IDLE_MS, `the file is ${age} ms old`);
+
+    // Another process's loader: the meta pid is "someone else" and alive. Keep the mtime.
+    const mtime = fs.statSync(file).mtime;
+    const lines = fs.readFileSync(file, 'utf-8').split('\n');
+    const meta = JSON.parse(lines[0]);
+    meta.meta.pid = 999_999;
+    lines[0] = JSON.stringify(meta);
+    fs.writeFileSync(file, lines.join('\n'));
+    fs.utimesSync(file, mtime, mtime);
+    const other = new OnosooSpool(fx.stateDir, fx.cwd, { isPidAlive: () => true, platform: 'win32' });
+    assert.deepEqual(other.loadReplayable(null), [], 'owned: not replayed');
+
+    const closing = relay.close();
+    await clock.tickAsync(CLOSE_DEADLINE_MS);
+    await closing;
+    // Closed: no more touches.
+    const closedAt = fs.statSync(file).mtimeMs;
+    await clock.tickAsync(5 * 60_000);
+    assert.equal(fs.statSync(file).mtimeMs, closedAt);
+  });
 
   it('a heartbeat answered 401 disables the relay too', async () => {
     const { calls, client } = recorder(() => ({ status: 401, body: '' }));

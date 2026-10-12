@@ -2440,6 +2440,43 @@ describe('TaskRunner — task-settled hook', () => {
       assert.ok(seen);
       assert.equal((seen as AbortSignal).aborted, true);
     });
+
+    it('stop() aborts a never-resolving hook at once: the task still completes, well under TASK_SETTLED_HOOK_MS', async () => {
+      const { runner, TaskRunner } = build();
+      assert.equal(TaskRunner.TASK_SETTLED_HOOK_MS, 20_000, 'the real bound is in force');
+      let seen: AbortSignal | null = null;
+      runner.setTaskSettledHook((_info: SettledInfo, signal: AbortSignal) => {
+        seen = signal;
+        setTimeout(() => runner.stop(), 10);
+        return new Promise<void>(() => undefined);
+      });
+      const completed: string[] = [];
+      runner.on('task-completed', (t: Task) => completed.push(t.id));
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+
+      const t0 = Date.now();
+      await runner.play(plan);
+      const elapsed = Date.now() - t0;
+
+      assert.ok(elapsed < 5_000, `play() settled in ${elapsed} ms`);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed, 'the outcome is unchanged');
+      assert.deepEqual(completed, [plan.playlists[0].tasks[0].id]);
+      assert.ok(seen);
+      assert.equal((seen as AbortSignal).aborted, true);
+    });
+
+    it('a hook that settles normally is not aborted by a later stop()', async () => {
+      const { runner } = build();
+      let seen: AbortSignal | null = null;
+      runner.setTaskSettledHook((_info: SettledInfo, signal: AbortSignal) => { seen = signal; });
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+      await runner.play(plan);
+      runner.stop();
+      assert.ok(seen);
+      assert.equal((seen as AbortSignal).aborted, false);
+    });
   });
 
   it('with no hook, no start facts are captured (no ls-files spawn)', async () => {
@@ -2480,6 +2517,57 @@ describe('TaskRunner — task-settled hook', () => {
 
     assert.equal(infos.length, 1);
     assert.deepEqual(infos[0].commit, { sha: 'f'.repeat(40), branch: 'moag/p' });
+  });
+
+  describe('the full sha is read only for the hook', () => {
+    /** Real commitTask over a recording git; returns the git calls and the options the runner passed. */
+    function buildRecording() {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const realDelivery = require('../../../runner/git-delivery');
+      const gitCalls: string[][] = [];
+      const optsSeen: unknown[] = [];
+      const git = async (args: string[]): Promise<string | null> => {
+        gitCalls.push(args);
+        if (args[0] === 'diff') { return 'src/a.ts'; }
+        if (args[0] === 'rev-parse' && args[1] === '--short') { return 'abc1234'; }
+        if (args[0] === 'rev-parse' && args[1] === 'HEAD') { return 'e'.repeat(40); }
+        return '';
+      };
+      const built = build({
+        './git-delivery': {
+          ...realDelivery,
+          prepareBranch: async () => ({ ok: true, branch: 'moag/p', created: true }),
+          commitTask: (req: unknown, _git: unknown, opts?: unknown) => { optsSeen.push(opts); return realDelivery.commitTask(req, git, opts); },
+        },
+      });
+      const revParseHead = (): boolean => gitCalls.some((a) => a[0] === 'rev-parse' && a[1] === 'HEAD');
+      return { ...built, gitCalls, optsSeen, revParseHead };
+    }
+
+    it('with no hook, the commit makes no rev-parse HEAD call', async () => {
+      vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+      const { runner, gitCalls, optsSeen, revParseHead } = buildRecording();
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+      await runner.play(plan);
+      assert.equal(plan.playlists[0].tasks[0].status, TaskStatus.Completed);
+      assert.ok(gitCalls.some((a) => a[0] === 'commit'), 'the task was committed');
+      assert.deepEqual(optsSeen, [{ fullSha: false }]);
+      assert.equal(revParseHead(), false);
+    });
+
+    it('with a hook, rev-parse HEAD is called and the hook gets the full sha', async () => {
+      vscodeMock.setMockConfig('agentTaskPlayer', { 'git.autoCommit': true });
+      const { runner, optsSeen, revParseHead } = buildRecording();
+      const infos: SettledInfo[] = [];
+      runner.setTaskSettledHook((info: SettledInfo) => { infos.push(info); });
+      const plan = makePlan();
+      plan.playlists[0].tasks = [plan.playlists[0].tasks[0]];
+      await runner.play(plan);
+      assert.deepEqual(optsSeen, [{ fullSha: true }]);
+      assert.equal(revParseHead(), true);
+      assert.deepEqual(infos[0].commit, { sha: 'e'.repeat(40), branch: 'moag/p' });
+    });
   });
 
   it('a commit without a readable full sha reports commit null', async () => {

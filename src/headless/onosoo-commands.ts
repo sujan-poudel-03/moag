@@ -296,8 +296,9 @@ export class CommandHost {
     if (this.pollTimer !== null) { this.timers.clearTimeout(this.pollTimer); this.pollTimer = null; }
     if (this.lockRetryTimer !== null) { this.timers.clearTimeout(this.lockRetryTimer); this.lockRetryTimer = null; }
     if (this.lockedOut) { return; }
-    if (this.booting) { await this.booting; }
     try {
+      // A boot that rejected must not make close() reject or keep the lock held.
+      await this.booting?.catch(() => undefined);
       if (!this.o.control.revoked) {
         const projects = this.o.loadProjects();
         await this.bounded(this.o.control.sendCapabilities({ ...this.capabilities(projects, this.isolation), remote_start: false }), HOST_CLOSE_DEADLINE_MS);
