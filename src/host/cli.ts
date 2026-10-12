@@ -27,6 +27,7 @@ import { execFileAsync } from '../utils/exec-file';
 
 import { HostAgent } from './agent';
 import { childEnv } from './compose';
+import { dockerChildEnv, prepareHostDockerConfig } from './docker-config';
 import { EnvironmentManager, type Exec } from './environments';
 import { Gateway } from './gateway';
 import { HOST_CONFIG_FILE, HOST_CONFIG_TEMPLATE, loadHostConfig } from './host-config';
@@ -85,7 +86,7 @@ async function cmdDraft(stateDir: string, projectId: string | undefined, loadPro
   const composeName = findComposeFile((n) => fs.existsSync(path.join(project.path, n)));
   let draft;
   if (composeName) {
-    const listed = await exec('docker', ['compose', '-f', composeName, 'config', '--services'], { cwd: project.path, env: childEnv(process.env), timeoutMs: 60_000 });
+    const listed = await exec('docker', ['compose', '-f', composeName, 'config', '--services'], { cwd: project.path, env: dockerChildEnv(childEnv(process.env), prepareHostDockerConfig(stateDir, process.env)), timeoutMs: 60_000 });
     if (listed.exitCode !== 0) { err(`docker compose could not read ${composeName}:\n${listed.stderr}\n`); return 2; }
     draft = draftFromCompose(composeName, listed.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean));
   } else {

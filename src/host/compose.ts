@@ -9,7 +9,7 @@
 //   - every service's published ports are reset, so two branches of the same project never fight
 //     over a host port and nothing is reachable from outside except through the gateway;
 //   - the web service alone is published again, on a loopback port the gateway proxies to;
-//   - every service gets CPU and memory limits;
+//   - every service gets CPU, memory and process-count (`pids_limit`) limits;
 //   - every container is labelled with the environment it belongs to.
 //
 // `!reset` / `!override` need Docker Compose 2.24.4 or newer; `moag host` checks the version.
@@ -22,6 +22,8 @@ import type { EnvStatus, ServiceHealth, ServiceRole, ServiceSnapshot, ServiceSta
 
 export const ENV_KEY_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 export const MIN_COMPOSE_VERSION: [number, number, number] = [2, 24, 4];
+/** Processes per container: enough for any dev server, too few for a fork bomb to hurt the machine. */
+export const PIDS_LIMIT = 512;
 
 function slug(s: string, max: number): string {
   return s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, max).replace(/-+$/g, '');
@@ -78,6 +80,7 @@ export function buildOverride(input: OverrideInput): string {
     }
     lines.push('    labels:');
     lines.push(`      moag.environment: ${yamlString(input.envKey)}`);
+    lines.push(`    pids_limit: ${PIDS_LIMIT}`);
     lines.push('    deploy:');
     lines.push('      resources:');
     lines.push('        limits:');
@@ -182,12 +185,14 @@ export function deriveStatus(services: ServiceSnapshot[], desired: 'running' | '
  * The ONLY variables a docker or git child process gets. An allow-list, not a deny-list: a branch's
  * compose file can interpolate `${ANYTHING}` into a container, so whatever the main user has in its
  * environment (API keys, GITHUB_TOKEN, AWS credentials, SSH_AUTH_SOCK, the machine key) would
- * otherwise be one line away from an AI-written container. DOCKER_HOST/DOCKER_CONTEXT/DOCKER_CONFIG
- * are kept so a non-default Docker setup still works; they identify the daemon, not a secret.
+ * otherwise be one line away from an AI-written container. DOCKER_HOST/DOCKER_CONTEXT and the TLS
+ * settings are kept so a non-default Docker setup still works; they identify the daemon, not a
+ * secret. DOCKER_CONFIG is NOT kept: the user's Docker configuration holds registry credentials, and
+ * every docker child gets the host-owned one instead (docker-config.ts).
  */
 const CHILD_ENV_ALLOW = new Set([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR', 'TEMP', 'TMP',
-  'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY',
+  'DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CERT_PATH', 'DOCKER_TLS_VERIFY',
   'XDG_RUNTIME_DIR', 'SYSTEMROOT', 'COMSPEC', 'WINDIR', 'PATHEXT',
 ]);
 

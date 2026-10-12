@@ -15,7 +15,8 @@
 //   run       Docker always runs from that saved, checked file — so a container rewriting the compose
 //             file in the checkout changes nothing until the next prepare, which checks it again
 //
-// Starting an environment that exists refreshes it to the branch's latest commit. Stopping keeps the
+// Starting an environment that exists refreshes it to the branch's latest commit — its containers are
+// stopped first, so none of them can touch the checkout between the check and `up`. Stopping keeps the
 // worktree and volumes; the agent never restarts what a person stopped, and stops what nobody has
 // opened for `idle_stop_minutes`.
 //
@@ -27,6 +28,7 @@ import * as path from 'path';
 
 import { buildOverride, childEnv, composeProjectName, composeVersionOk, deriveStatus, envKeyFor, isSafeBranch, parsePsOutput, servicesFromPs } from './compose';
 import { composePolicyViolations } from './compose-policy';
+import { dockerChildEnv, prepareHostDockerConfig } from './docker-config';
 import { gitVersionOk, mirrorPath, safeGitArgs, safeGitEnv } from './git-safe';
 import type { HostConfig } from './host-config';
 import { parseRecipe, RECIPE_FILE, type Recipe } from './recipe';
@@ -105,6 +107,9 @@ export class EnvironmentManager {
   private readonly now: () => number;
   private readonly portFree: (port: number) => Promise<boolean>;
   private readonly env: NodeJS.ProcessEnv;
+  /** The unfiltered environment: read once, to find the user's Docker configuration. */
+  private readonly rawEnv: NodeJS.ProcessEnv;
+  private dockerEnvCache: NodeJS.ProcessEnv | null = null;
   private readonly log: (line: string) => void;
 
   constructor(private readonly deps: EnvironmentDeps) {
@@ -112,7 +117,8 @@ export class EnvironmentManager {
     this.fs = deps.fs ?? fs;
     this.now = deps.now ?? Date.now;
     this.portFree = deps.portFree ?? defaultPortFree;
-    this.env = childEnv(deps.env ?? process.env);
+    this.rawEnv = deps.env ?? process.env;
+    this.env = childEnv(this.rawEnv);
     this.log = deps.log ?? ((l) => process.stderr.write(`${l}\n`));
     this.load();
   }
@@ -182,6 +188,22 @@ export class EnvironmentManager {
 
   // ─── Processes ───
 
+  /**
+   * The environment of every docker and compose child: the allow-list plus DOCKER_CONFIG pointing at
+   * the host-owned configuration with no registry credentials (docker-config.ts), written on first
+   * use. If it cannot be written, docker does not run — never with the user's own configuration.
+   */
+  private dockerEnv(): NodeJS.ProcessEnv {
+    if (!this.dockerEnvCache) {
+      try {
+        this.dockerEnvCache = dockerChildEnv(this.env, prepareHostDockerConfig(this.deps.stateDir, this.rawEnv));
+      } catch (err) {
+        throw new EnvError(`Could not write the host's Docker configuration: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    return this.dockerEnvCache;
+  }
+
   /** exec that never rejects: a spawn failure or an overflowing buffer is a failed result. */
   private async run(command: string, args: string[], opts: Parameters<Exec>[2]): Promise<ExecResult> {
     try {
@@ -191,30 +213,41 @@ export class EnvironmentManager {
     }
   }
 
+  /** A docker child with the host-owned Docker configuration. Never rejects, like run(). */
+  private docker(args: string[], opts: Omit<Parameters<Exec>[2], 'env'>): Promise<ExecResult> {
+    let env: NodeJS.ProcessEnv;
+    try {
+      env = this.dockerEnv();
+    } catch (err) {
+      return Promise.resolve({ exitCode: null, stdout: '', stderr: err instanceof Error ? err.message : String(err), timedOut: false });
+    }
+    return this.run('docker', args, { ...opts, env });
+  }
+
   /**
    * Compose on the BRANCH's file plus the override — used only to list and resolve the configuration
    * before it is checked. No inherited environment beyond the allow-list, and an empty env file so
    * the branch's .env is not read for interpolation either.
    */
   private composeSource(r: Pick<EnvRecord, 'key' | 'worktree' | 'composeFile'>, args: string[]): Promise<ExecResult> {
-    return this.run('docker', [
+    return this.docker([
       'compose', '-p', composeProjectName(r.key),
       '--project-directory', r.worktree,
       '--env-file', this.hostFile(r.key, 'empty.env'),
       '-f', r.composeFile, '-f', this.hostFile(r.key, 'override.yml'),
       ...args,
-    ], { cwd: this.hostDir(r.key), env: this.env, timeoutMs: CMD_TIMEOUT_MS, maxBuffer: BIG_BUFFER });
+    ], { cwd: this.hostDir(r.key), timeoutMs: CMD_TIMEOUT_MS, maxBuffer: BIG_BUFFER });
   }
 
   /** Compose on the checked, host-owned configuration. Every command that runs anything uses this. */
   private compose(r: Pick<EnvRecord, 'key'>, args: string[], timeoutMs = CMD_TIMEOUT_MS): Promise<ExecResult> {
-    return this.run('docker', [
+    return this.docker([
       'compose', '-p', composeProjectName(r.key),
       '--env-file', this.hostFile(r.key, 'empty.env'),
       '-f', this.hostFile(r.key, 'resolved.json'),
       '--progress', 'quiet',
       ...args,
-    ], { cwd: this.hostDir(r.key), env: this.env, timeoutMs, maxBuffer: BIG_BUFFER });
+    ], { cwd: this.hostDir(r.key), timeoutMs, maxBuffer: BIG_BUFFER });
   }
 
   /** Every host git call: hardened options, explicit repository, never discovered from a checkout. */
@@ -229,7 +262,9 @@ export class EnvironmentManager {
 
   /** Docker, Compose and git are present and new enough. Null when all is well. */
   async checkPrerequisites(): Promise<string | null> {
-    const v = await this.run('docker', ['compose', 'version', '--short'], { env: this.env, timeoutMs: 20_000 });
+    let dockerEnv: NodeJS.ProcessEnv;
+    try { dockerEnv = this.dockerEnv(); } catch (err) { return err instanceof Error ? err.message : String(err); }
+    const v = await this.run('docker', ['compose', 'version', '--short'], { env: dockerEnv, timeoutMs: 20_000 });
     if (v.exitCode !== 0) { return 'Docker with the Compose plugin is not available on this machine.'; }
     if (!composeVersionOk(v.stdout)) { return `Docker Compose ${v.stdout.trim()} is too old; 2.24.4 or newer is needed.`; }
     const g = await this.run('git', ['--version'], { env: safeGitEnv(this.env), timeoutMs: 20_000 });
@@ -269,9 +304,15 @@ export class EnvironmentManager {
     throw new EnvError('No free local port for the preview.', 'failed');
   }
 
+  /**
+   * Environments running or on their way: every running record plus EVERY admission in flight —
+   * new starts, refreshes of stopped ones and restarts of stopped ones alike, since a stopped record
+   * does not say "running" until its start finishes. Counted once per key.
+   */
   private runningCount(except: string): number {
-    const running = this.list().filter((r) => r.desired === 'running' && r.key !== except).length;
-    return running + [...this.pendingStarts].filter((k) => k !== except && !this.records.has(k)).length;
+    const keys = new Set([...this.list().filter((r) => r.desired === 'running').map((r) => r.key), ...this.pendingStarts]);
+    keys.delete(except);
+    return keys.size;
   }
 
   // ─── Git ───
@@ -368,7 +409,7 @@ export class EnvironmentManager {
       throw new EnvError('The compose configuration could not be read as JSON.', 'rejected');
     }
     const violations = composePolicyViolations(configJson, {
-      roots: [r.worktree], web: recipe.web, hostPort: r.port, realpath: this.deps.realpath,
+      roots: [r.worktree], web: recipe.web, hostPort: r.port, projectName: composeProjectName(r.key), realpath: this.deps.realpath,
     });
     if (violations.length > 0) {
       throw new EnvError(`This branch's compose file asks for more than an environment may have: ${violations.slice(0, 6).join('; ')}.`, 'rejected');
@@ -405,7 +446,30 @@ export class EnvironmentManager {
       return await this.withLock(key, async () => {
         const existing = this.records.get(key);
         const worktree = path.join(this.deps.config.worktreesDir, key);
-        await this.checkout(projectId, project.path, key, worktree, branch);
+
+        // A refresh: stop the old containers FIRST. While they run they can write to the checkout,
+        // so between the policy's realpath check and `up` they could swap a checked bind source,
+        // env_file or build context for a link — Docker resolves those paths again at `up`. With
+        // them stopped, nothing but the host touches the checkout until the checked `up`.
+        const refreshing = existing !== undefined && this.fs.existsSync(this.hostFile(key, 'resolved.json'));
+        if (refreshing) {
+          const stopped = await this.compose(existing, ['stop']);
+          if (stopped.exitCode !== 0) { throw new EnvError(`Could not stop the environment to refresh it: ${tail(stopped.stderr)}`); }
+        }
+        /** The old containers are stopped now: say so on the record, then rethrow. */
+        const failRefresh = (err: unknown): unknown => {
+          if (existing && refreshing) {
+            existing.status = 'failed';
+            existing.message = `Refreshing failed: ${err instanceof Error ? err.message : String(err)}`;
+            this.save();
+          }
+          return err;
+        };
+        try {
+          await this.checkout(projectId, project.path, key, worktree, branch);
+        } catch (err) {
+          throw failRefresh(err);
+        }
 
         const record: EnvRecord = {
           key,
@@ -426,7 +490,11 @@ export class EnvironmentManager {
           lastAccessAt: new Date(this.now()).toISOString(),
         };
 
-        await this.prepare(record, recipe);
+        try {
+          await this.prepare(record, recipe);
+        } catch (err) {
+          throw failRefresh(err);
+        }
         this.records.set(key, record);
         this.save();
 

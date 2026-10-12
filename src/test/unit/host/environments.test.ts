@@ -64,6 +64,9 @@ describe('host/environments', () => {
         db: { image: 'postgres' },
       } as Record<string, Record<string, unknown>>,
     };
+    // The override's process limit applies to every service, as Compose would merge it.
+    const pids = /pids_limit: (\d+)/.exec(override);
+    if (pids) { for (const s of Object.values(c.services)) { s.pids_limit = Number(pids[1]); } }
     mutate(c);
     return JSON.stringify(c);
   };
@@ -212,6 +215,51 @@ describe('host/environments', () => {
     assert.equal(calls.some((c) => c.args.some((x) => x.includes('attacker-controlled'))), false);
   });
 
+  it('on a refresh, stops the old containers before checkout, checks out before prepare, prepares before up', async () => {
+    const m = manager();
+    const r = await m.start('shop', 'main');
+    calls = [];
+    await m.start('shop', 'main');
+    const index = (pred: (c: Call) => boolean, what: string): number => {
+      const i = calls.findIndex(pred);
+      assert.ok(i >= 0, `no ${what}`);
+      return i;
+    };
+    const stop = index((c) => c.command === 'docker' && c.args.includes('stop'), 'stop');
+    const firstGit = index((c) => c.command === 'git', 'git');
+    const checkout = index((c) => c.command === 'git' && gitArgs(c.args)[0] === 'checkout', 'checkout');
+    const prepare = index((c) => c.command === 'docker' && c.args.includes('config'), 'prepare');
+    const up = index((c) => c.command === 'docker' && c.args.includes('up'), 'up');
+    assert.ok(stop < firstGit, 'containers stopped before the mirror or checkout is touched');
+    assert.ok(stop < checkout && checkout < prepare && prepare < up, `order: stop ${stop}, checkout ${checkout}, prepare ${prepare}, up ${up}`);
+    // The stop runs from the previously checked, host-owned configuration.
+    assert.equal(argAfter(calls[stop].args, '-f'), path.join(stateDir(), 'host', 'compose', r.key, 'resolved.json'));
+  });
+
+  it('a first start stops nothing; a refresh whose stop fails touches nothing', async () => {
+    const m = manager();
+    await m.start('shop', 'main');
+    assert.equal(calls.some((c) => c.command === 'docker' && c.args.includes('stop')), false);
+    const failingStop: Exec = async (command, args, opts) => {
+      if (args.includes('stop')) { calls.push({ command, args }); return failed('daemon gone'); }
+      return exec(command, args, opts);
+    };
+    const m2 = manager({}, { exec: failingStop });
+    calls = [];
+    await assert.rejects(m2.start('shop', 'main'), /Could not stop the environment to refresh it: daemon gone/);
+    assert.equal(calls.filter((c) => c.command === 'git').length, 0, 'no checkout');
+    assert.equal(ups().length, 0, 'no up');
+  });
+
+  it('a refresh that is refused after the stop leaves the environment marked failed with the reason', async () => {
+    const m = manager();
+    const r = await m.start('shop', 'main');
+    mutate = (c) => { c.services.api.privileged = true; };
+    await assert.rejects(m.start('shop', 'main'), /asks for more/);
+    assert.equal(m.get(r.key)?.status, 'failed');
+    assert.match(m.get(r.key)?.message ?? '', /Refreshing failed: .*asks for more/);
+  });
+
   it('refuses a compose file that would let a container out, and starts nothing', async () => {
     for (const change of [
       (c: { services: Record<string, Record<string, unknown>> }) => { c.services.api.privileged = true; },
@@ -293,6 +341,28 @@ describe('host/environments', () => {
     assert.match(String((results.find((x) => x.status === 'rejected') as PromiseRejectedResult).reason), /limit/);
   });
 
+  it('counts every admission in flight against the limit: concurrent restarts and refreshes of stopped ones', async () => {
+    const m = manager({ maxEnvironments: 2 });
+    const a = await m.start('shop', 'feat/a');
+    const b = await m.start('shop', 'feat/b');
+    await m.stop(a.key);
+    await m.stop(b.key);
+    await m.start('shop', 'main'); // one running; room for exactly one more
+
+    const restarts = await Promise.allSettled([m.restart(a.key, null), m.restart(b.key, null)]);
+    assert.equal(restarts.filter((x) => x.status === 'fulfilled').length, 1, 'only one of two concurrent restarts fits');
+    assert.match(String((restarts.find((x) => x.status === 'rejected') as PromiseRejectedResult).reason), /limit/);
+    assert.equal(m.list().filter((r) => r.desired === 'running').length, 2);
+
+    // A refresh (start) of a stopped one racing a restart of another: again only one fits.
+    const late = m.list().find((r) => r.desired === 'stopped')!;
+    await m.stop(m.list().find((r) => r.desired === 'running' && r.branch !== 'main')!.key);
+    const other = m.list().find((r) => r.desired === 'stopped' && r.key !== late.key)!;
+    const mixed = await Promise.allSettled([m.start('shop', late.branch), m.restart(other.key, null)]);
+    assert.equal(mixed.filter((x) => x.status === 'fulfilled').length, 1, 'only one of a refresh and a restart fits');
+    assert.equal(m.list().filter((r) => r.desired === 'running').length, 2);
+  });
+
   it('keeps at most MAX_RECORDS environments, stopped ones included', async () => {
     const m = manager({ maxEnvironments: 100 });
     const records = (m as unknown as { records: Map<string, unknown> }).records;
@@ -358,6 +428,34 @@ describe('host/environments', () => {
     await m.resetDb(r.key);
     const execCall = calls.find((c) => c.args.includes('exec'))!;
     assert.deepEqual(execCall.args.slice(-5), ['-T', 'api', 'npm', 'run', 'db:reset']);
+  });
+
+  it('runs every docker child with the host-owned Docker configuration, which has no registry credentials', async () => {
+    // The user's own configuration has every kind of registry credential.
+    const userDocker = path.join(root, 'home', '.docker');
+    fs.mkdirSync(userDocker, { recursive: true });
+    fs.writeFileSync(path.join(userDocker, 'config.json'), JSON.stringify({
+      auths: { 'ghcr.io': { auth: 'dXNlcjpwYXNz' } }, credsStore: 'desktop', credHelpers: { 'gcr.io': 'gcloud' },
+    }));
+    const m = manager({}, { env: { PATH: '/bin', HOME: path.join(root, 'home'), DOCKER_CONFIG: userDocker } });
+    assert.equal(await m.checkPrerequisites(), null);
+    await m.start('shop', 'main');
+    const hostDocker = path.join(stateDir(), 'host', 'docker-config');
+    const docker = calls.filter((c) => c.command === 'docker');
+    assert.ok(docker.length >= 4);
+    for (const c of docker) { assert.equal(c.env?.DOCKER_CONFIG, hostDocker, `${c.args.join(' ')} ran with DOCKER_CONFIG=${String(c.env?.DOCKER_CONFIG)}`); }
+    for (const c of calls.filter((x) => x.command === 'git')) { assert.equal(c.env?.DOCKER_CONFIG, undefined, 'git does not get the Docker configuration'); }
+    const cfg = JSON.parse(fs.readFileSync(path.join(hostDocker, 'config.json'), 'utf-8')) as Record<string, unknown>;
+    for (const k of ['auths', 'credsStore', 'credHelpers']) { assert.equal(k in cfg, false, `${k} in the host Docker configuration`); }
+  });
+
+  it('runs no docker at all when the host Docker configuration cannot be written', async () => {
+    fs.mkdirSync(path.join(stateDir(), 'host'), { recursive: true });
+    fs.writeFileSync(path.join(stateDir(), 'host', 'docker-config'), 'a file where the folder should be');
+    const m = manager();
+    assert.match(String(await m.checkPrerequisites()), /Could not write the host's Docker configuration/);
+    await assert.rejects(m.start('shop', 'main'), /Could not write the host's Docker configuration/);
+    assert.equal(calls.filter((c) => c.command === 'docker').length, 0);
   });
 
   it('checks docker compose and git versions', async () => {

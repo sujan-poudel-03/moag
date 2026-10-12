@@ -71,6 +71,7 @@ describe('host/compose', () => {
       assert.equal((text.match(/memory: "2048M"/g) ?? []).length, 3);
       assert.equal((text.match(/cpus: "2"/g) ?? []).length, 3);
       assert.equal((text.match(/moag\.environment: "shop-main-abc123"/g) ?? []).length, 3);
+      assert.equal((text.match(/\n {4}pids_limit: 512\n/g) ?? []).length, 3, 'a process limit on every service');
     });
 
     it('resets every port when there is no web service', () => {
@@ -127,6 +128,8 @@ describe('host/compose', () => {
       MOAG_ONOSOO_KEY: 'onosoo_live_x', MOAG_ONOSOO_URL: 'u', TUNNEL_TOKEN: 't', CLOUDFLARED_TOKEN: 'c',
       ANTHROPIC_API_KEY: 'sk-ant', OPENAI_API_KEY: 'sk', GITHUB_TOKEN: 'ghp', AWS_SECRET_ACCESS_KEY: 'aws',
       SSH_AUTH_SOCK: '/tmp/agent', DATABASE_URL: 'postgres://u:p@h/db', NPM_TOKEN: 'npm',
+      // The user's Docker configuration holds registry credentials: docker children get the host's.
+      DOCKER_CONFIG: '/h/.docker',
     });
     assert.deepEqual(env, { PATH: '/bin', HOME: '/h', LANG: 'C.UTF-8', DOCKER_HOST: 'unix:///run/docker.sock' });
   });

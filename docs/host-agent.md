@@ -21,6 +21,8 @@ it starts.
 
 - Linux (Ubuntu 24.04 LTS recommended), or Windows with everything inside **WSL2 Ubuntu** (`moag host` refuses to run on native Windows).
 - Docker Engine with the Compose plugin **2.24.4 or newer** (`docker compose version`).
+- Images from **public registries only**: `moag host` gives Docker no registry credentials (see
+  [Images: public registries only](#images-public-registries-only)).
 - Git **2.45.1 or newer**, Node 20, MOAG.
 - `cloudflared`, and a Cloudflare-managed domain for previews (e.g. `preview.onosoo.com`).
 - Always on: sleep off. Roughly 8 cores / 32 GB / 1 TB SSD for 3–4 environments at once.
@@ -104,16 +106,47 @@ WantedBy=multi-user.target
 
 | Risk | What the host agent does |
 |---|---|
-| A branch's compose file asks for the host | Before **every** `up` (start, restart from stopped, database reset) the configuration is resolved again and checked against an **allow-list** (`compose-policy.ts`): any key it does not know is refused. Refused in detail: privileged mode, capabilities, devices, host or `container:` namespaces, runtimes, sysctls, security profiles other than no-new-privileges, the Docker socket, bind mounts, env files, secrets and configs from outside the branch checkout (symlinks resolved), top-level volumes with driver options or external, external or non-bridge networks, unsafe `build:` options (contexts or Dockerfiles outside the checkout, additional contexts, build secrets, SSH forwarding, host build network, entitlements), device reservations, and any published port other than the web service's own `127.0.0.1:<allocated>`. |
+| A branch's compose file asks for the host | Before **every** `up` (start, restart from stopped, database reset) the configuration is resolved again and checked against an **allow-list** (`compose-policy.ts`): any key it does not know is refused — at every depth: each nested object it lets through (`build`, `deploy` and its `resources`, `healthcheck`, `logging`, mounts, network attachments, env-file, port, `depends_on`, secret and config entries, top-level volumes, networks, secrets and configs) has its own field allow-list. Refused in detail: privileged mode, capabilities, devices, host or `container:` namespaces, runtimes, sysctls, security profiles other than no-new-privileges, lifecycle hooks (`post_start`, `pre_stop`), `develop`, `annotations`, `group_add`, `ulimits`, the Docker socket, bind mounts, env files, secrets and configs from outside the branch checkout (symlinks resolved), bind propagation other than private, top-level volumes with driver options or external, external or non-bridge networks, network `ipam`, any volume or network `name` that does not start with the environment's own `moag-<env>_` (so a branch cannot attach another environment's or your own), unsafe `build:` options (contexts or Dockerfiles outside the checkout, additional contexts, `cache_from`, build secrets, SSH forwarding, host build network, entitlements), device reservations, an unbounded or over-1024 `pids_limit`, a negative `oom_score_adj`, more than one replica (`scale`, `deploy.replicas`), and any published port other than the web service's own `127.0.0.1:<allocated>`. |
 | A container rewrites the compose file in its checkout | Docker always runs from the host-owned copy that was checked (`<configDir>/moag/host/compose/<env>/resolved.json`), never from the checkout; a rewrite only matters at the next start, which checks it again. |
+| A running container swaps a checked path for a link during a refresh | Starting an environment that runs refreshes it — and its containers are **stopped first**, before the checkout is updated, checked and brought back up. Nothing but the host touches the checkout between the check and `up`, when Docker resolves bind sources, env files and build contexts again. |
+| A branch pulls private images with your registry logins | Every docker and compose call runs with `DOCKER_CONFIG` set to a host-owned folder whose `config.json` has no `auths`, `credsStore` or `credHelpers` — see [Images: public registries only](#images-public-registries-only). |
 | The branch's compose file reads the main user's secrets | Docker and git get an **allow-listed** environment only (PATH, HOME, locale, Docker connection settings), and every compose call gets an empty `--env-file`, so `${ANTHROPIC_API_KEY}`, `${GITHUB_TOKEN}`, `SSH_AUTH_SOCK`, the branch's `.env` and the machine key are not available for interpolation. |
 | Environments fight over ports or reach the internet directly | Every service's published ports are reset; only the web service is published, on `127.0.0.1`, for the gateway — and the check above refuses anything else. |
-| One environment starves the machine | CPU and memory limits on every service; a cap on running environments (also when restarting a stopped one) and on environments kept (50); idle ones stop. |
+| One environment starves the machine | CPU, memory and process-count (`pids_limit: 512`) limits on every service, one container per service; a cap on running environments (every start, refresh and restart in flight counts against it) and on environments kept (50); idle ones stop. |
 | An agent-written repo makes git run code (hooks, fsmonitor, filters, ext::) | The host never runs git in the project repo or in a checkout. It keeps its own mirror (`<configDir>/moag/host/repos/<id>.git`), fills it by reading the project as a remote, and passes every git call its repository explicitly (`--git-dir`, `--work-tree`) — never discovered from a checkout's `.git` file, which a container could repoint. Every call disables hooks, fsmonitor, prompts, system/global config and every transport but https/ssh (local paths only for the mirror refresh). git 2.45.1+ is required. |
 | The key or tunnel token leaks into an environment | Not in any child's environment (allow-list above); only `cloudflared` gets its token, and the token file is refused unless it is mode 600. |
 | Someone outside the workspace opens a preview | No session without a single-use, 60-second ONOSOO ticket bound to that environment; the session cookie is `__Host-` (host-only, Secure, no Domain); membership re-checked every minute, in batches, applied only when every batch answered. |
 | One environment's app attacks another (they share the preview domain) | App cookies are made host-only (`Domain=` removed) and may not use the session's name; WebSocket upgrades must come from the environment's own origin; redirects after login stay on the same origin. |
 | Logs reach someone who should not see them | Only a logs ticket (owner, admin or member) opens them — a preview session does not; logs are redacted and served straight from the machine, never stored in ONOSOO. |
+
+### Images: public registries only
+
+A branch's compose file names the images it pulls, so `moag host` never lets Docker use your
+registry logins. Every docker and compose child runs with `DOCKER_CONFIG` pointing at
+`<configDir>/moag/host/docker-config/` (mode 700), rewritten each time `moag host` starts. Its
+`config.json` has **no `auths`, no `credsStore` and no `credHelpers`**, so **only public images can
+be pulled**; a private image fails to pull and the environment fails to start. `docker login` as
+the main user changes nothing here. With `DOCKER_CONFIG` set, Docker does not read `~/.docker` at
+all, and because a `config.json` is always written there, it never falls back to defaults either.
+
+Carried over from your own configuration (`$DOCKER_CONFIG`, else `~/.docker`), and nothing else:
+
+- `currentContext`, and the context metadata in `contexts/meta` (name and endpoint; no credentials),
+  so a non-default Docker context keeps working. `contexts/tls` (client keys) is **never** copied:
+  a context that needs TLS keys does not work here; configure the daemon with `DOCKER_HOST`,
+  `DOCKER_CERT_PATH` and `DOCKER_TLS_VERIFY` instead (set `DOCKER_CERT_PATH` explicitly: its
+  default is the Docker configuration folder, which has no certificates).
+- Your `cli-plugins` folder is listed in `cliPluginsExtraDirs`, so a Compose or buildx plugin
+  installed under `~/.docker/cli-plugins` is still found. Proxy settings (`proxies`) are not carried
+  over.
+
+Context changes take effect the next time `moag host` starts.
+
+**Credential helpers on the `PATH`.** When a configuration has no credentials at all, the Docker
+CLI looks for a platform default helper on the `PATH` — on Linux `docker-credential-pass` (when
+`pass` is installed) or `docker-credential-secretservice` — and uses it. If either is installed for
+the main user and holds registry logins, Docker can still use them. On the build machine, do not
+install those helpers for the user that runs `moag host`, or keep no registry logins in them.
 
 ### Accepted risks
 
@@ -135,7 +168,7 @@ WantedBy=multi-user.target
 
 | Command | Who (workspace role) | What happens |
 |---|---|---|
-| `env-start {project_id, branch}` | owner, admin, member | mirror refreshed, detached worktree of the branch, policy check, `up -d --build`. Starting an existing one refreshes it to the branch's latest commit. |
+| `env-start {project_id, branch}` | owner, admin, member | mirror refreshed, detached worktree of the branch, policy check, `up -d --build`. Starting an existing one stops its containers, then refreshes it to the branch's latest commit. |
 | `env-stop {environment_id}` | owner, admin, member | `compose stop`; open previews closed. Stays stopped until started again. |
 | `env-restart {environment_id, service?}` | owner, admin, member | restart one service or all; a stopped environment is started. |
 | `env-reset-db {environment_id}` | owner, admin | the recipe's `reset_db` command, or volumes recreated. |
