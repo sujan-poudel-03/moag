@@ -45,6 +45,18 @@ describe('host/compose-policy', () => {
     assert.deepEqual(v, []);
   });
 
+  it('refuses every service-level CPU and memory key: the override\'s deploy limits are the only limits', () => {
+    const keys: Record<string, unknown> = {
+      mem_limit: '64g', memswap_limit: -1, mem_reservation: '32g', cpus: 64, cpu_shares: 262144,
+      cpu_quota: -1, cpu_period: 1000, cpuset: '0-63', cpu_count: 64, cpu_percent: 100,
+    };
+    for (const [k, value] of Object.entries(keys)) {
+      refuses(check({ api: { image: 'x', [k]: value } }), new RegExp(`api: "${k}" is not allowed`));
+    }
+    // The override's own limits still pass.
+    assert.deepEqual(check({ api: { image: 'x', deploy: { resources: { limits: { cpus: '2', memory: '2048M', pids: 512 } } } } }), []);
+  });
+
   it('refuses keys it does not know (fail closed)', () => {
     refuses(check({ api: { image: 'x', privileged: true } }), /api: "privileged" is not allowed/);
     refuses(check({ api: { image: 'x', cap_add: ['SYS_ADMIN'] } }), /"cap_add" is not allowed/);

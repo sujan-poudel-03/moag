@@ -46,13 +46,16 @@ const TOP_LEVEL_KEYS = new Set(['name', 'services', 'networks', 'volumes', 'secr
 // nofile/nproc is a way round the process and file limits, and previews do not need that either.
 // Also absent: `develop` (watch actions that sync and rebuild on host file changes), `annotations`,
 // and `group_add` (extra groups — the docker group's gid among them). `build.cache_from` likewise.
+// And every service-level CPU and memory key (`mem_limit`, `memswap_limit`, `mem_reservation`,
+// `cpus`, `cpu_shares`, `cpu_quota`, `cpu_period`, `cpuset`, `cpu_count`, `cpu_percent`): the
+// override's `deploy.resources.limits` are the only limits an environment gets.
 const SERVICE_KEYS = new Set([
   'image', 'build', 'command', 'entrypoint', 'environment', 'env_file', 'ports', 'expose', 'volumes',
   'depends_on', 'healthcheck', 'restart', 'working_dir', 'user', 'labels', 'deploy', 'networks',
   'network_mode', 'hostname', 'domainname', 'stdin_open', 'tty', 'init', 'stop_signal', 'stop_grace_period',
   'tmpfs', 'logging', 'extra_hosts', 'dns', 'dns_search', 'shm_size', 'platform', 'pull_policy',
   'profiles', 'scale', 'secrets', 'configs', 'attach', 'read_only', 'cap_drop', 'security_opt',
-  'links', 'volumes_from', 'mem_limit', 'mem_reservation', 'cpus', 'cpu_shares', 'pids_limit',
+  'links', 'volumes_from', 'pids_limit',
   'mac_address', 'oom_score_adj',
 ]);
 

@@ -571,6 +571,13 @@ export class EnvironmentManager {
     });
     try {
       await this.withLock(key, async () => {
+        // "Stopped" is what a person asked for, not proof that nothing runs: a `restart: always`
+        // container comes back with the Docker daemon and holds a read-write bind of the checkout.
+        // Stop it before the check, as start() does, so nothing can swap a checked path for a link.
+        if (this.fs.existsSync(this.hostFile(r.key, 'resolved.json'))) {
+          const stopped = await this.compose(r, ['stop']);
+          if (stopped.exitCode !== 0) { throw new EnvError(`Could not stop the environment to start it again: ${tail(stopped.stderr)}`); }
+        }
         r.composeFile = recipe.composeFromProject ? path.join(project.path, recipe.composeFile) : path.join(r.worktree, recipe.composeFile);
         await this.prepare(r, recipe);
         const res = await this.compose(r, ['up', '-d', '--force-recreate'], BUILD_TIMEOUT_MS);

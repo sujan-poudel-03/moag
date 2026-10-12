@@ -275,6 +275,41 @@ describe('host/environments', () => {
     }
   });
 
+  it('restarting a stopped environment stops its containers first (restart: always may have revived them), then prepares, then ups', async () => {
+    const m = manager();
+    const r = await m.start('shop', 'main');
+    await m.stop(r.key);
+    calls = [];
+    await m.restart(r.key, null);
+    const at = (pred: (c: Call) => boolean, what: string): number => {
+      const i = calls.findIndex(pred);
+      assert.ok(i >= 0, `no ${what}`);
+      return i;
+    };
+    const stop = at((c) => c.command === 'docker' && c.args.includes('stop'), 'stop');
+    const prepare = at((c) => c.command === 'docker' && c.args.includes('config'), 'prepare');
+    const up = at((c) => c.command === 'docker' && c.args.includes('up'), 'up');
+    assert.ok(stop < prepare && prepare < up, `order: stop ${stop}, prepare ${prepare}, up ${up}`);
+    assert.equal(argAfter(calls[stop].args, '-f'), path.join(stateDir(), 'host', 'compose', r.key, 'resolved.json'));
+    assert.equal(m.get(r.key)?.desired, 'running');
+  });
+
+  it('restarting a stopped environment whose stop fails prepares nothing and runs no up', async () => {
+    const m = manager();
+    const r = await m.start('shop', 'main');
+    await m.stop(r.key);
+    const failingStop: Exec = async (command, args, opts) => {
+      if (args.includes('stop')) { calls.push({ command, args }); return failed('daemon busy'); }
+      return exec(command, args, opts);
+    };
+    const m2 = manager({}, { exec: failingStop });
+    calls = [];
+    await assert.rejects(m2.restart(r.key, null), /Could not stop the environment to start it again: daemon busy/);
+    assert.equal(calls.some((c) => c.command === 'docker' && c.args.includes('config')), false, 'no prepare');
+    assert.equal(ups().length, 0, 'no up');
+    assert.equal(m2.get(r.key)?.desired, 'stopped');
+  });
+
   it('checks the configuration again before restarting a stopped environment', async () => {
     const m = manager();
     const r = await m.start('shop', 'main');
