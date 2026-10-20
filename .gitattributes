@@ -8,3 +8,6 @@
 # binary detection, so a binary file added under these folders is left alone.
 src/** text=auto eol=lf
 web/** text=auto eol=lf
+# Shell scripts run inside Linux/WSL straight from this checkout (e.g. /mnt/d/...): a CRLF
+# checkout breaks bash with "$'': command not found".
+*.sh text eol=lf
