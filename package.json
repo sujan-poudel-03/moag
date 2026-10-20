@@ -1727,6 +1727,15 @@
               "altText": "Advanced features overview",
               "markdown": "media/walkthrough-advanced.md"
             }
+          },
+          {
+            "id": "connectOnosoo",
+            "title": "Connect to ONOSOO Builds (optional)",
+            "description": "Watch your runs live in **ONOSOO Builds**. With a Linux or WSL machine you can also control runs and open live previews from ONOSOO.\n\n1. In ONOSOO open **Builds** → **Pair machine** and copy the key. It is shown **once**.\n2. Save it as ``{\"key\": \"<key>\", \"url\": \"https://<project-ref>.supabase.co\"}`` in ``%APPDATA%\\moag\\onosoo.json`` (Windows) or ``~/.config/moag/onosoo.json`` (Linux/WSL). Never inside a project, and never with ``setx``.\n3. Run any plan with the MOAG CLI (``moag run``) and it appears in ONOSOO.\n\n[Read the full ONOSOO Builds guide](https://github.com/sujan-poudel-03/moag/blob/master/docs/onosoo-builds.md)",
+            "media": {
+              "altText": "Connecting MOAG to ONOSOO Builds",
+              "markdown": "media/walkthrough-onosoo.md"
+            }
           }
         ]
       }

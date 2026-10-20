@@ -8,6 +8,10 @@ import * as vscode from 'vscode';
 import { EngineId } from '../models/types';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
+/** The end-to-end ONOSOO Builds guide. docs/ is not packaged, so it links to GitHub. */
+export const ONOSOO_GUIDE_URL = 'https://github.com/sujan-poudel-03/moag/blob/master/docs/onosoo-builds.md';
+
+/** Open the Setup Guide webview: detected engines, install hints, and optional ONOSOO Builds onboarding. */
 export function cmdShowSetupGuide(ctx: vscode.ExtensionContext): void {
   const detected = ctx.globalState.get<EngineId[]>('agentTaskPlayer.detectedEngines', []);
   const has = (id: string) => detected.includes(id as EngineId);
@@ -124,6 +128,10 @@ ${allGood
   <div class="section-title">After installing</div>
   <div class="tip-box">Open a terminal and run <code>claude</code> (or the relevant CLI) once to complete authentication, then click <strong>Re-check engines</strong> below.</div>
   <div class="tip-box">MOAG uses the CLI that matches your <strong>agentTaskPlayer.defaultEngine</strong> setting. You can change it in VS Code Settings.</div>
+</div>
+<div class="section" style="padding-top:0">
+  <div class="section-title">Connect to ONOSOO Builds (optional)</div>
+  <div class="tip-box">Watch <code>moag run</code> runs live in ONOSOO Builds, and on Linux or WSL control them and open live previews. <a class="engine-link" href="${ONOSOO_GUIDE_URL}" target="_blank">Setup guide &#8599;</a></div>
 </div>
 <div class="footer">
   <button class="btn-primary" id="recheckBtn">Re-check engines</button>

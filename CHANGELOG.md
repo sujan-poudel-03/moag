@@ -19,6 +19,7 @@
   - Compose files are checked against a strict allowlist before every start.
   - Containers never get your environment or registry logins.
   - See `docs/host-agent.md`.
+- **Onboarding.** The Get Started walkthrough has a new optional "Connect to ONOSOO Builds" step, and the Setup Guide links the end-to-end guide (`docs/onosoo-builds.md`).
 
 ### Automatic dependency installs
 
