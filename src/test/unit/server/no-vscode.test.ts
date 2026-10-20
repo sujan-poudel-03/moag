@@ -229,3 +229,30 @@ describe('ONOSOO remote-work modules never load vscode', function () {
     });
   }
 });
+
+// ─── The host agent (`moag host`) runs environments and a gateway, never the runner: never vscode ───
+
+const HOST = path.join(SRC, 'host');
+const hostFiles = fs.existsSync(HOST) ? fs.readdirSync(HOST).filter((n) => n.endsWith('.ts')).map((n) => path.join(HOST, n)) : [];
+
+describe('host agent modules never load vscode', function () {
+  this.timeout(20000);
+
+  it('finds the host modules (non-vacuous)', () => {
+    for (const name of ['cli.ts', 'agent.ts', 'gateway.ts', 'environments.ts', 'compose.ts', 'recipe.ts', 'host-config.ts', 'tunnel.ts', 'onosoo-client.ts']) {
+      assert.ok(hostFiles.some((f) => f.endsWith(name)), name);
+    }
+  });
+
+  for (const file of hostFiles) {
+    it(`host/${path.basename(file)} reaches no vscode import at load time`, () => {
+      const offenders = [...reachable(file)].filter((f) => importsVscode(fs.readFileSync(f, 'utf-8')));
+      assert.deepEqual(offenders.map((f) => path.relative(SRC, f)), []);
+    });
+
+    // Stricter than load time: not even a lazy require, since `moag host` never installs the shim.
+    it(`host/${path.basename(file)} never imports vscode anywhere in the file`, () => {
+      assert.equal(importsVscode(fs.readFileSync(file, 'utf-8')), false);
+    });
+  }
+});

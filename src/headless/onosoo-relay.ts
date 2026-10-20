@@ -28,7 +28,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { Redactor } from '../utils/redact';
 import type { OnosooConfig } from './onosoo-config';
-import type { OnosooSpool, RelayEvent } from './onosoo-spool';
+import type { OnosooSpool, RelayEvent, ReplayCursor } from './onosoo-spool';
 
 // ─── Constants ───
 
@@ -41,6 +41,8 @@ export const BACKOFF_START_MS = 5_000;
 export const BACKOFF_MAX_MS = 300_000;
 /** In-memory queue ceiling; beyond it new events go to the spool only (replayed by the next run). */
 export const MAX_MEMORY_BYTES = 16 * 1024 * 1024;
+/** Most of that a replayed backlog may take, so the live run keeps the rest as headroom. */
+export const REPLAY_MEMORY_BYTES = MAX_MEMORY_BYTES / 2;
 /** Largest serialized `data` of one event (ONOSOO's per-event cap is 96 KB); larger becomes a dropped marker. */
 export const MAX_EVENT_DATA_BYTES = 90_000;
 /** Events that never leave the machine: process ids, and raw agent output. */
@@ -51,6 +53,8 @@ export const REVOKED_MESSAGE = 'ONOSOO device key was revoked or is wrong — re
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const RUN_META_TASKS = 1000;
+/** How often a live run's spool file is touched; far inside SPOOL_OWNER_MAX_IDLE_MS (10 min). */
+const SPOOL_TOUCH_MS = 60_000;
 
 // ─── HTTP ───
 
@@ -155,6 +159,25 @@ export function classify(status: number, body: string): RelayOutcome {
   if (status >= 300 && status < 400) { return { kind: 'transient', reason: `redirect (HTTP ${status}), not followed` }; }
   if (status >= 500) { return { kind: 'transient', reason: 'server error (HTTP 5xx)' }; }
   return { kind: 'transient', reason: `HTTP ${status}` };
+}
+
+// ─── Task status ───
+
+/**
+ * ONOSOO's protocol spells a task's final status capitalized (PROTOCOL.md: "Skipped",
+ * "Blocked") and matches it exactly, while MOAG's stdout and the hosted server use the
+ * lowercase TaskStatus values. Only the relay copy is mapped.
+ */
+const PROTOCOL_STATUS: Readonly<Record<string, string>> = {
+  completed: 'Completed',
+  failed: 'Failed',
+  skipped: 'Skipped',
+  blocked: 'Blocked',
+};
+
+/** A TaskStatus value in ONOSOO's spelling; anything unknown is returned unchanged. */
+export function protocolStatus(status: string): string {
+  return Object.prototype.hasOwnProperty.call(PROTOCOL_STATUS, status) ? PROTOCOL_STATUS[status] : status;
 }
 
 // ─── Run meta ───
@@ -297,8 +320,17 @@ export class OnosooRelay {
   private queue: Queued[] = [];
   private memBytes = 0;
   private spoolOnly = false;
-  /** Highest seq seen per replayed (earlier) run, so its files can be dropped once acked. */
+  /**
+   * Last seq per replayed (earlier) run, so its files can be dropped once acked. Set only
+   * once the run has been read to the end, so a partly loaded run is never dropped early.
+   */
   private replayedLast = new Map<string, number>();
+  /** Where replay stands in each earlier run's spool file; advanced by the spool. */
+  private replayCursors = new Map<string, ReplayCursor>();
+  /** True while earlier runs still have events on disk that did not fit in memory yet. */
+  private replayPending = false;
+  /** Touches this run's spool file every SPOOL_TOUCH_MS until close (see armTouch). */
+  private touchTimer: ReturnType<typeof setTimeout> | null = null;
 
   private batchCap = MAX_EVENTS;
   private backoffMs = BACKOFF_START_MS;
@@ -338,13 +370,9 @@ export class OnosooRelay {
    * spool file, record `run-meta` as seq 1 when given, and arm the heartbeat.
    */
   start(meta?: RunMeta): void {
-    try {
-      for (const ev of this.spool.loadReplayable(this.runId)) {
-        this.replayedLast.set(ev.run_id, Math.max(this.replayedLast.get(ev.run_id) ?? 0, ev.seq));
-        this.pushMemory(ev);
-      }
-    } catch { /* a bad spool never stops the run */ }
+    this.loadReplayChunk();
     try { this.spool.openRun(this.runId); } catch { /* sent from memory only */ }
+    this.armTouch();
     if (meta) {
       try { this.enqueue(this.buildEvent('run-meta', new Date(this.now()).toISOString(), this.runMetaData(meta))); } catch { /* skip */ }
     }
@@ -361,7 +389,11 @@ export class OnosooRelay {
       const { event: _e, ts, ...rest } = line;
       void _e;
       const at = typeof ts === 'string' ? ts : new Date(this.now()).toISOString();
-      this.enqueue(this.buildEvent(type, at, this.redactData(rest)));
+      const data = this.redactData(rest);
+      if ((type === 'task-completed' || type === 'task-failed') && typeof data.status === 'string') {
+        data.status = protocolStatus(data.status);
+      }
+      this.enqueue(this.buildEvent(type, at, data));
       this.scheduleKick();
     } catch {
       // The relay must never disturb the run.
@@ -375,6 +407,7 @@ export class OnosooRelay {
   async close(): Promise<void> {
     if (this.closed) { return; }
     this.closed = true;
+    this.clearTouch();
     let deadline: ReturnType<typeof setTimeout> | null = null;
     try {
       this.clearHeartbeat();
@@ -485,6 +518,57 @@ export class OnosooRelay {
 
   // ─── Queue ───
 
+  /**
+   * Queue the next chunk of what earlier runs left unacknowledged, within REPLAY_MEMORY_BYTES
+   * less what is already in memory (all of it at start), so the live run always keeps the
+   * other half of MAX_MEMORY_BYTES. The spool's cursors carry on where the last chunk
+   * stopped, so no event is loaded twice or skipped. Never throws.
+   */
+  private loadReplayChunk(): void {
+    try {
+      const budget = REPLAY_MEMORY_BYTES - this.memBytes;
+      const events = budget > 0
+        ? this.spool.loadReplayable(this.runId, {
+          budgetBytes: budget,
+          cursors: this.replayCursors,
+          maxEventBytes: REPLAY_MEMORY_BYTES,
+          onOversize: (ev, bytes) => this.skipOversized(ev, bytes),
+        })
+        : [];
+      for (const ev of events) { this.pushMemory(ev); }
+      // A run read to the end (seq 0: everything left in it was skipped as too large) can be
+      // dropped once its last returned seq is acked. Stale cursors were removed by the spool.
+      for (const [run, c] of this.replayCursors) {
+        if (c.eof) { this.replayedLast.set(run, c.seq); }
+      }
+      this.replayPending = [...this.replayCursors.values()].some((c) => !c.eof);
+      if (this.replayPending && events.length === 0 && this.memBytes === 0) {
+        // With all of the replay budget free nothing came back: the file could not be read.
+        this.replayPending = false;
+        this.note('replay-unreadable', 'ONOSOO relay: an earlier run\'s spool file could not be read; the rest of that backlog stays on disk for the next run.');
+      }
+    } catch {
+      // A bad spool never stops the run.
+      this.replayPending = false;
+    }
+  }
+
+  /**
+   * A spooled event of an earlier run too large for the replay budget (never one this relay
+   * would write): kept in the run's rejected file for a human, one stderr line, never sent.
+   */
+  private skipOversized(ev: RelayEvent, bytes: number): void {
+    try { this.spool.quarantine([ev], 'too_large'); } catch { /* best effort */ }
+    this.note('replay-too-large', `ONOSOO relay: an earlier run's spooled event (${bytes} bytes) is too large to resend; it was skipped and kept in the run's rejected file.`);
+  }
+
+  /** Once every replayed event in memory is delivered, load the next chunk from disk. */
+  private continueReplay(): void {
+    if (!this.replayPending || this.disabled) { return; }
+    if (this.queue.some((q) => q.ev.run_id !== this.runId)) { return; }
+    this.loadReplayChunk();
+  }
+
   private pushMemory(ev: RelayEvent): void {
     const bytes = Buffer.byteLength(JSON.stringify(ev), 'utf-8');
     this.queue.push({ ev, bytes });
@@ -546,6 +630,29 @@ export class OnosooRelay {
       'Content-Type': 'application/json',
       'User-Agent': `moag/${this.version}`,
     };
+  }
+
+  /**
+   * Touch this run's spool file every SPOOL_TOUCH_MS for as long as the relay is open —
+   * disabled (a 401) included, since the run still appends to the file. Another process
+   * treats a live pid's run file as owned only while it was written recently
+   * (onosoo-spool.ts ownedByLiveProcess), and a quiet run appends nothing. Its own timer,
+   * unref'd and cleared in close(), independent of the HTTP heartbeat. Never throws.
+   */
+  private armTouch(): void {
+    this.clearTouch();
+    if (this.closed) { return; }
+    this.touchTimer = setTimeout(() => {
+      this.touchTimer = null;
+      if (this.closed) { return; }
+      try { this.spool.touchRun(this.runId); } catch { /* best effort */ }
+      this.armTouch();
+    }, SPOOL_TOUCH_MS);
+    this.touchTimer.unref?.();
+  }
+
+  private clearTouch(): void {
+    if (this.touchTimer) { clearTimeout(this.touchTimer); this.touchTimer = null; }
   }
 
   /** One POST, bounded by REQUEST_TIMEOUT_MS even if the client ignores its own timeout. */
@@ -639,6 +746,7 @@ export class OnosooRelay {
       if (last !== undefined && n >= last) { this.spool.dropIfFullyAcked(run, last); }
     }
     this.removeAcked(maxByRun, new Set(Object.keys(maxByRun)));
+    this.continueReplay();
   }
 
   /** Send batches until the queue is empty or an outcome says to wait or stop. */

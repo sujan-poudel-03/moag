@@ -42,8 +42,11 @@ export interface CommitRequest {
 }
 
 export type CommitOutcome =
-  /** `sha` is the short sha for display; `fullSha` the 40/64-hex sha, null when it could not be read. */
-  | { committed: true; sha: string; fullSha: string | null }
+  /**
+   * `sha` is the short sha for display. `fullSha` is the 40/64-hex sha — present only when
+   * the caller asked for it (`{ fullSha: true }`), null when it could not be read.
+   */
+  | { committed: true; sha: string; fullSha?: string | null }
   | { committed: false; reason: 'nothing-to-commit' | 'commit-failed'; detail: string };
 
 const MAX_SLUG = 32;
@@ -188,13 +191,19 @@ export async function prepareBranch(
   return { ok: true, branch, created };
 }
 
+/** Options for {@link commitTask}. */
+export interface CommitOptions {
+  /** Also read the full sha (one more `git rev-parse HEAD`). Off by default: only the relay needs it. */
+  fullSha?: boolean;
+}
+
 /**
  * Commit whatever the task just produced.
  *
  * A task that changed nothing is not an error — check tasks and no-op repairs
  * legitimately produce no diff — so that resolves to `nothing-to-commit`.
  */
-export async function commitTask(req: CommitRequest, git: GitRunner): Promise<CommitOutcome> {
+export async function commitTask(req: CommitRequest, git: GitRunner, opts: CommitOptions = {}): Promise<CommitOutcome> {
   const staged = await git(['add', '-A'], req.cwd);
   if (staged === null) {
     return { committed: false, reason: 'commit-failed', detail: 'git add failed.' };
@@ -212,10 +221,11 @@ export async function commitTask(req: CommitRequest, git: GitRunner): Promise<Co
     return { committed: false, reason: 'commit-failed', detail: 'git commit failed.' };
   }
 
-  const sha = await git(['rev-parse', '--short', 'HEAD'], req.cwd);
+  const sha = (await git(['rev-parse', '--short', 'HEAD'], req.cwd) ?? '').trim();
+  if (!opts.fullSha) { return { committed: true, sha }; }
   const full = ((await git(['rev-parse', 'HEAD'], req.cwd)) ?? '').trim();
   const fullSha = /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(full) ? full : null;
-  return { committed: true, sha: (sha ?? '').trim(), fullSha };
+  return { committed: true, sha, fullSha };
 }
 
 /** One human-readable line per prepare failure. */
