@@ -49,7 +49,7 @@ export const MAX_EVENT_DATA_BYTES = 90_000;
 export const NEVER_RELAYED: ReadonlySet<string> = new Set(['task-pid', 'task-output']);
 
 /** Printed once when the server refuses the device key. */
-export const REVOKED_MESSAGE = 'ONOSOO device key was revoked or is wrong — re-pair this machine in ONOSOO (Builds → Add machine).';
+export const REVOKED_MESSAGE = 'ONOSOO device key was revoked or is wrong — re-pair this machine in ONOSOO (Builds → Pair machine).';
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const RUN_META_TASKS = 1000;

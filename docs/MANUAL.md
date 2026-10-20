@@ -644,6 +644,8 @@ ONOSOO through a gateway that admits only holders of an ONOSOO ticket, over an
 outbound tunnel. `init` writes its config, `draft <project>` drafts a run recipe
 for a person to approve, `status` shows what is configured and running. Setup,
 the recipe and what keeps it safe: [host-agent.md](host-agent.md).
+Connecting a machine to ONOSOO from scratch (pairing, the key file, `moag run`,
+`moag daemon` and `moag host` in order): [onosoo-builds.md](onosoo-builds.md).
 
 `moag trace` prints one JSON line per PRD requirement — shipped, in-progress,
 not-shipped, untracked or removed — with the PRD version and release tag that

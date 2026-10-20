@@ -172,6 +172,20 @@ task-type reference, JSONL output, systemd/cron, and the safety model.
 
 ---
 
+## ONOSOO Builds
+
+Connect a machine to the **Builds** app in ONOSOO and the workspace can follow and steer its work:
+
+- **Watch:** live runs, with what each task changed, errors, cost and the pull request. Works with `moag run` on any OS.
+- **Control:** start, stop, approve, skip and retry runs from ONOSOO, through `moag daemon` on Linux/WSL.
+- **Open it live:** open a running branch inside ONOSOO, through `moag host` on Linux/WSL with Docker.
+
+The device key stays in your user folder and never reaches the AI agents. Remote runs execute as a separate locked-down account.
+
+📖 **End-to-end setup, both sides:** [docs/onosoo-builds.md](docs/onosoo-builds.md)
+
+---
+
 ## Configuration
 
 ### Execution Profiles

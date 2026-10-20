@@ -129,7 +129,7 @@ describe('ONOSOO relay — constants and classify', () => {
   });
 
   it('the revoked message is exact', () => {
-    assert.equal(REVOKED_MESSAGE, 'ONOSOO device key was revoked or is wrong — re-pair this machine in ONOSOO (Builds → Add machine).');
+    assert.equal(REVOKED_MESSAGE, 'ONOSOO device key was revoked or is wrong — re-pair this machine in ONOSOO (Builds → Pair machine).');
   });
 
   it('classifies every response class', () => {
