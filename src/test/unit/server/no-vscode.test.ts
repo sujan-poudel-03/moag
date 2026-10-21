@@ -178,12 +178,13 @@ const RELAY_MODULES = [
   'headless/onosoo-config.ts',
   'headless/onosoo-spool.ts',
   'headless/onosoo-relay.ts',
+  'headless/run-reporter.ts',
 ];
 
 describe('ONOSOO relay modules never load vscode', function () {
   this.timeout(20000);
 
-  it('finds all six modules (non-vacuous)', () => {
+  it('finds every relay module (non-vacuous)', () => {
     for (const rel of RELAY_MODULES) {
       assert.ok(fs.existsSync(path.join(SRC, rel)), rel);
     }
