@@ -81,15 +81,40 @@ function resolvePath(root: Record<string, unknown>, dotted: string): unknown {
   return undefined;
 }
 
+// ─── In-process overrides ───────────────────────────────────────────────────
+
+/**
+ * Settings a command overrides for its own run, keyed by the full dotted id. They are
+ * never written to a config file and win over it; the caller removes them when done.
+ */
+const overrides = new Map<string, unknown>();
+
+/**
+ * Override one full dotted setting id for this process (e.g.
+ * "agentTaskPlayer.engines.claude.outputFormat"); `undefined` removes the override.
+ * Read back by the exact full id, whichever section/key split the reader uses.
+ */
+export function __setConfigOverride(dotted: string, value: unknown): void {
+  if (value === undefined) { overrides.delete(dotted); } else { overrides.set(dotted, value); }
+}
+
+/** Whether the loaded config file sets `dotted`, in any shape resolvePath accepts. Ignores overrides. */
+export function __configFileSets(dotted: string): boolean {
+  return resolvePath(loadConfig(), dotted) !== undefined;
+}
+
 class Configuration {
   constructor(private readonly section?: string) {}
   private full(key: string): string { return this.section ? `${this.section}.${key}` : key; }
   get<T>(key: string, defaultValue?: T): T | undefined {
-    const v = resolvePath(loadConfig(), this.full(key));
+    const id = this.full(key);
+    if (overrides.has(id)) { return overrides.get(id) as T; }
+    const v = resolvePath(loadConfig(), id);
     return v === undefined ? defaultValue : (v as T);
   }
   has(key: string): boolean {
-    return resolvePath(loadConfig(), this.full(key)) !== undefined;
+    const id = this.full(key);
+    return overrides.has(id) || resolvePath(loadConfig(), id) !== undefined;
   }
   inspect(): undefined { return undefined; }
   // Persist into the in-memory config for the lifetime of the process.

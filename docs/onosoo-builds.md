@@ -107,15 +107,19 @@ On Windows without a `moag` command on the PATH, call the CLI directly:
 node D:\Projects\moag\out\headless\cli.js run --prompt "Add a short README" --cwd D:\path\to\repo
 ```
 
-**Cost.** Claude Code reports what a call cost only in JSON mode. With the default text mode,
-ONOSOO shows $0.00 for runs you start yourself. To see real cost, set it in the project's
-`.moag/config.json`:
+**Cost.** Claude Code reports what a call cost only in JSON mode. `moag run` handles this for you:
+when it is connected to ONOSOO and you have not set the format yourself, it uses JSON mode for that
+run (it prints one line saying so and changes no file). The CLI shows no live engine output anyway,
+so you lose nothing. To keep text mode anyway, set the format explicitly in the project's
+`.moag/config.json` (any value you set there wins):
 
 ```json
-{ "agentTaskPlayer.engines.claude.outputFormat": "json" }
+{ "agentTaskPlayer.engines.claude.outputFormat": "text" }
 ```
 
-Remote runs started from ONOSOO always use JSON mode.
+The VS Code panel keeps text mode (live output, no cost) unless you set
+`agentTaskPlayer.engines.claude.outputFormat` to `json` in its settings, so ONOSOO shows $0.00 for
+runs started from the panel until you do. Remote runs started from ONOSOO always use JSON mode.
 
 ### 4. Check it in ONOSOO
 

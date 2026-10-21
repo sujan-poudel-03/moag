@@ -922,11 +922,24 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
     makeRedactor: () => buildRedactor(redactorExtra),
   });
   let relay: OnosooRelay | null = null;
+  // Claude reports a call's cost only in JSON mode, and headless prints no live engine
+  // output anyway: when ONOSOO is connected and the user has not chosen a format, use JSON
+  // for this run — in-process through the shim, never written to the project's config.
+  const claudeFormatKey = 'agentTaskPlayer.engines.claude.outputFormat';
+  const shim = ctx.vscode as { __setConfigOverride?: (k: string, v: unknown) => void; __configFileSets?: (k: string) => boolean };
+  let overrodeClaudeFormat = false;
   try {
     const started = startRelay(args, ctx, plan, env, buildRedactor);
     // main() already did this; a caller that bypassed main() still must not leak the key to children.
     if (!ctx.relayDeps?.env) { forgetRelayEnv(process.env); }
     if (started) {
+      if (typeof shim.__setConfigOverride === 'function' && typeof shim.__configFileSets === 'function'
+        && !shim.__configFileSets(claudeFormatKey)) {
+        shim.__setConfigOverride(claudeFormatKey, 'json');
+        overrodeClaudeFormat = true;
+        (ctx.relayDeps?.stderr ?? ((s: string): void => { process.stderr.write(s); }))(
+          'ONOSOO: using Claude JSON output so ONOSOO shows real cost (set agentTaskPlayer.engines.claude.outputFormat to override).\n');
+      }
       relay = started.relay;
       // The device key is a secret of its own: it never appears in a reported diff or tail.
       redactorExtra.push(started.key);
@@ -935,6 +948,7 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
     return await runAfterWiring(args, ctx, plan, planPath, events);
   } finally {
     emitTap = null;
+    if (overrodeClaudeFormat) { shim.__setConfigOverride?.(claudeFormatKey, undefined); }
     if (relay) { await relay.close(); }
     unwireReporting();
   }
