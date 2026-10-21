@@ -116,7 +116,12 @@ import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
-import { OnosooRelay, RelayHttpClient, RunMeta } from './onosoo-relay';
+import { OnosooRelay, RelayHttpClient } from './onosoo-relay';
+import {
+  buildRunMeta, forgetRelayEnv, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
+} from './run-reporter';
+
+export { buildRunMeta, forgetRelayEnv };
 
 /** How long a freshly launched headless sandbox gets to report `running`. */
 const UAT_SANDBOX_READY_TIMEOUT_MS = 120_000;
@@ -386,29 +391,16 @@ export function wireEvents(runner: any): RunnerEventState {
   let manualGateHit = false;
   let manualGateTaskId: string | null = null;
   let budgetHit = false;
-  runner.on('state-changed', (state: string) => emit({ event: 'state', state }));
-  runner.on('task-started', (t: any) => emit({ event: 'task-started', id: t.id, name: t.name }));
-  // The final status says which: task-completed also fires for a Skipped task, task-failed
-  // for a Blocked one (a failed dependency, or failurePolicy "mark-blocked").
-  runner.on('task-completed', (t: any) => emit({ event: 'task-completed', id: t.id, name: t.name, status: t.status }));
-  runner.on('task-failed', (t: any) => emit({ event: 'task-failed', id: t.id, name: t.name, status: t.status }));
-  runner.on('task-escalate', (t: any, category: string) => emit({ event: 'task-escalate', id: t.id, name: t.name, category }));
-  runner.on('incident', (t: any, summary: string, issueUrl: string | null) => emit({ event: 'incident', id: t.id, name: t.name, summary, issueUrl }));
-  runner.on('error', (err: Error) => emit({ event: 'error', message: err.message }));
-  // Automatic dependency installs: the event already carries every field of the protocol line.
-  runner.on('dependencies-installed', (_t: any, ev: Record<string, unknown>) => emit(ev));
-  runner.on('dependencies-install-failed', (_t: any, ev: Record<string, unknown>) => emit(ev));
-  runner.on('dependencies-not-installed', (_t: any, ev: Record<string, unknown>) => emit(ev));
+  // The lines first (run-reporter.ts), so each policy listener below runs after its event's line.
+  wireRunEventLines(runner, emit);
   // Headless has no human to answer a Continue/Stop prompt, so a breached ceiling always stops.
-  runner.on('budget-exceeded', (d: any) => {
+  runner.on('budget-exceeded', () => {
     budgetHit = true;
-    emit({ event: 'budget-exceeded', totalCost: d.totalCost, budget: d.budget });
     runner.stop();
   });
   runner.on('manual-gate', (t: any) => {
     manualGateHit = true;
     manualGateTaskId = t.id;
-    emit({ event: 'manual-gate', id: t.id, name: t.name, note: 'Halting for human approval (ship gate).' });
     // Deferred on purpose (as in src/server/run-worker.ts): stop() inside this
     // emit aborts the task signal BEFORE runManualTask attaches its abort
     // listener, so the gate promise never settles and play() never resolves —
@@ -423,12 +415,7 @@ export function wireEvents(runner: any): RunnerEventState {
 }
 
 function tally(plan: any, TaskStatus: any): { total: number; completed: number; failed: number } {
-  const tasks = plan.playlists.flatMap((pl: any) => pl.tasks);
-  return {
-    total: tasks.length,
-    completed: tasks.filter((t: any) => t.status === TaskStatus.Completed).length,
-    failed: tasks.filter((t: any) => t.status === TaskStatus.Failed).length,
-  };
+  return tallyPlan(plan, TaskStatus);
 }
 
 // ─── verify helpers (pure — unit-testable without booting the CLI) ───────────
@@ -954,12 +941,6 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   }
 }
 
-/** Remove the ONOSOO relay variables from `env` (the device key must not reach child processes). */
-export function forgetRelayEnv(env: NodeJS.ProcessEnv): void {
-  delete env.MOAG_ONOSOO_KEY;
-  delete env.MOAG_ONOSOO_URL;
-}
-
 /** The relay variables as main() found them, before it removed them from process.env. */
 let relayEnvSnapshot: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string } | null = null;
 
@@ -969,11 +950,7 @@ let relayEnvSnapshot: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string } | n
  * command spawns — ever inherits the device key.
  */
 export function captureRelayEnv(env: NodeJS.ProcessEnv = process.env): void {
-  relayEnvSnapshot = {
-    ...(env.MOAG_ONOSOO_KEY !== undefined ? { MOAG_ONOSOO_KEY: env.MOAG_ONOSOO_KEY } : {}),
-    ...(env.MOAG_ONOSOO_URL !== undefined ? { MOAG_ONOSOO_URL: env.MOAG_ONOSOO_URL } : {}),
-  };
-  forgetRelayEnv(env);
+  relayEnvSnapshot = takeRelayEnv(env);
 }
 
 /** The env the relay configuration reads: process.env with main()'s captured relay variables over it. */
@@ -994,58 +971,21 @@ function startRelay(
   buildRedactor: (extra: string[]) => Redactor,
 ): { relay: OnosooRelay; key: string } | null {
   const deps = ctx.relayDeps;
-  const stderr = deps?.stderr ?? ((s: string): void => { process.stderr.write(s); });
-  try {
-    const cfg = resolveOnosooConfig({ env, cwd: args.cwd, stderr });
-    if (!cfg) { return null; }
-    let redactor: Redactor;
-    try {
-      redactor = buildRedactor([cfg.key]);
-    } catch {
-      // Every relayed event then carries { redaction_failed: true } instead of its data.
-      redactor = { redact: (): never => { throw new Error('redactor unavailable'); } };
-    }
-    const spool = new OnosooSpool(cfg.stateDir, args.cwd, { isPidAlive: deps?.isPidAlive });
-    const relay = new OnosooRelay({
-      config: cfg, spool, http: deps?.http, redactor, stderr, closeDeadlineMs: deps?.closeDeadlineMs, cwd: args.cwd,
-    });
-    relay.start(buildRunMeta(plan, args.cwd));
-    return { relay, key: cfg.key };
-  } catch (err) {
-    stderr(`ONOSOO relay could not start: ${err instanceof Error ? err.message : String(err)}\n`);
-    return null;
-  }
-}
-
-/**
- * The relay-only `run-meta` facts for a plan: its name, the project's package.json
- * name (else the folder's base name — never a path), and each task's id and name in
- * plan order. Caps and redaction are the relay's.
- */
-export function buildRunMeta(plan: any, cwd: string): RunMeta {
-  let project = '';
-  try {
-    const pkg: unknown = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf-8'));
-    const name = (pkg as { name?: unknown } | null)?.name;
-    if (typeof name === 'string' && name.trim().length > 0) { project = name; }
-  } catch { /* no package.json */ }
-  if (!project) { project = path.basename(path.resolve(cwd)); }
-  const tasks = (plan?.playlists ?? []).flatMap((pl: any) => pl?.tasks ?? [])
-    .map((t: any) => ({ id: String(t?.id), name: String(t?.name ?? '') }));
-  return { plan_name: String(plan?.name ?? ''), project, tasks };
+  return startRunRelay({
+    cwd: args.cwd,
+    plan,
+    env,
+    buildRedactor,
+    stderr: deps?.stderr ?? ((s: string): void => { process.stderr.write(s); }),
+    http: deps?.http,
+    isPidAlive: deps?.isPidAlive,
+    closeDeadlineMs: deps?.closeDeadlineMs,
+  });
 }
 
 /** Emit a `cost` line per engine call during a run; returns the unsubscribe. Never throws. */
 function subscribeRunCost(): () => void {
-  try {
-    const { costLedger } = require('../utils/cost-ledger');
-    const offRecord = costLedger.onRecord((e: { estimatedCostUsd: number; costSource?: string }) =>
-      emit({ event: 'cost', usd: e.estimatedCostUsd, source: e.costSource ?? 'estimated' }));
-    const offUnreported = costLedger.onUnreported(() => emit({ event: 'cost', usd: 0, source: 'none' }));
-    return (): void => { offRecord(); offUnreported(); };
-  } catch {
-    return (): void => undefined;
-  }
+  return subscribeRunCostLines(emit);
 }
 
 /** What a caller other than cmdRun adds to the run: the delivery branch an ONOSOO remote run commits to. */
