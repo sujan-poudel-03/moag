@@ -143,7 +143,8 @@ the **MOAG** output channel.
 - **Pull requests.** The panel does not relay `pr-created`: a pull request you open later by hand is
   not attached to the run in ONOSOO.
 - **Approval gates.** The panel waits at a gate for your click; it never reports "awaiting approval".
-  If you stop a run while it waits at a gate, ONOSOO shows it as stopped (code 1).
+  If you stop a run while it waits at a gate, ONOSOO shows it as **gaps** (code 1: the run did not
+  finish every task), the same as any other run you stop.
 
 ### 4. Check it in ONOSOO
 
@@ -160,8 +161,10 @@ wait in a local spool (`<config>/moag/onosoo-spool/`) and are sent by the next r
 
 ### 5. Stay online
 
-Between runs ONOSOO shows the machine **offline** after 3 minutes without a request. To keep it
-**online**, keep `moag daemon` running. With the key saved and no `.moag/daemon.json`, the daemon
+ONOSOO shows a machine **Online** after "any request in the last 3 minutes" (ONOSOO's
+`docs/builds/SETUP.md`; any authenticated request counts: events, command polls, environments).
+So between runs, with nothing sending, the machine shows **offline** 3 minutes after its last
+request. To keep it **online**, keep `moag daemon` running. With the key saved and no `.moag/daemon.json`, the daemon
 only polls ONOSOO: it never starts work on its own and, on Windows and macOS, reports remote start
 as off.
 
