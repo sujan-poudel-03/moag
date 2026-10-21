@@ -112,8 +112,10 @@ export const window = {
   createTreeView: () => ({ dispose: () => {} }),
   createStatusBarItem: () => ({
     text: '',
+    tooltip: '',
     command: '',
     show: () => {},
+    hide: () => {},
     dispose: () => {},
   }),
 };

@@ -881,6 +881,18 @@ describe('Regression: browser UAT manifest contributions', () => {
     assert.equal(prop.default, '1.62.1');
     assert.notEqual(prop.default, 'latest');
   });
+
+  it('declares agentTaskPlayer.onosoo.relay as a machine-scoped boolean, on by default', () => {
+    const prop = pkg.contributes.configuration.properties['agentTaskPlayer.onosoo.relay'] as {
+      type: string;
+      default: unknown;
+      scope?: string;
+    } | undefined;
+    assert.ok(prop, 'agentTaskPlayer.onosoo.relay is read at runtime but missing from contributes.configuration');
+    assert.equal(prop.type, 'boolean');
+    assert.equal(prop.default, true);
+    assert.equal(prop.scope, 'machine');
+  });
 });
 
 // ─── 5. Engine call-site census ───────────────────────────────────────────────

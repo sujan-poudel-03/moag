@@ -1349,6 +1349,12 @@
           "default": true,
           "description": "Record per-engine-call usage (task, developer, prompt, tokens/cost) to .moag/usage-log.jsonl and show the Contribution Ledger in the dashboard."
         },
+        "agentTaskPlayer.onosoo.relay": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Relay runs started from VS Code to ONOSOO Builds when this machine is paired (device key in MOAG_ONOSOO_KEY or the user-level moag/onosoo.json). Off: nothing is sent. Does not affect the moag CLI."
+        },
         "agentTaskPlayer.contributionLedger.leads": {
           "type": "array",
           "items": {
