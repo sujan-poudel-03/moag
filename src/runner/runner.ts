@@ -387,6 +387,8 @@ export class TaskRunner {
   private _currentPlaylistIndex = 0;
   private _currentTaskIndex = 0;
   private _plan: Plan | null = null;
+  /** Task ids a playTask/playTasks run is scoped to; null for a whole-plan play(). */
+  private _runTaskIds: string[] | null = null;
   private _pauseResolve: (() => void) | null = null;
   private _playLock = false;
   private _taskGitRefs = new Map<string, { ref: string; cwd: string }>();
@@ -617,6 +619,19 @@ export class TaskRunner {
     return this._currentRunId;
   }
 
+  /** The plan of the current run; valid from the `playing` state-changed onward; never cleared. */
+  get currentPlan(): Plan | null {
+    return this._plan;
+  }
+
+  /**
+   * Task ids the current run is scoped to (playTask/playTasks), or null for a whole-plan play();
+   * valid from the `playing` state-changed onward; never cleared.
+   */
+  get currentRunTaskIds(): readonly string[] | null {
+    return this._runTaskIds;
+  }
+
   getTaskGitRef(taskId: string): { ref: string; cwd: string } | undefined {
     return this._taskGitRefs.get(taskId);
   }
@@ -756,6 +771,7 @@ export class TaskRunner {
     this._playLock = true;
 
     this._plan = plan;
+    this._runTaskIds = null;
     this._currentPlaylistIndex = playlistIndex;
     this._currentTaskIndex = taskIndex;
     this._abortController = new AbortController();
@@ -801,10 +817,10 @@ export class TaskRunner {
     this._plan = plan;
     this._abortController = new AbortController();
     this.resetRunBudgetTracking();
-    this.setState(RunnerState.Playing);
-
     const playlist = plan.playlists[playlistIndex];
     const task = playlist.tasks[taskIndex];
+    this._runTaskIds = [task.id];
+    this.setState(RunnerState.Playing);
 
     try {
       const runStart = this.notifyRunStart();
@@ -832,6 +848,9 @@ export class TaskRunner {
     this._plan = plan;
     this._abortController = new AbortController();
     this.resetRunBudgetTracking();
+    this._runTaskIds = taskList
+      .map(({ playlistIndex, taskIndex }) => plan.playlists[playlistIndex]?.tasks[taskIndex]?.id)
+      .filter((id): id is string => typeof id === 'string');
     this.setState(RunnerState.Playing);
 
     try {

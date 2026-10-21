@@ -574,6 +574,80 @@ describe('TaskRunner', () => {
     assert.equal(runner.state, RunnerState.Idle);
   });
 
+  // ─── currentPlan / currentRunTaskIds ───
+
+  describe('current run scope getters', () => {
+    /** Records both getters at the moment the runner announces `playing`. */
+    function capture(runner: { on: (e: string, h: (s: RunnerState) => void) => void; currentPlan: Plan | null; currentRunTaskIds: readonly string[] | null }) {
+      const seen: Array<{ plan: Plan | null; ids: readonly string[] | null }> = [];
+      runner.on('state-changed', (s: RunnerState) => {
+        if (s === RunnerState.Playing) {
+          seen.push({ plan: runner.currentPlan, ids: runner.currentRunTaskIds ? [...runner.currentRunTaskIds] : null });
+        }
+      });
+      return seen;
+    }
+
+    it('play() exposes the plan and no task scope from the playing emit', async () => {
+      const { runner } = buildRunner();
+      const seen = capture(runner);
+      const plan = makePlan();
+      await runner.play(plan);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].plan, plan);
+      assert.equal(seen[0].ids, null);
+    });
+
+    it('playTask() scopes the run to that one task', async () => {
+      const { runner } = buildRunner();
+      const seen = capture(runner);
+      const plan = makePlan();
+      await runner.playTask(plan, 0, 1);
+      assert.equal(seen[0].plan, plan);
+      assert.deepEqual(seen[0].ids, [plan.playlists[0].tasks[1].id]);
+      assert.deepEqual(runner.currentRunTaskIds, [plan.playlists[0].tasks[1].id], 'never cleared at idle');
+    });
+
+    it('playTasks() scopes the run to the resolved ids and skips missing ones', async () => {
+      const { runner } = buildRunner();
+      const seen = capture(runner);
+      const plan = makePlan();
+      await runner.playTasks(plan, [
+        { playlistIndex: 0, taskIndex: 1 },
+        { playlistIndex: 0, taskIndex: 7 },
+        { playlistIndex: 3, taskIndex: 0 },
+        { playlistIndex: 0, taskIndex: 0 },
+      ]);
+      assert.equal(seen[0].plan, plan);
+      assert.deepEqual(seen[0].ids, [plan.playlists[0].tasks[1].id, plan.playlists[0].tasks[0].id]);
+    });
+
+    it('a play() after a playTask() resets the task scope to null', async () => {
+      const { runner } = buildRunner();
+      const seen = capture(runner);
+      const plan = makePlan();
+      await runner.playTask(plan, 0, 0);
+      const plan2 = makePlan();
+      await runner.play(plan2);
+      assert.equal(seen.length, 2);
+      assert.equal(seen[1].plan, plan2);
+      assert.equal(seen[1].ids, null);
+      assert.equal(runner.currentRunTaskIds, null);
+    });
+
+    it('a play() rejected by the play lock changes neither getter', async () => {
+      const { runner } = buildRunner();
+      const plan = makePlan();
+      await runner.playTask(plan, 0, 0);
+      const ids = runner.currentRunTaskIds;
+      (runner as unknown as { _playLock: boolean })._playLock = true;
+      await runner.play(makePlan());
+      assert.equal(runner.currentPlan, plan);
+      assert.equal(runner.currentRunTaskIds, ids);
+      (runner as unknown as { _playLock: boolean })._playLock = false;
+    });
+  });
+
   it('should retry a failed task when retryCount is set', async function () {
     this.timeout(10000);
     const { runner } = buildRunner();
