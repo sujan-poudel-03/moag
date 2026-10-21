@@ -107,6 +107,40 @@ describe('headless CLI: moag run uses Claude JSON output when connected to ONOSO
     assert.equal(shim.workspace.getConfiguration('agentTaskPlayer.engines.claude').get('outputFormat', 'text'), 'text', 'no override survives the run');
   });
 
+  it('the override is removed when the run fails: a rejecting play() (code 2) and a throw out of cmdRun', async () => {
+    const readFormat = (): unknown => shim.workspace.getConfiguration('agentTaskPlayer.engines.claude').get('outputFormat', 'text');
+    const ctxFor = (runner: unknown, configDir: string) => ({
+      runner, vscode: shim, TaskStatus, loadPlan,
+      relayDeps: {
+        env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: BASE },
+        http, closeDeadlineMs: 2000, stderr: () => undefined,
+      },
+    });
+
+    // 1. play() rejects: runAfterWiring reports code 2.
+    const a = workspace();
+    const seen: string[] = [];
+    const rejecting = new EventEmitter() as EventEmitter & { stop: () => void; play: (p: Plan) => Promise<void> };
+    rejecting.stop = () => undefined;
+    rejecting.play = async () => { seen.push(String(readFormat())); throw new Error('engine crashed'); };
+    const code = await loadCli().cmdRun(parseArgs(['run', a.planFile, '--cwd', a.dir]), ctxFor(rejecting, a.configDir));
+    assert.equal(code, 2);
+    assert.deepEqual(seen, ['json'], 'the override was in force during the run');
+    assert.equal(readFormat(), 'text', 'no override survives a rejected play()');
+
+    // 2. Something throws out of cmdRun itself (here: writing the run-started line).
+    const b = workspace();
+    stdout.callsFake((chunk: unknown) => {
+      if (String(chunk).includes('"run-started"')) { throw new Error('stdout closed'); }
+      return true;
+    });
+    await assert.rejects(
+      loadCli().cmdRun(parseArgs(['run', b.planFile, '--cwd', b.dir]), ctxFor(formatRecordingRunner([]), b.configDir)),
+      /stdout closed/,
+    );
+    assert.equal(readFormat(), 'text', 'no override survives a thrown run');
+  });
+
   it('relay on and the format unset: the project config file is not written', async () => {
     const { dir, planFile, configDir } = workspace({ agentTaskPlayer: { defaultEngine: 'claude' } });
     const before = fs.readFileSync(path.join(dir, '.moag', 'config.json'), 'utf-8');
