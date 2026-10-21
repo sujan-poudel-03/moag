@@ -16,10 +16,15 @@
 # The key stays in onosoo.json. This script never reads it into the task's arguments or
 # environment, and it never sets an environment variable.
 #
-# The daemon's output goes to %LOCALAPPDATA%\moag\daemon.log. If it exits with an error it
-# is started again after a minute. Its working directory is %LOCALAPPDATA%\moag\daemon (not
-# your profile folder: %APPDATA%\moag is inside the profile, and MOAG refuses to relay when its
-# config folder is inside the working directory).
+# The daemon's output goes to %LOCALAPPDATA%\moag\daemon.log (moved to daemon.log.1 past
+# 10 MB). If it exits with an error it is started again after a minute, but after 5 failures
+# within 10 minutes (a configuration error, say) it stops trying and says so in the log. Its
+# working directory is %LOCALAPPDATA%\moag\daemon (not your profile folder: %APPDATA%\moag is
+# inside the profile, and MOAG refuses to relay when its config folder is inside the working
+# directory).
+#
+# -Install, -Uninstall and -Status touch only this task's own processes: a `moag daemon` you
+# started by hand keeps running.
 #
 # -Run is internal: it is what the Scheduled Task runs.
 [CmdletBinding(DefaultParameterSetName = 'Status')]
@@ -42,6 +47,8 @@ $Log = Join-Path $StateDir 'daemon.log'
 $OnosooFile = Join-Path $env:APPDATA 'moag\onosoo.json'
 $RestartDelaySec = 60
 $MaxLogBytes = 10MB
+$MaxFailures = 5
+$FailureWindowSec = 600
 
 function Say($m) { Write-Host "  $m" }
 function Fail($m) { [Console]::Error.WriteLine("  $m"); exit 1 }
@@ -50,16 +57,41 @@ function Write-Log($line) {
   try { [System.IO.File]::AppendAllText($Log, "$line`r`n", (New-Object System.Text.UTF8Encoding $false)) } catch { }
 }
 
-# The node and powershell processes this task started, found by their command lines.
-function Get-DaemonProcesses {
+# Move a log past $MaxLogBytes to daemon.log.1 (one generation is kept). Never throws.
+function Invoke-LogRotate {
+  try {
+    if ((Test-Path $Log) -and (Get-Item $Log).Length -gt $MaxLogBytes) { Move-Item -Force $Log "$Log.1" }
+  } catch { }
+}
+
+# The Scheduled Task's own wrapper: powershell running THIS script with -Run, as the task's
+# action starts it (-File "<script>" -Run). Nothing else matches.
+function Get-DaemonWrappers {
+  $needle = ('-File "' + $Script + '" -Run').ToLowerInvariant()
+  @(Get-CimInstance Win32_Process -Filter "Name = 'powershell.exe' OR Name = 'pwsh.exe'" |
+    Where-Object { ([string]$_.CommandLine).ToLowerInvariant().Contains($needle) })
+}
+
+# The Scheduled Task's own node: this checkout's cli.js with exactly `daemon --cwd <WorkDir>`
+# (%LOCALAPPDATA%\moag\daemon). A `moag daemon --cwd <project>` started by hand never matches.
+function Get-DaemonNodes {
   $cliNeedle = $Cli.ToLowerInvariant()
-  $scriptNeedle = $Script.ToLowerInvariant()
-  Get-CimInstance Win32_Process -Filter "Name = 'node.exe' OR Name = 'powershell.exe' OR Name = 'pwsh.exe'" |
+  $cwdPattern = '\sdaemon\s+--cwd\s+"?' + [regex]::Escape($WorkDir.ToLowerInvariant()) + '"?\s*$'
+  @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
     Where-Object {
-      $cl = [string]$_.CommandLine
-      $low = $cl.ToLowerInvariant()
-      ($low.Contains($cliNeedle) -and $low.Contains(' daemon')) -or ($low.Contains($scriptNeedle) -and $low.Contains('-run'))
-    }
+      $low = ([string]$_.CommandLine).ToLowerInvariant()
+      $low.Contains($cliNeedle) -and ($low -match $cwdPattern)
+    })
+}
+
+# Stop the task's wrapper with its process tree (so it cannot start node again), then any node
+# of the task left without its wrapper. Returns how many processes were found.
+function Stop-DaemonProcesses {
+  $wrappers = Get-DaemonWrappers
+  foreach ($w in $wrappers) { & taskkill.exe /PID $w.ProcessId /T /F 2>&1 | Out-Null }
+  $orphans = Get-DaemonNodes
+  foreach ($n in $orphans) { Stop-Process -Id $n.ProcessId -Force -ErrorAction SilentlyContinue }
+  return ($wrappers.Count + $orphans.Count)
 }
 
 # --- -Run: what the Scheduled Task runs -----------------------------------------------
@@ -69,15 +101,27 @@ if ($Run) {
   New-Item -ItemType Directory -Force $WorkDir | Out-Null
   Set-Location $WorkDir
   if (-not $Node) { $Node = 'node' }
+  $failures = @()
   while ($true) {
-    if ((Test-Path $Log) -and (Get-Item $Log).Length -gt $MaxLogBytes) {
-      Move-Item -Force $Log "$Log.1"
-    }
+    Invoke-LogRotate
     Write-Log "[$(Get-Date -Format o)] starting: $Node $Cli daemon --cwd $WorkDir"
-    & $Node $Cli daemon --cwd $WorkDir 2>&1 | ForEach-Object { Write-Log "$_" }
+    # Rotation is also checked every 500 lines, so a chatty daemon cannot grow the log unbounded.
+    $lines = 0
+    & $Node $Cli daemon --cwd $WorkDir 2>&1 | ForEach-Object {
+      Write-Log "$_"
+      $lines++
+      if ($lines % 500 -eq 0) { Invoke-LogRotate }
+    }
     $code = $LASTEXITCODE
     Write-Log "[$(Get-Date -Format o)] moag daemon exited with code $code"
     if ($code -eq 0) { exit 0 }
+    $now = Get-Date
+    $failures = @(@($failures) + $now | Where-Object { ($now - $_).TotalSeconds -le $FailureWindowSec })
+    if ($failures.Count -ge $MaxFailures) {
+      Write-Log "[$(Get-Date -Format o)] GIVING UP: moag daemon failed $($failures.Count) times within $($FailureWindowSec / 60) minutes (last exit code $code) and is not restarted again. Fix the error above (exit code 2 is a configuration error), then run this script with -Install again."
+      # Exit 0 on purpose: the task's own restart-on-failure must not start the loop again.
+      exit 0
+    }
     Write-Log "[$(Get-Date -Format o)] restarting in $RestartDelaySec s"
     Start-Sleep -Seconds $RestartDelaySec
   }
@@ -111,10 +155,10 @@ if ($Install) {
   $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
     -Description 'Keeps this machine online in ONOSOO (moag daemon, poller only). Installed by scripts\install-daemon-windows.ps1.'
 
-  # A re-install replaces the task; stop the old daemon first so only one runs.
+  # A re-install replaces the task; stop the old task's daemon first so only one runs.
   if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-    Get-DaemonProcesses | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    [void](Stop-DaemonProcesses)
   }
   try {
     Register-ScheduledTask -TaskName $TaskName -InputObject $task -Force | Out-Null
@@ -138,10 +182,9 @@ if ($Uninstall) {
   } else {
     Say "'$TaskName' is not installed."
   }
-  # The wrapper first, so it cannot start node again; then node itself.
-  $procs = @(Get-DaemonProcesses | Sort-Object { if ($_.Name -eq 'node.exe') { 1 } else { 0 } })
-  foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-  if ($procs.Count -gt 0) { Say "Stopped $($procs.Count) daemon process(es)." }
+  # Only the task's own processes; a moag daemon started by hand keeps running.
+  $stopped = Stop-DaemonProcesses
+  if ($stopped -gt 0) { Say "Stopped the task's daemon ($stopped process(es) found)." }
   Say "The log is kept: $Log"
   exit 0
 }
@@ -156,7 +199,7 @@ if (-not $task) {
   Say "Runs as     : $($task.Principal.UserId)"
   Say "Last run    : $($info.LastRunTime) (result $($info.LastTaskResult))"
 }
-$running = @(Get-DaemonProcesses | Where-Object { $_.Name -eq 'node.exe' })
+$running = Get-DaemonNodes
 if ($running.Count -gt 0) {
   Say "Daemon      : running (pid $(($running | ForEach-Object { $_.ProcessId }) -join ', '))"
 } else {

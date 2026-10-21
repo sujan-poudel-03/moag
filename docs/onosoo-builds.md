@@ -178,8 +178,12 @@ powershell -ExecutionPolicy Bypass -File D:\Projects\moag\scripts\install-daemon
 starts at your logon with a hidden window and runs `node <repo>\out\headless\cli.js daemon` in
 `%LOCALAPPDATA%\moag\daemon` (deliberately not your profile folder, which contains `%APPDATA%\moag`:
 MOAG refuses to relay when its config folder is inside the working directory). If the daemon exits
-with an error it is started again after a minute. Output goes to `%LOCALAPPDATA%\moag\daemon.log`.
-The key stays in `onosoo.json`: it is never put in the task's arguments or environment.
+with an error it is started again after a minute; after 5 failures within 10 minutes (a configuration
+error, say) it stops and writes a `GIVING UP` line to the log: fix the error and run `-Install` again.
+Output goes to `%LOCALAPPDATA%\moag\daemon.log`, which moves to `daemon.log.1` past 10 MB.
+`-Install`, `-Uninstall` and `-Status` touch only the task's own processes: a `moag daemon` you started
+by hand keeps running. The key stays in `onosoo.json`: it is never put in the task's arguments or
+environment.
 
 **Linux / WSL2:** run it as a systemd service, as in
 [onosoo-remote.md, "Running the daemon as a service"](onosoo-remote.md#6-running-the-daemon-as-a-service).
