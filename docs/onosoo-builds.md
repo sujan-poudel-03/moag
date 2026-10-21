@@ -107,6 +107,16 @@ On Windows without a `moag` command on the PATH, call the CLI directly:
 node D:\Projects\moag\out\headless\cli.js run --prompt "Add a short README" --cwd D:\path\to\repo
 ```
 
+**Cost.** Claude Code reports what a call cost only in JSON mode. With the default text mode,
+ONOSOO shows $0.00 for runs you start yourself. To see real cost, set it in the project's
+`.moag/config.json`:
+
+```json
+{ "agentTaskPlayer.engines.claude.outputFormat": "json" }
+```
+
+Remote runs started from ONOSOO always use JSON mode.
+
 ### 4. Check it in ONOSOO
 
 Open **Builds**. Within seconds you should see:
