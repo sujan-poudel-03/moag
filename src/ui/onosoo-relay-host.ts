@@ -31,7 +31,13 @@ export interface OnosooRelayHostDeps {
   runner: HostRelayRunner;
   /** The relay variables activate() took out of process.env. */
   relayEnv: RelayEnvSnapshot;
+  /** The loaded plan's file path. */
   planPath(): string | null;
+  /**
+   * The loaded plan object. A run whose plan is not this one (a prompt or single-task temp
+   * plan) reports planPath '<inline prompt>' rather than the open plan's path.
+   */
+  loadedPlan?(): Plan | null;
   log(line: string): void;
 }
 
@@ -68,13 +74,20 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
     item.show();
   };
 
-  render(probeRelayStatus(env(), cwd(), enabled(), deps.log));
+  const reprobe = (): void => { render(probeRelayStatus(env(), cwd(), enabled(), deps.log)); };
+  reprobe();
 
   const configListener = vscode.workspace.onDidChangeConfiguration((e) => {
-    if (e.affectsConfiguration(RELAY_SETTING)) {
-      render(probeRelayStatus(env(), cwd(), enabled(), deps.log));
-    }
+    if (e.affectsConfiguration(RELAY_SETTING)) { reprobe(); }
   });
+  // The first folder is the relay's workspace (and the key check runs against it).
+  const foldersListener = vscode.workspace.onDidChangeWorkspaceFolders(() => reprobe());
+
+  /** The loaded plan's path, or null (→ '<inline prompt>') for a run of some other plan. */
+  const planPath = (): string | null => {
+    if (deps.loadedPlan && deps.runner.currentPlan !== deps.loadedPlan()) { return null; }
+    return deps.planPath();
+  };
 
   // ─── Cost notice ───
 
@@ -109,12 +122,12 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
     cwd,
     env,
     enabled,
-    planPath: deps.planPath,
+    planPath,
     fullAuto,
     log: deps.log,
     onStatus: render,
     onRunRelayed: maybeNotice,
   });
 
-  deps.context.subscriptions.push(item, configListener, { dispose: () => controller.dispose() });
+  deps.context.subscriptions.push(item, configListener, foldersListener, { dispose: () => controller.dispose() });
 }

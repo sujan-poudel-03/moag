@@ -35,6 +35,7 @@ describe('onosoo-relay-host', () => {
   let controllerDispose: sinon.SinonSpy;
   let probe: sinon.SinonStub;
   let configListener: ((e: { affectsConfiguration(s: string): boolean }) => void) | null;
+  let foldersListener: (() => void) | null;
   let globalStore: Map<string, unknown>;
   let update: sinon.SinonStub;
   let subscriptions: Array<{ dispose(): unknown }>;
@@ -48,12 +49,17 @@ describe('onosoo-relay-host', () => {
     controllerDispose = sinon.spy();
     probe = sinon.stub().returns('none');
     configListener = null;
+    foldersListener = null;
     globalStore = new Map();
     update = sinon.stub().callsFake(async (k: string, v: unknown) => { globalStore.set(k, v); });
     subscriptions = [];
     sinon.stub(vscodeMock.window, 'createStatusBarItem').returns(item);
     sinon.stub(vscodeMock.workspace, 'onDidChangeConfiguration').callsFake((...args: unknown[]) => {
       configListener = args[0] as typeof configListener;
+      return { dispose: () => undefined };
+    });
+    sinon.stub(vscodeMock.workspace, 'onDidChangeWorkspaceFolders').callsFake((...args: unknown[]) => {
+      foldersListener = args[0] as () => void;
       return { dispose: () => undefined };
     });
   });
@@ -64,7 +70,7 @@ describe('onosoo-relay-host', () => {
   });
 
   /** A fresh copy of the module (so its once-per-session flag starts unset), initialised. */
-  function init(relayEnv: Record<string, string> = {}): HostModule {
+  function init(relayEnv: Record<string, string> = {}, extra: { runner?: unknown; planPath?: () => string | null; loadedPlan?: () => Plan | null } = {}): HostModule {
     const mod = proxyquire('../../../ui/onosoo-relay-host', {
       vscode: vscodeMock,
       '../headless/host-run-relay': {
@@ -80,9 +86,10 @@ describe('onosoo-relay-host', () => {
         globalState: { get: <T>(k: string, d: T): T => (globalStore.has(k) ? globalStore.get(k) as T : d), update, keys: () => [], setKeysForSync: () => undefined },
         subscriptions,
       } as unknown as Parameters<HostModule['initOnosooRelayHost']>[0]['context'],
-      runner: {} as never,
+      runner: (extra.runner ?? {}) as never,
       relayEnv,
-      planPath: () => null,
+      planPath: extra.planPath ?? (() => null),
+      ...(extra.loadedPlan ? { loadedPlan: extra.loadedPlan } : {}),
       log: () => undefined,
     });
     return mod;
@@ -120,7 +127,25 @@ describe('onosoo-relay-host', () => {
     assert.equal(item.text, '$(circle-slash) ONOSOO: off');
   });
 
+  it('a change of workspace folders probes again', () => {
+    init();
+    assert.equal(probe.callCount, 1);
+    probe.returns('on');
+    foldersListener!();
+    assert.equal(probe.callCount, 2);
+    assert.equal(item.text, '$(cloud) ONOSOO');
+  });
+
   // ─── readers ───
+
+  it('planPath: the loaded plan reports its path; any other plan (a prompt run) reports null', () => {
+    const loaded = plan([undefined], 'claude');
+    const runner = { currentPlan: loaded as Plan | null };
+    init({}, { runner, planPath: () => '/w/plan.json', loadedPlan: () => loaded });
+    assert.equal(captured!.planPath(), '/w/plan.json');
+    runner.currentPlan = plan([undefined], 'claude'); // a temporary single-task / prompt plan
+    assert.equal(captured!.planPath(), null);
+  });
 
   it('enabled() honours the setting, default true', () => {
     init();
@@ -237,7 +262,7 @@ describe('onosoo-relay-host', () => {
 
   it('disposing the subscriptions disposes the controller', () => {
     init();
-    assert.equal(subscriptions.length, 3);
+    assert.equal(subscriptions.length, 4);
     for (const s of subscriptions) { s.dispose(); }
     assert.equal(controllerDispose.callCount, 1);
   });

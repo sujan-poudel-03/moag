@@ -180,6 +180,16 @@ describe('host-run-relay', function () {
     assert.equal(h.runner.setTaskSettledHook.called, false);
   });
 
+  it('no key and the setting off: status none, not off (the key is checked first)', async () => {
+    const h = make({ enabled: () => false });
+    delete h.env.MOAG_ONOSOO_KEY;
+    h.start();
+    setState(h.runner, 'idle');
+    assert.equal(h.ctl.status, 'none');
+    assert.deepEqual(h.statuses, ['none']);
+    assert.equal(h.rec.calls.length, 0);
+  });
+
   it('no cwd: not relayed', async () => {
     const h = make({ cwdNull: true });
     h.start();
@@ -378,6 +388,23 @@ describe('host-run-relay', function () {
       h.runner.emit('budget-exceeded', { totalCost: 2, budget: 1 });
       completeAll(h);
     }), 0);
+  });
+
+  it('a budget pause, Continue (resume), then a later Stop is code 1, not 4', async () => {
+    assert.equal(await codeOf((h) => {
+      h.runner.emit('budget-exceeded', { totalCost: 2, budget: 1 });
+      setState(h.runner, 'paused');
+      setState(h.runner, 'playing');
+      setState(h.runner, 'stopping');
+    }), 1);
+  });
+
+  it('a budget pause answered with Stop is still code 4', async () => {
+    assert.equal(await codeOf((h) => {
+      h.runner.emit('budget-exceeded', { totalCost: 2, budget: 1 });
+      setState(h.runner, 'paused');
+      setState(h.runner, 'stopping');
+    }), 4);
   });
 
   it('a failed task is code 1', async () => {

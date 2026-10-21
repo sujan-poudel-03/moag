@@ -118,9 +118,11 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     inRun = true;
     relay = null;
     scoped = null;
-    if (!d.enabled()) { setStatus('off'); return; }
     const cwd = d.cwd();
     if (!cwd) { setStatus('none'); return; }
+    // The key first: with no key the status is 'none' whatever the setting says. Switched off,
+    // the relay's own config messages are not repeated on every run.
+    if (!d.enabled()) { setStatus(probeRelayStatus(d.env(), cwd, false, () => undefined)); return; }
     const plan = d.runner.currentPlan;
     if (!plan) { return; }
     const runPlan = scopePlan(plan, d.runner.currentRunTaskIds);
@@ -190,6 +192,8 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
           rec(obj);
           return;
         }
+        // A resume (Continue after a budget pause, say): a later Stop is the user's, not the budget's.
+        if (s === RunnerState.Playing && prev === RunnerState.Paused) { budgetSeen = false; }
         if (s === RunnerState.Idle) {
           // A second idle (the stop watchdog forcing one) is a no-op.
           if (inRun) {

@@ -1447,7 +1447,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Before a run's first task: remember where the tree stood, so the standards check still
   // sees work the run committed (git.autoCommit, or an agent that commits).
   runner.setRunStartHook((cwd) => rememberStandardsBase(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? cwd));
-  initOnosooRelayHost({ context, runner, relayEnv: onosooRelayEnv, planPath: () => currentPlanPath, log: (l) => moagOutputChannel?.appendLine(l) });
+  initOnosooRelayHost({ context, runner, relayEnv: onosooRelayEnv, planPath: () => currentPlanPath, loadedPlan: () => currentPlan, log: (l) => moagOutputChannel?.appendLine(l) });
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
