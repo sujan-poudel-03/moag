@@ -46,7 +46,7 @@ export const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 export const SPOOL_MAX_DIR_BYTES = 100 * 1024 * 1024;
 /**
  * Without a start-time match, a live pid owns a run file only while the file was written
- * within this long ago. A live relay touches it at most every minute (see touchRun).
+ * within this long ago. A live relay touches it every 30 s (see touchRun and the relay's SPOOL_TOUCH_MS).
  */
 export const SPOOL_OWNER_MAX_IDLE_MS = 10 * 60 * 1000;
 
@@ -54,6 +54,12 @@ const RUN_FILE = /^(.+)\.jsonl$/;
 const REJECTED_SUFFIX = '.rejected.jsonl';
 /** How much of a run file is read at a time while replaying. */
 const READ_BLOCK_BYTES = 1024 * 1024;
+/**
+ * How much of each rejected line is read to find its seq. quarantine() writes
+ * {"rejected_at":…,"reason":…,"event":{"run_id":…,"seq":N,…}: well inside this.
+ */
+const REJECTED_PREFIX_BYTES = 1024;
+const REJECTED_SEQ_RE = /"event":\{"run_id":"[A-Za-z0-9_-]{1,128}","seq":(\d+)[,}]/;
 
 /**
  * How far replay has got through one earlier run's file. Owned by the caller of
@@ -175,6 +181,8 @@ export class OnosooSpool {
   private readonly platform: NodeJS.Platform;
   private readonly procStart: (pid: number) => string | null;
   private dirBytes: number | null = null;
+  /** Per run, the seqs already in its rejected file (see rejectedSeqs). */
+  private readonly rejectedSeen = new Map<string, Set<number>>();
 
   constructor(stateDir: string, cwd: string, opts: SpoolOptions = {}) {
     this.dir = path.join(stateDir, 'onosoo-spool', workspaceKey(cwd));
@@ -294,10 +302,15 @@ export class OnosooSpool {
     }
   }
 
-  /** Record that the server acked every seq ≤ `n` for `runId`. Never lowers the mark. */
+  /**
+   * Record that the server acked every seq ≤ `n` for `runId`. Never lowers the mark. A run
+   * whose event file is gone (removed by another process once fully acked, or pruned) gets
+   * no ack: it would only be a stray file nothing ever removes. False then.
+   */
   writeAck(runId: string, n: number): boolean {
     if (!safeRunId(runId) || !Number.isInteger(n) || n <= 0) { return false; }
     try {
+      if (!fs.existsSync(this.file(runId, '.jsonl'))) { return false; }
       if (n <= this.readAck(runId)) { return true; }
       this.ensureDir();
       writeFileAtomicSync(this.file(runId, '.ack'), JSON.stringify({ acked: n }), 0o600);
@@ -312,19 +325,69 @@ export class OnosooSpool {
     return this.file(runId, REJECTED_SUFFIX);
   }
 
-  /** Keep events the server refused, for a human; they are never replayed. Never throws. */
+  /**
+   * Keep events the server refused, for a human; they are never replayed. An event whose
+   * seq is already in its run's rejected file is not added again (an oversized spooled
+   * event is met again by every later run until its run is dropped). Never throws.
+   */
   quarantine(events: readonly RelayEvent[], reason: string): boolean {
     let ok = true;
     for (const ev of events) {
       if (!safeRunId(ev.run_id)) { ok = false; continue; }
       try {
+        const seen = this.rejectedSeqs(ev.run_id);
+        if (seen.has(ev.seq)) { continue; }
         const line = JSON.stringify({ rejected_at: new Date(this.now()).toISOString(), reason, event: ev }) + '\n';
-        if (!this.appendBounded(this.rejectedFile(ev.run_id), line)) { ok = false; }
+        if (this.appendBounded(this.rejectedFile(ev.run_id), line)) { seen.add(ev.seq); } else { ok = false; }
       } catch {
         ok = false;
       }
     }
     return ok;
+  }
+
+  /**
+   * The seqs already in `runId`'s rejected file, read once per run and then kept up to date
+   * by quarantine(). Cheap on a large file: only the first REJECTED_PREFIX_BYTES of each line
+   * are looked at, where quarantine() writes the event's run_id and seq.
+   */
+  private rejectedSeqs(runId: string): Set<number> {
+    const cached = this.rejectedSeen.get(runId);
+    if (cached) { return cached; }
+    const seqs = new Set<number>();
+    const take = (head: Buffer): void => {
+      const m = REJECTED_SEQ_RE.exec(head.toString('utf-8'));
+      if (m) { seqs.add(Number(m[1])); }
+    };
+    let fd: number | null = null;
+    try {
+      fd = fs.openSync(this.rejectedFile(runId), 'r');
+      const block = Buffer.alloc(READ_BLOCK_BYTES);
+      let head: Buffer = Buffer.alloc(0);
+      for (;;) {
+        const n = fs.readSync(fd, block, 0, block.length, null);
+        if (n <= 0) { break; }
+        let start = 0;
+        while (start < n) {
+          const nl = block.indexOf(0x0a, start);
+          const end = nl >= 0 && nl < n ? nl : n;
+          if (head.length < REJECTED_PREFIX_BYTES) {
+            head = Buffer.concat([head, block.subarray(start, Math.min(end, start + REJECTED_PREFIX_BYTES - head.length))]);
+          }
+          if (end === n) { break; }
+          take(head);
+          head = Buffer.alloc(0);
+          start = end + 1;
+        }
+      }
+      if (head.length > 0) { take(head); }
+    } catch {
+      // No rejected file yet (or unreadable): nothing to skip.
+    } finally {
+      if (fd !== null) { try { fs.closeSync(fd); } catch { /* ignore */ } }
+    }
+    this.rejectedSeen.set(runId, seqs);
+    return seqs;
   }
 
   /** Remove a run's event and ack files once everything up to `lastSeq` is acked. Keeps rejected events. */

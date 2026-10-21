@@ -56,8 +56,13 @@ export const REVOKED_MESSAGE = 'ONOSOO device key was revoked or is wrong — re
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const RUN_META_TASKS = 1000;
-/** How often a live run's spool file is touched; far inside SPOOL_OWNER_MAX_IDLE_MS (10 min). */
-const SPOOL_TOUCH_MS = 60_000;
+/**
+ * How often a live run's spool file is touched; far inside SPOOL_OWNER_MAX_IDLE_MS (10 min).
+ * 30 s, not 60: off Linux, ownership rests on the file's mtime alone, and after a sleep/resume
+ * the timer can fire up to one interval late. The callback touches as soon as it runs, so the
+ * stale window after a resume is at most one interval; halving the interval halves it.
+ */
+export const SPOOL_TOUCH_MS = 30_000;
 
 // ─── HTTP ───
 
@@ -181,6 +186,18 @@ const PROTOCOL_STATUS: Readonly<Record<string, string>> = {
 /** A TaskStatus value in ONOSOO's spelling; anything unknown is returned unchanged. */
 export function protocolStatus(status: string): string {
   return Object.prototype.hasOwnProperty.call(PROTOCOL_STATUS, status) ? PROTOCOL_STATUS[status] : status;
+}
+
+/**
+ * Put a task-completed / task-failed event's `data.status` in ONOSOO's spelling, in place.
+ * Applied once where an event is built: a live one in buildEvent, a replayed one as it is
+ * loaded from the spool (lines an older MOAG wrote still say "completed"). Idempotent, so an
+ * already-mapped status is left as it is.
+ */
+function applyProtocolStatus(type: string, data: Record<string, unknown>): void {
+  if ((type === 'task-completed' || type === 'task-failed') && typeof data.status === 'string') {
+    data.status = protocolStatus(data.status);
+  }
 }
 
 // ─── Run meta ───
@@ -392,11 +409,7 @@ export class OnosooRelay {
       const { event: _e, ts, ...rest } = line;
       void _e;
       const at = typeof ts === 'string' ? ts : new Date(this.now()).toISOString();
-      const data = this.redactData(rest);
-      if ((type === 'task-completed' || type === 'task-failed') && typeof data.status === 'string') {
-        data.status = protocolStatus(data.status);
-      }
-      this.enqueue(this.buildEvent(type, at, data));
+      this.enqueue(this.buildEvent(type, at, this.redactData(rest)));
       this.scheduleKick();
     } catch {
       // The relay must never disturb the run.
@@ -463,6 +476,7 @@ export class OnosooRelay {
   }
 
   private buildEvent(type: string, at: string, data: Record<string, unknown>): RelayEvent {
+    applyProtocolStatus(type, data);
     const ev: RelayEvent = { run_id: this.runId, seq: ++this.seq, type, at, data };
     const dataBytes = Buffer.byteLength(JSON.stringify(data), 'utf-8');
     const bytes = Buffer.byteLength(JSON.stringify(ev), 'utf-8');
@@ -538,7 +552,11 @@ export class OnosooRelay {
           onOversize: (ev, bytes) => this.skipOversized(ev, bytes),
         })
         : [];
-      for (const ev of events) { this.pushMemory(ev); }
+      for (const ev of events) {
+        // Earlier runs only (loadReplayable excludes this run), so no live event is mapped twice.
+        try { applyProtocolStatus(ev.type, ev.data); } catch { /* send it as spooled */ }
+        this.pushMemory(ev);
+      }
       // A run read to the end (seq 0: everything left in it was skipped as too large) can be
       // dropped once its last returned seq is acked. Stale cursors were removed by the spool.
       for (const [run, c] of this.replayCursors) {

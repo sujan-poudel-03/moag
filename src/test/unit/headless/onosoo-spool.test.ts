@@ -42,6 +42,48 @@ describe('ONOSOO spool', () => {
     assert.deepEqual(spool.loadReplayable('run-a'), [], 'the excluded (current) run is never replayed');
   });
 
+  it('writeAck does not recreate the ack of a run whose event file another process removed', () => {
+    const { spool, stateDir, cwd } = mk();
+    spool.openRun('r');
+    spool.append(ev('r', 1));
+    assert.ok(spool.writeAck('r', 1));
+    // Another process drained the run and removed its files.
+    const other = new OnosooSpool(stateDir, cwd, { isPidAlive: () => false });
+    assert.ok(other.dropIfFullyAcked('r', 1));
+    assert.equal(spool.writeAck('r', 2), false);
+    assert.ok(!fs.existsSync(path.join(spool.dir, 'r.ack')), 'no stray ack');
+    assert.deepEqual(fs.readdirSync(spool.dir), []);
+    assert.equal(spool.writeAck('never-opened', 1), false, 'nor for a run that never had a file');
+    assert.ok(!fs.existsSync(path.join(spool.dir, 'never-opened.ack')));
+  });
+
+  it('quarantine skips a seq already in the run\'s rejected file, across spool instances (restarts)', () => {
+    const { spool, stateDir, cwd } = mk();
+    assert.ok(spool.quarantine([ev('r', 2)], 'too_large'));
+    assert.ok(spool.quarantine([ev('r', 2)], 'too_large'), 'same instance: skipped, still ok');
+    const restarted = new OnosooSpool(stateDir, cwd, { isPidAlive: () => false });
+    assert.ok(restarted.quarantine([ev('r', 2), ev('r', 3)], 'too_large'));
+    assert.ok(restarted.quarantine([ev('r', 3)], 'bad_request'));
+    // Another run's rejected file is its own.
+    assert.ok(restarted.quarantine([ev('other', 2)], 'too_large'));
+    const seqs = (run: string): number[] => fs.readFileSync(spool.rejectedFile(run), 'utf-8').trim().split('\n').map((l) => JSON.parse(l).event.seq);
+    assert.deepEqual(seqs('r'), [2, 3]);
+    assert.deepEqual(seqs('other'), [2]);
+  });
+
+  it('the rejected-file scan finds seqs after a line larger than its read block, and ignores a malformed line', () => {
+    const { spool, stateDir, cwd } = mk();
+    spool.quarantine([ev('r', 1, { pad: 'x'.repeat(3 * 1024 * 1024) })], 'too_large');
+    spool.quarantine([ev('r', 7)], 'bad_request');
+    fs.appendFileSync(spool.rejectedFile('r'), 'not json\n');
+    spool.quarantine([ev('r', 9)], 'bad_request');
+    const restarted = new OnosooSpool(stateDir, cwd, { isPidAlive: () => false });
+    restarted.quarantine([ev('r', 1), ev('r', 7), ev('r', 9), ev('r', 10)], 'too_large');
+    const lines = fs.readFileSync(spool.rejectedFile('r'), 'utf-8').trim().split('\n');
+    assert.equal(lines.length, 5, 'four events and the malformed line; only seq 10 was added');
+    assert.equal(JSON.parse(lines[4]).event.seq, 10);
+  });
+
   it('writeAck never lowers the mark', () => {
     const { spool } = mk();
     spool.openRun('r');
