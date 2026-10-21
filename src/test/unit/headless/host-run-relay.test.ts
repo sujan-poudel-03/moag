@@ -14,7 +14,7 @@ import {
 } from '../../../headless/host-run-relay';
 import { REVOKED_MESSAGE } from '../../../headless/onosoo-relay';
 import { costLedger } from '../../../utils/cost-ledger';
-import { loadPlan } from '../../../models/plan';
+import { createPlaylist, createTask, loadPlan } from '../../../models/plan';
 import { Plan, TaskStatus } from '../../../models/types';
 
 const KEY = 'onosoo_live_' + 'H'.repeat(43);
@@ -412,6 +412,26 @@ describe('host-run-relay', function () {
     assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: 't-2', name: 'Second' }]);
     assert.equal(sent.find((e) => e.type === 'run-finished')!.data.total, 1);
     assert.equal(h.plan.playlists[0].tasks.length, 2, 'the runner\'s plan is not modified');
+  });
+
+  it('a play from a later playlist: a stale Failed task in playlist 0 neither shows nor counts', async () => {
+    const h = make();
+    const pl1 = createPlaylist('Later');
+    const t3 = createTask('Third', 'x');
+    pl1.tasks.push(t3);
+    h.plan.playlists.push(pl1);
+    h.plan.playlists[0].tasks[0].status = TaskStatus.Failed; // left over from an earlier run
+    // What TaskRunner.play(plan, 1) scopes the run to: playlists [1..end].
+    h.start([t3.id]);
+    h.runner.emit('task-started', t3);
+    t3.status = TaskStatus.Completed;
+    h.runner.emit('task-completed', t3, { stdout: '', stderr: '' });
+    setState(h.runner, 'idle');
+    await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+    const sent = h.rec.sent();
+    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: t3.id, name: 'Third' }]);
+    const fin = sent.find((e) => e.type === 'run-finished')!.data;
+    assert.deepEqual([fin.total, fin.completed, fin.failed, fin.code], [1, 1, 0, 0]);
   });
 
   it('cost filter: a prd-chat call gives no cost line; a task call does', async () => {

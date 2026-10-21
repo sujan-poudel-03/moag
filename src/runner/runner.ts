@@ -771,7 +771,11 @@ export class TaskRunner {
     this._playLock = true;
 
     this._plan = plan;
-    this._runTaskIds = null;
+    // A play from a later playlist runs playlists [index..end] only (runPlaylistsSequentially /
+    // runPlaylistsConcurrently start there), so that is the run's scope; from 0 it is the whole plan.
+    this._runTaskIds = playlistIndex > 0
+      ? plan.playlists.slice(playlistIndex).flatMap((pl) => pl.tasks.map((t) => t.id))
+      : null;
     this._currentPlaylistIndex = playlistIndex;
     this._currentTaskIndex = taskIndex;
     this._abortController = new AbortController();

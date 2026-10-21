@@ -622,6 +622,24 @@ describe('TaskRunner', () => {
       assert.deepEqual(seen[0].ids, [plan.playlists[0].tasks[1].id, plan.playlists[0].tasks[0].id]);
     });
 
+    it('a play() from a later playlist scopes the run to playlists [index..end]', async () => {
+      const { runner } = buildRunner();
+      const seen = capture(runner);
+      const plan = makePlan();
+      const pl2 = createPlaylist('Phase 2');
+      pl2.autoplayDelay = 0;
+      pl2.tasks.push(createTask('Task 3', 'Do third thing'));
+      const pl3 = createPlaylist('Phase 3');
+      pl3.autoplayDelay = 0;
+      pl3.tasks.push(createTask('Task 4', 'Do fourth thing'));
+      plan.playlists.push(pl2, pl3);
+      await runner.playPlaylist(plan, 1);
+      assert.deepEqual(seen[0].ids, [pl2.tasks[0].id, pl3.tasks[0].id]);
+      // From index 0 it is the whole plan again.
+      await runner.playPlaylist(plan, 0);
+      assert.equal(seen[1].ids, null);
+    });
+
     it('a play() after a playTask() resets the task scope to null', async () => {
       const { runner } = buildRunner();
       const seen = capture(runner);
