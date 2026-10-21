@@ -82,13 +82,21 @@ function memento() {
 
 describe('Extension activation', () => {
   let activated: Registered;
+  let keyAfter: string | undefined;
 
   // This hook loads extension.ts and its entire dependency tree through ts-node
   // and then runs activate(). On a loaded machine that exceeds mocha default 2s,
   // which showed up as an intermittent failure rather than a real defect.
   before(function () {
     this.timeout(60_000);
+    // A device key with no URL: activation must take it out of process.env (never relayed here).
+    process.env.MOAG_ONOSOO_KEY = 'test-only-key-1234';
     activated = activateExtension();
+    keyAfter = process.env.MOAG_ONOSOO_KEY;
+  });
+
+  after(() => {
+    delete process.env.MOAG_ONOSOO_KEY;
   });
 
   it('activates without throwing', () => {
@@ -113,6 +121,10 @@ describe('Extension activation', () => {
     const dupes = activated.ids.filter((id) => (seen.has(id) ? true : (seen.add(id), false)));
     assert.deepStrictEqual([...new Set(dupes)], [],
       'a duplicate registration means the second one silently wins');
+  });
+
+  it('takes the ONOSOO device key out of process.env at activation', () => {
+    assert.strictEqual(keyAfter, undefined, 'a child process spawned by this host would inherit the device key');
   });
 
   it('pushes its registrations onto subscriptions so they are disposed', () => {

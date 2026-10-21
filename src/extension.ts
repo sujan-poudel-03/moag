@@ -17,6 +17,8 @@ import { ghSync, ghAsync } from './utils/gh';
 import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
 import { cmdResolveParkedItem, cmdShowMorningReview } from './ui/morning-review';
 import { cmdShowSetupGuide } from './ui/setup-guide';
+import { takeRelayEnv } from './headless/run-reporter';
+import { initOnosooRelayHost } from './ui/onosoo-relay-host';
 import { setHost } from './core/host';
 import { TaskRunner, classifyFailure } from './runner/runner';
 import {
@@ -1312,6 +1314,8 @@ async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<voi
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  // Before anything in this host can spawn: engine probes, git, agents. The device key must never reach a child.
+  const onosooRelayEnv = takeRelayEnv(process.env);
   extensionContext = context;
 
   // Bind the engine core to the VS Code environment (see src/core/host.ts).
@@ -1443,6 +1447,7 @@ export function activate(context: vscode.ExtensionContext): void {
   // Before a run's first task: remember where the tree stood, so the standards check still
   // sees work the run committed (git.autoCommit, or an agent that commits).
   runner.setRunStartHook((cwd) => rememberStandardsBase(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? cwd));
+  initOnosooRelayHost({ context, runner, relayEnv: onosooRelayEnv, planPath: () => currentPlanPath, log: (l) => moagOutputChannel?.appendLine(l) });
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
