@@ -4,7 +4,7 @@ ONOSOO Builds shows your MOAG runs as they happen: tasks in plan order, what eac
 
 | Level | What works in ONOSOO | Machine | MOAG process |
 |-------|----------------------|---------|--------------|
-| **1. Watch** | Runs appear live | Windows, macOS or Linux | `moag run` |
+| **1. Watch** | Runs appear live | Windows, macOS or Linux | `moag run`, or any run from the VS Code panel |
 | **2. Control** | Start, stop, approve, skip, retry | Linux or WSL2 only | `moag daemon` |
 | **3. Open it live** | Open a running branch, health, logs | Linux or WSL2 only, with Docker | `moag host` |
 
@@ -34,11 +34,13 @@ chmod 600 ~/.config/moag/onosoo.json
 
 ### 3. Run something
 
+Run any plan, from this panel or with `moag run`, and it appears in ONOSOO. From the terminal:
+
 ```bash
 moag run --prompt "Add a short README describing this project" --cwd /path/to/repo
 ```
 
-Open **Builds** in ONOSOO: within seconds the machine shows **online** and the run appears with its tasks.
+Open **Builds** in ONOSOO: within seconds the machine shows **online** and the run appears with its tasks. Runs from this panel relay while the status bar shows **☁ ONOSOO**; the setting `agentTaskPlayer.onosoo.relay` turns that off.
 
 > No key at all turns the relay off silently. If nothing shows up, check the file path and that it is valid JSON. In WSL, the Windows file is not visible.
 

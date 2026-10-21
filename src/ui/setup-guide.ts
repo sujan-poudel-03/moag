@@ -131,7 +131,7 @@ ${allGood
 </div>
 <div class="section" style="padding-top:0">
   <div class="section-title">Connect to ONOSOO Builds (optional)</div>
-  <div class="tip-box">Watch <code>moag run</code> runs live in ONOSOO Builds, and on Linux or WSL control them and open live previews. <a class="engine-link" href="${ONOSOO_GUIDE_URL}" target="_blank">Setup guide &#8599;</a></div>
+  <div class="tip-box">Watch runs live in ONOSOO Builds, from this panel or <code>moag run</code>, and on Linux or WSL control them and open live previews. <a class="engine-link" href="${ONOSOO_GUIDE_URL}" target="_blank">Setup guide &#8599;</a></div>
 </div>
 <div class="footer">
   <button class="btn-primary" id="recheckBtn">Re-check engines</button>

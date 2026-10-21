@@ -16,7 +16,7 @@ its own document:
 
 | Level | What works in ONOSOO | Machine | MOAG process |
 |---|---|---|---|
-| **1. Watch** | Runs appear live: tasks in plan order, what each task changed (files, line counts, diff), error output, cost, branch, pull request. | Windows, macOS or Linux | `moag run` |
+| **1. Watch** | Runs appear live: tasks in plan order, what each task changed (files, line counts, diff), error output, cost, branch, pull request. | Windows, macOS or Linux | `moag run`, or any run from the VS Code panel |
 | **2. Control** | Start a run (goal or a PRD from Notes), stop, approve or skip a gate, retry. | **Linux or WSL2 only** | `moag daemon` |
 | **3. Open it live** | Open a running branch inside ONOSOO, see service health, read logs. | **Linux or WSL2 only**, with Docker | `moag host` |
 
@@ -95,7 +95,8 @@ Rules MOAG applies:
 
 ### 3. Run something
 
-Any `moag run` now reports to ONOSOO. In a git repository:
+Any `moag run` now reports to ONOSOO, and so does any run started from the VS Code panel (see
+[From the VS Code panel](#from-the-vs-code-panel) below). In a git repository:
 
 ```sh
 moag run --prompt "Add a short README describing this project" --cwd /path/to/repo
@@ -117,9 +118,32 @@ so you lose nothing. To keep text mode anyway, set the format explicitly in the 
 { "agentTaskPlayer.engines.claude.outputFormat": "text" }
 ```
 
-The VS Code panel keeps text mode (live output, no cost) unless you set
-`agentTaskPlayer.engines.claude.outputFormat` to `json` in its settings, so ONOSOO shows $0.00 for
-runs started from the panel until you do. Remote runs started from ONOSOO always use JSON mode.
+Remote runs started from ONOSOO always use JSON mode.
+
+#### From the VS Code panel
+
+When the machine is paired (the key in `onosoo.json` from step 2, or `MOAG_ONOSOO_KEY` in the
+environment VS Code was started from), every run you start from the MOAG panel is relayed too: play,
+play playlist, a single task, retries and fix runs. Each run gets its own entry in Builds, and a
+paused run that you resume stays the same run. Relay messages (a rejected URL, a revoked key) go to
+the **MOAG** output channel.
+
+- **Turn it off** with the setting `agentTaskPlayer.onosoo.relay` (on by default). It applies to this
+  machine, not per workspace, and does not affect `moag run`. Off means nothing is sent.
+- **Cost.** Unlike `moag run`, the panel keeps Claude in text mode, so you keep live output, and
+  ONOSOO shows $0.00 for its Claude calls. The first relayed run that uses Claude in text mode shows
+  a one-time notice explaining this, with **Open Setting** and **Don't Show Again**. To see real cost,
+  set `agentTaskPlayer.engines.claude.outputFormat` to `json` (live output then appears when each
+  call ends).
+- **Status bar.** An item on the left shows the state, and clicking it opens the setting:
+  - **☁ ONOSOO**: connected; runs started here appear in Builds;
+  - **ONOSOO: off**: paired, but `agentTaskPlayer.onosoo.relay` is off;
+  - **ONOSOO: key revoked**: ONOSOO refused the key; pair the machine again;
+  - no item: no key was found (or no folder is open).
+- **Pull requests.** The panel does not relay `pr-created`: a pull request you open later by hand is
+  not attached to the run in ONOSOO.
+- **Approval gates.** The panel waits at a gate for your click; it never reports "awaiting approval".
+  If you stop a run while it waits at a gate, ONOSOO shows it as stopped (code 1).
 
 ### 4. Check it in ONOSOO
 
