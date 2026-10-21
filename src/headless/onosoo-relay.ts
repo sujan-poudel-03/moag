@@ -34,9 +34,12 @@ import type { OnosooSpool, RelayEvent, ReplayCursor } from './onosoo-spool';
 
 export const MAX_EVENTS = 100;
 export const MAX_BODY_BYTES = 262_144;
-export const REQUEST_TIMEOUT_MS = 10_000;
+// ONOSOO's ingest answers in about 5 s for a small batch, longer from a cold start (measured 2026-10-21).
+// A request that times out has often been stored anyway (the resend comes back as duplicates), so
+// these leave room for a slow reply instead of giving up and resending.
+export const REQUEST_TIMEOUT_MS = 30_000;
 export const HEARTBEAT_MS = 60_000;
-export const CLOSE_DEADLINE_MS = 5_000;
+export const CLOSE_DEADLINE_MS = 20_000;
 export const BACKOFF_START_MS = 5_000;
 export const BACKOFF_MAX_MS = 300_000;
 /** In-memory queue ceiling; beyond it new events go to the spool only (replayed by the next run). */

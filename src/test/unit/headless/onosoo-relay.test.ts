@@ -120,9 +120,9 @@ describe('ONOSOO relay — constants and classify', () => {
   it('pins the limits and timings', () => {
     assert.equal(MAX_EVENTS, 100);
     assert.equal(MAX_BODY_BYTES, 262_144);
-    assert.equal(REQUEST_TIMEOUT_MS, 10_000);
+    assert.equal(REQUEST_TIMEOUT_MS, 30_000);
     assert.equal(HEARTBEAT_MS, 60_000);
-    assert.equal(CLOSE_DEADLINE_MS, 5_000);
+    assert.equal(CLOSE_DEADLINE_MS, 20_000);
     assert.equal(BACKOFF_START_MS, 5_000);
     assert.equal(BACKOFF_MAX_MS, 300_000);
     assert.equal(MAX_EVENT_DATA_BYTES, 90_000);
@@ -167,7 +167,7 @@ describe('ONOSOO relay — wire format', () => {
     assert.equal(req.headers.Authorization, `Bearer ${KEY}`);
     assert.equal(req.headers['Content-Type'], 'application/json');
     assert.equal(req.headers['User-Agent'], `moag/${PKG_VERSION}`);
-    assert.ok(req.timeoutMs <= 10_000);
+    assert.ok(req.timeoutMs <= 30_000);
     assert.deepEqual(Object.keys(body).sort(), ['device_id', 'events', 'moag_version', 'protocol']);
     assert.equal(body.protocol, 1);
     assert.equal(body.device_id, 'dev-1');
