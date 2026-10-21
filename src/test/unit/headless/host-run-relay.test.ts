@@ -302,6 +302,37 @@ describe('host-run-relay', function () {
     }
   });
 
+  it('back-to-back runs: the second run never resends the first run while it is still closing', async () => {
+    // Every POST takes 400 ms, so run A is still draining in close() when run B starts 50 ms later.
+    const h = make({
+      respond: async (body) => {
+        await new Promise((r) => setTimeout(r, 400));
+        const acked: Record<string, number> = {};
+        for (const e of body.events) { acked[e.run_id] = Math.max(acked[e.run_id] ?? 0, e.seq); }
+        return { status: 200, body: JSON.stringify({ acked }) };
+      },
+      closeDeadlineMs: 3000,
+    });
+    const t = h.plan.playlists[0].tasks[0];
+    h.start();
+    h.runner.emit('task-started', t);
+    t.status = TaskStatus.Completed;
+    h.runner.emit('task-completed', t, { stdout: '', stderr: '' });
+    setState(h.runner, 'idle');
+    await new Promise((r) => setTimeout(r, 50));
+    h.start();
+    setState(h.runner, 'idle');
+    // Only now wait: both runs delivered, plus time for any resend to arrive.
+    await waitFor(() => h.rec.sent().filter((e) => e.type === 'run-finished').length >= 2, 8000);
+    await new Promise((r) => setTimeout(r, 1000));
+    const sent = h.rec.sent();
+    const runA = sent.find((e) => e.type === 'run-meta')!.run_id;
+    const seqsA = sent.filter((e) => e.run_id === runA).map((e) => e.seq);
+    assert.deepEqual(seqsA, [...new Set(seqsA)], `run A sent a seq twice: ${seqsA.join(',')}`);
+    const keys = sent.map((e) => `${e.run_id}:${e.seq}`);
+    assert.equal(new Set(keys).size, keys.length, 'no event of either run is sent twice');
+  });
+
   it('a watchdog double idle produces one run-finished', async () => {
     const h = make();
     h.start();

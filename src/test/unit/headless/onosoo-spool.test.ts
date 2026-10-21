@@ -4,7 +4,9 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { OnosooSpool, RelayEvent, SPOOL_MAX_AGE_MS, SPOOL_OWNER_MAX_IDLE_MS } from '../../../headless/onosoo-spool';
+import {
+  isLiveRelayRun, OnosooSpool, registerLiveRelayRun, RelayEvent, releaseLiveRelayRun, SPOOL_MAX_AGE_MS, SPOOL_OWNER_MAX_IDLE_MS,
+} from '../../../headless/onosoo-spool';
 
 function tmp(prefix: string): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -40,6 +42,22 @@ describe('ONOSOO spool', () => {
     assert.ok(spool.writeAck('run-a', 3));
     assert.deepEqual(spool.loadReplayable(null).map((e) => e.seq), [4, 5]);
     assert.deepEqual(spool.loadReplayable('run-a'), [], 'the excluded (current) run is never replayed');
+  });
+
+  it('a run a relay of this process still has open or closing is never replayed, until released', () => {
+    const { spool } = mk();
+    spool.openRun('run-live');
+    spool.append(ev('run-live', 1));
+    spool.append(ev('run-live', 2));
+    registerLiveRelayRun('run-live');
+    try {
+      assert.equal(isLiveRelayRun('run-live'), true);
+      assert.deepEqual(spool.loadReplayable(null), [], 'still being sent by its own relay');
+    } finally {
+      releaseLiveRelayRun('run-live');
+    }
+    assert.equal(isLiveRelayRun('run-live'), false);
+    assert.deepEqual(spool.loadReplayable(null).map((e) => e.seq), [1, 2], 'released: its unacked rest is replayable');
   });
 
   it('writeAck does not recreate the ack of a run whose event file another process removed', () => {

@@ -14,7 +14,9 @@ import {
   MAX_EVENT_DATA_BYTES, MAX_MEMORY_BYTES, OnosooRelay, protocolStatus, REPLAY_MEMORY_BYTES, RelayHttpClient, RelayHttpRequest, REQUEST_TIMEOUT_MS, REVOKED_MESSAGE, RunMeta, scrubPaths,
   SPOOL_TOUCH_MS,
 } from '../../../headless/onosoo-relay';
-import { OnosooSpool, RelayEvent, SPOOL_OWNER_MAX_IDLE_MS } from '../../../headless/onosoo-spool';
+import {
+  isLiveRelayRun, OnosooSpool, RelayEvent, releaseLiveRelayRun, SPOOL_OWNER_MAX_IDLE_MS,
+} from '../../../headless/onosoo-spool';
 import type { OnosooConfig } from '../../../headless/onosoo-config';
 import { createRedactor, Redactor } from '../../../utils/redact';
 
@@ -306,7 +308,10 @@ describe('ONOSOO relay — acknowledgement and spool', () => {
     assert.equal(spooledBeforeSend, true);
     for (let i = 2; i < 5; i++) { a.relay.record(line('task-started', { id: `t${i}`, name: 'n' })); }
     await settle();
-    // No close(): relay A is abandoned as a killed process would be.
+    // No close(): relay A is abandoned as a killed process would be. A killed process's
+    // live-run registry dies with it; in this process it has to be cleared by hand.
+    assert.equal(isLiveRelayRun(a.relay.runId), true, 'an open relay is registered as live');
+    releaseLiveRelayRun(a.relay.runId);
 
     const b = recorder();
     const relayB = mkRelay(b.client, { fx });

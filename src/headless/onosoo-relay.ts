@@ -29,6 +29,7 @@ import * as path from 'path';
 import type { Redactor } from '../utils/redact';
 import type { OnosooConfig } from './onosoo-config';
 import type { OnosooSpool, RelayEvent, ReplayCursor } from './onosoo-spool';
+import { registerLiveRelayRun, releaseLiveRelayRun } from './onosoo-spool';
 
 // ─── Constants ───
 
@@ -390,6 +391,8 @@ export class OnosooRelay {
    * spool file, record `run-meta` as seq 1 when given, and arm the heartbeat.
    */
   start(meta?: RunMeta): void {
+    // Until close() resolves, no other relay in this process replays this run's spool.
+    registerLiveRelayRun(this.runId);
     this.loadReplayChunk();
     try { this.spool.openRun(this.runId); } catch { /* sent from memory only */ }
     this.armTouch();
@@ -455,6 +458,7 @@ export class OnosooRelay {
         this.spool.dropIfFullyAcked(this.runId, this.seq);
         for (const [run, last] of this.replayedLast) { this.spool.dropIfFullyAcked(run, last); }
       } catch { /* best effort */ }
+      releaseLiveRelayRun(this.runId);
     }
   }
 

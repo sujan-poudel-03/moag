@@ -51,6 +51,31 @@ export const SPOOL_MAX_DIR_BYTES = 100 * 1024 * 1024;
 export const SPOOL_OWNER_MAX_IDLE_MS = 10 * 60 * 1000;
 
 const RUN_FILE = /^(.+)\.jsonl$/;
+
+// ─── Runs this process still relays ───
+
+/**
+ * Run ids whose relay in THIS process is open or still closing. Ownership by pid cannot
+ * see them (a file this process wrote never counts as owned), so without this registry a
+ * run started while the previous one is still draining would resend that run's events.
+ * Process-level on purpose: the CLI and the extension host share it.
+ */
+const liveRelayRuns = new Set<string>();
+
+/** Mark `runId` as relayed by this process until {@link releaseLiveRelayRun}. */
+export function registerLiveRelayRun(runId: string): void {
+  liveRelayRuns.add(runId);
+}
+
+/** The relay of `runId` has closed: an unacked rest may now be replayed by a later run. */
+export function releaseLiveRelayRun(runId: string): void {
+  liveRelayRuns.delete(runId);
+}
+
+/** True while this process's relay of `runId` is open or closing. */
+export function isLiveRelayRun(runId: string): boolean {
+  return liveRelayRuns.has(runId);
+}
 const REJECTED_SUFFIX = '.rejected.jsonl';
 /** How much of a run file is read at a time while replaying. */
 const READ_BLOCK_BYTES = 1024 * 1024;
@@ -407,7 +432,8 @@ export class OnosooSpool {
   /**
    * Unacked events of earlier runs, to resend: oldest run first (by its meta started_at),
    * each run in seq order, only seq > its ack. Prunes files older than seven days first;
-   * skips `excludeRunId`, rejected files, runs still owned by another live process,
+   * skips `excludeRunId`, rejected files, runs still owned by another live process, runs a
+   * relay of this process still has open or closing ({@link registerLiveRelayRun}),
    * unknown spool versions and malformed lines. Runs with nothing left unacked are removed.
    *
    * With `budgetBytes` it stops before the events would exceed it, and `cursors` records
@@ -450,6 +476,8 @@ export class OnosooSpool {
       if (!m) { continue; }
       const runId = m[1];
       if (runId === excludeRunId || !safeRunId(runId)) { continue; }
+      // Still being sent by a relay of this process (open, or draining in close()).
+      if (liveRelayRuns.has(runId)) { continue; }
       if (cursors.get(runId)?.eof) { continue; }
       const file = path.join(this.dir, name);
       let meta: Meta | null = null;
