@@ -592,6 +592,33 @@ describe('headless CLI: cmdRun persists only requirement trace', () => {
     assert.ok(String(tail.tail).includes('[REDACTED]'));
     assert.ok(!lines.join('').includes(secret));
     assert.equal(runner.listenerCount('task-failed'), 1, 'reporting listeners are removed when the run ends');
+    assert.equal(events.find((e) => e.event === 'run-finished')!.code, 1, 'run-finished carries the run exit code');
+  });
+
+  it('run-finished carries code 0 for a clean run, and every engine call cost is a cost line', async () => {
+    const { dir, planFile } = writePlanFile();
+    const { costLedger } = require('../../../utils/cost-ledger');
+    const { EventEmitter } = require('events');
+    const runner = new EventEmitter();
+    runner.stop = () => undefined;
+    runner.play = async (plan: Plan) => {
+      const t = plan.playlists[0].tasks[0];
+      runner.emit('task-started', t);
+      costLedger.record({ estimatedCost: 0.0123, costSource: 'reported' }, { engineId: 'claude' });
+      costLedger.recordUnreported({ engineId: 'gemini' });
+      t.status = TaskStatus.Completed;
+      runner.emit('task-completed', t, { stdout: '', stderr: '' });
+    };
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]), { ...fakeCtx(), runner, relayDeps: { env: {} } });
+    assert.equal(code, 0);
+    const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const costs = events.filter((e) => e.event === 'cost');
+    assert.deepEqual(costs.map((c) => [c.usd, c.source]), [[0.0123, 'reported'], [0, 'none']]);
+    assert.equal(events.find((e) => e.event === 'run-finished')!.code, 0);
+    // After the run, the subscription is gone: a later engine call is not reported as this run's.
+    const before = lines.length;
+    costLedger.record({ estimatedCost: 1 }, { engineId: 'claude' });
+    assert.equal(lines.length, before);
   });
 
   it('a run that recorded no trace does not touch the plan file', async () => {

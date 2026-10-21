@@ -1021,6 +1021,19 @@ export function buildRunMeta(plan: any, cwd: string): RunMeta {
   return { plan_name: String(plan?.name ?? ''), project, tasks };
 }
 
+/** Emit a `cost` line per engine call during a run; returns the unsubscribe. Never throws. */
+function subscribeRunCost(): () => void {
+  try {
+    const { costLedger } = require('../utils/cost-ledger');
+    const offRecord = costLedger.onRecord((e: { estimatedCostUsd: number; costSource?: string }) =>
+      emit({ event: 'cost', usd: e.estimatedCostUsd, source: e.costSource ?? 'estimated' }));
+    const offUnreported = costLedger.onUnreported(() => emit({ event: 'cost', usd: 0, source: 'none' }));
+    return (): void => { offRecord(); offUnreported(); };
+  } catch {
+    return (): void => undefined;
+  }
+}
+
 /** What a caller other than cmdRun adds to the run: the delivery branch an ONOSOO remote run commits to. */
 export interface RunExtra {
   branch?: string | null;
@@ -1050,13 +1063,20 @@ export async function runAfterWiring(
   // Headless runs do not save the plan, except for requirement trace evidence (commits,
   // release stamps) the run recorded — that is persisted only when it actually changed.
   const persistTrace = !args.prompt && args.planPath ? tracePersister(plan, args.planPath) : (): void => undefined;
+  // Every engine call's cost, in the hosted worker's shape (run-worker.ts subscribeCost), so ONOSOO
+  // can total what the run spent. A call that reported no cost is counted as `source: 'none'`.
+  const offCost = subscribeRunCost();
   try { await ctx.runner.play(plan); }
-  catch (err) { persistTrace(); emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
+  catch (err) { offCost(); persistTrace(); emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
+  offCost();
   persistTrace();
 
   const t = tally(plan, ctx.TaskStatus);
-  emit({ event: 'run-finished', ...t, manualGateHit: events.manualGateHit() });
   const runCode = events.manualGateHit() ? 3 : (t.failed > 0 ? 1 : 0);
+  // `code` is the run's own outcome, as the hosted worker reports it: ONOSOO derives the run's
+  // status from it (0 completed, 1 gaps, 3 awaiting approval, 4 budget) and treats a missing one
+  // as a failure.
+  emit({ event: 'run-finished', ...t, manualGateHit: events.manualGateHit(), code: events.budgetHit() ? 4 : runCode });
 
   if (args.pr) { await openPullRequest(args, plan, prBaseRef); }
 
