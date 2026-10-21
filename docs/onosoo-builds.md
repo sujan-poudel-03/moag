@@ -134,6 +134,32 @@ Nothing secret leaves the machine. Values from `.env` / `.env.local`, engine key
 common key formats are redacted, and absolute paths are shortened. If ONOSOO is unreachable, events
 wait in a local spool (`<config>/moag/onosoo-spool/`) and are sent by the next run.
 
+### 5. Stay online
+
+Between runs ONOSOO shows the machine **offline** after 3 minutes without a request. To keep it
+**online**, keep `moag daemon` running. With the key saved and no `.moag/daemon.json`, the daemon
+only polls ONOSOO: it never starts work on its own and, on Windows and macOS, reports remote start
+as off.
+
+**Windows:** install it as a logon task for your own account (no administrator rights needed):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File D:\Projects\moag\scripts\install-daemon-windows.ps1 -Install
+powershell -ExecutionPolicy Bypass -File D:\Projects\moag\scripts\install-daemon-windows.ps1 -Status
+powershell -ExecutionPolicy Bypass -File D:\Projects\moag\scripts\install-daemon-windows.ps1 -Uninstall
+```
+
+`-Install` refuses unless `%APPDATA%\moag\onosoo.json` exists (step 2), and needs a built checkout
+(`npm run compile`) and `node` on the PATH. It registers a Scheduled Task named **MOAG daemon** that
+starts at your logon with a hidden window and runs `node <repo>\out\headless\cli.js daemon` in
+`%LOCALAPPDATA%\moag\daemon` (deliberately not your profile folder, which contains `%APPDATA%\moag`:
+MOAG refuses to relay when its config folder is inside the working directory). If the daemon exits
+with an error it is started again after a minute. Output goes to `%LOCALAPPDATA%\moag\daemon.log`.
+The key stays in `onosoo.json`: it is never put in the task's arguments or environment.
+
+**Linux / WSL2:** run it as a systemd service, as in
+[onosoo-remote.md, "Running the daemon as a service"](onosoo-remote.md#6-running-the-daemon-as-a-service).
+
 ## Level 2: control runs from ONOSOO
 
 Remote runs need **Linux or WSL2**. MOAG runs them as a separate low-privilege account
