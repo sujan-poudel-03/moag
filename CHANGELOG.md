@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.9.14] - 2026-10-22
+
+### ONOSOO Builds
+
+- **Runs from the VS Code panel appear in ONOSOO.** Play, Play playlist, Play task, retry, fix-all, prompt runs and the PRD loop all report to ONOSOO when this machine is paired, exactly as `moag run` does.
+  - A status-bar item shows **☁ ONOSOO**, **ONOSOO: off** or **ONOSOO: key revoked**.
+  - The new setting `agentTaskPlayer.onosoo.relay` (on by default, per machine) turns it off.
+  - The device key is removed from VS Code's environment when MOAG starts, so no agent or tool it launches can see it.
+- **The right outcome and cost in ONOSOO.**
+  - `moag run` now reports its exit code. Runs no longer show as Failed when they completed.
+  - It reports every AI call's cost, and uses Claude's JSON output when connected so the cost is real.
+  - The VS Code panel keeps live output; a one-time tip explains how to see cost there.
+- **Stay online on Windows.** `scripts/install-daemon-windows.ps1 -Install` starts a background `moag daemon` at logon, so the machine shows as online in ONOSOO. No admin rights are needed, and the key is never put into the task.
+- **Sturdier delivery.**
+  - Longer waits for a slow ONOSOO.
+  - Two runs started back to back no longer resend events.
+  - A run started from a later playlist reports only its own tasks.
+  - Old backlog is sent with the protocol's status names.
+  - A replayed backlog stays within memory limits.
+- **Onboarding.** The Get Started walkthrough has a new optional "Connect to ONOSOO Builds" step. The Setup Guide links the end-to-end guide (`docs/onosoo-builds.md`).
+- **Tests never use your real ONOSOO key.** MOAG's own test runs no longer read the developer's real config, so they can't send runs to a live ONOSOO.
+
 ## [0.9.13] - 2026-10-20
 
 ### ONOSOO Builds
@@ -19,7 +41,6 @@
   - Compose files are checked against a strict allowlist before every start.
   - Containers never get your environment or registry logins.
   - See `docs/host-agent.md`.
-- **Onboarding.** The Get Started walkthrough has a new optional "Connect to ONOSOO Builds" step, and the Setup Guide links the end-to-end guide (`docs/onosoo-builds.md`).
 
 ### Automatic dependency installs
 
