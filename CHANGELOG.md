@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.9.15] - 2026-10-24
+
+### Fixed
+
+- The extension failed to activate ("Cannot find module '../server/secrets'") in 0.9.13 and 0.9.14. Packaging is now smoke-tested in CI and before every publish.
+
 ## [0.9.14] - 2026-10-22
 
 ### ONOSOO Builds
