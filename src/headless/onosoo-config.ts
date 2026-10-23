@@ -18,7 +18,7 @@ import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { API_KEY_RE } from '../server/secrets';
+import { API_KEY_RE } from '../shared/engine-keys';
 import { writeFileAtomicSync } from '../utils/file-io';
 
 /** Path of the ingest function under the configured base URL. */

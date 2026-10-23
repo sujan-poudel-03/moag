@@ -16,74 +16,14 @@
 // work to Pending. The approve/skip distinction also lives in the audit log
 // and the run record.
 
-import { Plan, PlanFileTask, StandardsCheckCounts, TaskStatus } from '../models/types';
+import { Plan, StandardsCheckCounts, TaskStatus } from '../models/types';
 import { stampRelease } from '../models/requirement-trace';
-import { SHIPPING_TASK_TYPES, shippingTaskIds } from './prd-ops';
+import { SHIPPING_TASK_TYPES } from '../shared/ship-gate';
 
-const RESETTABLE = new Set<TaskStatus>([TaskStatus.Blocked, TaskStatus.Skipped, TaskStatus.Failed]);
-
-export class GateResumeError extends Error {
-  constructor(message: string) { super(message); this.name = 'GateResumeError'; }
-}
-
-/** How a halted ship gate was decided — the two decisions that resume the run. */
-export type GateResumeKind = 'approve' | 'skip';
-
-/** The task-status rewrite `prepareGateResume` applied to the snapshot. */
-export interface GateResumeResult {
-  /** Ids reset to Pending — they run in the next segment. */
-  reset: string[];
-  /** Ids set to Skipped — shipping work a `skip` must never run. Empty on approve. */
-  skipped: string[];
-}
-
-/**
- * Mark `gateTaskId` Completed and rewrite its transitive dependents (via
- * `dependsOn`, across playlists). On `approve` every halted dependent goes back
- * to Pending. On `skip` the shipping dependents (release/deploy tasks and
- * everything downstream of one) that are not already Completed become Skipped,
- * and only the non-shipping halted dependents go back to Pending. Throws when
- * the task is missing or is not a `manual` task.
- */
-export function prepareGateResume(plan: Plan, gateTaskId: string, kind: GateResumeKind): GateResumeResult {
-  const all = plan.playlists.flatMap((pl) => pl.tasks);
-  const gate = all.find((t) => t.id === gateTaskId);
-  if (!gate) { throw new GateResumeError(`Gate task "${gateTaskId}" not found in the plan.`); }
-  if (gate.type !== 'manual') { throw new GateResumeError(`Task "${gateTaskId}" is not a manual ship gate.`); }
-  gate.status = TaskStatus.Completed;
-
-  const closure = new Set<string>([gate.id]);
-  let grew = true;
-  while (grew) {
-    grew = false;
-    for (const t of all) {
-      if (closure.has(t.id)) { continue; }
-      if ((t.dependsOn ?? []).some((d) => closure.has(d))) {
-        closure.add(t.id);
-        grew = true;
-      }
-    }
-  }
-
-  const shipping = kind === 'skip'
-    ? shippingTaskIds(all.map((t): PlanFileTask => ({ id: t.id, name: t.name, prompt: t.prompt, type: t.type, dependsOn: t.dependsOn })))
-    : new Set<string>();
-  const reset: string[] = [];
-  const skipped: string[] = [];
-  for (const t of all) {
-    if (t.id === gate.id || !closure.has(t.id)) { continue; }
-    if (shipping.has(t.id)) {
-      if (t.status !== TaskStatus.Completed) {
-        t.status = TaskStatus.Skipped;
-        skipped.push(t.id);
-      }
-    } else if (RESETTABLE.has(t.status)) {
-      t.status = TaskStatus.Pending;
-      reset.push(t.id);
-    }
-  }
-  return { reset, skipped };
-}
+// The resume itself is in shared/ship-gate.ts: the ONOSOO remote child ships in the
+// extension and resumes its own gates, and the server does not ship.
+export { GateResumeError, prepareGateResume } from '../shared/ship-gate';
+export type { GateResumeKind, GateResumeResult } from '../shared/ship-gate';
 
 // ─── Ship stamp after an approved gate ───
 

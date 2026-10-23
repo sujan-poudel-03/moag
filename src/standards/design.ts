@@ -9,7 +9,7 @@
 // Pure: no `fs`, no `vscode`. `profile.ts` imports from here, never the other way.
 
 import { createHash } from 'crypto';
-import type { StackId } from '../server/stacks';
+import type { StackId } from '../shared/stacks';
 import { TOKENS_CSS, designDoc } from './design-templates';
 
 // ─── Types and caps ───

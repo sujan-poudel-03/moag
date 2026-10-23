@@ -12,7 +12,7 @@
 // Free of VS Code API imports and of the runner. Type-only import of the profile module, so
 // there is no runtime cycle: profile.ts imports this module, not the other way round.
 
-import type { StackId } from '../server/stacks';
+import type { StackId } from '../shared/stacks';
 import type { StandardsProfile } from './profile';
 
 // ─── Shape ───

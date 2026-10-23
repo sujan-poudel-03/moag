@@ -15,6 +15,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { parseJob, WorkerJob, RunJob, PlanJob, ProbeRow, DeltaOutcomeKind } from './worker-protocol';
 import { installVscodeShim } from '../headless/install-shim';
+// Pipe guarding and the disconnect watchdog are in shared/: the ONOSOO remote child
+// ships in the extension and uses them too, and the server does not ship. A pure
+// module with no imports of its own, so the worker's load stays light.
+import { armDisconnectWatchdog, guardParentPipes, DISCONNECT_WATCHDOG_MS, DisconnectWatchdogOptions } from '../shared/worker-pipes';
+
+export { guardParentPipes, armDisconnectWatchdog, DISCONNECT_WATCHDOG_MS, DisconnectWatchdogOptions };
 
 // ─── Narrow structural types (no engine-core imports at top level) ───
 
@@ -526,46 +532,6 @@ function emitLine(obj: Record<string, unknown>, out: { write(s: string): unknown
   try {
     out.write(JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n');
   } catch { /* parent gone: nothing is listening; keep supervising the task tree */ }
-}
-
-/**
- * Swallow write errors on the worker's pipes. When the server dies, the next
- * write gets EPIPE; unhandled, that error event crashes the worker and orphans
- * the agent it was supervising (still running, with no timeout and uncounted
- * spend). With this the worker survives, its disconnect handler stops the
- * runner, and it exits only once play() has settled and killed the task tree.
- */
-export function guardParentPipes(...streams: Array<{ on(event: 'error', fn: (err: Error) => void): unknown } | null | undefined>): void {
-  for (const s of streams) { s?.on('error', () => { /* EPIPE after the parent died */ }); }
-}
-
-// ─── Post-disconnect watchdog ───
-
-/** How long a worker whose server died may take to settle before it kills its own tree and exits. */
-export const DISCONNECT_WATCHDOG_MS = 30_000;
-
-export interface DisconnectWatchdogOptions {
-  /** Kill every descendant of this process (`killOwnProcessTree`). */
-  killTree(): void;
-  exit(code: number): void;
-  graceMs?: number;
-  setTimer?: (fn: () => void, ms: number) => unknown;
-}
-
-/**
- * Arm the last-resort exit for a worker whose server is gone. The disconnect
- * handler already stopped the runner; normally `play()` settles and `main()`
- * exits well inside the grace period. If it has not — a task that escaped its
- * abort, a hung promise — nobody is left to stop it, and while the worker lives
- * the project's job lock stays held. So after `graceMs` the worker kills its own
- * process tree and exits 2, unconditionally. Never throws.
- */
-export function armDisconnectWatchdog(opts: DisconnectWatchdogOptions): void {
-  const setTimer = opts.setTimer ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
-  setTimer(() => {
-    try { opts.killTree(); } catch { /* exit regardless */ }
-    opts.exit(2);
-  }, opts.graceMs ?? DISCONNECT_WATCHDOG_MS);
 }
 
 /**

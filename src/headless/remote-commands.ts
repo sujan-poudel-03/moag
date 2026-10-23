@@ -9,8 +9,8 @@
 // `rejected` result. Nothing here does I/O.
 
 import { Plan, PlanFile, TaskStatus } from '../models/types';
-import { prepareGateResume, GateResumeKind, GateResumeResult } from '../server/gate';
-import { PLANNER_LOCKED_ENGINES } from '../server/run-env';
+import { prepareGateResume, GateResumeKind, GateResumeResult } from '../shared/ship-gate';
+import { PLANNER_LOCKED_ENGINES } from '../shared/worker-config';
 import type { ApprovedProjects, ApprovedProject } from './onosoo-projects';
 import type { RemoteRunRecord } from './remote-runs';
 

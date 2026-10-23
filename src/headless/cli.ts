@@ -110,7 +110,7 @@ import { profileHash, renderStandardsText, StandardsDocument } from '../standard
 import { clearStandardsBase, rememberStandardsBase, resolveStandardsBase } from '../runner/standards-base';
 import { detectedStackId, proposeProfile } from '../standards/propose';
 import { detectConventions } from '../ai-rules/project-detector';
-import { STACK_IDS, isStackId } from '../server/stacks';
+import { STACK_IDS, isStackId } from '../shared/stacks';
 import type { Plan } from '../models/types';
 import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
@@ -2124,7 +2124,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       process.stderr.write('Usage: moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]  (--max-usd must be a positive number)\n');
       return 2;
     }
-    return require('../bench/harness').cmdBench(args);
+    // The bench is a development tool and is not in the VSIX (.vscodeignore: out/bench/**).
+    let harness: { cmdBench(a: Args): Promise<number> };
+    try {
+      harness = require('../bench/harness');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') { throw err; }
+      process.stderr.write('moag bench runs from a MOAG source checkout (npm run compile); it is not part of the installed extension.\n');
+      return 2;
+    }
+    return harness.cmdBench(args);
   }
   if (args.command === 'run') {
     if (!args.planPath && !args.prompt) {

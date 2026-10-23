@@ -32,8 +32,9 @@ import * as os from 'os';
 import * as path from 'path';
 import { dehydratePlan, hydratePlan } from '../models/plan';
 import type { Plan, PlanFile, PlanFileTask } from '../models/types';
-import { appendShipGate, cwdEscapesWorkspace, shippingTaskIds, stripGeneratedSideEffects } from '../server/prd-ops';
-import { buildPlanWorkerConfig, buildWorkerConfig } from '../server/run-env';
+import { cwdEscapesWorkspace, stripGeneratedSideEffects } from '../shared/generated-plan';
+import { appendShipGate, shippingTaskIds } from '../shared/ship-gate';
+import { buildPlanWorkerConfig, buildWorkerConfig } from '../shared/worker-config';
 import { addBranchWorktree } from '../runner/worktree';
 import { killProcess } from '../utils/process-kill';
 import { ENGINE_ENV_KEYS, REMOTE_EXCLUDED_ENGINES } from './remote-isolation';
@@ -687,7 +688,7 @@ export const spawnGit: ChildGit = (args, cwd) => new Promise((resolve) => {
 /* eslint-disable @typescript-eslint/no-var-requires */
 /** `moag remote-child`: read the spec from stdin, run it, exit. */
 export async function remoteChildMain(): Promise<number> {
-  const { guardParentPipes, armDisconnectWatchdog } = require('../server/run-worker');
+  const { guardParentPipes, armDisconnectWatchdog } = require('../shared/worker-pipes');
   guardParentPipes(process.stdout, process.stderr);
   const write = (line: Record<string, unknown>): void => {
     try { process.stdout.write(JSON.stringify({ ts: new Date().toISOString(), ...line }) + '\n'); } catch { /* parent gone */ }
