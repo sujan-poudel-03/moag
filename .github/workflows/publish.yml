@@ -20,15 +20,61 @@ jobs:
       - run: npm run test:unit
 
       - name: Package extension
-        run: npx vsce package
+        run: npx @vscode/vsce package -o moag.vsix
+      # Tests run against the repo's out/, which holds every compiled file; the VSIX
+      # holds only what .vscodeignore lets through. 0.9.13 and 0.9.14 shipped an
+      # extension that could not activate ("Cannot find module '../server/secrets'")
+      # while every test passed. Load the shipped entry points from the unzipped VSIX.
+      - name: Unzip the VSIX
+        run: rm -rf vsix-smoke && mkdir vsix-smoke && unzip -q moag.vsix -d vsix-smoke
+      - name: Write a stub vscode module
+        run: |
+          cat > vsix-smoke/vscode-stub.js <<'EOF'
+          'use strict';
+          // Every property, call and construction yields the stub again. __esModule keeps
+          // tsc's __importStar from copying the proxy's few own keys.
+          const handler = {
+            get(_t, p) {
+              if (p === '__esModule') { return true; }
+              if (p === 'then') { return undefined; }
+              if (p === Symbol.toPrimitive) { return () => ''; }
+              if (p === 'prototype') { return {}; }
+              return stub;
+            },
+            apply() { return stub; },
+            construct() { return stub; },
+          };
+          const stub = new Proxy(function vscode() {}, handler);
+          module.exports = stub;
+          EOF
+      - name: Load extension.js with the stub vscode
+        run: |
+          node -e "
+            const Module = require('module');
+            const path = require('path');
+            const stub = path.resolve('vsix-smoke/vscode-stub.js');
+            const resolve = Module._resolveFilename;
+            Module._resolveFilename = function (request, ...rest) { return request === 'vscode' ? stub : resolve.call(this, request, ...rest); };
+            const ext = require(path.resolve('vsix-smoke/extension/out/extension.js'));
+            if (typeof ext.activate !== 'function') { console.error('extension.js does not export activate()'); process.exit(1); }
+            console.log('extension.js loaded');
+          "
+      - name: Run the packaged CLI
+        run: |
+          set +e
+          node vsix-smoke/extension/out/headless/cli.js --help > cli-help.log 2>&1
+          code=$?
+          cat cli-help.log
+          if grep -q "Cannot find module" cli-help.log; then echo "::error::the packaged CLI is missing a module"; exit 1; fi
+          if [ "$code" -ne 0 ] && [ "$code" -ne 2 ]; then echo "::error::cli.js --help exited $code"; exit 1; fi
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v4
         with:
           name: vsix
-          path: '*.vsix'
+          path: moag.vsix
 
       - name: Publish to Marketplace
         if: env.VSCE_PAT != ''
-        run: npx vsce publish -p ${{ secrets.VSCE_PAT }}
+        run: npx @vscode/vsce publish --packagePath moag.vsix -p ${{ secrets.VSCE_PAT }}
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}

@@ -1760,6 +1760,7 @@
     "package": "vsce package",
     "moag": "node ./out/headless/cli.js",
     "server": "node ./out/server/main.js",
+    "smoke:vsix": "node scripts/smoke-vsix.mjs",
     "headless:smoke": "npm run compile && node ./out/headless/cli.js run .moag/sample.plan.json --no-interactive --full-auto",
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch",
