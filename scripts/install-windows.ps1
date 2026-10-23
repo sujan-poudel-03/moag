@@ -43,7 +43,7 @@ Say 'Compiling...'; npm run compile
 $version = node -p "require('./package.json').version"
 $vsix = "agent-task-player-$version.vsix"
 Say "Packaging $vsix..."
-npx --yes vsce package --no-dependencies --allow-missing-repository --skip-license -o $vsix
+npx --yes vsce package --allow-missing-repository --skip-license -o $vsix
 
 # ── Install / update the extension ──
 Say 'Installing extension into VS Code...'
