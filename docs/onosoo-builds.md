@@ -1,13 +1,11 @@
 # MOAG + ONOSOO Builds: end-to-end setup
 
 This guide connects a machine running MOAG to the **Builds** app in ONOSOO, from nothing to a run you
-can watch, control and open live. It covers both sides in order. The detail of each piece lives in
-its own document:
+can watch, control and open live. ONOSOO is a hosted service: there is nothing to deploy. The detail
+of each piece lives in its own document:
 
 | Piece | Document |
 |---|---|
-| ONOSOO side: deploy, pairing, roles | ONOSOO repo: `docs/builds/README.md` and `docs/builds/SETUP.md` |
-| The contract between the two | ONOSOO repo: `docs/builds/PROTOCOL.md` |
 | Remote runs (`moag daemon`), the runner account, `projects.json` | [onosoo-remote.md](onosoo-remote.md) |
 | Live previews (`moag host`), Docker, the gateway, the tunnel | [host-agent.md](host-agent.md) |
 | One-shot Linux/WSL setup | [`scripts/setup-build-server.sh`](../scripts/setup-build-server.sh) |
@@ -20,70 +18,79 @@ its own document:
 | **2. Control** | Start a run (goal or a PRD from Notes), stop, approve or skip a gate, retry. | **Linux or WSL2 only** | `moag daemon` |
 | **3. Open it live** | Open a running branch inside ONOSOO, see service health, read logs. | **Linux or WSL2 only**, with Docker | `moag host` |
 
-Each level builds on the one before. Get level 1 working first: it proves the pairing, the URL and
-the key.
+Each level builds on the one before. Get level 1 working first: it proves the pairing and the key.
 
-## Before you start (ONOSOO side)
+## Before you start
 
-Someone with owner or admin rights in the ONOSOO workspace:
+Someone with owner or admin rights in the ONOSOO workspace switches the app on:
+**Settings › Apps › Builds**.
 
-1. Has deployed the Builds feature: the migrations, the `builds` edge function deployed with
-   `--no-verify-jwt`, and the frontend. See the ONOSOO repo's `docs/builds/SETUP.md`.
-2. Has switched the app on: **Settings › Apps › Builds**.
-3. Knows the **base URL** of the ONOSOO backend, e.g. `https://<project-ref>.supabase.co`. MOAG adds
-   `/functions/v1/builds/…` itself, so do not include that path.
-
-Quick check that the backend is live, from any terminal:
-
-```sh
-curl -s -o /dev/null -w "%{http_code}\n" -X POST -H "Content-Type: application/json" -d '{}' \
-  https://<project-ref>.supabase.co/functions/v1/builds/events
-```
-
-`401` means it is deployed and waiting for a key. `404` means the function is not deployed.
+For the `moag` command in a terminal (levels 1 to 3 from the command line, and the Windows daemon),
+run **MOAG: Install Command-Line Tool** in VS Code once, then open a new terminal. `moag --version`
+should print the extension's version, and an extension update updates `moag` too.
 
 ## Level 1: watch a run
 
-### 1. Pair the machine
+### 1. Get a device key
 
 In ONOSOO open **Builds**, go to the machines list, click **Pair machine**, give the machine a name
 (e.g. "Office PC") and copy the key. Only owners and admins see the button. The key starts with
 `onosoo_live_` and is shown **once**. One key per machine. A WSL2 Ubuntu on a Windows PC
 is a separate machine: pair it separately.
 
-### 2. Save the key on the machine
+### 2. Pair the machine
 
-The key belongs in a file in **your user folder**. Never put it inside a project (MOAG refuses to
-relay if its config folder is inside the workspace, so a commit can never carry it). Never set it as
-an account-wide environment variable either (`setx`, System Properties, `/etc/environment`): every
-process would get it, including the AI agents MOAG runs.
+**In VS Code:** run **MOAG: Connect to ONOSOO Builds** and paste the key. MOAG saves it, checks it
+with ONOSOO and says whether it was accepted. The status bar then shows **☁ ONOSOO**.
+**MOAG: Disconnect from ONOSOO** removes the key again.
+
+**In a terminal:**
+
+```sh
+moag pair
+```
+
+and paste the key at the prompt (it is not echoed). `moag pair <key>` works too, but puts the key in
+your shell history; piping it in (`moag pair < key.txt`) does not. Exit code 0 means paired (or saved
+while ONOSOO could not be reached: runs relay once it can), 1 means ONOSOO refused the key, 2 means
+the key or URL was not valid.
+
+Both save the key in **your user folder**, never inside a project: `%APPDATA%\moag\onosoo.json` on
+Windows, `~/.config/moag/onosoo.json` elsewhere (`$XDG_CONFIG_HOME/moag/` if you set that variable).
+On Windows MOAG restricts that folder to your account. Pairing again with a different key discards
+the previous pairing's unsent events, so they are never sent under the new key.
+
+#### Advanced: write the file yourself
+
+MOAG reads `{"key": "…", "url": "…"}` from that file. The `url` is the ONOSOO backend
+(`https://jcudchpeetqutfplksre.supabase.co` for the hosted ONOSOO); pairing writes it for you. Never
+put the key inside a project (MOAG refuses to relay if its config folder is inside the workspace, so a
+commit can never carry it), and never set it as an account-wide environment variable (`setx`, System
+Properties, `/etc/environment`): every process would get it, including the AI agents MOAG runs.
 
 **Windows (PowerShell):**
 
 ```powershell
 $dir = "$env:APPDATA\moag"
 New-Item -ItemType Directory -Force $dir | Out-Null
-@{ key = "<paste key>"; url = "https://<project-ref>.supabase.co" } | ConvertTo-Json | Set-Content "$dir\onosoo.json" -Encoding ascii
+@{ key = "<paste key>"; url = "https://jcudchpeetqutfplksre.supabase.co" } | ConvertTo-Json | Set-Content "$dir\onosoo.json" -Encoding ascii
 ```
-
-This creates `%APPDATA%\moag\onosoo.json`.
 
 **Linux / WSL2 / macOS:**
 
 ```sh
 mkdir -p ~/.config/moag && chmod 700 ~/.config/moag
-printf '{"key":"<paste key>","url":"https://<project-ref>.supabase.co"}' > ~/.config/moag/onosoo.json
+printf '{"key":"<paste key>","url":"https://jcudchpeetqutfplksre.supabase.co"}' > ~/.config/moag/onosoo.json
 chmod 600 ~/.config/moag/onosoo.json
 ```
 
-The file lives in `$XDG_CONFIG_HOME/moag/` if you set that variable. On first use MOAG adds a
-`device_id` to the file by itself.
+On first use MOAG adds a `device_id` to the file by itself.
 
-**For one terminal only** (a quick test, or `scripts/builds-smoke.mjs` in the ONOSOO repo), set the
-environment variables instead. They win over the file:
+**For one terminal only** (a quick test), set the environment variables instead. They win over the
+file:
 
 ```powershell
-$env:MOAG_ONOSOO_URL = "https://<project-ref>.supabase.co"
+$env:MOAG_ONOSOO_URL = "https://jcudchpeetqutfplksre.supabase.co"
 $env:MOAG_ONOSOO_KEY = "<paste key>"
 ```
 
@@ -102,12 +109,6 @@ Any `moag run` now reports to ONOSOO, and so does any run started from the VS Co
 moag run --prompt "Add a short README describing this project" --cwd /path/to/repo
 ```
 
-On Windows without a `moag` command on the PATH, call the CLI directly:
-
-```powershell
-node D:\Projects\moag\out\headless\cli.js run --prompt "Add a short README" --cwd D:\path\to\repo
-```
-
 **Cost.** Claude Code reports what a call cost only in JSON mode. `moag run` handles this for you:
 when it is connected to ONOSOO and you have not set the format yourself, it uses JSON mode for that
 run (it prints one line saying so and changes no file). The CLI shows no live engine output anyway,
@@ -122,29 +123,33 @@ Remote runs started from ONOSOO always use JSON mode.
 
 #### From the VS Code panel
 
-When the machine is paired (the key in `onosoo.json` from step 2, or `MOAG_ONOSOO_KEY` in the
-environment VS Code was started from), every run you start from the MOAG panel is relayed too: play,
-play playlist, a single task, retries and fix runs. Each run gets its own entry in Builds, and a
-paused run that you resume stays the same run. Relay messages (a rejected URL, a revoked key) go to
-the **MOAG** output channel.
+When the machine is paired (step 2, or `MOAG_ONOSOO_KEY` in the environment VS Code was started
+from), every run you start from the MOAG panel is relayed too: play, play playlist, a single task,
+retries and fix runs. Each run gets its own entry in Builds, and a paused run that you resume stays
+the same run. Relay messages (a rejected URL, a revoked key) go to the **MOAG** output channel.
 
 - **Turn it off** with the setting `agentTaskPlayer.onosoo.relay` (on by default). It applies to this
   machine, not per workspace, and does not affect `moag run`. Off means nothing is sent.
-- **Cost.** Unlike `moag run`, the panel keeps Claude in text mode, so you keep live output, and
-  ONOSOO shows $0.00 for its Claude calls. The first relayed run that uses Claude in text mode shows
-  a one-time notice explaining this, with **Open Setting** and **Don't Show Again**. To see real cost,
-  set `agentTaskPlayer.engines.claude.outputFormat` to `json` (live output then appears when each
-  call ends).
+- **Cost.** Unlike `moag run`, the panel keeps Claude in text mode, so you keep live output. ONOSOO
+  shows $0.00 for Claude runs in text mode because Claude reports cost only in JSON output, and MOAG
+  never guesses a cost; ONOSOO cannot mark a total as unknown yet. The first relayed run that uses
+  Claude in text mode shows a notice explaining this. To see real cost, set
+  `agentTaskPlayer.engines.claude.outputFormat` to `json` (live output then appears when each call
+  ends). Engines that report no cost (Claude in text mode, Codex, Gemini, Copilot, custom) are not
+  counted by `costBudgetUsd` either, so the ceiling cannot stop them; MOAG says so when such a run
+  starts, and offers to switch Claude to JSON output.
 - **Status bar.** An item on the left shows the state, and clicking it opens the setting:
   - **☁ ONOSOO**: connected; runs started here appear in Builds;
   - **ONOSOO: off**: paired, but `agentTaskPlayer.onosoo.relay` is off;
-  - **ONOSOO: key revoked**: ONOSOO refused the key; pair the machine again;
+  - **ONOSOO: key revoked**: ONOSOO refused the key; run **MOAG: Connect to ONOSOO Builds** with a new key;
   - no item: no key was found (or no folder is open).
-- **Pull requests.** The panel does not relay `pr-created`: a pull request you open later by hand is
-  not attached to the run in ONOSOO.
-- **Approval gates.** The panel waits at a gate for your click; it never reports "awaiting approval".
-  If you stop a run while it waits at a gate, ONOSOO shows it as **gaps** (code 1: the run did not
-  finish every task), the same as any other run you stop.
+- **Pull requests.** A pull request you open with **MOAG: Create PR** right after a relayed run is
+  attached to that run in ONOSOO. Once another run has started, a pull request is no longer attached
+  to the earlier run.
+- **Approval gates.** The panel waits at a gate for your click in VS Code; ONOSOO shows the gate on
+  the run, but never as "awaiting approval" (its Approve button could not reach a run waiting in VS
+  Code). If you stop a run while it waits at a gate, ONOSOO shows it as **gaps** (code 1: the run
+  did not finish every task), the same as any other run you stop.
 
 ### 4. Check it in ONOSOO
 
@@ -161,32 +166,36 @@ wait in a local spool (`<config>/moag/onosoo-spool/`) and are sent by the next r
 
 ### 5. Stay online
 
-ONOSOO shows a machine **Online** after "any request in the last 3 minutes" (ONOSOO's
-`docs/builds/SETUP.md`; any authenticated request counts: events, command polls, environments).
-So between runs, with nothing sending, the machine shows **offline** 3 minutes after its last
-request. To keep it **online**, keep `moag daemon` running. With the key saved and no `.moag/daemon.json`, the daemon
-only polls ONOSOO: it never starts work on its own and, on Windows and macOS, reports remote start
-as off.
+ONOSOO shows a machine **Online** after any authenticated request in the last 3 minutes (events,
+command polls, environments). So between runs, with nothing sending, the machine shows **offline**
+3 minutes after its last request. To keep it **online**, keep `moag daemon` running. With the key
+saved and no `.moag/daemon.json`, the daemon only polls ONOSOO: it never starts work on its own and,
+on Windows and macOS, reports remote start as off.
 
-**Windows:** install it as a logon task for your own account (no administrator rights needed):
+**Windows:** install it as a logon task for your own account (no administrator rights needed).
+**MOAG: Install Command-Line Tool** puts the script next to the `moag` command:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File D:\Projects\moag\scripts\install-daemon-windows.ps1 -Install
-powershell -ExecutionPolicy Bypass -File D:\Projects\moag\scripts\install-daemon-windows.ps1 -Status
-powershell -ExecutionPolicy Bypass -File D:\Projects\moag\scripts\install-daemon-windows.ps1 -Uninstall
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\moag\bin\install-daemon-windows.ps1" -Install
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\moag\bin\install-daemon-windows.ps1" -Status
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\moag\bin\install-daemon-windows.ps1" -Uninstall
 ```
 
-`-Install` refuses unless `%APPDATA%\moag\onosoo.json` exists (step 2), and needs a built checkout
-(`npm run compile`) and `node` on the PATH. It registers a Scheduled Task named **MOAG daemon** that
-starts at your logon with a hidden window and runs `node <repo>\out\headless\cli.js daemon` in
-`%LOCALAPPDATA%\moag\daemon` (deliberately not your profile folder, which contains `%APPDATA%\moag`:
-MOAG refuses to relay when its config folder is inside the working directory). If the daemon exits
-with an error it is started again after a minute; after 5 failures within 10 minutes (a configuration
-error, say) it stops and writes a `GIVING UP` line to the log: fix the error and run `-Install` again.
-Output goes to `%LOCALAPPDATA%\moag\daemon.log`, which moves to `daemon.log.1` past 10 MB.
-`-Install`, `-Uninstall` and `-Status` touch only the task's own processes: a `moag daemon` you started
-by hand keeps running. The key stays in `onosoo.json`: it is never put in the task's arguments or
-environment.
+If that file is missing (an extension build that does not ship it yet), download
+`scripts/install-daemon-windows.ps1` from the MOAG release tag matching your version into
+`%LOCALAPPDATA%\moag\bin\` and run it from there.
+
+`-Install` refuses unless the machine is paired (step 2) and the command-line tool is installed, and
+needs `node` on the PATH. It registers a Scheduled Task named **MOAG daemon** that starts at your
+logon with a hidden window and runs `moag daemon` (through `moag-launch.js`, so it always uses the
+newest installed extension) in `%LOCALAPPDATA%\moag\daemon` (deliberately not your profile folder,
+which contains `%APPDATA%\moag`: MOAG refuses to relay when its config folder is inside the working
+directory). If the daemon exits with an error it is started again after a minute; after 5 failures
+within 10 minutes (a configuration error, say) it stops and writes a `GIVING UP` line to the log: fix
+the error and run `-Install` again. Output goes to `%LOCALAPPDATA%\moag\daemon.log`, which moves to
+`daemon.log.1` past 10 MB. `-Install`, `-Uninstall` and `-Status` touch only the task's own
+processes: a `moag daemon` you started by hand keeps running. The key stays in `onosoo.json`: it is
+never put in the task's arguments or environment.
 
 **Linux / WSL2:** run it as a systemd service, as in
 [onosoo-remote.md, "Running the daemon as a service"](onosoo-remote.md#6-running-the-daemon-as-a-service).
@@ -208,10 +217,10 @@ happens inside Ubuntu.
 
 ### 2. Run the setup script
 
-From the MOAG repository (on WSL it is visible as `/mnt/<drive>/…`):
+The Linux build server is set up from a clone of MOAG:
 
 ```sh
-bash /mnt/d/Projects/moag/scripts/setup-build-server.sh
+git clone https://github.com/sujan-poudel-03/moag && bash moag/scripts/setup-build-server.sh
 ```
 
 It asks for your Linux password where it needs `sudo`, and is safe to run again. It installs Node 20,
@@ -226,7 +235,7 @@ re-run it. When it finishes, do `wsl --shutdown` once more so the docker group a
 ### 3. Save the key in Linux
 
 Pair the Linux machine in ONOSOO (a WSL2 Ubuntu does not see the Windows file) and save its key with
-the Linux commands from level 1.
+`moag pair` (level 1, step 2).
 
 ### 4. Give the runner account an engine
 
@@ -301,9 +310,9 @@ Only images from **public** registries can be used: previews never get your Dock
 |---|---|---|
 | The run works but nothing appears in ONOSOO | No key found: the relay is off and says nothing | Check the file is at `%APPDATA%\moag\onosoo.json` (Windows) or `~/.config/moag/onosoo.json`, and that it is valid JSON. In WSL, the Windows file is not visible. |
 | "ONOSOO relay is off: MOAG_ONOSOO_URL must be an https URL …" | URL rejected | Use the base `https://<ref>.supabase.co`, with no path, query or credentials. |
-| "ONOSOO relay is off: a device key is set but no URL …" | Key without a URL | Add `"url"` to `onosoo.json`, or set `MOAG_ONOSOO_URL`. |
+| "ONOSOO relay is off: a device key is set but no URL …" | Key without a URL | Pair again with `moag pair` or **MOAG: Connect to ONOSOO Builds**: pairing writes the URL. |
 | "ONOSOO relay is off: the device key is not 8-512 printable characters." | Bad paste (quotes, spaces, a line break) | Paste the key again, exactly as shown in ONOSOO. |
-| "ONOSOO device key was revoked or is wrong — re-pair this machine" | 401 from ONOSOO | Pair the machine again and replace the key. Unsent events stay in the spool. |
+| "ONOSOO device key was revoked or is wrong — re-pair this machine" | 401 from ONOSOO | Get a new key in ONOSOO and pair again (`moag pair`, or **MOAG: Connect to ONOSOO Builds**). |
 | Machine shows offline | No request for 3 minutes | Check `moag daemon` (or a run) is running and the machine is awake. |
 | Remote start shows off although `projects.json` says on | `daily_budget_usd` is null, or isolation failed | Set a budget. Read the daemon's stderr: it names the failed check. |
 | "The runner account did not answer the isolation check … MOAG ran: sudo -n -u …" | The sudoers rule does not match | The rule must allow exactly the command shown. Re-run the setup script, or check `sudo -l -U <you>`. |

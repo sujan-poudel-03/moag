@@ -8,27 +8,15 @@ ONOSOO Builds shows your MOAG runs as they happen: tasks in plan order, what eac
 | **2. Control** | Start, stop, approve, skip, retry | Linux or WSL2 only | `moag daemon` |
 | **3. Open it live** | Open a running branch, health, logs | Linux or WSL2 only, with Docker | `moag host` |
 
-### 1. Pair the machine
+### 1. Get a device key
 
-In ONOSOO open **Builds**, click **Pair machine**, name the machine and copy the key. The key starts with `onosoo_live_` and is shown **once**. A WSL2 Ubuntu on a Windows PC is a separate machine: pair it separately.
+In ONOSOO, switch the app on in **Settings › Apps › Builds**, open **Builds**, click **Pair machine**, name the machine and copy the key. The key starts with `onosoo_live_` and is shown **once**. A WSL2 Ubuntu on a Windows PC is a separate machine: pair it separately.
 
-### 2. Save the key in your user folder
+### 2. Pair this machine
 
-**Windows (PowerShell):**
+Run **MOAG: Connect to ONOSOO Builds** and paste the key. MOAG saves it in your user folder (`%APPDATA%\moag\onosoo.json` on Windows, `~/.config/moag/onosoo.json` elsewhere), checks it with ONOSOO, and the status bar shows **☁ ONOSOO**.
 
-```powershell
-$dir = "$env:APPDATA\moag"
-New-Item -ItemType Directory -Force $dir | Out-Null
-@{ key = "<paste key>"; url = "https://<project-ref>.supabase.co" } | ConvertTo-Json | Set-Content "$dir\onosoo.json" -Encoding ascii
-```
-
-**Linux / WSL2 / macOS:**
-
-```bash
-mkdir -p ~/.config/moag && chmod 700 ~/.config/moag
-printf '{"key":"<paste key>","url":"https://<project-ref>.supabase.co"}' > ~/.config/moag/onosoo.json
-chmod 600 ~/.config/moag/onosoo.json
-```
+In a terminal, after **MOAG: Install Command-Line Tool**, `moag pair` does the same: paste the key at the prompt.
 
 > Never put the key inside a project, and never set it account-wide (`setx`, System Properties, `/etc/environment`): every process would get it, including the AI agents MOAG runs.
 
@@ -42,6 +30,6 @@ moag run --prompt "Add a short README describing this project" --cwd /path/to/re
 
 Open **Builds** in ONOSOO: within seconds the machine shows **online** and the run appears with its tasks. Runs from this panel relay while the status bar shows **☁ ONOSOO**; the setting `agentTaskPlayer.onosoo.relay` turns that off.
 
-> No key at all turns the relay off silently. If nothing shows up, check the file path and that it is valid JSON. In WSL, the Windows file is not visible.
+> If nothing shows up, run **MOAG: Connect to ONOSOO Builds** again: it says whether ONOSOO accepted the key. In WSL, the Windows pairing is not visible: pair inside WSL with `moag pair`.
 
 Full guide, including remote runs and live previews: [docs/onosoo-builds.md](https://github.com/sujan-poudel-03/moag/blob/master/docs/onosoo-builds.md)
