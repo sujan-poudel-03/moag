@@ -1,0 +1,3 @@
+# Owner of every path. With branch protection set to "Require review from Code
+# Owners", a pull request needs their approval.
+* @sujan-poudel-03

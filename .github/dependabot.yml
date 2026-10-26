@@ -1,0 +1,32 @@
+# Weekly dependency updates. Merging the docker ones keeps the Dockerfile's
+# node:24-bookworm-slim digest pin current (it goes stale otherwise).
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      # Minor and patch updates arrive as one pull request; majors stay separate.
+      npm-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # @types/vscode tracks engines.vscode (the oldest VS Code MOAG supports) and
+      # @types/node tracks VS Code's Electron runtime: both move deliberately.
+      - dependency-name: '@types/vscode'
+        update-types: ['version-update:semver-major', 'version-update:semver-minor']
+      - dependency-name: '@types/node'
+        update-types: ['version-update:semver-major']
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
