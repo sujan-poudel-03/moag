@@ -47,6 +47,8 @@ export interface OnosooRelayHost {
   reprobe(): void;
   /** True while a run is being relayed. */
   isLive(): boolean;
+  /** Report a PR opened for the last relayed run on that run in ONOSOO. Never rejects. */
+  notePrCreated?(url: string, runnerRunId: string | null): Promise<void>;
 }
 
 /** Call once during activate(), after the runner exists. */
@@ -141,5 +143,6 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost 
   return {
     reprobe,
     isLive: () => controller.live,
+    notePrCreated: (url, runnerRunId) => controller.notePrCreated(url, runnerRunId),
   };
 }

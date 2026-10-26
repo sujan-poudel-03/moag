@@ -77,6 +77,7 @@ type FakeRunner = EventEmitter & {
   state: string;
   currentPlan: Plan | null;
   currentRunTaskIds: readonly string[] | null;
+  currentRunId: string | null;
   setTaskSettledHook: sinon.SinonSpy;
 };
 
@@ -85,6 +86,7 @@ function fakeRunner(): FakeRunner {
   r.state = 'idle';
   r.currentPlan = null;
   r.currentRunTaskIds = null;
+  r.currentRunId = null;
   r.setTaskSettledHook = sinon.spy();
   return r;
 }
@@ -139,8 +141,11 @@ describe('host-run-relay', function () {
 
   // ─── pure helpers ───
 
-  it('hostRunFinishedCode: 4 budget-stopped, 1 failed or stopped, else 0', () => {
+  it('hostRunFinishedCode: 4 budget-stopped, 3 still waiting at a gate, 1 failed or stopped, else 0', () => {
     assert.equal(hostRunFinishedCode({ budgetStopped: true, failed: 0, stopped: true }), 4);
+    assert.equal(hostRunFinishedCode({ budgetStopped: true, failed: 0, stopped: true, gateWaiting: true }), 4, 'budget first');
+    assert.equal(hostRunFinishedCode({ budgetStopped: false, failed: 0, stopped: true, gateWaiting: true }), 3);
+    assert.equal(hostRunFinishedCode({ budgetStopped: false, failed: 1, stopped: false, gateWaiting: true }), 3);
     assert.equal(hostRunFinishedCode({ budgetStopped: false, failed: 2, stopped: false }), 1);
     assert.equal(hostRunFinishedCode({ budgetStopped: false, failed: 0, stopped: true }), 1);
     assert.equal(hostRunFinishedCode({ budgetStopped: false, failed: 0, stopped: false }), 0);
@@ -416,16 +421,137 @@ describe('host-run-relay', function () {
     }), 1);
   });
 
-  it('a manual gate carries the host note and never code 3', async () => {
+  // ─── manual gate: awaiting approval ───
+
+  const finishedCodes = (h: ReturnType<typeof harness>): unknown[] =>
+    h.rec.sent().filter((e) => e.type === 'run-finished').sort((a, b) => a.seq - b.seq).map((e) => e.data.code);
+
+  it('a manual gate sends a provisional run-finished code 3, then the final code 0 after the gate resolves', async () => {
+    const h = make();
+    h.start();
+    const gate = h.plan.playlists[0].tasks[0];
+    h.runner.emit('manual-gate', gate);
+    await waitFor(() => finishedCodes(h).length === 1);
+    const provisional = h.rec.sent().find((e) => e.type === 'run-finished')!;
+    assert.equal(provisional.data.code, 3);
+    assert.equal(provisional.data.manualGateHit, true);
+    assert.equal(h.rec.sent().find((e) => e.type === 'manual-gate')!.data.note, HOST_MANUAL_GATE_NOTE);
+    for (const t of h.plan.playlists[0].tasks) {
+      t.status = TaskStatus.Completed;
+      h.runner.emit('task-completed', t, { stdout: '', stderr: '' });
+    }
+    setState(h.runner, 'idle');
+    await waitFor(() => finishedCodes(h).length === 2);
+    assert.deepEqual(finishedCodes(h), [3, 0]);
+    const final = h.rec.sent().filter((e) => e.type === 'run-finished').sort((a, b) => b.seq - a.seq)[0];
+    assert.equal(final.data.manualGateHit, false);
+  });
+
+  it('stopping while the gate still waits ends with code 3', async () => {
     const h = make();
     h.start();
     h.runner.emit('manual-gate', h.plan.playlists[0].tasks[0]);
     setState(h.runner, 'stopping');
     setState(h.runner, 'idle');
+    await waitFor(() => finishedCodes(h).length === 2);
+    assert.deepEqual(finishedCodes(h), [3, 3]);
+  });
+
+  it('a budget breach while the gate waits is still code 4', async () => {
+    const h = make();
+    h.start();
+    h.runner.emit('manual-gate', h.plan.playlists[0].tasks[0]);
+    h.runner.emit('budget-exceeded', { totalCost: 2, budget: 1 });
+    setState(h.runner, 'stopping');
+    setState(h.runner, 'idle');
+    await waitFor(() => finishedCodes(h).length === 2);
+    assert.deepEqual(finishedCodes(h), [3, 4]);
+  });
+
+  // ─── pr-created on the finished run ───
+
+  /** A finished, delivered run with runner run id 'rr-1'. */
+  const finishedRun = async (opts: Parameters<typeof harness>[0] = {}): Promise<ReturnType<typeof harness>> => {
+    const h = make(opts);
+    h.runner.currentRunId = 'rr-1';
+    h.start();
+    setState(h.runner, 'idle');
     await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
-    const sent = h.rec.sent();
-    assert.equal(sent.find((e) => e.type === 'manual-gate')!.data.note, HOST_MANUAL_GATE_NOTE);
-    assert.equal(sent.find((e) => e.type === 'run-finished')!.data.code, 1);
+    return h;
+  };
+  const PR = 'https://github.com/o/r/pull/7';
+
+  it('pr-created goes out on the same run_id with seq = the run\'s last seq + 1', async () => {
+    const h = await finishedRun();
+    const before = h.rec.sent();
+    const runId = before.find((e) => e.type === 'run-finished')!.run_id;
+    const lastSeq = Math.max(...before.filter((e) => e.run_id === runId).map((e) => e.seq));
+    await h.ctl.notePrCreated(PR, 'rr-1');
+    const pr = h.rec.sent().find((e) => e.type === 'pr-created');
+    assert.ok(pr, 'pr-created was sent');
+    assert.equal(pr.run_id, runId);
+    assert.equal(pr.seq, lastSeq + 1);
+    assert.equal(pr.data.url, PR);
+  });
+
+  it('two PRs in a row continue the seq: +1 then +2', async () => {
+    const h = await finishedRun();
+    const runId = h.rec.sent().find((e) => e.type === 'run-finished')!.run_id;
+    const lastSeq = Math.max(...h.rec.sent().filter((e) => e.run_id === runId).map((e) => e.seq));
+    await Promise.all([h.ctl.notePrCreated(PR, 'rr-1'), h.ctl.notePrCreated(PR + '8', 'rr-1')]);
+    const seqs = h.rec.sent().filter((e) => e.type === 'pr-created').map((e) => e.seq).sort((a, b) => a - b);
+    assert.deepEqual(seqs, [lastSeq + 1, lastSeq + 2]);
+  });
+
+  it('nothing is sent for another runner run, with the setting off, or without a key', async () => {
+    let on = true;
+    const h = await finishedRun({ enabled: () => on });
+    await h.ctl.notePrCreated(PR, 'some-other-run');
+    on = false;
+    await h.ctl.notePrCreated(PR, 'rr-1');
+    on = true;
+    delete h.env.MOAG_ONOSOO_KEY;
+    await h.ctl.notePrCreated(PR, 'rr-1');
+    await h.ctl.notePrCreated(PR, null);
+    assert.equal(h.rec.sent().filter((e) => e.type === 'pr-created').length, 0);
+  });
+
+  it('the follow-up starts only after the run\'s own close has settled', async () => {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => { release = r; });
+    let holding = true;
+    const h = make({
+      closeDeadlineMs: 3000,
+      respond: async (body) => {
+        if (holding && body.events.some((e) => e.type === 'run-finished')) { await held; }
+        const acked: Record<string, number> = {};
+        for (const e of body.events) { acked[e.run_id] = Math.max(acked[e.run_id] ?? 0, e.seq); }
+        return { status: 200, body: JSON.stringify({ acked }) };
+      },
+    });
+    h.runner.currentRunId = 'rr-1';
+    h.start();
+    setState(h.runner, 'idle');
+    await waitFor(() => h.rec.calls.some((c) => c.body.events.some((e) => e.type === 'run-finished')));
+    const note = h.ctl.notePrCreated(PR, 'rr-1');
+    await new Promise((r) => setTimeout(r, 150));
+    assert.equal(h.rec.sent().filter((e) => e.type === 'pr-created').length, 0, 'sent before the first close settled');
+    holding = false;
+    release();
+    await note;
+    assert.equal(h.rec.sent().filter((e) => e.type === 'pr-created').length, 1);
+  });
+
+  it('notePrCreated never rejects, even when the HTTP client throws', async () => {
+    let fail = false;
+    const h = await finishedRun({ respond: (body) => {
+      if (fail) { throw new Error('network down'); }
+      const acked: Record<string, number> = {};
+      for (const e of body.events) { acked[e.run_id] = Math.max(acked[e.run_id] ?? 0, e.seq); }
+      return { status: 200, body: JSON.stringify({ acked }) };
+    } });
+    fail = true;
+    await h.ctl.notePrCreated(PR, 'rr-1');
   });
 
   // ─── scope, cost, secrets ───

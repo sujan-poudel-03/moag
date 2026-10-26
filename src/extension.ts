@@ -2049,7 +2049,7 @@ export function activate(context: vscode.ExtensionContext): void {
       ).then(action => {
         if (action === issueLabel) { void cmdCloseSourceIssues(sourceIssues); }
         else if (action === 'Show Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); }
-        else if (action === 'Create PR') { createPRFromRun(); }
+        else if (action === 'Create PR') { createPRFromRun().catch(showPrError); }
       });
       return;
     }
@@ -2065,7 +2065,7 @@ export function activate(context: vscode.ExtensionContext): void {
       } else if (action === 'Review Changes') {
         vscode.commands.executeCommand('agentTaskPlayer.reviewChanges');
       } else if (action === 'Create PR') {
-        createPRFromRun();
+        createPRFromRun().catch(showPrError);
       }
     });
   });
@@ -2338,7 +2338,7 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.runContextEval', cmdRunContextEval),
     vscode.commands.registerCommand('agentTaskPlayer.analyzeContextWeights', cmdAnalyzeContextWeights),
     vscode.commands.registerCommand('agentTaskPlayer.reviewSelfIssues', cmdReviewSelfIssues),
-    vscode.commands.registerCommand('agentTaskPlayer.createPR', createPRFromRun),
+    vscode.commands.registerCommand('agentTaskPlayer.createPR', () => createPRFromRun().catch(showPrError)),
     // The morning review: same digest the headless CLI prints, in the IDE.
     // The sidebar's New Chat button posts this; it was never registered, so the
     // button did nothing at all.
@@ -2626,6 +2626,11 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(planFileWatcher);
 }
 
+/** A failed Create PR reaches the user instead of the extension host's unhandled rejections. */
+function showPrError(err: unknown): void {
+  void vscode.window.showErrorMessage(`Could not create the pull request: ${err instanceof Error ? err.message : String(err)}`);
+}
+
 async function createPRFromRun(): Promise<void> {
   const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
   if (!workspaceFolder) { return; }
@@ -2663,6 +2668,13 @@ async function createPRFromRun(): Promise<void> {
     if (outcome.reason === 'failed') { vscode.window.showErrorMessage(text); }
     else { vscode.window.showWarningMessage(text); }
     return;
+  }
+
+  // The PR on the run's own ONOSOO build. Never affects the PR itself.
+  if (outcome.url && relayHost?.notePrCreated) {
+    relayHost.notePrCreated(outcome.url, runner.currentRunId).catch((err: unknown) => {
+      moagOutputChannel?.appendLine(`[onosoo] PR follow-up failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
   }
 
   const action = await vscode.window.showInformationMessage(`PR created: ${outcome.url}`, 'Open PR');
