@@ -636,6 +636,8 @@ moag standards check [--base <ref>] [--no-commands]
 moag standards propose [--stack <id>] [--write [--force]]
 moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]
 moag host [run | init | draft <project> | status | stop <env> | remove <env>]
+moag pair [<key>] [--url <base>]
+moag --version | moag help
 ```
 
 `moag host` runs on a build machine paired with ONOSOO. It runs approved project

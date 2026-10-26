@@ -3,7 +3,7 @@
 // Features: agentic tool-use loop (read/write/bash), real extended thinking,
 // multi-turn sessions per playlist, live streaming output, browser vision.
 
-import { getConfig } from '../core/host';
+import { getConfig, hostSecret, notifyWarn } from '../core/host';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
@@ -23,6 +23,37 @@ interface MessageParam {
 
 /** A tool result content block — either plain text or an image array */
 type ToolResultContent = string | Array<{ type: string; [key: string]: unknown }>;
+
+/** Where to put the key: shown whenever none is found. */
+export const ANTHROPIC_KEY_HINT =
+  'Run **MOAG: Set Anthropic API Key**, or set ANTHROPIC_API_KEY (command line).';
+
+/** The legacy-setting warning shows once per process. */
+let legacyKeyWarned = false;
+
+/**
+ * The Anthropic API key, in order: the host's secret store (VS Code
+ * SecretStorage), ANTHROPIC_API_KEY, then the deprecated
+ * agentTaskPlayer.engines.anthropic.apiKey setting (warned once per process).
+ */
+export async function resolveAnthropicApiKey(legacySetting: string | undefined): Promise<string> {
+  const stored = await hostSecret('anthropicApiKey');
+  if (stored) { return stored; }
+  const env = process.env.ANTHROPIC_API_KEY;
+  if (env) { return env; }
+  const legacy = typeof legacySetting === 'string' ? legacySetting.trim() : '';
+  if (!legacy) { return ''; }
+  if (!legacyKeyWarned) {
+    legacyKeyWarned = true;
+    try {
+      notifyWarn(
+        'The Anthropic API key in agentTaskPlayer.engines.anthropic.apiKey is deprecated: settings files can be synced or committed. ' +
+        'Run "MOAG: Set Anthropic API Key", or set ANTHROPIC_API_KEY (command line).',
+      );
+    } catch { /* no host: the key still works */ }
+  }
+  return legacy;
+}
 
 const MAX_AGENT_ITERATIONS = 40;
 const MAX_SESSION_TURNS = 20;
@@ -118,6 +149,21 @@ export class AnthropicAdapter implements EngineAdapter {
     return 'anthropic-api';
   }
 
+  /**
+   * No CLI to find on PATH: the engine can run when a key resolves (stored
+   * secret or ANTHROPIC_API_KEY) and the SDK loads.
+   */
+  async checkAvailability(): Promise<boolean> {
+    const key = (await hostSecret('anthropicApiKey')) || process.env.ANTHROPIC_API_KEY;
+    if (!key) { return false; }
+    try {
+      require.resolve('@anthropic-ai/sdk');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   clearSession(sessionId: string): void {
     this._sessions.delete(sessionId);
   }
@@ -128,15 +174,12 @@ export class AnthropicAdapter implements EngineAdapter {
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {
     const cfg = getConfig('agentTaskPlayer.engines.anthropic');
-    const apiKey = cfg.get<string>('apiKey', '') || process.env.ANTHROPIC_API_KEY || '';
+    const apiKey = await resolveAnthropicApiKey(cfg.get<string>('apiKey', ''));
 
     if (!apiKey) {
       return {
         stdout: '',
-        stderr:
-          '[Anthropic] API key not configured.\n' +
-          'Set the ANTHROPIC_API_KEY environment variable, or add it in:\n' +
-          'Settings → agentTaskPlayer.engines.anthropic.apiKey',
+        stderr: `[Anthropic] API key not configured.\n${ANTHROPIC_KEY_HINT}`,
         exitCode: 1,
         durationMs: 0,
       };

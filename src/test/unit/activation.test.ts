@@ -20,16 +20,21 @@ const manifest = require('../../../package.json');
 interface Registered {
   ids: string[];
   disposables: number;
+  ext: { activate: (c: unknown) => void; deactivate: () => void };
+  handlers: Map<string, (...args: unknown[]) => unknown>;
 }
 
 function activateExtension(): Registered {
   const ids: string[] = [];
   const subscriptions: unknown[] = [];
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  let ext;
 
   // Record every registration instead of discarding it.
   const originalRegister = vscodeMock.commands.registerCommand;
-  vscodeMock.commands.registerCommand = (id: string, _handler: unknown) => {
+  vscodeMock.commands.registerCommand = (id: string, handler: (...args: unknown[]) => unknown) => {
     ids.push(id);
+    handlers.set(id, handler);
     return { dispose: () => { /* no-op */ } };
   };
 
@@ -45,7 +50,6 @@ function activateExtension(): Registered {
       return originalLoad.call(Module, request, parent, isMain);
     };
 
-    let ext;
     try {
       ext = require('../../extension');
     } finally {
@@ -62,12 +66,18 @@ function activateExtension(): Registered {
       workspaceState: memento(),
       globalStorageUri: vscodeMock.Uri.file('/mock/global'),
       extension: { packageJSON: manifest },
+      secrets: {
+        get: async () => undefined,
+        store: async () => { /* no-op */ },
+        delete: async () => { /* no-op */ },
+        onDidChange: () => ({ dispose() { /* no-op */ } }),
+      },
     });
   } finally {
     vscodeMock.commands.registerCommand = originalRegister;
   }
 
-  return { ids, disposables: subscriptions.length };
+  return { ids, disposables: subscriptions.length, ext: ext as Registered['ext'], handlers };
 }
 
 function memento() {
@@ -83,6 +93,8 @@ function memento() {
 describe('Extension activation', () => {
   let activated: Registered;
   let keyAfter: string | undefined;
+  let uncaughtBefore = 0;
+  let rejectionBefore = 0;
 
   // This hook loads extension.ts and its entire dependency tree through ts-node
   // and then runs activate(). On a loaded machine that exceeds mocha default 2s,
@@ -91,6 +103,8 @@ describe('Extension activation', () => {
     this.timeout(60_000);
     // A device key with no URL: activation must take it out of process.env (never relayed here).
     process.env.MOAG_ONOSOO_KEY = 'test-only-key-1234';
+    uncaughtBefore = process.listenerCount('uncaughtException');
+    rejectionBefore = process.listenerCount('unhandledRejection');
     activated = activateExtension();
     keyAfter = process.env.MOAG_ONOSOO_KEY;
   });
@@ -129,5 +143,42 @@ describe('Extension activation', () => {
 
   it('pushes its registrations onto subscriptions so they are disposed', () => {
     assert.ok(activated.disposables > 0, 'nothing was pushed to context.subscriptions');
+  });
+
+  it('refuses to verify against the PRD without a workspace, before touching the runner', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { TaskRunner } = require('../../runner/runner');
+    const originalFolders = vscodeMock.workspace.workspaceFolders;
+    const originalError = vscodeMock.window.showErrorMessage;
+    const originalOn = TaskRunner.prototype.on;
+    const errors: string[] = [];
+    let onCalls = 0;
+    vscodeMock.workspace.workspaceFolders = undefined;
+    vscodeMock.window.showErrorMessage = (msg: string) => { errors.push(msg); return Promise.resolve(undefined); };
+    TaskRunner.prototype.on = function (...args: unknown[]) { onCalls++; return originalOn.apply(this, args); };
+    try {
+      const handler = activated.handlers.get('agentTaskPlayer.verifyAgainstPrd');
+      assert.ok(handler, 'verifyAgainstPrd is not registered');
+      await handler();
+    } finally {
+      vscodeMock.workspace.workspaceFolders = originalFolders;
+      vscodeMock.window.showErrorMessage = originalError;
+      TaskRunner.prototype.on = originalOn;
+    }
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { noWorkspace } = require('../../utils/user-messages');
+    assert.deepStrictEqual(errors, [noWorkspace().text]);
+    assert.strictEqual(onCalls, 0, 'a runner listener was attached with no workspace open');
+  });
+
+  // Keep this last: deactivate() tears down module state the other tests read.
+  it('installs process error handlers and removes them on deactivate', () => {
+    assert.strictEqual(process.listenerCount('uncaughtException'), uncaughtBefore + 1);
+    assert.strictEqual(process.listenerCount('unhandledRejection'), rejectionBefore + 1);
+    activated.ext.deactivate();
+    assert.strictEqual(process.listenerCount('uncaughtException'), uncaughtBefore,
+      'an uncaughtException handler survived deactivate()');
+    assert.strictEqual(process.listenerCount('unhandledRejection'), rejectionBefore,
+      'an unhandledRejection handler survived deactivate()');
   });
 });

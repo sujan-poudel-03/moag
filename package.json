@@ -394,6 +394,11 @@
         "icon": "$(bug)"
       },
       {
+        "command": "agentTaskPlayer.exportDiagnostics",
+        "title": "Export Diagnostics",
+        "category": "MOAG"
+      },
+      {
         "command": "agentTaskPlayer.planFromOpenIssues",
         "title": "Plan from Open GitHub Issues",
         "category": "MOAG",
@@ -404,6 +409,31 @@
         "title": "Setup Guide",
         "category": "MOAG",
         "icon": "$(getting-started)"
+      },
+      {
+        "command": "agentTaskPlayer.setAnthropicApiKey",
+        "title": "Set Anthropic API Key",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.clearAnthropicApiKey",
+        "title": "Clear Anthropic API Key",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.connectOnosoo",
+        "title": "Connect to ONOSOO Builds",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.disconnectOnosoo",
+        "title": "Disconnect from ONOSOO",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.installCli",
+        "title": "Install Command-Line Tool",
+        "category": "MOAG"
       },
       {
         "command": "agentTaskPlayer.shareRunFeedback",
@@ -1224,7 +1254,7 @@
         "agentTaskPlayer.issueRepo": {
           "type": "string",
           "default": "",
-          "description": "GitHub repo (owner/repo) where MOAG bug reports are filed via the Report Bug button. Example: myorg/moag. Leave blank to prompt each time."
+          "description": "GitHub repository (owner/repo) that GitHub Issues Sync imports tasks from. MOAG bug reports always go to sujan-poudel-03/moag."
         },
         "agentTaskPlayer.issueSync.enabled": {
           "type": "boolean",
@@ -1269,7 +1299,7 @@
           "type": "number",
           "default": 10,
           "minimum": 0,
-          "description": "Hard spend ceiling in USD, counted across every engine call in the process — plan tasks and authoring calls alike. When it is passed the run stops and parks, rather than warning and continuing. Raise it for a long unattended run; set it to 0 only if you genuinely want no ceiling at all."
+          "description": "Hard spend ceiling in USD, counted across every engine call in the process — plan tasks and authoring calls alike. When it is passed the run stops and parks, rather than warning and continuing. Raise it for a long unattended run; set it to 0 only if you genuinely want no ceiling at all. Engines that report no cost (Claude in text mode, Codex, Gemini, Copilot, custom) are not counted, so the ceiling cannot stop them."
         },
         "agentTaskPlayer.prdLoop.maxFixIterations": {
           "type": "number",
@@ -1347,7 +1377,12 @@
         "agentTaskPlayer.contributionLedger.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Record per-engine-call usage (task, developer, prompt, tokens/cost) to .moag/usage-log.jsonl and show the Contribution Ledger in the dashboard."
+          "description": "Record per-engine-call usage (task, prompt, tokens/cost) to .moag/usage-log.jsonl (local; rotated at 5 MB) and show the Contribution Ledger in the dashboard."
+        },
+        "agentTaskPlayer.contributionLedger.recordDeveloperEmail": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also record your git user.email with each usage entry, so the Contribution Ledger can attribute work per developer. Off by default: the usage log may be shared."
         },
         "agentTaskPlayer.onosoo.relay": {
           "type": "boolean",
@@ -1618,7 +1653,8 @@
         "agentTaskPlayer.engines.anthropic.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Anthropic API key for the direct API engine. If empty, falls back to the ANTHROPIC_API_KEY environment variable."
+          "description": "Anthropic API key for the direct API engine. If empty, falls back to the ANTHROPIC_API_KEY environment variable.",
+          "markdownDeprecationMessage": "Deprecated: settings files can be synced or committed. Run **MOAG: Set Anthropic API Key** instead; MOAG moves a key found here into VS Code's secret storage and clears it from settings."
         },
         "agentTaskPlayer.engines.anthropic.model": {
           "type": "string",

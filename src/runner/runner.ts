@@ -598,10 +598,13 @@ export class TaskRunner {
         taskName: task.name,
         engine: engineId,
         prompt: task.prompt?.trim() || task.name,
-        tokenUsageAvailable: result.tokenUsage !== undefined,
+        // Tokens are available only when the engine counted some; an empty usage block is not usage.
+        tokenUsageAvailable: ((result.tokenUsage?.inputTokens ?? 0) + (result.tokenUsage?.outputTokens ?? 0)
+          + (result.tokenUsage?.totalTokens ?? 0)) > 0,
         inputTokens: result.tokenUsage?.inputTokens ?? 0,
         outputTokens: result.tokenUsage?.outputTokens ?? 0,
         estimatedCostUsd: result.tokenUsage?.estimatedCost ?? 0,
+        costKnown: typeof result.tokenUsage?.estimatedCost === 'number' && result.tokenUsage.costSource !== 'unknown',
       };
       this._usageRecorder(record);
     } catch { /* a throwing recorder must never break task execution */ }
@@ -2063,7 +2066,7 @@ export class TaskRunner {
         stdout: '',
         stderr:
           '[Visual Test] The "anthropic" engine is not available.\n' +
-          'Configure ANTHROPIC_API_KEY or add it in Settings → agentTaskPlayer.engines.anthropic.apiKey',
+          'Run **MOAG: Set Anthropic API Key**, or set ANTHROPIC_API_KEY (command line).',
         exitCode: 1,
         durationMs: 0,
       };

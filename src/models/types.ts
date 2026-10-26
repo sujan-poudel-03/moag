@@ -388,10 +388,11 @@ export interface TokenUsage {
   /**
    * Where `estimatedCost` came from: 'reported' = the engine's own billing
    * figure (e.g. Claude JSON `total_cost_usd`), 'estimated' = derived by MOAG
-   * (price table, text scraping). Absent = treated as 'estimated'. Runtime
-   * only — not a plan-file field.
+   * from real token counts and a price table, 'unknown' = the engine reported no
+   * cost, and `estimatedCost` is then absent (never read cost from agent prose).
+   * Absent = treated as 'estimated'. Runtime only — not a plan-file field.
    */
-  costSource?: 'reported' | 'estimated';
+  costSource?: 'reported' | 'estimated' | 'unknown';
 }
 
 /** Result of an AI-driven PRD verification pass */

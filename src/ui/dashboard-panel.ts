@@ -10,8 +10,18 @@ import { designSystemCssTokens } from './design-system';
 import { SandboxState } from '../sandbox/sandbox-manager';
 import { ContributionLedgerPayload } from '../utils/contribution-ledger';
 
-// Diagnostic output channel for debugging dashboard issues
-const outputChannel = vscode.window.createOutputChannel('ATP Dashboard');
+// Diagnostic trace for debugging dashboard issues. Its own channel, so the
+// per-message trace never buries the user-facing MOAG channel; created on
+// first use rather than at import.
+let dashboardChannel: vscode.OutputChannel | null = null;
+
+/** Append one line to the "MOAG Dashboard" output channel, creating it on first use. */
+function log(line: string): void {
+  try {
+    dashboardChannel ??= vscode.window.createOutputChannel('MOAG Dashboard');
+    dashboardChannel.appendLine(line);
+  } catch { /* diagnostics never break the dashboard */ }
+}
 
 // Increment this whenever the HTML/JS template changes. If the webview
 // reports a different version on webview-ready, we force a full re-render
@@ -61,7 +71,7 @@ export class DashboardPanel {
       this._disposables,
     );
     const plan = this.getPlan();
-    outputChannel.appendLine(`[constructor] getPlan() returned: ${plan ? plan.name + ' (' + plan.playlists.length + ' playlists)' : 'null'}`);
+    log(`[constructor] getPlan() returned: ${plan ? plan.name + ' (' + plan.playlists.length + ' playlists)' : 'null'}`);
     this.renderWebview();
 
     // Resend state whenever the panel becomes visible (e.g. user switches tabs)
@@ -92,7 +102,7 @@ export class DashboardPanel {
     const column = vscode.ViewColumn.Beside;
 
     if (DashboardPanel.currentPanel) {
-      outputChannel.appendLine(`[createOrShow] reusing existing panel, webviewReady=${DashboardPanel.currentPanel._webviewReady}`);
+      log(`[createOrShow] reusing existing panel, webviewReady=${DashboardPanel.currentPanel._webviewReady}`);
       DashboardPanel.currentPanel._panel.reveal(column);
       if (!DashboardPanel.currentPanel._webviewReady) {
         DashboardPanel.currentPanel.renderWebview();
@@ -101,7 +111,7 @@ export class DashboardPanel {
       }
       return DashboardPanel.currentPanel;
     }
-    outputChannel.appendLine('[createOrShow] creating new panel');
+    log('[createOrShow] creating new panel');
 
     // Allow loading local files (screenshots) from any workspace folder
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
@@ -141,7 +151,7 @@ export class DashboardPanel {
     this._webviewReadyFallbackTimer = setTimeout(() => {
       this._webviewReadyFallbackTimer = null;
       if (!this._webviewReady) {
-        outputChannel.appendLine('[renderWebview] webview-ready handshake timed out; sending fallback update');
+        log('[renderWebview] webview-ready handshake timed out; sending fallback update');
         this._webviewReady = true;
         this.update();
         this.replayHistoryCards();
@@ -183,7 +193,7 @@ export class DashboardPanel {
   /** Push updated state to the webview */
   public update(): void {
     const plan = this.getPlan();
-    outputChannel.appendLine(`[update] plan=${plan ? plan.name : 'null'}, webviewReady=${this._webviewReady}, disposed=${this._disposed}`);
+    log(`[update] plan=${plan ? plan.name : 'null'}, webviewReady=${this._webviewReady}, disposed=${this._disposed}`);
     this.postMessageWithRetries({
       type: 'update',
       plan,
@@ -352,7 +362,7 @@ export class DashboardPanel {
     const replayable = entries.filter(
       e => e.result && (e.status === 'completed' || e.status === 'failed' || e.status === 'blocked'),
     );
-    outputChannel.appendLine(`[replayHistoryCards] replaying ${replayable.length} entries`);
+    log(`[replayHistoryCards] replaying ${replayable.length} entries`);
     for (const entry of replayable) {
       const r = entry.result;
       this.safePostMessage({
@@ -418,7 +428,7 @@ export class DashboardPanel {
   }
 
   private handleMessage(msg: { type: string; [key: string]: unknown }): void {
-    outputChannel.appendLine(`[handleMessage] type=${msg.type}`);
+    log(`[handleMessage] type=${msg.type}`);
     switch (msg.type) {
       case 'webview-ready':
         if (this._webviewReady) {
@@ -427,7 +437,7 @@ export class DashboardPanel {
         // If the webview reports a stale HTML version (VS Code restored old
         // cached HTML from a previous session), force a full re-render.
         if (msg.htmlVersion !== HTML_VERSION) {
-          outputChannel.appendLine(`[handleMessage] stale htmlVersion=${msg.htmlVersion}, expected=${HTML_VERSION} — forcing re-render`);
+          log(`[handleMessage] stale htmlVersion=${msg.htmlVersion}, expected=${HTML_VERSION} — forcing re-render`);
           this.renderWebview();
           break;
         }
@@ -647,7 +657,7 @@ export class DashboardPanel {
   public getHtml(webview?: vscode.Webview): string {
     // Encode initial state as base64 so prompt/task text cannot break the inline script.
     const plan = this.getPlan();
-    outputChannel.appendLine(`[getHtml] plan=${plan ? plan.name + ' (' + plan.playlists?.length + ' playlists, ' + plan.playlists?.reduce((s: number, p: { tasks: unknown[] }) => s + p.tasks.length, 0) + ' tasks)' : 'null'}`);
+    log(`[getHtml] plan=${plan ? plan.name + ' (' + plan.playlists?.length + ' playlists, ' + plan.playlists?.reduce((s: number, p: { tasks: unknown[] }) => s + p.tasks.length, 0) + ' tasks)' : 'null'}`);
     const initialStateBase64 = Buffer.from(JSON.stringify({
       plan,
       runnerState: this.runner.state,
@@ -655,7 +665,7 @@ export class DashboardPanel {
       promptEngines: this.getPromptEngines(),
       selectedPromptEngineId: this.getSelectedPromptEngineId(),
     }), 'utf8').toString('base64');
-    outputChannel.appendLine(`[getHtml] base64 length=${initialStateBase64.length}`);
+    log(`[getHtml] base64 length=${initialStateBase64.length}`);
 
     // Handed to the page as DATA, not as an interpolated script. The lone < is
     // escaped so a value can never terminate the block it is carried in.

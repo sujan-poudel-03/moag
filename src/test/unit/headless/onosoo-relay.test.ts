@@ -1104,3 +1104,46 @@ describe('ONOSOO relay — default HTTP client (loopback only)', () => {
     await assert.rejects(p);
   });
 });
+
+describe('ONOSOO relay — seqStart and lastSeq (continuing a finished run)', () => {
+  it('with seqStart 41 the first recorded event has seq 42, and lastSeq follows recording', async () => {
+    const rec = recorder();
+    const fx = fixture();
+    const relay = new OnosooRelay({
+      config: fx.config, spool: fx.spool(), http: rec.client, redactor: createRedactor([KEY]),
+      stderr: () => undefined, closeDeadlineMs: 2000, runId: 'run-continued', heartbeat: false, seqStart: 41,
+    });
+    assert.equal(relay.lastSeq, 41);
+    relay.start();
+    relay.record(line('pr-created', { url: 'https://github.com/o/r/pull/1' }));
+    assert.equal(relay.lastSeq, 42);
+    relay.record(line('pr-created', { url: 'https://github.com/o/r/pull/2' }));
+    assert.equal(relay.lastSeq, 43);
+    await relay.close();
+    const events = rec.calls.flatMap((c) => c.body.events);
+    assert.deepEqual(events.map((e) => [e.run_id, e.seq, e.type]), [['run-continued', 42, 'pr-created'], ['run-continued', 43, 'pr-created']]);
+  });
+
+  it('an invalid seqStart is ignored: the first event is seq 1', async () => {
+    for (const seqStart of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      const rec = recorder();
+      const fx = fixture();
+      const relay = new OnosooRelay({
+        config: fx.config, spool: fx.spool(), http: rec.client, redactor: createRedactor([KEY]),
+        stderr: () => undefined, closeDeadlineMs: 2000, heartbeat: false, seqStart,
+      });
+      assert.equal(relay.lastSeq, 0, String(seqStart));
+      relay.start();
+      relay.record(line('state-changed', { state: 'playing' }));
+      await relay.close();
+      assert.equal(rec.calls.flatMap((c) => c.body.events)[0].seq, 1, String(seqStart));
+    }
+  });
+
+  it('lastSeq counts run-meta too', () => {
+    const { relay } = mkRelay(recorder().client, { heartbeat: false });
+    relay.start({ plan_name: 'P', project: 'p', tasks: [] });
+    assert.equal(relay.lastSeq, 1);
+    void relay.close();
+  });
+});

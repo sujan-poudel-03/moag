@@ -32,8 +32,9 @@ export function getMoagPlanPath(): string | null {
 
 /**
  * Pure migration for .gitignore's `.moag/` entry so `.moag/usage-log.jsonl`
- * survives ignore rules (it must be committed — it is the Contribution
- * Ledger's source of truth and needs to merge across branches).
+ * survives ignore rules. No longer called: MOAG edits .gitignore only with the
+ * user's consent (gitignore-consent.ts), and the usage log is local by default.
+ * Kept as tested pure logic.
  *  (a) an exact bare `.moag/` (or `.moag`) line is replaced in place with
  *      `.moag/*` followed by `!.moag/usage-log.jsonl` on the next line
  *  (b) `.moag/*` present without the negation gets the negation appended
@@ -70,7 +71,47 @@ export function upgradeGitignoreForUsageLog(content: string): string {
   return lines.length === 0 ? '' : lines.join('\n') + '\n';
 }
 
-/** Ensure .moag/ directory exists */
+// ─── .gitignore: only with the user's consent ───
+//
+// MOAG used to edit .gitignore and .gitattributes the moment it created .moag/.
+// It no longer touches either file on its own: creating .moag/ fires a listener,
+// and src/ui/gitignore-consent.ts asks once per workspace what to ignore.
+
+/** What the user chose to ignore. */
+export type GitignoreChoice = 'share-plan' | 'ignore-all';
+
+let dirCreatedListener: ((dir: string) => void) | null = null;
+
+/** Called with the .moag/ path each time ensureMoagDir() actually creates it. Null clears it. */
+export function setMoagDirCreatedListener(fn: ((dir: string) => void) | null): void {
+  dirCreatedListener = fn;
+}
+
+/** The .gitignore lines for a choice. Pure. */
+export function gitignoreLinesFor(choice: GitignoreChoice): string[] {
+  return choice === 'share-plan'
+    ? ['.moag/*', '!.moag/plan.json', '!.moag/.agent-plan.json']
+    : ['.moag/'];
+}
+
+/**
+ * Append the choice's lines that `root`/.gitignore does not already have (compared
+ * trimmed). Existing lines are never changed or removed; running it twice changes
+ * nothing. fs only. Returns true when the file was written. Throws on a write error.
+ */
+export function applyGitignoreChoice(root: string, choice: GitignoreChoice): boolean {
+  const file = path.join(root, '.gitignore');
+  const content = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
+  const have = new Set(content.split(/\r?\n/).map((l) => l.trim()));
+  const missing = gitignoreLinesFor(choice).filter((l) => !have.has(l));
+  if (missing.length === 0) { return false; }
+  const eol = content.includes('\r\n') ? '\r\n' : '\n';
+  const sep = content.length > 0 && !content.endsWith('\n') ? eol : '';
+  fs.writeFileSync(file, content + sep + missing.join(eol) + eol, 'utf-8');
+  return true;
+}
+
+/** Ensure .moag/ directory exists. Never touches .gitignore or .gitattributes. */
 export function ensureMoagDir(): string | null {
   const dir = getMoagDir();
   if (!dir) { return null; }
@@ -80,33 +121,7 @@ export function ensureMoagDir(): string | null {
     } catch {
       return null; // read-only FS or permission denied
     }
-  }
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-  if (workspaceRoot) {
-    // Add / upgrade .moag/'s .gitignore entry so usage-log.jsonl is tracked.
-    const gitignorePath = path.join(workspaceRoot, '.gitignore');
-    try {
-      const content = fs.existsSync(gitignorePath) ? fs.readFileSync(gitignorePath, 'utf-8') : '';
-      const updated = upgradeGitignoreForUsageLog(content);
-      if (updated !== content) { fs.writeFileSync(gitignorePath, updated, 'utf-8'); }
-    } catch {
-      // ignore gitignore errors
-    }
-
-    // Best-effort: ensure usage-log.jsonl merges cleanly across branches
-    // instead of producing spurious conflicts.
-    const gitattributesPath = path.join(workspaceRoot, '.gitattributes');
-    const GITATTR_LINE = '.moag/usage-log.jsonl merge=union';
-    try {
-      const content = fs.existsSync(gitattributesPath) ? fs.readFileSync(gitattributesPath, 'utf-8') : '';
-      const hasLine = content.split('\n').some(l => l.trim() === GITATTR_LINE);
-      if (!hasLine) {
-        const newLine = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
-        fs.appendFileSync(gitattributesPath, `${newLine}${GITATTR_LINE}\n`);
-      }
-    } catch {
-      // ignore gitattributes errors
-    }
+    try { dirCreatedListener?.(dir); } catch { /* a listener never breaks the caller */ }
   }
   return dir;
 }

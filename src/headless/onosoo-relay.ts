@@ -307,6 +307,11 @@ export interface OnosooRelayOptions {
   heartbeat?: boolean;
   /** More home directories to show as `~` (a remote run's runner account). */
   otherHomes?: string[];
+  /**
+   * Continue an earlier relay of the same run id: the first event recorded gets
+   * seqStart + 1. Ignored unless a non-negative safe integer.
+   */
+  seqStart?: number;
 }
 
 /** Run ids the relay accepts from a caller: the same set the spool accepts as a file name. */
@@ -381,10 +386,18 @@ export class OnosooRelay {
     if (home === null) { try { home = os.homedir(); } catch { home = null; } }
     this.home = home || null;
     this.otherHomes = (opts.otherHomes ?? []).filter((h) => typeof h === 'string' && h.length > 1);
+    if (typeof opts.seqStart === 'number' && Number.isSafeInteger(opts.seqStart) && opts.seqStart >= 0) {
+      this.seq = opts.seqStart;
+    }
     this.envelopeBytes = Buffer.byteLength(JSON.stringify(this.envelope([])), 'utf-8');
   }
 
   // ─── Public API ───
+
+  /** The seq of the last event this relay recorded (seqStart before any). */
+  get lastSeq(): number {
+    return this.seq;
+  }
 
   /**
    * Begin the run: queue what earlier runs left unacknowledged, open this run's

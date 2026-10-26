@@ -209,7 +209,7 @@ Open `Ctrl+,` → search `agentTaskPlayer`:
 | `autoplayDelay` | `2000` | Delay between tasks (ms) |
 | `taskTimeoutMs` | `600000` | Per-task timeout (default 10 min) |
 | `parallelPlaylists` | `1` | Concurrent playlists (1-8) |
-| `costBudgetUsd` | -- | Spending limit with warning |
+| `costBudgetUsd` | `10` | Hard spend ceiling (USD); calls that report no cost are not counted |
 | `maxHistoryEntries` | `200` | History entries to retain |
 | `engines.*.command` | varies | CLI path per engine |
 | `engines.*.args` | varies | Extra CLI arguments |

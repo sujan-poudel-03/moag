@@ -41,8 +41,18 @@ export interface OnosooRelayHostDeps {
   log(line: string): void;
 }
 
+/** What activate() keeps: the pairing commands and the PR follow-up use it. */
+export interface OnosooRelayHost {
+  /** Re-read the pairing and redraw the status bar (after Connect / Disconnect). */
+  reprobe(): void;
+  /** True while a run is being relayed. */
+  isLive(): boolean;
+  /** Report a PR opened right after a relayed run on that run in ONOSOO. Never rejects. */
+  notePrCreated?(url: string): Promise<void>;
+}
+
 /** Call once during activate(), after the runner exists. */
-export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
+export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost {
   const env = (): NodeJS.ProcessEnv => ({ ...process.env, ...deps.relayEnv });
   const cwd = (): string | null => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
   const enabled = (): boolean => vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('onosoo.relay', true);
@@ -100,7 +110,7 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
       if (!planUsesClaude(plan)) { return; }
       shownThisSession = true;
       void vscode.window.showInformationMessage(
-        'ONOSOO will show $0.00 for Claude runs: Claude reports its cost only in JSON output. Set agentTaskPlayer.engines.claude.outputFormat to "json" to see real cost (live output then appears when each call ends).',
+        'ONOSOO shows $0.00 for Claude runs in text mode because Claude reports cost only in JSON output, and MOAG never guesses a cost. Set agentTaskPlayer.engines.claude.outputFormat to "json" to see real cost (live output then appears when each call ends).',
         'Open Setting',
         "Don't Show Again",
       ).then((choice) => {
@@ -130,4 +140,9 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
   });
 
   deps.context.subscriptions.push(item, configListener, foldersListener, { dispose: () => controller.dispose() });
+  return {
+    reprobe,
+    isLive: () => controller.live,
+    notePrCreated: (url) => controller.notePrCreated(url),
+  };
 }

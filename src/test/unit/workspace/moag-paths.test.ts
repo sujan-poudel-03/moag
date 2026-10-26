@@ -10,7 +10,9 @@ const vscodeMock = require('../mocks/vscode');
 
 // `moag-paths.ts` imports the real 'vscode' module, which does not exist
 // outside a VS Code host — proxyquire it even for the pure function.
-const { upgradeGitignoreForUsageLog, ensureMoagDir } = proxyquire('../../../workspace/moag-paths', {
+const {
+  upgradeGitignoreForUsageLog, ensureMoagDir, setMoagDirCreatedListener, gitignoreLinesFor, applyGitignoreChoice,
+} = proxyquire('../../../workspace/moag-paths', {
   vscode: vscodeMock,
 });
 
@@ -60,16 +62,65 @@ describe('ensureMoagDir', () => {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('creates .moag/, and writes a correct .gitignore and .gitattributes on disk', () => {
+  afterEach(() => { setMoagDirCreatedListener(null); });
+
+  it('creates .moag/ and never creates or changes .gitignore or .gitattributes', () => {
+    fs.writeFileSync(path.join(tmpDir, '.gitignore'), 'node_modules/\n');
     const dir = ensureMoagDir();
     assert.equal(dir, path.join(tmpDir, '.moag'));
     assert.ok(fs.existsSync(dir));
+    assert.equal(fs.readFileSync(path.join(tmpDir, '.gitignore'), 'utf-8'), 'node_modules/\n');
+    assert.equal(fs.existsSync(path.join(tmpDir, '.gitattributes')), false);
+  });
 
-    const gitignore = fs.readFileSync(path.join(tmpDir, '.gitignore'), 'utf-8');
-    assert.ok(gitignore.includes('.moag/*'));
-    assert.ok(gitignore.includes('!.moag/usage-log.jsonl'));
+  it('fires the dir-created listener once, on creation only', () => {
+    const seen: string[] = [];
+    setMoagDirCreatedListener((d: string) => seen.push(d));
+    ensureMoagDir();
+    ensureMoagDir();
+    assert.deepEqual(seen, [path.join(tmpDir, '.moag')]);
+  });
 
-    const gitattributes = fs.readFileSync(path.join(tmpDir, '.gitattributes'), 'utf-8');
-    assert.ok(gitattributes.includes('.moag/usage-log.jsonl merge=union'));
+  it('does not fire when .moag/ already exists, and a throwing listener does not break it', () => {
+    fs.mkdirSync(path.join(tmpDir, '.moag'));
+    let fired = 0;
+    setMoagDirCreatedListener(() => { fired++; });
+    ensureMoagDir();
+    assert.equal(fired, 0);
+    fs.rmSync(path.join(tmpDir, '.moag'), { recursive: true });
+    setMoagDirCreatedListener(() => { throw new Error('boom'); });
+    assert.equal(ensureMoagDir(), path.join(tmpDir, '.moag'));
+  });
+});
+
+describe('gitignore choice', () => {
+  let tmpDir: string;
+  beforeEach(() => { tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-gitignore-')); });
+  afterEach(() => { fs.rmSync(tmpDir, { recursive: true, force: true }); });
+
+  it('gitignoreLinesFor: share the plan, or ignore everything', () => {
+    assert.deepEqual(gitignoreLinesFor('share-plan'), ['.moag/*', '!.moag/plan.json', '!.moag/.agent-plan.json']);
+    assert.deepEqual(gitignoreLinesFor('ignore-all'), ['.moag/']);
+  });
+
+  it('share-plan appends after existing lines, leaves them alone, and is idempotent', () => {
+    const file = path.join(tmpDir, '.gitignore');
+    fs.writeFileSync(file, 'node_modules/\ndist');
+    assert.equal(applyGitignoreChoice(tmpDir, 'share-plan'), true);
+    const once = fs.readFileSync(file, 'utf-8');
+    assert.equal(once, 'node_modules/\ndist\n.moag/*\n!.moag/plan.json\n!.moag/.agent-plan.json\n');
+    assert.equal(applyGitignoreChoice(tmpDir, 'share-plan'), false);
+    assert.equal(fs.readFileSync(file, 'utf-8'), once);
+  });
+
+  it('creates .gitignore when there is none, and keeps CRLF files CRLF', () => {
+    assert.equal(applyGitignoreChoice(tmpDir, 'ignore-all'), true);
+    assert.equal(fs.readFileSync(path.join(tmpDir, '.gitignore'), 'utf-8'), '.moag/\n');
+    const crlf = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-gitignore-crlf-'));
+    try {
+      fs.writeFileSync(path.join(crlf, '.gitignore'), 'a\r\n');
+      applyGitignoreChoice(crlf, 'ignore-all');
+      assert.equal(fs.readFileSync(path.join(crlf, '.gitignore'), 'utf-8'), 'a\r\n.moag/\r\n');
+    } finally { fs.rmSync(crlf, { recursive: true, force: true }); }
   });
 });

@@ -66,11 +66,23 @@ export function retryFailed(detail?: string): UserMessage {
   };
 }
 
-export function planLoadError(detail?: string): UserMessage {
-  const hint = detail ? ` ${truncate(detail, 150)}` : '';
-  return {
-    text: `Could not read the plan file.${hint}`,
-  };
+/** Max characters of parser detail shown in a plan-load error, ellipsis included. */
+const PLAN_LOAD_DETAIL_MAX = 150;
+
+/**
+ * A plan file that could not be read or parsed.
+ * @param detail   The parser/loader message (truncated to 150 characters)
+ * @param filePath When given, the text names the file and offers Open File
+ */
+export function planLoadError(detail?: string, filePath?: string): UserMessage {
+  const hint = detail ? ` ${truncate(detail, PLAN_LOAD_DETAIL_MAX - 3)}` : '';
+  // Split on both separators: the message names a Windows path correctly on any host.
+  const name = filePath ? ` ${filePath.split(/[\\/]/).pop() ?? filePath}` : '';
+  const msg: UserMessage = { text: `Could not read the plan file${name}.${hint}` };
+  if (filePath) {
+    msg.actions = [{ label: 'Open File', command: 'vscode.open', args: [vscode.Uri.file(filePath)] }];
+  }
+  return msg;
 }
 
 export function standardsLoadError(detail?: string): UserMessage {

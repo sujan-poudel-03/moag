@@ -15,6 +15,7 @@ import type { InternalError } from '../utils/error-log';
 import { appendErrorLog as _appendErrorLog, readRecentErrors as _readRecentErrors } from '../utils/error-log';
 import { EngineId, HistoryEntry } from '../models/types';
 import * as os from 'os';
+import { execSync } from 'child_process';
 import { analyzeProject } from '../context/project-analyzer';
 import { analyzeWeights, saveWeights } from '../context/weights';
 import { invalidateWeightsCache } from '../context/context-builder';
@@ -22,6 +23,8 @@ import { ghSync } from '../utils/gh';
 import { getMoagDir } from '../workspace/moag-paths';
 import { RunSession } from '../models/run-session';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
+import { buildReportRedactor } from './report-redaction';
+import { formatUsd } from '../utils/cost-format';
 
 /** What a run cost in friction: retries, escalations, auto-fixes. */
 export interface RunFrictionReport {
@@ -45,9 +48,12 @@ export interface SelfReportingDeps {
   executionTaskCount(): number;
   executionTasksFailed(): number;
   appendOutput(line: string): void;
+  /** Exact secret values to strip from outbound reports (Anthropic key, ONOSOO key). */
+  extraSecrets(): Promise<string[]>;
 }
 
-const MOAG_REPO = 'sujan-poudel-03/moag';
+/** Every bug report, feedback and self-issue goes here, whatever the workspace is. */
+export const MOAG_REPO = 'sujan-poudel-03/moag';
 
 let deps: SelfReportingDeps;
 
@@ -301,7 +307,8 @@ export function buildFrictionIssueBody(report: RunFrictionReport, notes: string)
   const durationStr = report.summary.durationMs > 0
     ? `${Math.floor(report.summary.durationMs / 60000)}m ${Math.floor((report.summary.durationMs % 60000) / 1000)}s`
     : 'n/a';
-  const costStr = report.summary.estimatedCostUsd > 0 ? `$${report.summary.estimatedCostUsd.toFixed(2)}` : 'n/a';
+  // The friction report has no count of unknown-cost calls, so zero reads "not reported", never "$0".
+  const costStr = report.summary.estimatedCostUsd > 0 ? formatUsd(report.summary.estimatedCostUsd) : 'not reported';
 
   const frictionTable = report.friction.length > 0
     ? `| Task | Attempts | Auto-fixed | Escalated | Error |\n` +
@@ -411,6 +418,10 @@ export function markSelfIssuesFiled(ids: string[]): void {
   } catch { /* best-effort */ }
 }
 
+/**
+ * File the selected self-issues as one public issue on the MOAG repository,
+ * through the same preview-before-posting panel as a bug report.
+ */
 export async function cmdReviewSelfIssues(): Promise<void> {
   const issues = readUnfiledSelfIssues();
   if (issues.length === 0) {
@@ -425,54 +436,84 @@ export async function cmdReviewSelfIssues(): Promise<void> {
   }));
   const selected = await vscode.window.showQuickPick(items, {
     canPickMany: true,
-    placeHolder: issues.length + ' MOAG issue' + (issues.length > 1 ? 's' : '') + ' collected — select to file on GitHub',
+    placeHolder: issues.length + ' MOAG issue' + (issues.length > 1 ? 's' : '') + ' collected — select to report in one public issue',
     title: 'MOAG Self-Issues',
   });
   if (!selected || selected.length === 0) { return; }
-  const { execSync } = require('child_process') as typeof import('child_process');
-  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-  try { execSync('gh --version', { cwd, timeout: 5000, stdio: 'ignore' }); }
-  catch { vscode.window.showWarningMessage('Install GitHub CLI (gh) to file issues. https://cli.github.com'); return; }
-  const repo = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('issueRepo', '').trim() || MOAG_REPO;
-  const extVersion = (vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON as { version?: string } | undefined)?.version ?? 'unknown';
-  const filedIds: string[] = [];
-  for (const item of selected) {
-    const { issue } = item;
-    const title = '[auto] ' + issue.message + ' [v' + issue.moagVersion + ' / ' + issue.type + ']';
-    const body = [
-      '## Auto-collected MOAG Issue',
-      '**Type:** `' + issue.type + '`  **Detected:** ' + new Date(issue.timestamp).toLocaleString(),
-      '', '## Environment', '| | |', '|---|---|',
-      '| **MOAG** | v' + issue.moagVersion + ' |',
-      '| **Engine** | ' + issue.engine + ' |',
-      '| **Platform** | ' + issue.platform + ' |',
-      '', '## Detail', '```', issue.detail.substring(0, 500), '```',
-      '---', '*Auto-collected by MOAG v' + extVersion + ' self-issue monitor*',
-    ].join('\n');
-    try {
-      const tmpPath = path.join(require('os').tmpdir(), 'moag-si-' + Date.now() + '.md');
-      fs.writeFileSync(tmpPath, body, 'utf-8');
-      const result = ghSync(
-        ['issue', 'create', '--repo', repo, '--title', title, '--body-file', tmpPath, '--label', 'bug'],
-        { cwd, timeout: 20000 },
-      ).trim();
-      filedIds.push(issue.id);
-      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
-      const url = result.split('\n').pop() || '';
-      if (url) {
-        vscode.window.showInformationMessage('Filed: ' + url, 'View').then((a: string | undefined) => {
-          if (a === 'View') { vscode.env.openExternal(vscode.Uri.parse(url)); }
-        });
-      }
-    } catch (err) {
-      vscode.window.showErrorMessage('Failed: ' + (err instanceof Error ? err.message.substring(0, 150) : String(err)));
-    }
-  }
-  if (filedIds.length > 0) { markSelfIssuesFiled(filedIds); }
+  const extVersion = moagVersion();
+  const n = selected.length;
+  const title = `[auto] ${n} MOAG self-issue${n === 1 ? '' : 's'} [v${extVersion}]`;
+  const sections = selected.map(({ issue }, i) => [
+    `## ${i + 1}. ${issue.message}`,
+    '**Type:** `' + issue.type + '`  **Detected:** ' + new Date(issue.timestamp).toLocaleString(),
+    '', '| | |', '|---|---|',
+    '| **MOAG** | v' + issue.moagVersion + ' |',
+    '| **Engine** | ' + issue.engine + ' |',
+    '| **Platform** | ' + issue.platform + ' |',
+    '', '```', issue.detail.substring(0, 500), '```',
+  ].join('\n'));
+  const body = [
+    ...sections,
+    '---', '*Auto-collected by MOAG v' + extVersion + ' self-issue monitor*',
+  ].join('\n\n');
+  await openReportPanel('bug', undefined, undefined, {
+    draft: { title, body },
+    onPosted: () => markSelfIssuesFiled(selected.map(s => s.issue.id)),
+  });
 }
 
 
-// ─── Embedded report panel (replaces showInputBox for bug/feedback flows) ───
+// ─── Embedded report panel: compose → preview → post ───
+
+/** GitHub caps nothing, but the OS does: ShellExecute on Windows stops near 2,083 characters. */
+const NEW_ISSUE_URL_MAX: Readonly<Record<'win32' | 'other', number>> = { win32: 2000, other: 8000 };
+
+const TRUNCATION_NOTE = '\n\n_(Truncated: the full report is on your clipboard — paste it here.)_';
+
+/**
+ * A prefilled `issues/new` URL on the MOAG repository, for when `gh` is missing
+ * or not signed in. The whole URL (after encodeURIComponent) stays under the
+ * platform cap; when the body had to be cut, the cut is stated in the body and
+ * `truncated` is true so the caller can put the full body on the clipboard.
+ */
+export function buildNewIssueUrl(
+  title: string,
+  body: string,
+  platform: NodeJS.Platform = process.platform,
+): { url: string; truncated: boolean } {
+  const cap = platform === 'win32' ? NEW_ISSUE_URL_MAX.win32 : NEW_ISSUE_URL_MAX.other;
+  const head = (t: string): string => `https://github.com/${MOAG_REPO}/issues/new?title=${encodeURIComponent(t)}&body=`;
+  let base = head(title);
+  const full = base + encodeURIComponent(body);
+  if (full.length <= cap) { return { url: full, truncated: false }; }
+
+  // A title that alone overflows is cut too (by code point, so no lone surrogate reaches the encoder).
+  const titleChars = Array.from(title);
+  while (base.length + encodeURIComponent(TRUNCATION_NOTE).length > cap && titleChars.length > 0) {
+    titleChars.splice(Math.max(0, titleChars.length - 10));
+    base = head(titleChars.join(''));
+  }
+  // Largest body prefix (in code points) that still fits with the note.
+  const chars = Array.from(body);
+  let lo = 0;
+  let hi = chars.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    const len = base.length + encodeURIComponent(chars.slice(0, mid).join('') + TRUNCATION_NOTE).length;
+    if (len <= cap) { lo = mid; } else { hi = mid - 1; }
+  }
+  return { url: base + encodeURIComponent(chars.slice(0, lo).join('') + TRUNCATION_NOTE), truncated: true };
+}
+
+/** Escape text for an HTML text node or attribute. */
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+/** The installed MOAG version, or 'unknown'. */
+function moagVersion(): string {
+  return (vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON as { version?: string } | undefined)?.version ?? 'unknown';
+}
 
 export function buildReportPanelHtml(webview: vscode.Webview, opts: {
   mode: 'bug' | 'feedback';
@@ -480,220 +521,303 @@ export function buildReportPanelHtml(webview: vscode.Webview, opts: {
   subtitle: string;
   placeholder: string;
   contextHtml: string;
+  /** A ready draft (self-issues): the panel opens straight on the preview step. */
+  draft?: { title: string; body: string };
 }): string {
   // The script is a compiled file; the CSP admits only the nonce it carries.
   const scriptUri = webviewScriptUri(webview, 'report-panel');
   const nonce = webviewNonce();
   const csp = webviewCsp(webview, nonce);
-  const { mode, title, subtitle, placeholder, contextHtml } = opts;
-  const btnLabel = mode === 'bug' ? 'File Issue &rarr;' : 'Share Feedback &rarr;';
+  const { mode, title, subtitle, placeholder, contextHtml, draft } = opts;
   const icon = mode === 'bug' ? '🐛' : '📊';
+  // Data, not script: the CSP never runs it, and `<` is escaped so it cannot close the tag.
+  const draftJson = draft ? JSON.stringify(draft).replace(/</g, '\\u003c') : '';
   return `<!DOCTYPE html><html lang="en"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">${csp}
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   ${csp}
-<title>${title}</title>
+<title>${escapeHtml(title)}</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
   body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);color:var(--vscode-foreground);background:var(--vscode-editor-background);display:flex;flex-direction:column;height:100vh;overflow:hidden}
-  .header{padding:20px 24px 12px;border-bottom:1px solid var(--vscode-widget-border,#333)}
+  .header{padding:20px 24px 12px;border-bottom:1px solid var(--vscode-widget-border,transparent)}
   h1{font-size:1.3em;font-weight:600;margin-bottom:6px}
+  h2{font-size:1em;font-weight:600}
   .subtitle{color:var(--vscode-descriptionForeground);font-size:.88em;line-height:1.5}
   .body{flex:1;padding:16px 24px;display:flex;flex-direction:column;gap:12px;overflow:auto}
   label{font-size:.85em;font-weight:600;color:var(--vscode-foreground);opacity:.8}
-  textarea{flex:1;min-height:120px;resize:none;padding:10px 12px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,#555);border-radius:4px;font-family:inherit;font-size:inherit;line-height:1.5}
+  textarea{flex:1;min-height:120px;resize:none;padding:10px 12px;background:var(--vscode-input-background);color:var(--vscode-input-foreground);border:1px solid var(--vscode-input-border,transparent);border-radius:4px;font-family:inherit;font-size:inherit;line-height:1.5}
   textarea:focus{outline:none;border-color:var(--vscode-focusBorder)}
-  .context-box{background:var(--vscode-textBlockQuote-background,#1e1e2e);border-left:3px solid var(--vscode-textBlockQuote-border,#444);padding:10px 14px;border-radius:0 4px 4px 0;font-size:.82em;line-height:1.7;color:var(--vscode-descriptionForeground)}
+  .context-box{background:var(--vscode-textBlockQuote-background);border-left:3px solid var(--vscode-textBlockQuote-border);padding:10px 14px;border-radius:0 4px 4px 0;font-size:.82em;line-height:1.7;color:var(--vscode-descriptionForeground)}
   .context-box strong{color:var(--vscode-foreground)}
-  .footer{padding:12px 24px;border-top:1px solid var(--vscode-widget-border,#333);display:flex;justify-content:flex-end}
-  .file-btn{padding:8px 22px;background:var(--vscode-button-background);color:var(--vscode-button-foreground);border:none;border-radius:4px;cursor:pointer;font-size:.9em;font-weight:600}
-  .file-btn:hover{background:var(--vscode-button-hoverBackground)}
-  .file-btn:disabled{opacity:.5;cursor:not-allowed}
+  pre{white-space:pre-wrap;word-break:break-word;background:var(--vscode-textCodeBlock-background);padding:10px 12px;border-radius:4px;font-family:var(--vscode-editor-font-family);font-size:.85em;line-height:1.5;flex:1;overflow:auto}
+  .notice{color:var(--vscode-descriptionForeground);font-size:.85em}
+  .footer{padding:12px 24px;border-top:1px solid var(--vscode-widget-border,transparent);display:flex;justify-content:flex-end;gap:8px}
+  button{padding:8px 18px;border:none;border-radius:4px;cursor:pointer;font-size:.9em;font-weight:600;background:var(--vscode-button-secondaryBackground);color:var(--vscode-button-secondaryForeground)}
+  button.primary{background:var(--vscode-button-background);color:var(--vscode-button-foreground)}
+  button.primary:hover{background:var(--vscode-button-hoverBackground)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  [hidden]{display:none!important}
 </style></head><body>
 <div class="header">
-  <h1>${icon} ${title}</h1>
+  <h1>${icon} ${escapeHtml(title)}</h1>
   <p class="subtitle">${subtitle}</p>
 </div>
-<div class="body">
+<div id="composeStep" class="body"${draft ? ' hidden' : ''}>
   <div>
-    <label>Description (optional)</label>
-    <textarea id="desc" placeholder="${placeholder}" style="margin-top:6px;width:100%"></textarea>
+    <label for="desc">Description (optional)</label>
+    <textarea id="desc" placeholder="${escapeHtml(placeholder)}" style="margin-top:6px;width:100%"></textarea>
   </div>
   <div class="context-box"><strong>Auto-included:</strong><br>${contextHtml}</div>
 </div>
-<div class="footer">
-  <button class="file-btn" id="fileBtn">${btnLabel}</button>
+<div id="previewStep" class="body"${draft ? '' : ' hidden'}>
+  <p class="notice">This is exactly what will be posted. Secrets and your home and workspace paths have been removed.</p>
+  <h2 id="previewTitle"></h2>
+  <pre id="preview"></pre>
 </div>
+<div class="footer">
+  <span id="composeButtons"${draft ? ' hidden' : ''}><button class="primary" id="fileBtn">Preview &rarr;</button></span>
+  <span id="previewButtons"${draft ? '' : ' hidden'}>
+    <button id="cancelBtn">Cancel</button>
+    <button id="copyBtn">Copy</button>
+    <button class="primary" id="postBtn" title="Posts a public issue on github.com/${MOAG_REPO}">Post publicly</button>
+  </span>
+</div>
+<p class="notice" style="padding:0 24px 12px;text-align:right">Posts a public issue on github.com/${MOAG_REPO}</p>
+<script type="application/json" id="draft">${draftJson}</script>
   <script nonce="${nonce}" src="${scriptUri}"></script></body></html>`;
+}
+
+/** A report as it will be posted: already redacted. */
+interface ReportDraft { title: string; body: string }
+
+/** Options for a panel opened on a ready draft (self-issues). */
+interface PreparedReport {
+  draft: { title: string; body: string };
+  /** Called after the issue was created through gh. */
+  onPosted?: () => void;
+}
+
+/** The redactor every outbound report passes through, built per report. */
+async function reportRedactor(cwd: string | null): Promise<(text: string) => string> {
+  let extra: string[] = [];
+  try { extra = await deps.extraSecrets(); } catch { /* the shapes and .env still apply */ }
+  return buildReportRedactor({ cwd, home: os.homedir(), env: process.env, extraSecrets: extra });
+}
+
+/** True when `gh` is installed and signed in. */
+function ghReady(cwd: string | undefined): boolean {
+  try {
+    execSync('gh auth status', { cwd, timeout: 8000, stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Post a redacted draft to the MOAG repository: through `gh` when it is signed
+ * in, otherwise by opening a prefilled issues/new page in the browser. Returns
+ * true when an issue was created through gh.
+ */
+async function postReport(draft: ReportDraft, cwd: string | undefined): Promise<boolean> {
+  if (ghReady(cwd)) {
+    const tmpPath = path.join(os.tmpdir(), `moag-report-${Date.now()}.md`);
+    try {
+      fs.writeFileSync(tmpPath, draft.body, 'utf-8');
+      const rawOut = ghSync(['issue', 'create', '--repo', MOAG_REPO, '--title', draft.title, '--body-file', tmpPath], { cwd, timeout: 20000 });
+      const url = rawOut.trim().split('\n').filter(l => l.includes('github.com')).pop() || '';
+      if (!url) {
+        vscode.window.showErrorMessage(`Issue creation returned unexpected output: ${rawOut.substring(0, 200)}`);
+        return false;
+      }
+      void vscode.window.showInformationMessage(`Issue filed: ${url}`, 'View Issue').then((a) => {
+        if (a === 'View Issue') { void vscode.env.openExternal(vscode.Uri.parse(url)); }
+      });
+      return true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message.substring(0, 300) : String(err);
+      appendErrorLog({ ts: new Date().toISOString(), category: 'github', message: msg, context: 'gh issue create (report)' });
+      vscode.window.showErrorMessage(`Failed to create issue: ${msg}`);
+      return false;
+    } finally {
+      try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    }
+  }
+
+  // No gh, or not signed in: the browser fallback.
+  const { url, truncated } = buildNewIssueUrl(draft.title, draft.body);
+  if (truncated) {
+    await vscode.env.clipboard.writeText(draft.body);
+    void vscode.window.showInformationMessage(
+      'The report was too long for a link, so GitHub opens with a shortened copy. The full report is on your clipboard: paste it into the issue.',
+    );
+  }
+  await vscode.env.openExternal(vscode.Uri.parse(url));
+  return false;
 }
 
 export async function openReportPanel(
   mode: 'bug' | 'feedback',
   prefillText?: string,
   frictionReport?: RunFrictionReport | null,
-  targetRepo?: string,
+  prepared?: PreparedReport,
 ): Promise<void> {
-  const { execSync } = require('child_process') as typeof import('child_process');
-  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-  try { execSync('gh --version', { cwd, timeout: 5000, stdio: 'ignore' }); }
-  catch { vscode.window.showWarningMessage('Install GitHub CLI (gh) to file issues. https://cli.github.com'); return; }
+  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
+  const cwd = workspaceRoot ?? undefined;
+  // Built first: even the compose step shows only redacted text.
+  const redact = await reportRedactor(workspaceRoot);
 
-  const extVersion = (vscode.extensions.getExtension('moag.agent-task-player')?.packageJSON as { version?: string } | undefined)?.version ?? 'unknown';
+  const extVersion = moagVersion();
   const detectedEngines = deps.globalState?.get<EngineId[]>('agentTaskPlayer.detectedEngines', []) ?? [];
   const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('defaultEngine', 'claude');
 
-  let contextHtml = `MOAG v${extVersion} &nbsp;·&nbsp; VS Code v${vscode.version} &nbsp;·&nbsp; ${process.platform} &nbsp;·&nbsp; engine: ${defaultEngine}`;
-  if (detectedEngines.length > 0) { contextHtml += ` (installed: ${detectedEngines.join(', ')})`; }
+  let contextHtml = `MOAG v${escapeHtml(extVersion)} &nbsp;·&nbsp; VS Code v${escapeHtml(vscode.version)} &nbsp;·&nbsp; ${process.platform} &nbsp;·&nbsp; engine: ${escapeHtml(defaultEngine)}`;
+  if (detectedEngines.length > 0) { contextHtml += ` (installed: ${escapeHtml(detectedEngines.join(', '))})`; }
 
   let panelTitle: string, subtitle: string, placeholder: string;
 
-  if (mode === 'bug') {
+  if (prepared) {
+    panelTitle = 'Report MOAG Self-Issues';
+    subtitle = `Review the report, then post it as a public issue on <code>${MOAG_REPO}</code>.`;
+    placeholder = '';
+  } else if (mode === 'bug') {
     panelTitle = 'Report MOAG Issue';
-    subtitle = `Files to <code>${MOAG_REPO}</code> with environment info attached automatically.`;
+    subtitle = `Posts a public issue on <code>${MOAG_REPO}</code> with environment info. You see the full text before anything is posted.`;
     placeholder = 'e.g. task hung, wrong output, crashed on start...';
     const friction = frictionReport ?? readLastFrictionReport();
     if (friction) {
-      contextHtml += `<br>Recent run: ${friction.summary.failed} failed · ${friction.summary.escalated} escalated · engine: ${friction.engine}`;
+      contextHtml += `<br>Recent run: ${friction.summary.failed} failed · ${friction.summary.escalated} escalated · engine: ${escapeHtml(friction.engine)}`;
     }
     if (prefillText) {
-      const snippet = prefillText.split('\n').filter(l => l.trim()).slice(0, 5).join('<br>');
+      const snippet = redact(prefillText).split('\n').filter(l => l.trim()).slice(0, 5).map(escapeHtml).join('<br>');
       contextHtml += `<br><em>Error output: ${snippet}</em>`;
     }
   } else {
     panelTitle = 'Share Run Feedback';
     const fc = frictionReport?.friction.length ?? 0;
-    subtitle = `${fc} friction point${fc !== 1 ? 's' : ''} on <strong>${frictionReport?.projectType ?? 'unknown project'}</strong> — files to <code>${targetRepo ?? MOAG_REPO}</code>.`;
+    subtitle = `${fc} friction point${fc !== 1 ? 's' : ''} on <strong>${escapeHtml(frictionReport?.projectType ?? 'unknown project')}</strong>. Posts a public issue on <code>${MOAG_REPO}</code>; you see the full text first.`;
     placeholder = 'What was confusing, slow, or broke unexpectedly? (optional)';
     if (frictionReport) {
       contextHtml += `<br>${frictionReport.summary.total} tasks · ${frictionReport.summary.failed} failed · ${frictionReport.summary.escalated} escalated · ${frictionReport.summary.durationMs > 0 ? Math.round(frictionReport.summary.durationMs / 60000) + 'm' : 'n/a'}`;
       const cats = Object.entries(frictionReport.errorCategories).map(([k, v]) => `${k}(${v})`).join(', ');
-      if (cats) { contextHtml += ` · errors: ${cats}`; }
+      if (cats) { contextHtml += ` · errors: ${escapeHtml(cats)}`; }
     }
   }
 
+  // The draft shown is the draft posted: both are this redacted copy.
+  let pending: ReportDraft | null = prepared
+    ? { title: redact(prepared.draft.title), body: redact(prepared.draft.body) }
+    : null;
+
   const panel = vscode.window.createWebviewPanel(
     'moagReportIssue', `MOAG — ${panelTitle}`, vscode.ViewColumn.One,
-    { enableScripts: true, retainContextWhenHidden: false },
+    { enableScripts: true, retainContextWhenHidden: true },
   );
-  panel.webview.html = buildReportPanelHtml(panel.webview, { mode, title: panelTitle, subtitle, placeholder, contextHtml });
+  let disposed = false;
+  panel.onDidDispose(() => { disposed = true; });
+  const post = (message: unknown): void => {
+    if (disposed) { return; }
+    try { void panel.webview.postMessage(message); } catch { /* panel closed mid-call */ }
+  };
+  panel.webview.html = buildReportPanelHtml(panel.webview, {
+    mode, title: panelTitle, subtitle, placeholder, contextHtml, draft: pending ?? undefined,
+  });
 
-  panel.webview.onDidReceiveMessage(async (message) => {
-    if (message.type !== 'submitReport') { return; }
-    panel.dispose();
-    const description = message.description as string;
-
-    if (mode === 'bug') {
-      const autoTitle = `MOAG bug report [v${extVersion} / ${new Date().toISOString().substring(0, 10)}]`;
-      const errLines = (prefillText ?? '').split('\n').filter(l => l.trim()).slice(0, 30).join('\n');
-      const friction = frictionReport ?? readLastFrictionReport();
-      const frictionSuffix = friction
-        ? `\n\n**Recent run friction:**\n- ${friction.summary.failed} failed · ${friction.summary.escalated} escalated · engine: ${friction.engine}\n- Error patterns: ${Object.entries(friction.errorCategories).map(([k, v]) => `${k}(${v})`).join(', ') || 'none'}`
-        : '';
-      // Attach recent internal extension errors to the report
-      const recentErrs = readRecentErrors(15);
-      const errorLogSection = recentErrs.length > 0
-        ? `\n\n## Extension Error Log (last ${recentErrs.length})\n\`\`\`\n` +
-          recentErrs.map(e =>
-            `[${e.ts.substring(0, 19)}] [${e.category}] ${e.message}` +
-            (e.context ? ` | ${e.context}` : '') +
-            (e.stack ? `\n  ${(e.stack.split('\n')[1] ?? '').trim()}` : '')
-          ).join('\n') +
-          '\n```'
-        : '';
-
-      const bodyParts = [
-        '## Environment', '| | |', '|---|---|',
-        `| **MOAG** | v${extVersion} |`,
-        `| **VS Code** | v${vscode.version} |`,
-        `| **Platform** | ${process.platform} |`,
-        `| **Engine** | ${defaultEngine} (detected: ${detectedEngines.join(', ') || 'none'}) |`,
-        errLines ? `\n## Error Output\n\`\`\`\n${errLines}\n\`\`\`` : '',
-      ].filter(Boolean).join('\n');
-      const fullBody = [description, bodyParts + frictionSuffix + errorLogSection].filter(Boolean).join('\n\n');
-      const cfgForReport = vscode.workspace.getConfiguration('agentTaskPlayer');
-      const repo = cfgForReport.get<string>('issueRepo', '').trim() || MOAG_REPO;
-      const syncLabel = cfgForReport.get<string>('issueSync.label', '').trim() || 'moag';
-      const tmpPath = path.join(os.tmpdir(), `moag-bug-${Date.now()}.md`);
-      // Verify gh is available and authenticated (exit code 0 = ok, non-zero = not auth'd, ENOENT = not installed)
-      try {
-        execSync('gh auth status', { cwd, timeout: 8000, stdio: 'ignore' });
-      } catch (authErr) {
-        const msg = authErr instanceof Error ? authErr.message : String(authErr);
-        if (msg.includes('ENOENT') || msg.includes('not found') || msg.includes('not recognized')) {
-          vscode.window.showErrorMessage('GitHub CLI (gh) is not installed. Install from https://cli.github.com');
-        } else {
-          vscode.window.showErrorMessage('GitHub CLI (gh) is not authenticated. Run "gh auth login" in a terminal first.');
-        }
+  let posting = false;
+  panel.webview.onDidReceiveMessage(async (message: { type?: string; description?: string }) => {
+    switch (message?.type) {
+      case 'submitReport': {
+        const description = typeof message.description === 'string' ? message.description : '';
+        const draft = mode === 'bug'
+          ? buildBugDraft(description, prefillText, frictionReport, extVersion, defaultEngine, detectedEngines)
+          : buildFeedbackDraft(description, frictionReport);
+        if (!draft) { return; }
+        pending = { title: redact(draft.title), body: redact(draft.body) };
+        post({ type: 'preview', title: pending.title, body: pending.body, via: ghReady(cwd) ? 'gh' : 'browser' });
         return;
       }
-      try {
-        fs.writeFileSync(tmpPath, fullBody, 'utf-8');
-        // Ensure labels exist (idempotent)
-        try { ghSync(['label', 'create', 'bug', '--repo', repo, '--color', 'd73a4a', '--description', "Something isn't working", '--force'], { cwd, timeout: 8000 }); } catch { /* already exists */ }
-        try { ghSync(['label', 'create', syncLabel, '--repo', repo, '--color', '0075ca', '--description', 'MOAG task sync', '--force'], { cwd, timeout: 8000 }); } catch { /* already exists */ }
-        const rawOut = ghSync(['issue', 'create', '--repo', repo, '--title', autoTitle, '--body-file', tmpPath, '--label', 'bug', '--label', syncLabel], { cwd, timeout: 20000 });
-        const url = rawOut.trim().split('\n').filter(l => l.includes('github.com')).pop() || rawOut.trim().split('\n').pop() || '';
-        if (!url.includes('github.com')) {
-          vscode.window.showErrorMessage(`Issue creation returned unexpected output: ${rawOut.substring(0, 200)}`);
-          return;
-        }
-        const action = await vscode.window.showInformationMessage(`Issue filed: ${url}`, 'View Issue');
-        if (action === 'View Issue') { vscode.env.openExternal(vscode.Uri.parse(url)); }
-        // Immediately poll so the new issue appears as a task without waiting for the interval
-        void vscode.commands.executeCommand('agentTaskPlayer.ghSyncPollNow');
-      } catch (err) {
-        const msg = err instanceof Error ? err.message.substring(0, 300) : String(err);
-        appendErrorLog({ ts: new Date().toISOString(), category: 'github', message: msg, context: 'gh issue create (bug report)' });
-        vscode.window.showErrorMessage(`Failed to create issue: ${msg}`);
-      }
-      finally { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
-
-    } else {
-      if (!frictionReport) { return; }
-      const fc = frictionReport.friction.length;
-      const title = `Session feedback: ${fc} friction point${fc !== 1 ? 's' : ''} on ${frictionReport.projectType} [${frictionReport.date.substring(0, 10)}]`;
-      const body = buildFrictionIssueBody(frictionReport, description);
-      const repo = targetRepo ?? MOAG_REPO;
-      const tmpPath = path.join(os.tmpdir(), `moag-feedback-${Date.now()}.md`);
-      try {
-        fs.writeFileSync(tmpPath, body, 'utf-8');
-        const url = ghSync(['issue', 'create', '--repo', repo, '--title', title, '--body-file', tmpPath, '--label', 'feedback'], { cwd, timeout: 20000 }).trim().split('\n').pop() || '';
-        const action = await vscode.window.showInformationMessage(`Feedback filed: ${url}`, 'View Issue');
-        if (action === 'View Issue' && url) { vscode.env.openExternal(vscode.Uri.parse(url)); }
-      } catch {
+      case 'confirmPost': {
+        if (!pending || posting) { return; }
+        posting = true;
         try {
-          fs.writeFileSync(tmpPath, body, 'utf-8');
-          const url = ghSync(['issue', 'create', '--repo', repo, '--title', title, '--body-file', tmpPath], { cwd, timeout: 20000 }).trim().split('\n').pop() || '';
-          const action = await vscode.window.showInformationMessage(`Feedback filed: ${url}`, 'View Issue');
-          if (action === 'View Issue' && url) { vscode.env.openExternal(vscode.Uri.parse(url)); }
-        } catch (e2) { vscode.window.showErrorMessage(`Failed to file feedback: ${e2 instanceof Error ? e2.message.substring(0, 200) : String(e2)}`); }
-      } finally { try { fs.unlinkSync(tmpPath); } catch { /* ignore */ } }
+          const viaGh = await postReport(pending, cwd);
+          if (viaGh) { prepared?.onPosted?.(); }
+        } finally {
+          posting = false;
+        }
+        if (!disposed) { panel.dispose(); }
+        return;
+      }
+      case 'copy': {
+        if (!pending) { return; }
+        await vscode.env.clipboard.writeText(`${pending.title}\n\n${pending.body}`);
+        void vscode.window.showInformationMessage('Report copied to the clipboard.');
+        return;
+      }
+      case 'cancel':
+        if (!disposed) { panel.dispose(); }
+        return;
+      default:
+        return;
     }
   });
 }
 
-export async function cmdShareRunFeedback(): Promise<void> {
-  const { execSync } = require('child_process') as typeof import('child_process');
-  const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+/** The bug report as it would be posted, before redaction. */
+function buildBugDraft(
+  description: string,
+  prefillText: string | undefined,
+  frictionReport: RunFrictionReport | null | undefined,
+  extVersion: string,
+  defaultEngine: string,
+  detectedEngines: readonly string[],
+): ReportDraft {
+  const title = `MOAG bug report [v${extVersion} / ${new Date().toISOString().substring(0, 10)}]`;
+  const errLines = (prefillText ?? '').split('\n').filter(l => l.trim()).slice(0, 30).join('\n');
+  const friction = frictionReport ?? readLastFrictionReport();
+  const frictionSuffix = friction
+    ? `\n\n**Recent run friction:**\n- ${friction.summary.failed} failed · ${friction.summary.escalated} escalated · engine: ${friction.engine}\n- Error patterns: ${Object.entries(friction.errorCategories).map(([k, v]) => `${k}(${v})`).join(', ') || 'none'}`
+    : '';
+  // Attach recent internal extension errors to the report
+  const recentErrs = readRecentErrors(15);
+  const errorLogSection = recentErrs.length > 0
+    ? `\n\n## Extension Error Log (last ${recentErrs.length})\n\`\`\`\n` +
+      recentErrs.map(e =>
+        `[${e.ts.substring(0, 19)}] [${e.category}] ${e.message}` +
+        (e.context ? ` | ${e.context}` : '') +
+        (e.stack ? `\n  ${(e.stack.split('\n')[1] ?? '').trim()}` : '')
+      ).join('\n') +
+      '\n```'
+    : '';
 
+  const bodyParts = [
+    '## Environment', '| | |', '|---|---|',
+    `| **MOAG** | v${extVersion} |`,
+    `| **VS Code** | v${vscode.version} |`,
+    `| **Platform** | ${process.platform} |`,
+    `| **Engine** | ${defaultEngine} (detected: ${detectedEngines.join(', ') || 'none'}) |`,
+    errLines ? `\n## Error Output\n\`\`\`\n${errLines}\n\`\`\`` : '',
+  ].filter(Boolean).join('\n');
+  const body = [description, bodyParts + frictionSuffix + errorLogSection].filter(Boolean).join('\n\n');
+  return { title, body };
+}
+
+/** The run-feedback report as it would be posted, before redaction; null without friction data. */
+function buildFeedbackDraft(description: string, frictionReport: RunFrictionReport | null | undefined): ReportDraft | null {
+  if (!frictionReport) { return null; }
+  const fc = frictionReport.friction.length;
+  const title = `Session feedback: ${fc} friction point${fc !== 1 ? 's' : ''} on ${frictionReport.projectType} [${frictionReport.date.substring(0, 10)}]`;
+  return { title, body: buildFrictionIssueBody(frictionReport, description) };
+}
+
+/** Share the last run's friction report as a public issue on the MOAG repository. */
+export async function cmdShareRunFeedback(): Promise<void> {
   const report = readLastFrictionReport();
   if (!report) {
     vscode.window.showInformationMessage('No recent friction data found. Run a plan first.');
     return;
   }
-
-  // 3-tier repo resolution: setting → git remote → MOAG repo
-  const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
-  let repo = cfg.get<string>('issueRepo', '').trim();
-  if (!repo) {
-    try {
-      const remote = execSync('git remote get-url origin', { cwd, timeout: 5000 }).toString().trim();
-      const m = remote.match(/github\.com[:/]([^/]+)\/([^/.]+)/);
-      if (m) { repo = `${m[1]}/${m[2]}`; }
-    } catch { /* no remote */ }
-  }
-  if (!repo) { repo = MOAG_REPO; }
-
-  await openReportPanel('feedback', undefined, report, repo);
+  await openReportPanel('feedback', undefined, report);
 }
 
 export async function cmdReportIssue(prefillText?: string): Promise<void> {

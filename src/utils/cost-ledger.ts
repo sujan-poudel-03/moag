@@ -55,7 +55,8 @@ interface CostUsage {
   inputTokens?: number;
   outputTokens?: number;
   estimatedCost?: number;
-  costSource?: 'reported' | 'estimated';
+  /** 'unknown' is never recorded: the call's cost is not known. */
+  costSource?: 'reported' | 'estimated' | 'unknown';
 }
 
 /** Attribution metadata supplied by the recording call site. */
@@ -75,6 +76,8 @@ class CostLedger {
    * must never corrupt the running total.
    */
   record(usage: CostUsage | undefined, meta: CostMeta): void {
+    // Second line of defence (withCostAccounting checks first): an unknown cost is never counted.
+    if (usage?.costSource === 'unknown') { return; }
     const estimatedCost = usage?.estimatedCost;
     if (estimatedCost === undefined || !Number.isFinite(estimatedCost) || estimatedCost < 0) {
       return;

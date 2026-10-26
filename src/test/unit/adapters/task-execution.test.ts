@@ -328,7 +328,7 @@ describe('Claude Task Execution', () => {
     assert.equal(count, 1, 'should have exactly one --dangerously-skip-permissions');
   });
 
-  it('should parse token usage from stderr', async () => {
+  it('never reads a cost from text output: "Cost: $0.035" leaves the cost unknown', async () => {
     const { ClaudeAdapter } = proxyquire('../../../adapters/claude-adapter', {
       vscode: vscodeMock,
       './base-cli': {
@@ -343,14 +343,53 @@ describe('Claude Task Execution', () => {
     const adapter = new ClaudeAdapter();
     const result = await adapter.runTask({ prompt: 'test', cwd: '/tmp' });
 
-    assert.ok(result.tokenUsage, 'should have tokenUsage');
-    assert.equal(result.tokenUsage!.inputTokens, 1500);
-    assert.equal(result.tokenUsage!.outputTokens, 800);
-    assert.equal(result.tokenUsage!.totalTokens, 2300);
-    assert.equal(result.tokenUsage!.estimatedCost, 0.035);
+    assert.ok(result.tokenUsage, 'text mode tags the cost as unknown');
+    assert.equal(result.tokenUsage!.estimatedCost, undefined);
+    assert.equal(result.tokenUsage!.costSource, 'unknown');
+    assert.equal(result.tokenUsage!.inputTokens, undefined, 'token counts in prose are not usage either');
   });
 
-  it('should return undefined tokenUsage when stderr has no token info', async () => {
+  it('agent prose with a dollar figure gives no cost (Claude, text mode)', async () => {
+    const { ClaudeAdapter } = proxyquire('../../../adapters/claude-adapter', {
+      vscode: vscodeMock,
+      './base-cli': {
+        runCli: () => Promise.resolve({ stdout: 'Caching this will save you $12.50 a month.', stderr: '', exitCode: 0, durationMs: 10 }),
+      },
+    });
+    const result = await new ClaudeAdapter().runTask({ prompt: 'test', cwd: '/tmp' });
+    assert.deepEqual(result.tokenUsage, { costSource: 'unknown' });
+  });
+
+  it('Codex and Gemini with no token counts still tag the cost unknown (never undefined)', async () => {
+    for (const [mod, cls] of [['codex-adapter', 'CodexAdapter'], ['gemini-adapter', 'GeminiAdapter']] as const) {
+      const loaded = proxyquire(`../../../adapters/${mod}`, {
+        vscode: vscodeMock,
+        './base-cli': { runCli: () => Promise.resolve({ stdout: 'done', stderr: '', exitCode: 0, durationMs: 5 }) },
+      });
+      const result = await new loaded[cls]().runTask({ prompt: 'test', cwd: '/tmp' });
+      assert.deepEqual(result.tokenUsage, { costSource: 'unknown' }, mod);
+      const empty = proxyquire(`../../../adapters/${mod}`, {
+        vscode: vscodeMock,
+        './base-cli': { runCli: () => Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 5 }) },
+      });
+      assert.deepEqual((await new empty[cls]().runTask({ prompt: 'test', cwd: '/tmp' })).tokenUsage, { costSource: 'unknown' }, mod + ' (empty output)');
+    }
+  });
+
+  it('agent prose with a dollar figure gives no cost (Codex)', async () => {
+    const { CodexAdapter } = proxyquire('../../../adapters/codex-adapter', {
+      vscode: vscodeMock,
+      './base-cli': {
+        runCli: () => Promise.resolve({ stdout: 'This will save you $12.50. cost: $3.00', stderr: 'tokens used\ninput_tokens: 900\noutput_tokens: 100', exitCode: 0, durationMs: 10 }),
+      },
+    });
+    const result = await new CodexAdapter().runTask({ prompt: 'test', cwd: '/tmp' });
+    assert.equal(result.tokenUsage?.estimatedCost, undefined);
+    assert.equal(result.tokenUsage?.costSource, 'unknown');
+    assert.equal(result.tokenUsage?.inputTokens, 900, 'token counts are still kept');
+  });
+
+  it('text mode with no token info still tags the cost unknown', async () => {
     const { ClaudeAdapter } = proxyquire('../../../adapters/claude-adapter', {
       vscode: vscodeMock,
       './base-cli': {
@@ -360,7 +399,7 @@ describe('Claude Task Execution', () => {
     const adapter = new ClaudeAdapter();
     const result = await adapter.runTask({ prompt: 'test', cwd: '/tmp' });
 
-    assert.equal(result.tokenUsage, undefined);
+    assert.deepEqual(result.tokenUsage, { costSource: 'unknown' });
   });
 
   it('should use custom command path from settings', () => {
