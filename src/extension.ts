@@ -74,7 +74,7 @@ import { standardsReportSection, verificationGateRows } from './ui/standards-rep
 import { createLocalStandardsProvider, loadLocalStandards } from './standards/local-store';
 import { captureScreenshot } from './sandbox/screenshot';
 import { resolveDeveloperEmail } from './utils/git-identity';
-import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
+import { createUsageRecorder, readAllUsageEntries } from './utils/usage-log';
 import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
 import { costLedger } from './utils/cost-ledger';
 import { isOwnStack } from './utils/error-log';
@@ -1518,21 +1518,18 @@ export function activate(context: vscode.ExtensionContext): void {
   runner.setPromptLibrary(promptLibraryStore);
 
   // Contribution Ledger: record per-engine-call usage facts to
-  // .moag/usage-log.jsonl. Best-effort — appendUsageEntry never throws, and
-  // the recorder itself is already wrapped by the runner's own try/catch.
-  // The recorded `record.prompt` is always the short human prompt the
-  // runner computes — never the assembled buildContext() prompt; this file
-  // is git-tracked, so anything wider than that would land in git history.
-  runner.setUsageRecorder((record) => {
-    const enabled = vscode.workspace.getConfiguration('agentTaskPlayer')
-      .get<boolean>('contributionLedger.enabled', true);
-    if (!enabled) { return; }
-    const moagDir = getMoagDir();
-    if (!moagDir) { return; }
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-    const developerEmail = resolveDeveloperEmail(cwd);
-    appendUsageEntry(moagDir, { ...record, developerEmail });
-  });
+  // .moag/usage-log.jsonl (local, rotated at 5 MB). Best-effort — the append
+  // never throws, and the recorder itself is wrapped by the runner's own
+  // try/catch. `record.prompt` is always the short human prompt the runner
+  // computes — never the assembled buildContext() prompt. The developer's
+  // email is recorded only when contributionLedger.recordDeveloperEmail is on.
+  runner.setUsageRecorder(createUsageRecorder({
+    enabled: () => vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('contributionLedger.enabled', true),
+    recordEmail: () => vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('contributionLedger.recordDeveloperEmail', false),
+    moagDir: getMoagDir,
+    cwd: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+    resolveEmail: resolveDeveloperEmail,
+  }));
 
   // Initialize AI rules store
   aiRulesStore = new AiRulesStore(context.globalStorageUri.fsPath);
@@ -2607,9 +2604,20 @@ export function activate(context: vscode.ExtensionContext): void {
     .catch(() => undefined);
 
   // Auto-load plan if one exists in workspace, then restore pause state
+  // MOAG edits .gitignore only after asking, once per workspace: when it first
+  // creates .moag/, or at startup when .moag/ already exists.
+  const offerGitignore = (): void => {
+    maybeOfferGitignore(context).catch((err: unknown) => {
+      moagOutputChannel?.appendLine(`[gitignore] ${err instanceof Error ? err.message : String(err)}`);
+    });
+  };
+  setMoagDirCreatedListener(offerGitignore);
+  context.subscriptions.push({ dispose: () => setMoagDirCreatedListener(null) });
+
   autoLoadPlan().then(() => {
     restorePauseState(context);
     startIssuePolling(context);
+    offerGitignore();
   }).catch((err: unknown) => {
     appendErrorLog({
       ts: new Date().toISOString(), category: 'plan',
@@ -2882,7 +2890,9 @@ import {
   resolvePlanPath,
   getNewPlanSavePath,
   MOAG_PLAN_FILE,
+  setMoagDirCreatedListener,
 } from './workspace/moag-paths';
+import { maybeOfferGitignore } from './ui/gitignore-consent';
 
 // ─── Auto-load plan ───
 

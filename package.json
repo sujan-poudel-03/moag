@@ -1377,7 +1377,12 @@
         "agentTaskPlayer.contributionLedger.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Record per-engine-call usage (task, developer, prompt, tokens/cost) to .moag/usage-log.jsonl and show the Contribution Ledger in the dashboard."
+          "description": "Record per-engine-call usage (task, prompt, tokens/cost) to .moag/usage-log.jsonl (local; rotated at 5 MB) and show the Contribution Ledger in the dashboard."
+        },
+        "agentTaskPlayer.contributionLedger.recordDeveloperEmail": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also record your git user.email with each usage entry, so the Contribution Ledger can attribute work per developer. Off by default: the usage log may be shared."
         },
         "agentTaskPlayer.onosoo.relay": {
           "type": "boolean",
