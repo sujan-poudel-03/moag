@@ -50,7 +50,9 @@ describe('walkthrough — agentTaskPlayer.getStarted', () => {
   });
 
   it('links the ONOSOO guide on GitHub, because docs/ is not shipped', () => {
-    assert.ok(vscodeignore.includes('docs/**'), 'premise: docs/ is excluded from the VSIX');
+    // .vscodeignore is an allowlist (`**`, then `!` lines); of docs/ only the manual ships.
+    assert.ok(vscodeignore[0] === '**' && !vscodeignore.some(l => l.startsWith('!docs/') && l !== '!docs/MANUAL.md'),
+      'premise: docs/ (but the manual) is excluded from the VSIX');
     const step = getStarted!.steps.find(s => s.id === 'connectOnosoo')!;
     const repo = pkg.repository.url.replace(/\.git$/, '');
     const guide = `${repo}/blob/master/docs/onosoo-builds.md`;

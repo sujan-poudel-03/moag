@@ -39,7 +39,9 @@ CODE="$(find_code || true)"
 say "VS Code CLI : $CODE"
 
 # ── Build ──
-[ -d node_modules ] || { say "Installing dependencies…"; npm install; }
+# Always npm ci: the build needs every devDependency (esbuild bundles the
+# extension), and an older clone's node_modules may predate one.
+say "Installing dependencies…"; npm ci
 say "Compiling…"; npm run compile
 
 # ── Package VSIX ──

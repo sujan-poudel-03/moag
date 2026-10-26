@@ -66,9 +66,11 @@ describe('server packaging', () => {
   });
 
   it('the extension package excludes the Docker files', () => {
-    const ignore = read('.vscodeignore').split(/\r?\n/).map((l) => l.trim());
-    assert.ok(ignore.includes('Dockerfile'));
-    assert.ok(ignore.includes('.dockerignore'));
+    // .vscodeignore is an allowlist: `**` excludes everything, and only `!` lines ship.
+    const rules = read('.vscodeignore').split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== '' && !l.startsWith('#'));
+    assert.equal(rules[0], '**');
+    const kept = rules.filter((l) => l.startsWith('!'));
+    assert.ok(!kept.some((l) => /docker/i.test(l) || l === '!*' || l === '!**'), kept.join(', '));
   });
 
   it('docs/server.md covers TLS, bootstrap, backup, CLIs, the CI lock, passthrough and the same-uid residual', () => {

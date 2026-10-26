@@ -100,7 +100,10 @@ describe('repository line endings (.gitattributes)', () => {
 
   it('is repository plumbing: the VSIX does not ship it', () => {
     const ignore = fs.readFileSync(path.join(REPO, '.vscodeignore'), 'utf-8').split(/\r?\n/).map((l) => l.trim());
-    assert.ok(ignore.includes('.gitattributes'));
+    // .vscodeignore is an allowlist: everything is excluded unless a `!` line keeps it.
+    const rules = ignore.filter((l) => l !== '' && !l.startsWith('#'));
+    assert.equal(rules[0], '**');
+    assert.ok(!rules.some((l) => l.startsWith('!') && l.includes('gitattributes')));
   });
 
   it('a core.autocrlf=true checkout holds src/ and web/ with LF, and still converts files outside them', function () {

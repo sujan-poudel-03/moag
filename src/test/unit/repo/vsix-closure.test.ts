@@ -1,13 +1,15 @@
 // ─── VSIX closure: everything the shipped entry points require is in the package ───
 //
 // Unit and integration tests run against the repository's own out/, which holds
-// every compiled file. The VSIX does not: .vscodeignore drops out/server/**,
-// out/test/**, out/bench/** and more. 0.9.13 and 0.9.14 shipped an extension
-// whose activation chain required ../server/secrets, which was not in the
-// package, so VS Code failed with "Cannot find module" on activation while every
-// test passed. This walks the compiled require graph from the two shipped entry
-// points (the extension and the headless CLI) and fails when any reachable file
-// is one .vscodeignore excludes. It needs a fresh `npm run compile`.
+// every compiled file. The VSIX does not: .vscodeignore is an allowlist that
+// keeps the two esbuild bundles (out/bundle/), the webview scripts and a few
+// named files. 0.9.13 and 0.9.14 shipped an extension whose activation chain
+// required ../server/secrets, which was not in the package, so VS Code failed
+// with "Cannot find module" on activation while every test passed. This walks
+// the require graph from the two shipped entry points (package.json `main` and
+// `bin.moag`) and fails when any reachable file is one .vscodeignore excludes,
+// and checks that every file package.json names is shipped. It needs a fresh
+// `npm run compile` (which bundles).
 
 import { strict as assert } from 'assert';
 import * as fs from 'fs';
@@ -15,7 +17,23 @@ import * as os from 'os';
 import * as path from 'path';
 
 const REPO = path.resolve(__dirname, '..', '..', '..', '..');
-const ENTRY_POINTS = ['out/extension.js', 'out/headless/cli.js'];
+interface Manifest {
+  main?: string;
+  bin?: string | Record<string, string>;
+  icon?: string;
+  contributes?: unknown;
+}
+
+const MANIFEST = JSON.parse(fs.readFileSync(path.join(REPO, 'package.json'), 'utf-8')) as Manifest;
+
+/** A package.json path (`./out/x.js`) as a repo-relative POSIX path. */
+const normRel = (p: string): string => path.posix.normalize(p.split(path.sep).join('/')).replace(/^\.\//, '');
+
+/** The shipped entry points: package.json `main` and `bin.moag`. */
+const ENTRY_POINTS = [
+  MANIFEST.main,
+  typeof MANIFEST.bin === 'string' ? MANIFEST.bin : MANIFEST.bin?.moag,
+].filter((p): p is string => typeof p === 'string').map(normRel);
 
 /**
  * Require edges into excluded files that are deliberate: the target is a
@@ -24,7 +42,7 @@ const ENTRY_POINTS = ['out/extension.js', 'out/headless/cli.js'];
  */
 const GUARDED_DEV_EDGES: ReadonlyArray<{ from: string; to: string }> = [
   // `moag bench` drives the hosted server; it runs from a source checkout only.
-  { from: 'out/headless/cli.js', to: 'out/bench/harness.js' },
+  { from: 'out/bundle/cli.js', to: 'out/bench/harness.js' },
 ];
 
 // ─── .vscodeignore, read the way vsce reads it ───
@@ -116,11 +134,25 @@ describe('VSIX closure (.vscodeignore vs the compiled require graph)', () => {
     assert.ok(isExcluded('src/extension.ts'));
     assert.ok(isExcluded('docs/startup.md'));
     assert.ok(!isExcluded('docs/MANUAL.md'), 'a negated pattern keeps the file');
-    assert.ok(!isExcluded('out/extension.js'));
-    assert.ok(!isExcluded('out/headless/cli.js'));
-    assert.ok(!isExcluded('out/shared/stacks.js'));
-    assert.ok(!isExcluded('node_modules/@anthropic-ai/sdk/index.js'));
+    // The bundles inline tsc's output and the SDK, so neither ships.
+    assert.ok(isExcluded('out/extension.js'));
+    assert.ok(isExcluded('out/headless/cli.js'));
+    assert.ok(isExcluded('out/shared/stacks.js'));
+    assert.ok(isExcluded('node_modules/@anthropic-ai/sdk/index.js'));
+    assert.ok(isExcluded('out/bundle/extension.js.map'), 'bundle source maps are excluded');
+    assert.ok(!isExcluded('out/bundle/extension.js'));
+    assert.ok(!isExcluded('out/bundle/cli.js'));
+    assert.ok(!isExcluded('out/webview/sidebar.js'));
+    assert.ok(!isExcluded('media/walkthrough-install.md'));
+    assert.ok(isExcluded('media/screenshots/CAPTURES.md'), 'listing screenshots are served from GitHub, not the VSIX');
     assert.ok(!isExcluded('package.json'));
+    // "Install Command-Line Tool" copies these out of the extension folder.
+    assert.ok(!isExcluded('out/headless/moag-launch.js'));
+    assert.ok(!isExcluded('scripts/install-daemon-windows.ps1'));
+  });
+
+  it('the entry points are the two bundles', () => {
+    assert.deepEqual(ENTRY_POINTS, ['out/bundle/extension.js', 'out/bundle/cli.js']);
   });
 
   it('every file reachable from the extension and the CLI is shipped', function () {
@@ -130,9 +162,41 @@ describe('VSIX closure (.vscodeignore vs the compiled require graph)', () => {
       }
     }
     const { reached, problems, skipped } = closureProblems(REPO, ENTRY_POINTS, isExcluded, GUARDED_DEV_EDGES);
-    assert.ok(reached > 50, `walked only ${reached} files; the require scan is broken`);
+    // A bundle inlines its relative requires, so the walk reaches little beyond the
+    // entries; the guarded edge below proves the scan still reads them.
+    assert.ok(reached >= ENTRY_POINTS.length, `walked only ${reached} files; the require scan is broken`);
     assert.deepEqual(skipped.sort(), GUARDED_DEV_EDGES.map((e) => `${e.from} -> ${e.to}`).sort(), 'every allowed edge still exists');
     assert.deepEqual(problems.map((p) => `${p.file} (${p.problem}, required by ${p.requiredBy})`), []);
+  });
+
+  it('every file package.json names (icon, main, bin, media) exists and is shipped', () => {
+    const named = new Set<string>(ENTRY_POINTS);
+    if (MANIFEST.icon) { named.add(normRel(MANIFEST.icon)); }
+    // Walkthrough markdown, view-container icons and the like, wherever contributes names them.
+    const visit = (v: unknown): void => {
+      if (typeof v === 'string') {
+        if (/^(\.\/)?media\/[^\s]+\.\w+$/.test(v)) { named.add(normRel(v)); }
+      } else if (Array.isArray(v)) {
+        v.forEach(visit);
+      } else if (v && typeof v === 'object') {
+        Object.values(v as Record<string, unknown>).forEach(visit);
+      }
+    };
+    visit(MANIFEST.contributes);
+    assert.ok([...named].some((p) => p.startsWith('media/') && p.endsWith('.md')), 'found no walkthrough markdown; the scan is broken');
+    const problems = [...named].sort().flatMap((p) => [
+      ...(isExcluded(p) ? [`${p} is excluded by .vscodeignore`] : []),
+      ...(fs.existsSync(path.join(REPO, p)) ? [] : [`${p} does not exist`]),
+    ]);
+    assert.deepEqual(problems, []);
+  });
+
+  it('the asset check catches a named file the allowlist drops', () => {
+    const narrow = vscodeIgnoreMatcher('**\n!package.json\n!out/bundle/*.js\n');
+    assert.ok(narrow('media/icon.png'));
+    assert.ok(narrow('out/webview/sidebar.js'));
+    assert.ok(!narrow('out/bundle/cli.js'));
+    assert.ok(narrow('out/bundle/cli.js.map'));
   });
 
   it('catches an excluded file on the require path (the 0.9.13 failure)', () => {

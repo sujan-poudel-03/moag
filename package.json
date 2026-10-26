@@ -53,9 +53,9 @@
     "workspaceContains:.moag/plan.json",
     "workspaceContains:**/*.agent-plan.json"
   ],
-  "main": "./out/extension.js",
+  "main": "./out/bundle/extension.js",
   "bin": {
-    "moag": "./out/headless/cli.js"
+    "moag": "./out/bundle/cli.js"
   },
   "contributes": {
     "commands": [
@@ -1787,7 +1787,9 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "npm run compile:ext && npm run compile:webview",
+    "compile": "npm run compile:ext && npm run compile:webview && npm run bundle",
+    "bundle": "node scripts/bundle.js --production",
+    "watch:bundle": "node scripts/bundle.js --watch",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
     "test": "npm run test:unit",
@@ -1820,6 +1822,7 @@
     "@vscode/test-cli": "^0.0.15",
     "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.28.2",
     "eslint": "^8.56.0",
     "mocha": "^10.7.0",
     "proxyquire": "^2.1.3",

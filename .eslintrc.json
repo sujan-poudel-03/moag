@@ -51,7 +51,7 @@
                   "**/server",
                   "**/server/*"
                 ],
-                "message": "The hosted server (src/server) is not in the VSIX (.vscodeignore: out/server/**), so shipped code must not load it. Move the pure part to src/shared/ and import that."
+                "message": "The hosted server (src/server) is not in the VSIX: the shipped bundles (scripts/bundle.js) refuse it as an input, so shipped code must not load it. Move the pure part to src/shared/ and import that."
               }
             ]
           }
@@ -92,7 +92,7 @@
                   "**/server",
                   "**/server/*"
                 ],
-                "message": "The hosted server (src/server) is not in the VSIX (.vscodeignore: out/server/**), so shipped code must not load it. Move the pure part to src/shared/ and import that."
+                "message": "The hosted server (src/server) is not in the VSIX: the shipped bundles (scripts/bundle.js) refuse it as an input, so shipped code must not load it. Move the pure part to src/shared/ and import that."
               }
             ]
           }

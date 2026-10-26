@@ -1503,12 +1503,18 @@ describe('Regression: the published package is complete', () => {
       .filter((l: string) => l.length > 0 && !l.startsWith('#'));
   }
 
-  it('does not exclude runtime dependencies from the VSIX', () => {
+  it('every runtime dependency is either bundled or shipped', () => {
+    // The VSIX carries no node_modules (.vscodeignore is an allowlist), so a
+    // runtime dependency has to be inlined by scripts/bundle.js. One the bundle
+    // leaves external would need its own `!node_modules/<dep>/**` line.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { EXTERNAL } = require('../../../scripts/bundle') as { EXTERNAL: string[] };
     const rules = ignoreRules();
-    const blanket = rules.filter((r: string) => r === 'node_modules/**' || r === 'node_modules/');
-    assert.deepEqual(blanket, [],
-      'a blanket node_modules exclusion strips production dependencies too — ' +
-      'exclude the dev-only subtrees instead');
+    const deps = Object.keys(JSON.parse(fsMod.readFileSync('package.json', 'utf-8')).dependencies || {});
+    assert.ok(deps.length > 0, 'no runtime dependencies found; the check is vacuous');
+    const missing = deps.filter((d: string) => EXTERNAL.includes(d) && !rules.includes(`!node_modules/${d}/**`));
+    assert.deepEqual(missing, [],
+      'external to the bundle and not shipped either — it would be missing at run time');
   });
 
   it('every declared runtime dependency is actually required by shipped code', () => {
@@ -1537,9 +1543,13 @@ describe('Regression: the published package is complete', () => {
 
   it('excludes what a user has no use for', () => {
     const rules = ignoreRules();
+    // .vscodeignore is an allowlist: `**` first, then `!` lines for what ships.
+    assert.equal(rules[0], '**', '.vscodeignore must start by excluding everything');
+    const kept = rules.filter((r: string) => r.startsWith('!')).map((r: string) => new RegExp(
+      '^' + r.slice(1).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '<<GLOBSTAR>>').replace(/\*/g, '[^/]*').replace(/<<GLOBSTAR>>/g, '.*') + '$'));
     // Each of these shipped once and is pure noise in an install.
-    for (const unwanted of ['src/**', 'CLAUDE.md', 'scripts/**', 'tsconfig.webview*.json']) {
-      assert.ok(rules.includes(unwanted), `.vscodeignore no longer excludes ${unwanted}`);
+    for (const unwanted of ['src/extension.ts', 'CLAUDE.md', 'scripts/bundle.js', 'tsconfig.webview.json', 'out/extension.js', 'out/server/main.js', 'node_modules/@anthropic-ai/sdk/index.js']) {
+      assert.ok(!kept.some((re: RegExp) => re.test(unwanted)), `.vscodeignore now ships ${unwanted}`);
     }
   });
 });
