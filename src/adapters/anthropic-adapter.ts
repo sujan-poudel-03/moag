@@ -149,6 +149,21 @@ export class AnthropicAdapter implements EngineAdapter {
     return 'anthropic-api';
   }
 
+  /**
+   * No CLI to find on PATH: the engine can run when a key resolves (stored
+   * secret or ANTHROPIC_API_KEY) and the SDK loads.
+   */
+  async checkAvailability(): Promise<boolean> {
+    const key = (await hostSecret('anthropicApiKey')) || process.env.ANTHROPIC_API_KEY;
+    if (!key) { return false; }
+    try {
+      require.resolve('@anthropic-ai/sdk');
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   clearSession(sessionId: string): void {
     this._sessions.delete(sessionId);
   }

@@ -104,6 +104,19 @@ describe('Anthropic adapter: where the API key comes from', () => {
     assert.ok(!warnings[0].includes('sk-ant-legacy-setting'), 'the warning must not echo the key');
   });
 
+  it('checkAvailability: true with a stored key or ANTHROPIC_API_KEY (no CLI needed), false with neither', async () => {
+    const { AnthropicAdapter } = require('../../../adapters/anthropic-adapter');
+    // eslint-disable-next-line no-restricted-syntax -- the unit under test, not an engine lookup
+    const adapter = new AnthropicAdapter();
+    installHost(undefined);
+    assert.equal(await adapter.checkAvailability(), false);
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-from-env';
+    assert.equal(await adapter.checkAvailability(), true);
+    delete process.env.ANTHROPIC_API_KEY;
+    installHost('sk-ant-from-secret-storage');
+    assert.equal(await adapter.checkAvailability(), true);
+  });
+
   it('with no key anywhere, fails with exit 1 and names the command and the variable', async () => {
     installHost(undefined);
     const r = await loadAdapter().runTask({ prompt: 'hi', cwd: process.cwd() });

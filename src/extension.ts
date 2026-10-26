@@ -199,8 +199,6 @@ const NO_ENGINES_PROMPT_KEY = 'agentTaskPlayer.noEnginesPromptShown';
 /** globalState: the user dismissed the "ceiling cannot stop unreported cost" warning for good. */
 const BUDGET_NOTICE_DISMISSED_KEY = 'agentTaskPlayer.budgetUnenforceableNoticeDismissed';
 const RECENT_PLANS_KEY = 'moag.recentPlans';
-const CLAUDE_INSTALL_URL = 'https://www.npmjs.com/package/@anthropic-ai/claude-code';
-const CODEX_INSTALL_URL = 'https://www.npmjs.com/package/@openai/codex';
 // MOAG's own GitHub repo — always the target for bug reports
 
 interface TaskLocation {
@@ -780,6 +778,11 @@ function getPromptSidebarChatState(): { title: string; messages: PromptSidebarCh
   return { title, messages, threadId: currentSidebarThreadId ?? '' };
 }
 
+/** A setup guide that failed to open says so instead of rejecting unhandled. */
+function showSetupGuideError(err: unknown): void {
+  void vscode.window.showErrorMessage(`Could not open the MOAG Setup Guide: ${err instanceof Error ? err.message : String(err)}`);
+}
+
 async function promptToInstallEngineOnce(
   context: vscode.ExtensionContext,
   available: EngineId[],
@@ -796,15 +799,15 @@ async function promptToInstallEngineOnce(
   await context.globalState.update(NO_ENGINES_PROMPT_KEY, true);
 
   const choice = await vscode.window.showInformationMessage(
-    'MOAG: No AI engines found. Install one to get started.',
-    'Install Claude',
-    'Install Codex',
+    'MOAG: No AI engines found. Install a coding CLI, or use an Anthropic API key (no install).',
+    'Open Setup Guide',
+    'Use an Anthropic API Key',
   );
 
-  if (choice === 'Install Claude') {
-    void vscode.env.openExternal(vscode.Uri.parse(CLAUDE_INSTALL_URL));
-  } else if (choice === 'Install Codex') {
-    void vscode.env.openExternal(vscode.Uri.parse(CODEX_INSTALL_URL));
+  if (choice === 'Open Setup Guide') {
+    void vscode.commands.executeCommand('agentTaskPlayer.setupGuide');
+  } else if (choice === 'Use an Anthropic API Key') {
+    void vscode.commands.executeCommand('agentTaskPlayer.setAnthropicApiKey');
   }
 }
 
@@ -2335,7 +2338,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (promptViewProvider) { schedulePromptProviderSidebarSync(); }
       vscode.window.showInformationMessage(`GitHub sync connected to ${repo.trim()} — polling for "${label.trim() || 'moag'}" issues.`);
     }),
-    vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context).catch(showSetupGuideError)),
     vscode.commands.registerCommand('agentTaskPlayer.setAnthropicApiKey', () => cmdSetAnthropicKey(context)),
     vscode.commands.registerCommand('agentTaskPlayer.clearAnthropicApiKey', () => cmdClearAnthropicKey(context)),
     vscode.commands.registerCommand('agentTaskPlayer.planFromPrd', cmdPlanFromPRD),
@@ -2598,7 +2601,7 @@ export function activate(context: vscode.ExtensionContext): void {
       const hasSeenSetup = context.globalState.get<boolean>('moag.setupGuideSeen', false);
       if (!hasSeenSetup && result.available.length === 0) {
         context.globalState.update('moag.setupGuideSeen', true);
-        cmdShowSetupGuide(context);
+        cmdShowSetupGuide(context).catch(showSetupGuideError);
       }
     })
     .catch(() => undefined);

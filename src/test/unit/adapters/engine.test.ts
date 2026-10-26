@@ -330,4 +330,18 @@ describe('withCostAccounting', () => {
     assert.equal(entry!.command, 'custom-cmd');
     assert.equal(entry!.displayName, 'Cost custom');
   });
+
+  it('checkEngineAvailability() asks an adapter with checkAvailability instead of looking for its command on PATH', async () => {
+    const withCheck = (answer: () => Promise<boolean>) => ({
+      ...makeCostAdapter('anthropic', async () => ({ stdout: '', stderr: '', exitCode: 0, durationMs: 1 })),
+      getCommand: () => 'anthropic-api', // never on PATH
+      checkAvailability: answer,
+    });
+    registerEngine(withCheck(async () => true));
+    assert.equal((await checkEngineAvailability(['anthropic'])).get('anthropic')!.available, true);
+    registerEngine(withCheck(async () => false));
+    assert.equal((await checkEngineAvailability(['anthropic'])).get('anthropic')!.available, false);
+    registerEngine(withCheck(async () => { throw new Error('keychain locked'); }));
+    assert.equal((await checkEngineAvailability(['anthropic'])).get('anthropic')!.available, false);
+  });
 });

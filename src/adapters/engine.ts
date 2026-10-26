@@ -40,6 +40,11 @@ export interface EngineAdapter {
   /** Returns the CLI command this adapter will invoke */
   getCommand(): string;
   runTask(options: EngineRunOptions): Promise<EngineResult>;
+  /**
+   * For an engine with no CLI on PATH (the Anthropic API): whether it can run.
+   * When present, checkEngineAvailability uses it instead of looking for getCommand().
+   */
+  checkAvailability?(): Promise<boolean>;
 }
 
 // ─── Cost ceiling guard ──────────────────────────────────────────────────────
@@ -99,6 +104,7 @@ export function withCostAccounting(adapter: EngineAdapter): EngineAdapter {
     id: adapter.id,
     displayName: adapter.displayName,
     getCommand: () => adapter.getCommand(),
+    ...(adapter.checkAvailability ? { checkAvailability: () => adapter.checkAvailability!() } : {}),
     async runTask(options: EngineRunOptions): Promise<EngineResult> {
       const label = options.costLabel ?? 'unattributed';
       if (!isAllowedByCeiling(adapter.id, label)) {
@@ -184,6 +190,13 @@ export async function checkEngineAvailability(
         return;
       }
       const command = adapter.getCommand();
+      // An engine with no CLI (the Anthropic API) says itself whether it can run.
+      if (adapter.checkAvailability) {
+        let ok = false;
+        try { ok = await adapter.checkAvailability(); } catch { ok = false; }
+        results.set(id, { available: ok, command, displayName: adapter.displayName });
+        return;
+      }
       const exists = await commandExists(command);
       if (!exists) {
         results.set(id, { available: false, command, displayName: adapter.displayName });
