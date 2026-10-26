@@ -1049,15 +1049,12 @@ describe('headless CLI: moag daemon with ONOSOO', function () {
     const port = (server.address() as { port: number }).port;
     const dir = fs.realpathSync(tmpDir());
     const configDir = fs.realpathSync(tmpDir());
-    const nodeFlags = ['--no-experimental-strip-types', '--no-experimental-detect-module']
-      .filter((f) => process.allowedNodeEnvironmentFlags.has(f));
     let child: ChildProcess;
     try {
-      child = spawn(process.execPath, [...nodeFlags, '-r', 'ts-node/register', path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'daemon', '--cwd', dir], {
+      child = spawn(process.execPath, ['--import', 'tsx', path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'daemon', '--cwd', dir], {
         cwd: path.join(__dirname, '..', '..', '..', '..'),
         env: {
           ...process.env, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: `http://127.0.0.1:${port}`, APPDATA: configDir, XDG_CONFIG_HOME: configDir,
-          TS_NODE_TRANSPILE_ONLY: 'true',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
@@ -1073,7 +1070,7 @@ describe('headless CLI: moag daemon with ONOSOO', function () {
     child.on('exit', (code: number | null) => { exited = code ?? -1; });
     try {
       const polls = (): number => seen.filter((s) => s.url.endsWith('/commands/poll')).length;
-      // Start-up (ts-node compiling the CLI) can be slow; then two polls 5 s apart.
+      // Start-up (tsx loading the CLI) can be slow; then two polls 5 s apart.
       await until(() => polls() >= 2 || exited !== null, 200_000);
       assert.equal(exited, null, `the daemon exited (${exited}): ${stderrText.slice(-500)}`);
       await new Promise((r) => setTimeout(r, 1_000));

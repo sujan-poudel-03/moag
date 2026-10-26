@@ -54,7 +54,7 @@ describe('remote daemon lock', () => {
     const script = path.join(scriptDir, 'contender.js');
     const modulePath = path.join(__dirname, '..', '..', '..', 'headless', 'remote-lock.ts');
     fs.writeFileSync(script, [
-      `require(${JSON.stringify(require.resolve('ts-node'))}).register({ transpileOnly: true });`,
+      `require(${JSON.stringify(require.resolve('tsx/cjs/api'))}).register();`,
       `const { DaemonLock } = require(${JSON.stringify(modulePath)});`,
       'process.on("message", (m) => {',
       '  if (m && m.go) {',
@@ -65,7 +65,6 @@ describe('remote daemon lock', () => {
       '});',
       'process.send({ ready: true });',
     ].join('\n'));
-    const execArgv = ['--no-experimental-strip-types', '--no-experimental-detect-module'].filter((f) => process.allowedNodeEnvironmentFlags.has(f));
     const N = 6;
     const TRIALS = 40;
     type Contender = {
@@ -74,7 +73,7 @@ describe('remote daemon lock', () => {
     };
     let kids: Contender[];
     try {
-      kids = Array.from({ length: N }, () => fork(script, [], { execArgv, cwd: path.join(__dirname, '..', '..', '..', '..'), stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }) as Contender);
+      kids = Array.from({ length: N }, () => fork(script, [], { execArgv: [], cwd: path.join(__dirname, '..', '..', '..', '..'), stdio: ['ignore', 'ignore', 'pipe', 'ipc'] }) as Contender);
     } catch (err) {
       if (err instanceof Error && /spawn EPERM/i.test(err.message)) { this.skip(); }
       throw err;
