@@ -79,7 +79,7 @@ import { rollupContributionLedger, ContributionLedgerPayload } from './utils/con
 import { costLedger } from './utils/cost-ledger';
 import { isOwnStack } from './utils/error-log';
 import { formatTotal, formatUsageCost, isCostKnown, isUnknownCostCall, sessionUsageDelta } from './utils/cost-format';
-import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from './utils/budget-notice';
+import { initBudgetNotice } from './ui/budget-notice-host';
 
 // ─── Shared state ───
 
@@ -196,8 +196,6 @@ let progressResolve: (() => void) | null = null;
 let progressReport: vscode.Progress<{ message?: string; increment?: number }> | null = null;
 
 const NO_ENGINES_PROMPT_KEY = 'agentTaskPlayer.noEnginesPromptShown';
-/** globalState: the user dismissed the "ceiling cannot stop unreported cost" warning for good. */
-const BUDGET_NOTICE_DISMISSED_KEY = 'agentTaskPlayer.budgetUnenforceableNoticeDismissed';
 const RECENT_PLANS_KEY = 'moag.recentPlans';
 // MOAG's own GitHub repo — always the target for bug reports
 
@@ -1501,19 +1499,12 @@ export function activate(context: vscode.ExtensionContext): void {
   // costBudgetUsd), so the user is never stuck without reloading the window.
   setCeilingGuard(() => !ceilingBlocked);
   context.subscriptions.push({ dispose: () => setCeilingGuard(null) });
-  // The ceiling counts recorded cost only: say once when a call it cannot see happens.
-  const offBudgetNotice = watchUnenforceableBudget({
-    budget: () => vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('costBudgetUsd', 10),
-    onFirst: () => {
-      if (context.globalState.get<boolean>(BUDGET_NOTICE_DISMISSED_KEY, false)) { return; }
-      void vscode.window.showWarningMessage(BUDGET_UNENFORCEABLE_TEXT, 'Open Setting', "Don't Show Again").then((choice) => {
-        if (choice === 'Open Setting') {
-          void vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer.engines.claude.outputFormat');
-        } else if (choice === "Don't Show Again") {
-          void Promise.resolve(context.globalState.update(BUDGET_NOTICE_DISMISSED_KEY, true)).catch(() => undefined);
-        }
-      }, () => undefined);
-    },
+  // The ceiling counts recorded cost only: at each run whose engines report no cost
+  // (and on any unreported call in a run that was not flagged), say so.
+  const offBudgetNotice = initBudgetNotice({
+    workspaceState: context.workspaceState,
+    runner,
+    engineIdsForRun: () => (runner.currentPlan ? collectEngineIds(runner.currentPlan) : []),
   });
   context.subscriptions.push({ dispose: offBudgetNotice });
   runner.setPromptLibrary(promptLibraryStore);
