@@ -7,6 +7,8 @@
 
 > **Run AI agents like a playlist.** Build a plan, pick your engines, hit Play — Claude Code, Codex, Gemini, Ollama, GitHub Copilot or the Anthropic API execute your tasks while you watch.
 
+<!-- screenshot: media/screenshots/hero.gif | alt: "MOAG running a plan: the sidebar plan, Play, and the Dashboard streaming live output" -->
+
 ---
 
 ## Why MOAG
@@ -36,6 +38,8 @@ npm i -g @google/gemini-cli          # Gemini CLI
 
 or no CLI at all: run **MOAG: Set Anthropic API Key** (the key is kept in VS Code's secret storage), or use GitHub Copilot through the Copilot Chat extension. **MOAG: Setup Guide** shows what is found and what is missing.
 
+<!-- screenshot: media/screenshots/setup-guide.png | alt: "The MOAG Setup Guide listing six engines, with the Anthropic API row configured" -->
+
 ### 2. Create a Plan
 
 - **Smart Plan** (recommended): `Ctrl+Shift+P` → `MOAG: Smart New Plan` → describe your goal → get a full plan
@@ -43,9 +47,15 @@ or no CLI at all: run **MOAG: Set Anthropic API Key** (the key is kept in VS Cod
 - **From GitHub Issue**: `MOAG: Plan from GitHub Issue` → paste an issue URL
 - **Manual**: Click the rocket icon in the Activity Bar → New Plan → add playlists and tasks
 
+<!-- screenshot: media/screenshots/smart-plan.png | alt: "Smart New Plan turning a PRD into playlists and tasks" -->
+
 ### 3. Hit Play
 
 Click **Play** in the title bar. MOAG opens the Dashboard, validates engines, and starts executing. Tasks stream live output, run verification commands, and auto-fix failures.
+
+<!-- screenshot: media/screenshots/dashboard.png | alt: "The MOAG Dashboard with live task output and task cards" -->
+
+<!-- screenshot: media/screenshots/plan-tree.png | alt: "A plan in the sidebar with playlists and tasks in mixed statuses" -->
 
 ---
 
@@ -84,6 +94,8 @@ Click **Play** in the title bar. MOAG opens the Dashboard, validates engines, an
 | **ONOSOO Builds** | Pair this machine with ONOSOO, or remove the pairing | `MOAG: Connect to ONOSOO Builds` / `MOAG: Disconnect from ONOSOO` |
 | **Command-line tool** | Put `moag` on your PATH, running the CLI bundled in the extension | `MOAG: Install Command-Line Tool` |
 | **Diagnostics** | Save a redacted support report (versions, engines, settings, recent errors) | `MOAG: Export Diagnostics` |
+
+<!-- screenshot: media/screenshots/cost-summary.png | alt: "The cost and usage summary, with a cost unknown row" -->
 
 ---
 
@@ -185,6 +197,8 @@ Connect a machine to the **Builds** app in ONOSOO and the workspace can follow a
 Pair in one step: **MOAG: Connect to ONOSOO Builds** in VS Code, or `moag pair` in a terminal, with the key from **Builds › Pair machine**. The device key stays in your user folder and never reaches the AI agents. Remote runs execute as a separate locked-down account.
 
 📖 **End-to-end setup, both sides:** [docs/onosoo-builds.md](docs/onosoo-builds.md)
+
+<!-- screenshot: media/screenshots/onosoo-run.png | alt: "A MOAG run in ONOSOO Builds with its tasks, changes and cost" -->
 
 ---
 

@@ -29,9 +29,11 @@
     }
   ],
   "categories": [
-    "Machine Learning",
-    "Other"
+    "AI",
+    "Machine Learning"
   ],
+  "qna": "https://github.com/sujan-poudel-03/moag/issues",
+  "pricing": "Free",
   "keywords": [
     "ai",
     "agent",
