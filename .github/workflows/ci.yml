@@ -123,7 +123,11 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run compile
-      - run: xvfb-run -a npm run test:integration
+      # The current VS Code on every platform (labels are in .vscode-test.mjs).
+      - run: xvfb-run -a npm run test:integration -- --label stable
         if: runner.os == 'Linux'
-      - run: npm run test:integration
+      - run: npm run test:integration -- --label stable
         if: runner.os != 'Linux'
+      # The oldest VS Code engines.vscode admits, once, on Linux.
+      - run: xvfb-run -a npm run test:integration -- --label minimum
+        if: runner.os == 'Linux'
