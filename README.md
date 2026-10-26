@@ -305,6 +305,27 @@ A new plan is saved as `.moag/plan.json`; `.moag/.agent-plan.json` is loaded too
 
 ---
 
+## Data & privacy
+
+MOAG sends **no product telemetry**. Data leaves your machine only for a feature you use:
+
+- **AI engines** — each prompt goes to the engine that runs it: the Claude Code, Codex or Gemini CLI (to their vendors), `api.anthropic.com` for the Anthropic API engine, VS Code's language-model API for Copilot, and your local or configured Ollama host.
+- **ONOSOO Builds, only when paired** — run events: plan, project and task names, statuses, changed file names with line counts and redacted diffs, error tails, cost, branch, PR URL, a device id and the MOAG version. Secrets and absolute paths are removed first. Turn it off with `agentTaskPlayer.onosoo.relay`; **MOAG: Disconnect from ONOSOO** removes the key.
+- **GitHub, through `gh`** — Issues Sync (reads issues; can comment, label and close them), Create PR, releases, monitor incidents, and **Share Plan, which makes a public, redacted gist**. Plan from GitHub Issue reads public issues from `api.github.com`.
+- **Bug reports and feedback** — public issues on [sujan-poudel-03/moag](https://github.com/sujan-poudel-03/moag/issues), redacted and shown to you in full before anything is posted.
+
+What stays local: `.moag/` in your workspace (MOAG asks before adding it to `.gitignore`), run history in VS Code's workspace storage, and the Anthropic key in VS Code's secret storage. Details: [PRIVACY.md](PRIVACY.md). Security problems: [SECURITY.md](SECURITY.md).
+
+---
+
+## Support
+
+- **Questions and bugs:** [GitHub Issues](https://github.com/sujan-poudel-03/moag/issues), or **MOAG: Report Issue to GitHub** from VS Code (you see the full, redacted report before it is posted).
+- **Attach diagnostics:** **MOAG: Export Diagnostics** saves a redacted report (versions, engines, changed settings, recent errors) to a file you choose.
+- **Security:** report privately, see [SECURITY.md](SECURITY.md).
+
+---
+
 ## Development
 
 ```bash
