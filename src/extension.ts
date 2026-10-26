@@ -72,6 +72,7 @@ import { resolveDeveloperEmail } from './utils/git-identity';
 import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
 import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
 import { costLedger } from './utils/cost-ledger';
+import { isOwnStack } from './utils/error-log';
 
 // ─── Shared state ───
 
@@ -119,6 +120,17 @@ let watchModeActive = false;
 let watchWatcher: vscode.FileSystemWatcher | null = null;
 let watchStatusBarItem: vscode.StatusBarItem | null = null;
 let watchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ─── Process-level error capture ───
+// Kept so deactivate() can take them off the shared extension-host process.
+let uncaughtHandler: ((err: Error) => void) | null = null;
+let rejectionHandler: ((reason: unknown) => void) | null = null;
+
+/** Removes the process-wide error handlers activate() installed (idempotent). */
+function removeProcessErrorHandlers(): void {
+  if (uncaughtHandler) { process.off('uncaughtException', uncaughtHandler); uncaughtHandler = null; }
+  if (rejectionHandler) { process.off('unhandledRejection', rejectionHandler); rejectionHandler = null; }
+}
 
 // ─── Dev hot-reload watcher ───
 let devReloadWatcher: fs.FSWatcher | null = null;
@@ -1322,6 +1334,8 @@ export function activate(context: vscode.ExtensionContext): void {
   setHost({
     getConfiguration: (section) => vscode.workspace.getConfiguration(section),
     warn: (message) => { void vscode.window.showWarningMessage(message); },
+    // The port must return a string. The process.cwd() fallback is unreachable from
+    // the execution entry points: each one calls requireWorkspaceRoot() first.
     workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
   });
 
@@ -1329,21 +1343,29 @@ export function activate(context: vscode.ExtensionContext): void {
   moagOutputChannel = vscode.window.createOutputChannel('MOAG');
   context.subscriptions.push(moagOutputChannel);
 
-  process.on('uncaughtException', (err: Error) => {
+  // The extension host is shared: these handlers see every extension's errors,
+  // so only stacks that pass through this extension's folder are recorded.
+  removeProcessErrorHandlers();
+  const extensionPath = context.extensionPath;
+  uncaughtHandler = (err: Error) => {
+    if (!isOwnStack(err?.stack, extensionPath)) { return; }
     appendErrorLog({
       ts: new Date().toISOString(), category: 'uncaught',
-      message: err.message.substring(0, 300),
+      message: String(err.message).substring(0, 300),
       stack: err.stack?.split('\n').slice(0, 3).join('\n'),
     });
-  });
-  process.on('unhandledRejection', (reason: unknown) => {
-    const msg = reason instanceof Error ? reason.message : String(reason);
+  };
+  rejectionHandler = (reason: unknown) => {
+    if (!(reason instanceof Error) || !isOwnStack(reason.stack, extensionPath)) { return; }
     appendErrorLog({
       ts: new Date().toISOString(), category: 'unhandled-rejection',
-      message: msg.substring(0, 300),
-      stack: reason instanceof Error ? reason.stack?.split('\n').slice(0, 3).join('\n') : undefined,
+      message: reason.message.substring(0, 300),
+      stack: reason.stack?.split('\n').slice(0, 3).join('\n'),
     });
-  });
+  };
+  process.on('uncaughtException', uncaughtHandler);
+  process.on('unhandledRejection', rejectionHandler);
+  context.subscriptions.push({ dispose: removeProcessErrorHandlers });
 
   // Register all engine adapters
   registerAllEngines();
@@ -2488,6 +2510,12 @@ export function activate(context: vscode.ExtensionContext): void {
   autoLoadPlan().then(() => {
     restorePauseState(context);
     startIssuePolling(context);
+  }).catch((err: unknown) => {
+    appendErrorLog({
+      ts: new Date().toISOString(), category: 'plan',
+      message: (err instanceof Error ? err.message : String(err)).substring(0, 300),
+      context: 'autoLoadPlan startup',
+    });
   });
 
   // Restart polling when issueSync settings change
@@ -2508,8 +2536,11 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const plan = loadPlan(currentPlanPath);
         setVisiblePlan(plan, currentPlanPath);
-      } catch {
-        // ignore reload errors
+      } catch (err) {
+        // Saving half-written JSON from an editor is normal: note it, don't interrupt.
+        moagOutputChannel?.appendLine(
+          `[plan] reload of ${path.basename(currentPlanPath)} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
   });
@@ -2562,6 +2593,7 @@ async function createPRFromRun(): Promise<void> {
 }
 
 export function deactivate(): void {
+  removeProcessErrorHandlers();
   extensionContext = null;
   promptViewProvider = null;
   runner?.stop();
@@ -2750,8 +2782,15 @@ async function autoLoadPlan(): Promise<void> {
   try {
     const plan = loadPlan(planPath);
     setVisiblePlan(plan, planPath);
-  } catch {
-    // Silently ignore corrupt plan files on startup
+  } catch (err) {
+    // A plan that fails to load at startup is a real problem the user must see:
+    // otherwise MOAG looks empty and the next save could overwrite the file.
+    const msg = err instanceof Error ? err.message : String(err);
+    appendErrorLog({
+      ts: new Date().toISOString(), category: 'plan',
+      message: msg.substring(0, 300), context: `autoLoadPlan: ${planPath}`,
+    });
+    void UserMsg.showError(UserMsg.planLoadError(msg, planPath));
   }
 }
 
@@ -2944,6 +2983,20 @@ async function resolveRunPromptEngine(): Promise<EngineId | null> {
   return null;
 }
 
+/**
+ * Guard for every execution entry point: returns the first workspace folder's
+ * path, or shows the no-workspace error and returns null. Without it a run would
+ * fall back to the extension host's process.cwd() and edit files there.
+ */
+function requireWorkspaceRoot(): string | null {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) {
+    void UserMsg.showError(UserMsg.noWorkspace());
+    return null;
+  }
+  return root;
+}
+
 async function runPromptSubmission(
   prompt: string,
   selectedEngineId?: EngineId,
@@ -3091,6 +3144,7 @@ async function cmdRunPrompt(): Promise<void> {
 }
 
 async function cmdPlay(): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   const activePlan = getActivePlan();
   if (!activePlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
@@ -5194,9 +5248,9 @@ ${standardsReportSection(report.standards)}
  * only, and the HTML report is written and opened at the end.
  */
 async function runPrdLoopInteractive(options: { fix: boolean; title: string }): Promise<void> {
+  const cwd = requireWorkspaceRoot();
+  if (!cwd) { return; }
   const plan = getActivePlan();
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
   const activePlan: Plan = plan ?? createEmptyPlan('Unnamed Plan');
   const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
 
@@ -5328,9 +5382,9 @@ async function cmdVerifyAgainstPrd(): Promise<void> {
 }
 
 async function cmdSuggestCommit(): Promise<void> {
+  const cwd = requireWorkspaceRoot();
+  if (!cwd) { return; }
   const plan = currentPlan;
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
 
   if (!plan) {
     vscode.window.showWarningMessage('No active plan. Open a plan before committing.');
@@ -5400,9 +5454,9 @@ async function cmdSplitTask(item?: PlanTreeItem): Promise<void> {
   const task = playlist?.tasks[item.taskIndex];
   if (!task) { return; }
 
+  const cwd = requireWorkspaceRoot();
+  if (!cwd) { return; }
   const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
 
   let subTasks: Array<{ name: string; prompt: string }> = [];
 
@@ -5604,6 +5658,7 @@ async function cmdClearAllTasks(): Promise<void> {
 }
 
 async function cmdRetryTask(item?: PlanTreeItem | TaskLocation): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) { return; }
 
   let playlistIndex: number;
@@ -5646,6 +5701,7 @@ async function cmdRetryTask(item?: PlanTreeItem | TaskLocation): Promise<void> {
 }
 
 async function cmdRetryTaskWithNote(item?: PlanTreeItem | TaskLocation): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) { return; }
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy. Stop it first before retrying.');
@@ -5783,6 +5839,7 @@ async function cmdShowSmartFix(item?: PlanTreeItem | TaskLocation): Promise<void
 }
 
 async function cmdRetryTaskWithPrompt(item?: { playlistIndex: number; taskIndex: number; prompt: string }): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan || !item) { return; }
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy. Stop it first before retrying.');
@@ -5815,6 +5872,7 @@ async function cmdRetryTaskWithPrompt(item?: { playlistIndex: number; taskIndex:
 }
 
 async function cmdFixAllFailed(): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) { return; }
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy — stop it before running Fix All.');
@@ -6080,6 +6138,7 @@ function isTaskLikeItem(item: unknown): item is { kind?: string; playlistIndex: 
 }
 
 async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIndex: number }): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   const activePlan = getActivePlan();
   if (!activePlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
@@ -6132,6 +6191,7 @@ async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIn
 }
 
 async function cmdPlayTask(item?: PlanTreeItem | { kind?: string; playlistIndex: number; taskIndex: number }): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   const activePlan = getActivePlan();
   if (!activePlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
@@ -6165,6 +6225,7 @@ async function cmdPlayTask(item?: PlanTreeItem | { kind?: string; playlistIndex:
 }
 
 async function cmdRunSelected(item?: PlanTreeItem, selectedItems?: PlanTreeItem[]): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) {
     vscode.window.showWarningMessage('No plan loaded.');
     return;
@@ -6356,6 +6417,7 @@ async function cmdSaveTaskAsTemplate(item?: PlanTreeItem): Promise<void> {
 // ─── Quick Run: load + play in one shot, zero interaction ───
 
 async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   // If called from explorer context menu or command palette with a URI
   let planPath: string;
 
@@ -7510,6 +7572,7 @@ function onWatchedFileChanged(relativePath: string): void {
     'Dismiss',
   ).then(action => {
     if (action !== 'Run') { return; }
+    if (!requireWorkspaceRoot()) { return; }
 
     if (matchingTasks.length === 1) {
       first.task.status = TaskStatus.Pending;
