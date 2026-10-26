@@ -20,6 +20,7 @@ import { cmdShowSetupGuide } from './ui/setup-guide';
 import { takeRelayEnv } from './headless/run-reporter';
 import { resolveOnosooConfig } from './headless/onosoo-config';
 import { initOnosooRelayHost } from './ui/onosoo-relay-host';
+import { cmdClearAnthropicKey, cmdSetAnthropicKey, migrateAnthropicKeySetting, SECRET_KEYS } from './ui/anthropic-key';
 import { setHost } from './core/host';
 import { TaskRunner, classifyFailure } from './runner/runner';
 import {
@@ -1338,11 +1339,17 @@ export function activate(context: vscode.ExtensionContext): void {
     // The port must return a string. The process.cwd() fallback is unreachable from
     // the execution entry points: each one calls requireWorkspaceRoot() first.
     workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+    secret: (name) => Promise.resolve(context.secrets.get(SECRET_KEYS[name])),
   });
 
   // ── Output Channel + Global Error Capture ────────────────────────────────
   moagOutputChannel = vscode.window.createOutputChannel('MOAG');
   context.subscriptions.push(moagOutputChannel);
+
+  // A key left in settings by an older MOAG moves to SecretStorage.
+  migrateAnthropicKeySetting(context).catch((err: unknown) => {
+    moagOutputChannel?.appendLine(`[secrets] Anthropic key migration failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
 
   // The extension host is shared: these handlers see every extension's errors,
   // so only stacks that pass through this extension's folder are recorded.
@@ -1427,6 +1434,10 @@ export function activate(context: vscode.ExtensionContext): void {
     // so it is read from the relay snapshot and the saved pairing.
     extraSecrets: async () => {
       const out: string[] = [];
+      try {
+        const anthropic = await context.secrets.get(SECRET_KEYS.anthropicApiKey);
+        if (anthropic) { out.push(anthropic); }
+      } catch { /* no secret store */ }
       if (onosooRelayEnv.MOAG_ONOSOO_KEY) { out.push(onosooRelayEnv.MOAG_ONOSOO_KEY); }
       try {
         const cfg = resolveOnosooConfig({
@@ -2261,6 +2272,8 @@ export function activate(context: vscode.ExtensionContext): void {
       vscode.window.showInformationMessage(`GitHub sync connected to ${repo.trim()} — polling for "${label.trim() || 'moag'}" issues.`);
     }),
     vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.setAnthropicApiKey', () => cmdSetAnthropicKey(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.clearAnthropicApiKey', () => cmdClearAnthropicKey(context)),
     vscode.commands.registerCommand('agentTaskPlayer.planFromPrd', cmdPlanFromPRD),
     vscode.commands.registerCommand('agentTaskPlayer.generatePlanFromPrdText', (prdText: string) => generatePlanFromPrdText(prdText)),
     vscode.commands.registerCommand('agentTaskPlayer.generateDeltaPlan', (args?: { prdText?: string }) =>
@@ -2542,6 +2555,12 @@ export function activate(context: vscode.ExtensionContext): void {
     // Re-editing the budget is an explicit "I know, carry on" — release the latch.
     if (e.affectsConfiguration('agentTaskPlayer.costBudgetUsd')) {
       ceilingBlocked = false;
+    }
+    // A key typed into settings moves to SecretStorage as soon as it lands there.
+    if (e.affectsConfiguration('agentTaskPlayer.engines.anthropic.apiKey')) {
+      migrateAnthropicKeySetting(context).catch((err: unknown) => {
+        moagOutputChannel?.appendLine(`[secrets] Anthropic key migration failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
     }
   }));
 

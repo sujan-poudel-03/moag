@@ -20,6 +20,12 @@ export interface ConfigSection {
   get<T>(key: string): T | undefined;
 }
 
+/**
+ * Secrets a host may hold in a real secret store (VS Code SecretStorage). Closed
+ * set: the engine core asks by name and never learns where the value lives.
+ */
+export type HostSecretName = 'anthropicApiKey';
+
 /** Everything the engine core needs from its runtime environment. */
 export interface MoagHost {
   /** Read a configuration namespace (e.g. `'agentTaskPlayer.engines.claude'`). */
@@ -28,6 +34,11 @@ export interface MoagHost {
   warn(message: string): void;
   /** Absolute path of the active workspace/project root. */
   workspaceRoot(): string;
+  /**
+   * Read a secret from the host's secret store. Optional: the headless CLI has
+   * no store, so callers fall back to the environment.
+   */
+  secret?(name: HostSecretName): Promise<string | undefined>;
 }
 
 let current: MoagHost | undefined;
@@ -64,4 +75,19 @@ export function notifyWarn(message: string): void {
 
 export function workspaceRoot(): string {
   return host().workspaceRoot();
+}
+
+/**
+ * A secret from the host's store, or undefined when there is no host, the host
+ * has no store, nothing is stored, or the store fails. Never throws.
+ */
+export async function hostSecret(name: HostSecretName): Promise<string | undefined> {
+  const h = current;
+  if (!h || typeof h.secret !== 'function') { return undefined; }
+  try {
+    const v = await h.secret(name);
+    return typeof v === 'string' && v.length > 0 ? v : undefined;
+  } catch {
+    return undefined;
+  }
 }

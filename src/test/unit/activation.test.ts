@@ -66,6 +66,12 @@ function activateExtension(): Registered {
       workspaceState: memento(),
       globalStorageUri: vscodeMock.Uri.file('/mock/global'),
       extension: { packageJSON: manifest },
+      secrets: {
+        get: async () => undefined,
+        store: async () => { /* no-op */ },
+        delete: async () => { /* no-op */ },
+        onDidChange: () => ({ dispose() { /* no-op */ } }),
+      },
     });
   } finally {
     vscodeMock.commands.registerCommand = originalRegister;

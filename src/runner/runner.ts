@@ -2063,7 +2063,7 @@ export class TaskRunner {
         stdout: '',
         stderr:
           '[Visual Test] The "anthropic" engine is not available.\n' +
-          'Configure ANTHROPIC_API_KEY or add it in Settings → agentTaskPlayer.engines.anthropic.apiKey',
+          'Run **MOAG: Set Anthropic API Key**, or set ANTHROPIC_API_KEY (command line).',
         exitCode: 1,
         durationMs: 0,
       };

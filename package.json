@@ -406,6 +406,16 @@
         "icon": "$(getting-started)"
       },
       {
+        "command": "agentTaskPlayer.setAnthropicApiKey",
+        "title": "Set Anthropic API Key",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.clearAnthropicApiKey",
+        "title": "Clear Anthropic API Key",
+        "category": "MOAG"
+      },
+      {
         "command": "agentTaskPlayer.shareRunFeedback",
         "title": "Share Run Feedback with MOAG",
         "category": "MOAG",
@@ -1618,7 +1628,8 @@
         "agentTaskPlayer.engines.anthropic.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Anthropic API key for the direct API engine. If empty, falls back to the ANTHROPIC_API_KEY environment variable."
+          "description": "Anthropic API key for the direct API engine. If empty, falls back to the ANTHROPIC_API_KEY environment variable.",
+          "markdownDeprecationMessage": "Deprecated: settings files can be synced or committed. Run **MOAG: Set Anthropic API Key** instead; MOAG moves a key found here into VS Code's secret storage and clears it from settings."
         },
         "agentTaskPlayer.engines.anthropic.model": {
           "type": "string",
