@@ -1224,7 +1224,7 @@
         "agentTaskPlayer.issueRepo": {
           "type": "string",
           "default": "",
-          "description": "GitHub repo (owner/repo) where MOAG bug reports are filed via the Report Bug button. Example: myorg/moag. Leave blank to prompt each time."
+          "description": "GitHub repository (owner/repo) that GitHub Issues Sync imports tasks from. MOAG bug reports always go to sujan-poudel-03/moag."
         },
         "agentTaskPlayer.issueSync.enabled": {
           "type": "boolean",

@@ -18,6 +18,7 @@ import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
 import { cmdResolveParkedItem, cmdShowMorningReview } from './ui/morning-review';
 import { cmdShowSetupGuide } from './ui/setup-guide';
 import { takeRelayEnv } from './headless/run-reporter';
+import { resolveOnosooConfig } from './headless/onosoo-config';
 import { initOnosooRelayHost } from './ui/onosoo-relay-host';
 import { setHost } from './core/host';
 import { TaskRunner, classifyFailure } from './runner/runner';
@@ -1422,6 +1423,21 @@ export function activate(context: vscode.ExtensionContext): void {
     executionTaskCount: () => executionTaskCount,
     executionTasksFailed: () => executionTasksFailed,
     appendOutput: (line) => moagOutputChannel?.appendLine(line),
+    // Exact values no report may carry. The device key left process.env above,
+    // so it is read from the relay snapshot and the saved pairing.
+    extraSecrets: async () => {
+      const out: string[] = [];
+      if (onosooRelayEnv.MOAG_ONOSOO_KEY) { out.push(onosooRelayEnv.MOAG_ONOSOO_KEY); }
+      try {
+        const cfg = resolveOnosooConfig({
+          env: { ...process.env, ...onosooRelayEnv },
+          cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir(),
+          stderr: () => { /* a report must not warn about relay config */ },
+        });
+        if (cfg?.key) { out.push(cfg.key); }
+      } catch { /* no pairing */ }
+      return out;
+    },
   });
 
   // Initialize template store
