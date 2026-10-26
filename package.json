@@ -17,6 +17,16 @@
   "engines": {
     "vscode": "^1.90.0"
   },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "MOAG runs AI agent CLIs and shell commands defined by the workspace's plan files. It is disabled until you trust the workspace."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "MOAG spawns local processes against files on disk."
+    }
+  },
   "galleryBanner": {
     "color": "#1e1e2e",
     "theme": "dark"

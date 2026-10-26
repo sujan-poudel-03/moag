@@ -12,8 +12,11 @@ import * as path from 'path';
 
 const REPO = path.resolve(__dirname, '..', '..', '..', '..');
 
+interface Capability { supported?: boolean | string; description?: string }
+
 interface Manifest {
   engines?: { vscode?: string };
+  capabilities?: { untrustedWorkspaces?: Capability; virtualWorkspaces?: Capability };
   devDependencies?: Record<string, string>;
 }
 
@@ -49,5 +52,23 @@ describe('extension manifest (package.json)', () => {
   it('the installed @types/vscode is the declared one', () => {
     const installed = JSON.parse(fs.readFileSync(path.join(REPO, 'node_modules', '@types', 'vscode', 'package.json'), 'utf8')) as { version: string };
     assert.equal(majorMinor(installed.version), majorMinor(manifest.engines?.vscode));
+  });
+
+  // MOAG spawns agent CLIs and runs shell commands that a workspace's plan files
+  // define. In an untrusted (Restricted Mode) workspace that would let a cloned
+  // repository run commands on open, so the extension does not activate there.
+  it('does not run in untrusted workspaces, and says why', () => {
+    const cap = manifest.capabilities?.untrustedWorkspaces;
+    assert.ok(cap, 'capabilities.untrustedWorkspaces is missing');
+    assert.equal(cap.supported, false);
+    assert.match(cap.description ?? '', /shell commands/);
+    assert.match(cap.description ?? '', /trust/);
+  });
+
+  it('does not run in virtual workspaces (it needs files on disk), and says why', () => {
+    const cap = manifest.capabilities?.virtualWorkspaces;
+    assert.ok(cap, 'capabilities.virtualWorkspaces is missing');
+    assert.equal(cap.supported, false);
+    assert.match(cap.description ?? '', /local processes/);
   });
 });
