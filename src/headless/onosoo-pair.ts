@@ -23,6 +23,7 @@ import { writeFileAtomicSync } from '../utils/file-io';
 import { execFileAsync } from '../utils/exec-file';
 import { DEFAULT_ONOSOO_URL, endpointFor, OnosooConfig, userConfigDir } from './onosoo-config';
 import { defaultHttpClient, readMoagVersion, RelayHttpClient } from './onosoo-relay';
+import { defaultIsPidAlive, isLiveRelayRun, SPOOL_OWNER_MAX_IDLE_MS } from './onosoo-spool';
 
 /** A pairing input was refused. The message never contains the key. */
 export class PairError extends Error {
@@ -37,6 +38,8 @@ export interface PairingLocation {
   env: NodeJS.ProcessEnv;
   platform?: NodeJS.Platform;
   homedir?: () => string;
+  /** How a still-relayed spool run is recognised (tests). */
+  liveness?: SpoolLiveness;
 }
 
 export interface WritePairingOptions extends PairingLocation {
@@ -112,11 +115,58 @@ export function spoolBacklog(stateDir: string): { runs: number; events: number }
   return { runs, events };
 }
 
-/** Remove the whole spool; returns how many run files were in it. */
-function discardSpool(stateDir: string): number {
-  const { runs } = spoolBacklog(stateDir);
-  try { fs.rmSync(path.join(stateDir, 'onosoo-spool'), { recursive: true, force: true }); } catch { /* best effort */ }
-  return runs;
+/** How discardSpool tells a run that some relay is still sending; injectable for tests. */
+export interface SpoolLiveness {
+  isPidAlive?: (pid: number) => boolean;
+  now?: () => number;
+}
+
+/**
+ * True when a relay still holds this run: one of this process (open or draining), or
+ * another live process that wrote the file recently (the same ownership rule the spool
+ * uses for replay). Never throws; an unreadable file counts as not held.
+ */
+function runIsHeld(runId: string, file: string, o: SpoolLiveness): boolean {
+  if (isLiveRelayRun(runId)) { return true; }
+  try {
+    const first = fs.readFileSync(file, 'utf-8').split('\n', 1)[0];
+    const meta = (JSON.parse(first) as { meta?: { pid?: unknown } }).meta;
+    const pid = meta?.pid;
+    if (typeof pid !== 'number' || pid === process.pid || !(o.isPidAlive ?? defaultIsPidAlive)(pid)) { return false; }
+    return (o.now ?? Date.now)() - fs.statSync(file).mtimeMs <= SPOOL_OWNER_MAX_IDLE_MS;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Remove the spooled runs no relay holds (their .jsonl, .ack and .rejected.jsonl), so a
+ * new key never replays the old pairing's events. A run a relay is still sending is left
+ * alone: wiping its file under a live relay would lose events and confuse its acks.
+ * Returns how many runs were removed.
+ */
+function discardSpool(stateDir: string, o: SpoolLiveness = {}): number {
+  const root = path.join(stateDir, 'onosoo-spool');
+  let removed = 0;
+  let workspaces: string[];
+  try { workspaces = fs.readdirSync(root); } catch { return 0; }
+  for (const ws of workspaces) {
+    const dir = path.join(root, ws);
+    let names: string[];
+    try { names = fs.readdirSync(dir); } catch { continue; }
+    for (const name of names) {
+      if (!name.endsWith('.jsonl') || name.endsWith('.rejected.jsonl')) { continue; }
+      const runId = name.slice(0, -'.jsonl'.length);
+      if (runIsHeld(runId, path.join(dir, name), o)) { continue; }
+      for (const suffix of ['.jsonl', '.ack', '.rejected.jsonl']) {
+        try { fs.rmSync(path.join(dir, runId + suffix), { force: true }); } catch { /* best effort */ }
+      }
+      removed++;
+    }
+    try { if (fs.readdirSync(dir).length === 0) { fs.rmdirSync(dir); } } catch { /* best effort */ }
+  }
+  try { if (fs.readdirSync(root).length === 0) { fs.rmdirSync(root); } } catch { /* best effort */ }
+  return removed;
 }
 
 /** Validate the inputs; throws PairError. Returns the base URL to save. */
@@ -160,7 +210,7 @@ export async function writePairing(o: WritePairingOptions): Promise<WritePairing
   const deviceId = typeof existing.device_id === 'string' && existing.device_id.length > 0 ? existing.device_id : randomUUID();
   writeFileAtomicSync(file, JSON.stringify({ ...existing, key: o.key, url, device_id: deviceId }, null, 2), 0o600);
 
-  const spoolDiscarded = keyChanged ? discardSpool(stateDir) : 0;
+  const spoolDiscarded = keyChanged ? discardSpool(stateDir, o.liveness) : 0;
 
   let aclApplied: boolean | 'n/a' = 'n/a';
   if (platform === 'win32') {
@@ -199,7 +249,7 @@ export function removePairing(o: PairingLocation): { file: string; spoolDiscarde
   delete rest.key;
   delete rest.url;
   writeFileAtomicSync(file, JSON.stringify(rest, null, 2), 0o600);
-  return { file, spoolDiscarded: discardSpool(stateDir) };
+  return { file, spoolDiscarded: discardSpool(stateDir, o.liveness) };
 }
 
 /**

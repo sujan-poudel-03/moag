@@ -101,6 +101,21 @@ describe('ONOSOO pairing commands', () => {
     assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'moag', 'onosoo.json'), 'utf-8')).key, 'old-device-key-0000');
   });
 
+  it('Connect while a run is relayed asks first; declining writes nothing', async () => {
+    const { mod, messages } = load({ input: KEY, answer: undefined });
+    await mod.cmdConnectOnosoo(deps({ isLive: () => true, http: async () => ({ status: 200, body: '' }) }));
+    const modal = messages.find((m) => m.modal);
+    assert.ok(modal);
+    assert.match(modal.text, /A run is being relayed to ONOSOO\. Change the device key now\?/);
+    assert.equal(fs.existsSync(path.join(home, 'moag', 'onosoo.json')), false);
+  });
+
+  it('Connect while a run is relayed, confirmed: saves the key', async () => {
+    const { mod } = load({ input: KEY, answer: 'Change Key' });
+    await mod.cmdConnectOnosoo(deps({ isLive: () => true, http: async () => ({ status: 200, body: '' }) }));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(home, 'moag', 'onosoo.json'), 'utf-8')).key, KEY);
+  });
+
   it('Disconnect refuses while a run is relayed', async () => {
     fs.mkdirSync(path.join(home, 'moag'), { recursive: true });
     fs.writeFileSync(path.join(home, 'moag', 'onosoo.json'), JSON.stringify({ key: KEY, device_id: 'd1' }));

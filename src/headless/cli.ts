@@ -2137,19 +2137,54 @@ export interface PairDeps {
   err?: (s: string) => void;
 }
 
+/** How long `moag pair` waits for a key on a non-TTY stdin. */
+export const PAIR_STDIN_TIMEOUT_MS = 30_000;
+
+/**
+ * The first line of `stream`: resolves as soon as a newline arrives (the stream may
+ * never close), at end of input, or after `timeoutMs` with what came so far and
+ * `timedOut`. Stops reading and removes its listeners either way. Never rejects.
+ */
+export function readFirstLine(stream: NodeJS.ReadableStream, timeoutMs: number): Promise<{ line: string; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    let buf = '';
+    let settled = false;
+    const finish = (timedOut: boolean): void => {
+      if (settled) { return; }
+      settled = true;
+      clearTimeout(timer);
+      stream.removeListener('data', onData);
+      stream.removeListener('end', onEnd);
+      stream.removeListener('error', onEnd);
+      try { stream.pause(); } catch { /* ignore */ }
+      resolve({ line: (buf.split(/\r?\n/)[0] ?? '').trim(), timedOut });
+    };
+    const onData = (c: string | Buffer): void => {
+      buf += String(c);
+      if (/\r?\n/.test(buf)) { finish(false); }
+    };
+    const onEnd = (): void => finish(false);
+    const timer = setTimeout(() => finish(true), timeoutMs);
+    timer.unref?.();
+    stream.on('data', onData);
+    stream.on('end', onEnd);
+    stream.on('error', onEnd);
+    stream.resume();
+  });
+}
+
 /**
  * Read the device key: on a TTY, a prompt with echo off; otherwise the first
- * line of stdin. Resolves '' when nothing was given.
+ * line of stdin (30 s at most). Resolves '' when nothing was given.
  */
 function readKeyFromStdin(): Promise<string> {
   const stdin = process.stdin;
   if (!stdin.isTTY) {
-    return new Promise((resolve) => {
-      let buf = '';
-      stdin.setEncoding('utf-8');
-      stdin.on('data', (c: string) => { buf += c; });
-      stdin.on('end', () => resolve((buf.split(/\r?\n/)[0] ?? '').trim()));
-      stdin.on('error', () => resolve(''));
+    return readFirstLine(stdin, PAIR_STDIN_TIMEOUT_MS).then(({ line, timedOut }) => {
+      if (timedOut) {
+        process.stderr.write(`No device key arrived on stdin within ${PAIR_STDIN_TIMEOUT_MS / 1000} s.\n`);
+      }
+      return line;
     });
   }
   return new Promise((resolve) => {
