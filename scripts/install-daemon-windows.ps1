@@ -4,10 +4,14 @@
 #   powershell -ExecutionPolicy Bypass -File scripts\install-daemon-windows.ps1 -Status
 #   powershell -ExecutionPolicy Bypass -File scripts\install-daemon-windows.ps1 -Uninstall
 #
+# It runs from a MOAG checkout (scripts\ next to out\), or from %LOCALAPPDATA%\moag\bin, where
+# "MOAG: Install Command-Line Tool" copies it next to moag-launch.js.
+#
 # -Install registers a Scheduled Task named "MOAG daemon" for the CURRENT user only. It
 # starts at your logon, runs hidden, needs no administrator rights, and runs
 #
-#   node <repo>\out\headless\cli.js daemon
+#   node <repo>\out\headless\cli.js daemon        (a checkout)
+#   node <bin>\moag-launch.js daemon            (installed: the newest installed extension's CLI)
 #
 # With the device key in %APPDATA%\moag\onosoo.json and no .moag\daemon.json, `moag daemon`
 # is an ONOSOO poller only: on Windows it reports remote start as off and keeps the machine's
@@ -39,7 +43,20 @@ $ErrorActionPreference = 'Stop'
 
 $TaskName = 'MOAG daemon'
 $Repo = Split-Path $PSScriptRoot -Parent
-$Cli = Join-Path $Repo 'out\headless\cli.js'
+$Launcher = Join-Path $PSScriptRoot 'moag-launch.js'
+
+# Which CLI to run, resolved again at every (re)start so an update is picked up:
+#   1. a checkout: out\headless\cli.js;
+#   2. the installed copy: moag-launch.js next to this script (%LOCALAPPDATA%\moag\bin),
+#      which runs the newest installed extension's CLI.
+# $null when neither exists.
+function Resolve-MoagCli {
+  $checkout = Join-Path $Repo 'out\headless\cli.js'
+  if (Test-Path $checkout) { return $checkout }
+  if (Test-Path $Launcher) { return $Launcher }
+  return $null
+}
+$Cli = Resolve-MoagCli
 $Script = Join-Path $PSScriptRoot 'install-daemon-windows.ps1'
 $StateDir = Join-Path $env:LOCALAPPDATA 'moag'
 $WorkDir = Join-Path $StateDir 'daemon'
@@ -72,15 +89,19 @@ function Get-DaemonWrappers {
     Where-Object { ([string]$_.CommandLine).ToLowerInvariant().Contains($needle) })
 }
 
-# The Scheduled Task's own node: this checkout's cli.js with exactly `daemon --cwd <WorkDir>`
-# (%LOCALAPPDATA%\moag\daemon). A `moag daemon --cwd <project>` started by hand never matches.
+# The Scheduled Task's own node: a MOAG CLI (a checkout's cli.js, or the installed
+# moag-launch.js) with exactly `daemon --cwd <WorkDir>` (%LOCALAPPDATA%\moag\daemon). WorkDir is
+# the discriminator: only the task uses it, so a `moag daemon --cwd <project>` started by hand
+# never matches.
 function Get-DaemonNodes {
-  $cliNeedle = $Cli.ToLowerInvariant()
+  $cliNeedles = @('\out\headless\cli.js', '\moag-launch.js')
+  if ($Cli) { $cliNeedles += $Cli.ToLowerInvariant() }
   $cwdPattern = '\sdaemon\s+--cwd\s+"?' + [regex]::Escape($WorkDir.ToLowerInvariant()) + '"?\s*$'
   @(Get-CimInstance Win32_Process -Filter "Name = 'node.exe'" |
     Where-Object {
       $low = ([string]$_.CommandLine).ToLowerInvariant()
-      $low.Contains($cliNeedle) -and ($low -match $cwdPattern)
+      $isCli = @($cliNeedles | Where-Object { $low.Contains($_) }).Count -gt 0
+      $isCli -and ($low -match $cwdPattern)
     })
 }
 
@@ -104,6 +125,12 @@ if ($Run) {
   $failures = @()
   while ($true) {
     Invoke-LogRotate
+    # Resolved on every start: an extension update moves the CLI.
+    $Cli = Resolve-MoagCli
+    if (-not $Cli) {
+      Write-Log "[$(Get-Date -Format o)] MOAG is not installed: run 'MOAG: Install Command-Line Tool' in VS Code. Not restarting."
+      exit 0
+    }
     Write-Log "[$(Get-Date -Format o)] starting: $Node $Cli daemon --cwd $WorkDir"
     # Rotation is also checked every 500 lines, so a chatty daemon cannot grow the log unbounded.
     $lines = 0
@@ -132,8 +159,8 @@ if ($Install) {
   if (-not (Test-Path $OnosooFile)) {
     Fail "No ONOSOO device key found: $OnosooFile does not exist. Pair this machine in ONOSOO (Builds > Pair machine) and save the key there first; see docs\onosoo-builds.md, Level 1, step 2."
   }
-  if (-not (Test-Path $Cli)) {
-    Fail "MOAG is not built: $Cli does not exist. Run 'npm install' and 'npm run compile' in $Repo first."
+  if (-not $Cli) {
+    Fail "MOAG is not installed: run 'MOAG: Install Command-Line Tool' in VS Code (or, in a checkout, 'npm install' and 'npm run compile' in $Repo)."
   }
   $nodeCmd = Get-Command node -ErrorAction SilentlyContinue
   if (-not $nodeCmd) { Fail 'node not found on PATH. Install Node.js 20 first (https://nodejs.org).' }
@@ -153,7 +180,7 @@ if ($Install) {
     -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) `
     -MultipleInstances IgnoreNew
   $task = New-ScheduledTask -Action $action -Trigger $trigger -Principal $principal -Settings $settings `
-    -Description 'Keeps this machine online in ONOSOO (moag daemon, poller only). Installed by scripts\install-daemon-windows.ps1.'
+    -Description 'Keeps this machine online in ONOSOO (moag daemon, poller only). Installed by install-daemon-windows.ps1.'
 
   # A re-install replaces the task; stop the old task's daemon first so only one runs.
   if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {

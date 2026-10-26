@@ -21,6 +21,7 @@ import { takeRelayEnv } from './headless/run-reporter';
 import { resolveOnosooConfig } from './headless/onosoo-config';
 import { initOnosooRelayHost, OnosooRelayHost } from './ui/onosoo-relay-host';
 import { cmdConnectOnosoo, cmdDisconnectOnosoo, OnosooPairingDeps } from './ui/onosoo-pairing';
+import { cmdInstallCli } from './ui/cli-install-command';
 import { cmdClearAnthropicKey, cmdSetAnthropicKey, migrateAnthropicKeySetting, SECRET_KEYS } from './ui/anthropic-key';
 import { setHost } from './core/host';
 import { TaskRunner, classifyFailure } from './runner/runner';
@@ -2339,6 +2340,10 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.analyzeContextWeights', cmdAnalyzeContextWeights),
     vscode.commands.registerCommand('agentTaskPlayer.reviewSelfIssues', cmdReviewSelfIssues),
     vscode.commands.registerCommand('agentTaskPlayer.createPR', () => createPRFromRun().catch(showPrError)),
+    vscode.commands.registerCommand('agentTaskPlayer.installCli', () =>
+      cmdInstallCli({ extensionPath: context.extensionPath }).catch((err: unknown) => {
+        void vscode.window.showErrorMessage(`Could not install the MOAG command-line tool: ${err instanceof Error ? err.message : String(err)}`);
+      })),
     // The morning review: same digest the headless CLI prints, in the IDE.
     // The sidebar's New Chat button posts this; it was never registered, so the
     // button did nothing at all.

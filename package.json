@@ -426,6 +426,11 @@
         "category": "MOAG"
       },
       {
+        "command": "agentTaskPlayer.installCli",
+        "title": "Install Command-Line Tool",
+        "category": "MOAG"
+      },
+      {
         "command": "agentTaskPlayer.shareRunFeedback",
         "title": "Share Run Feedback with MOAG",
         "category": "MOAG",

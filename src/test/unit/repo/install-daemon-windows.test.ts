@@ -51,9 +51,14 @@ describe('scripts/install-daemon-windows.ps1', () => {
     assert.ok(/-WindowStyle Hidden/.test(body), 'hidden window');
   });
 
-  it('runs `node <repo>\\out\\headless\\cli.js daemon`, outside the profile, logging to %LOCALAPPDATA%\\moag\\daemon.log', () => {
-    assert.ok(body.includes("Join-Path $Repo 'out\\headless\\cli.js'"));
+  it('runs a checkout\'s cli.js, else the installed moag-launch.js, outside the profile, logging to %LOCALAPPDATA%\\moag\\daemon.log', () => {
+    assert.ok(body.includes("Join-Path $Repo 'out\\headless\\cli.js'"), 'a checkout first');
+    assert.ok(body.includes("$Launcher = Join-Path $PSScriptRoot 'moag-launch.js'"), 'then the installed launcher next to the script');
+    const resolve = body.slice(body.indexOf('function Resolve-MoagCli'), body.indexOf('$Cli = Resolve-MoagCli'));
+    assert.ok(resolve.indexOf('Test-Path $checkout') < resolve.indexOf('Test-Path $Launcher'), 'the checkout wins over the launcher');
     assert.ok(/& \$Node \$Cli daemon --cwd \$WorkDir/.test(body));
+    const run = body.slice(body.indexOf('if ($Run) {'), body.indexOf('if ($Install) {'));
+    assert.ok(run.indexOf('$Cli = Resolve-MoagCli') > 0 && run.indexOf('$Cli = Resolve-MoagCli') < run.indexOf('& $Node $Cli daemon'), '-Run resolves the CLI again on each start');
     assert.ok(body.includes("Join-Path $env:LOCALAPPDATA 'moag'"));
     assert.ok(body.includes("Join-Path $StateDir 'daemon.log'"));
     assert.ok(body.includes("Join-Path $env:APPDATA 'moag\\onosoo.json'"));
@@ -70,6 +75,7 @@ describe('scripts/install-daemon-windows.ps1', () => {
     assert.ok(!/Get-DaemonProcesses/.test(body), 'the broad " daemon" matcher is gone');
     assert.ok(body.includes(`$needle = ('-File "' + $Script + '" -Run').ToLowerInvariant()`), 'the wrapper is matched by its -File "<script>" -Run');
     assert.ok(body.includes(`[regex]::Escape($WorkDir.ToLowerInvariant())`), 'node is matched by the exact work dir');
+    assert.ok(body.includes("@('\\out\\headless\\cli.js', '\\moag-launch.js')"), 'a checkout CLI or the installed launcher');
     assert.ok(/'"\?\\s\*\$'/.test(body), 'the --cwd value must end the command line (no prefix match)');
     assert.ok(!/low\.Contains\(' daemon'\)/.test(body), 'no bare " daemon" substring match');
   });
@@ -147,7 +153,9 @@ describe('scripts/install-daemon-windows.ps1', () => {
         `    [pscustomobject]@{ ProcessId = 4; Name = 'node.exe'; CommandLine = 'node C:\\r\\out\\headless\\cli.js daemon --cwd D:\\proj' },`,
         `    [pscustomobject]@{ ProcessId = 5; Name = 'node.exe'; CommandLine = 'node C:\\r\\out\\headless\\cli.js daemon --cwd "C:\\Users\\A B\\AppData\\Local\\moag\\daemon\\sub"' },`,
         `    [pscustomobject]@{ ProcessId = 6; Name = 'node.exe'; CommandLine = 'node C:\\other\\out\\headless\\cli.js daemon --cwd "C:\\Users\\A B\\AppData\\Local\\moag\\daemon"' },`,
-        `    [pscustomobject]@{ ProcessId = 7; Name = 'node.exe'; CommandLine = 'node C:\\r\\out\\headless\\cli.js daemon' }`,
+        `    [pscustomobject]@{ ProcessId = 7; Name = 'node.exe'; CommandLine = 'node C:\\r\\out\\headless\\cli.js daemon' },`,
+        `    [pscustomobject]@{ ProcessId = 8; Name = 'node.exe'; CommandLine = '"C:\\n\\node.exe" "C:\\Users\\A B\\AppData\\Local\\moag\\bin\\moag-launch.js" daemon --cwd "C:\\Users\\A B\\AppData\\Local\\moag\\daemon"' },`,
+        `    [pscustomobject]@{ ProcessId = 9; Name = 'node.exe'; CommandLine = 'node "C:\\Users\\A B\\AppData\\Local\\moag\\bin\\moag-launch.js" daemon --cwd D:\\proj' }`,
         '  )',
         '}',
         fns,
@@ -158,7 +166,24 @@ describe('scripts/install-daemon-windows.ps1', () => {
       if (!r) { this.skip(); }
       assert.equal(r!.status, 0, r!.stderr);
       const out = r!.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-      assert.deepEqual(out, ['W=1', 'N=3']);
+      // WorkDir is the discriminator: any MOAG CLI (6: another checkout, 8: the installed launcher)
+      // with --cwd <WorkDir> is the task's; a hand-started daemon on a project (4, 9) never is.
+      assert.deepEqual(out, ['W=1', 'N=3,6,8']);
+    });
+
+    it('-Install refuses with "MOAG is not installed" when neither a checkout CLI nor the launcher exists', function () {
+      const appData = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-appdata-'));
+      fs.mkdirSync(path.join(appData, 'moag'));
+      fs.writeFileSync(path.join(appData, 'moag', 'onosoo.json'), '{}');
+      // A copy of the script alone: no out\\ beside it and no moag-launch.js next to it.
+      const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'moag-bin-'));
+      const copy = path.join(bin, 'scripts', 'install-daemon-windows.ps1');
+      fs.mkdirSync(path.dirname(copy));
+      fs.copyFileSync(SCRIPT, copy);
+      const r = ps(['-File', copy, '-Install'], { ...process.env, APPDATA: appData });
+      if (!r) { this.skip(); }
+      assert.equal(r!.status, 1, r!.stdout + r!.stderr);
+      assert.match(r!.stderr, /MOAG is not installed: run 'MOAG: Install Command-Line Tool'/);
     });
 
     it('-Install refuses, with a clear message and exit 1, when %APPDATA%\\moag\\onosoo.json does not exist', function () {
