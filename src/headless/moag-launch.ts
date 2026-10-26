@@ -70,7 +70,22 @@ export function cliPathIn(folder: string, fsLike: LaunchFs): string {
 }
 
 /**
- * The CLI to run: in the newest installed extension folder whose CLI exists,
+ * Folder names VS Code marked obsolete in `<dir>/.obsolete` (a JSON object of
+ * folder name → true), lower-cased. Empty when the file is missing or unreadable.
+ */
+export function obsoleteFolders(dir: string, fsLike: LaunchFs): Set<string> {
+  try {
+    const raw = JSON.parse(fsLike.readFileSync(path.join(dir, '.obsolete'), 'utf-8')) as unknown;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { return new Set(); }
+    return new Set(Object.entries(raw as Record<string, unknown>).filter(([, v]) => !!v).map(([k]) => k.toLowerCase()));
+  } catch {
+    return new Set();
+  }
+}
+
+/**
+ * The CLI to run: in the newest installed extension folder whose CLI exists (and that
+ * VS Code has not marked obsolete),
  * else `fixedCli` when it exists, else null.
  */
 export function pickCli(cfg: LaunchConfig, fsLike: LaunchFs = fs): string | null {
@@ -78,7 +93,10 @@ export function pickCli(cfg: LaunchConfig, fsLike: LaunchFs = fs): string | null
   for (const dir of cfg.extensionsDirs ?? []) {
     let names: string[];
     try { names = fsLike.readdirSync(dir); } catch { continue; }
+    const obsolete = obsoleteFolders(dir, fsLike);
     for (const name of names) {
+      // VS Code leaves an uninstalled or replaced version on disk until restart, listed in .obsolete.
+      if (obsolete.has(name.toLowerCase())) { continue; }
       const m = FOLDER_RE.exec(name);
       if (m) { candidates.push({ version: m[1], folder: path.join(dir, name) }); }
     }
