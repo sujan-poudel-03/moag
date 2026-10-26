@@ -1,6 +1,22 @@
 # Changelog
 
+All notable changes to MOAG. Each release is `## [x.y.z] - YYYY-MM-DD`, newest first; a
+version number that was skipped is `## [x.y.z] - not released`. A release that asks
+something of the user (a new minimum VS Code, a changed default, a moved setting) starts
+with `### Upgrade notes`. The release workflow publishes the section for the tag as the
+GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
+
 ## [Unreleased]
+
+### Upgrade notes
+
+- **VS Code 1.90 or newer is required** (was 1.85). Older VS Code keeps the version of MOAG it has.
+- **MOAG does not run in Restricted Mode.** It runs agent CLIs and shell commands that a workspace's plan files define, so it now activates only after you trust the workspace (and never in a virtual workspace).
+
+### Changed
+
+- The extension and the `moag` CLI ship as two bundled files. The package drops from 686 files to about 30 and carries no `node_modules`.
+- `@anthropic-ai/sdk` 0.137 (was 0.39), bundled into the extension.
 
 ## [0.9.15] - 2026-10-24
 
@@ -9,6 +25,10 @@
 - The extension failed to activate ("Cannot find module '../server/secrets'") in 0.9.13 and 0.9.14. Packaging is now smoke-tested in CI and before every publish.
 
 ## [0.9.14] - 2026-10-22
+
+### Upgrade notes
+
+- **Panel runs report to ONOSOO once this machine is paired.** `agentTaskPlayer.onosoo.relay` is on by default and machine-scoped; turn it off on a machine whose panel runs should stay local.
 
 ### ONOSOO Builds
 
@@ -51,6 +71,20 @@
 ### Automatic dependency installs
 
 - **Dependencies are installed before the step that needs them** — before a command, check, service, deploy or release task, a `verifyCommand`, a PRD-verify gate, a standards profile command or a benchmark acceptance gate, MOAG installs the project's dependencies when a manifest or lockfile changed since the last install (recorded in `.moag/dependencies.json`) or `node_modules` is missing. Commands come from a fixed table (`npm ci` / `npm install`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile` / `--immutable`, venv-only `pip install -r requirements.txt`, `go mod download`, `dotnet restore`); a failed install fails the step with the command and its output. Settings: `agentTaskPlayer.autoInstallDependencies`, `agentTaskPlayer.dependencyInstall.ignoreScripts`, `agentTaskPlayer.dependencyInstall.pythonVenv`; on the server `MOAG_AUTO_INSTALL_DEPENDENCIES` and `MOAG_INSTALL_IGNORE_SCRIPTS`. The plan review card states the rule before approval.
+
+## [0.9.12] - 2026-06-20
+
+No changelog was recorded at the time; this is reconstructed from commits 40b65b8 and 84fcf76.
+
+- **Headless CLI.** `moag` runs plans outside VS Code, with a daemon mode and a VS Code API shim.
+- **Install scripts** for Linux, macOS and Windows that build and install the extension from a checkout.
+- **GitHub issue sync** and a `gh` helper.
+- **Error log** (`.moag/errors.jsonl`) and context-builder, knowledge-graph and weights test coverage.
+- Dashboard and sidebar updates.
+
+## [0.9.11] - not released
+
+Version number skipped; no build was released.
 
 ## [0.9.10] - 2026-05-27
 
@@ -121,6 +155,8 @@
 
 ## [0.9.8] - 2026-05-09
 
+_No separate commit: this work shipped in 4573414 together with 0.9.7 and 0.9.9._
+
 ### PRD → Plan Generation
 
 - **PRD editor panel** — "Generate Plan from PRD" now opens a full-width dark-theme editor tab instead of VS Code's narrow QuickPick popup; paste long PRDs without width constraints, browse `.md`/`.txt` files directly
@@ -152,6 +188,8 @@
 - **Workspace state size fix** — reduced default storage budgets for history (3 MB → 400 KB) and run sessions (800 KB → 200 KB); per-entry output clamping lowered to 4 KB (was 12 KB); eliminates VS Code's "large extension state" workspace warning
 
 ## [0.9.7] - 2026-05-06
+
+_No separate commit: this work shipped in 4573414 together with 0.9.8 and 0.9.9._
 
 ### Sidebar UX Redesign
 - **Tabs with labels** — Chat / Plan / History tabs now show icon + text label in a compact column layout; previously icon-only
@@ -225,7 +263,7 @@
 ### Session Cost Display
 - Running session cost appears as a `$0.04` chip in the composer context bar, accumulating across all tasks; resets at the start of each new run
 
-## [0.9.0] - 2026-03-XX
+## [0.9.0] - 2026-03-21
 
 ### Validation Engine
 - New `validate` task type — unified entrypoint for cross-platform quality gates
@@ -270,9 +308,11 @@
 - Existing tasks without `type: "validate"` run exactly as before.
 - The `validate` task type is opt-in — no behavior changes for `agent`, `command`, `service`, `check`, or `review` tasks.
 
-## [1.0.0] - 2026-03-24
+### Workflow (previously mislabelled [1.0.0])
 
-### Workflow
+These features were listed under a `[1.0.0] - 2026-03-24` heading, but no 1.0.0 was ever released;
+they shipped in the 0.9.x line.
+
 - Task Editor webview form for streamlined task creation
 - Quick Add Task (Ctrl+Shift+T) — add tasks without leaving the keyboard
 - Add Task from Editor Selection — highlight code, create a task
@@ -394,6 +434,8 @@
 
 ## [0.5.0] - 2026-03-10
 
+_No separate commit: this work shipped in 66dd50c together with 0.4.0 and 0.6.0._
+
 ### Stability & Recovery
 
 ### Fixed
@@ -416,6 +458,8 @@
 - **Engine version check**: Availability checks verify engines actually work, not just that the command exists
 
 ## [0.4.0] - 2026-03-09
+
+_No separate commit: this work shipped in 66dd50c together with 0.5.0 and 0.6.0._
 
 ### Dashboard Redesign
 
@@ -453,3 +497,25 @@
 - Verification commands per task
 - Configurable autoplay delay
 - `.agent-plan.json` file format with auto-load on workspace open
+
+[Unreleased]: https://github.com/sujan-poudel-03/moag/compare/v0.9.15...HEAD
+[0.9.15]: https://github.com/sujan-poudel-03/moag/compare/v0.9.14...v0.9.15
+[0.9.14]: https://github.com/sujan-poudel-03/moag/compare/v0.9.13...v0.9.14
+[0.9.13]: https://github.com/sujan-poudel-03/moag/compare/v0.9.12...v0.9.13
+[0.9.12]: https://github.com/sujan-poudel-03/moag/compare/v0.9.10...v0.9.12
+[0.9.10]: https://github.com/sujan-poudel-03/moag/compare/v0.9.9...v0.9.10
+[0.9.9]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
+[0.9.8]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
+[0.9.7]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
+[0.9.6]: https://github.com/sujan-poudel-03/moag/compare/v0.9.5...v0.9.6
+[0.9.5]: https://github.com/sujan-poudel-03/moag/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/sujan-poudel-03/moag/compare/a1f8e7e...v0.9.4
+[0.9.0]: https://github.com/sujan-poudel-03/moag/compare/f2654de...a1f8e7e
+[0.8.0]: https://github.com/sujan-poudel-03/moag/compare/v0.7.0...f2654de
+[0.7.0]: https://github.com/sujan-poudel-03/moag/compare/66dd50c...v0.7.0
+[0.6.0]: https://github.com/sujan-poudel-03/moag/compare/7540f78...66dd50c
+[0.5.0]: https://github.com/sujan-poudel-03/moag/compare/7540f78...66dd50c
+[0.4.0]: https://github.com/sujan-poudel-03/moag/compare/7540f78...66dd50c
+[0.3.0]: https://github.com/sujan-poudel-03/moag/compare/84036e6...7540f78
+[0.2.0]: https://github.com/sujan-poudel-03/moag/compare/60368b6...84036e6
+[0.1.0]: https://github.com/sujan-poudel-03/moag/tree/60368b6
