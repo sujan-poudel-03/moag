@@ -85,6 +85,16 @@ export function planLoadError(detail?: string, filePath?: string): UserMessage {
   return msg;
 }
 
+/**
+ * An action from a panel button that failed: say what, never fail silently.
+ * @param what   What MOAG was doing, as a verb phrase ("post the report")
+ * @param detail The error message (truncated to 120 characters)
+ */
+export function actionFailed(what: string, detail?: string): UserMessage {
+  const hint = detail ? `: ${truncate(detail, 120)}` : '';
+  return { text: `MOAG could not ${what}${hint}.` };
+}
+
 export function standardsLoadError(detail?: string): UserMessage {
   const hint = detail ? ` ${truncate(detail, 240)}` : '';
   return {

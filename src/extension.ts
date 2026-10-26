@@ -35,7 +35,7 @@ import { generateId } from './models/plan';
 import { isRoleId, resolveRoleCharter } from './models/roles';
 import { PlanTreeProvider, PlanTreeItem } from './ui/plan-tree';
 import { HistoryTreeProvider } from './ui/history-tree';
-import { DashboardPanel } from './ui/dashboard-panel';
+import { DashboardPanel, disposeDashboardLog } from './ui/dashboard-panel';
 import { ExecutionDetailPanel } from './ui/execution-detail-panel';
 import { TaskEditorPanel } from './ui/task-editor-panel';
 import { RuleEditorPanel } from './ui/rule-editor-panel';
@@ -2706,6 +2706,7 @@ async function createPRFromRun(): Promise<void> {
 
 export function deactivate(): void {
   removeProcessErrorHandlers();
+  disposeDashboardLog();
   extensionContext = null;
   promptViewProvider = null;
   runner?.stop();

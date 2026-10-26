@@ -15,6 +15,12 @@ import { ContributionLedgerPayload } from '../utils/contribution-ledger';
 // first use rather than at import.
 let dashboardChannel: vscode.OutputChannel | null = null;
 
+/** Dispose the "MOAG Dashboard" channel (deactivate). A later log() creates a new one. */
+export function disposeDashboardLog(): void {
+  try { dashboardChannel?.dispose(); } catch { /* already gone */ }
+  dashboardChannel = null;
+}
+
 /** Append one line to the "MOAG Dashboard" output channel, creating it on first use. */
 function log(line: string): void {
   try {

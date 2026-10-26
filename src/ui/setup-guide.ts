@@ -11,6 +11,7 @@
 import * as vscode from 'vscode';
 import { EngineId } from '../models/types';
 import { designSystemCssTokens } from './design-system';
+import * as UserMsg from '../utils/user-messages';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 
 /** The end-to-end ONOSOO Builds guide. docs/ is not packaged, so it links to GitHub. */
@@ -56,18 +57,23 @@ export async function cmdShowSetupGuide(ctx: GuideContext): Promise<void> {
   panel.onDidDispose(() => { disposed = true; });
 
   panel.webview.onDidReceiveMessage(async (msg: { type?: string }) => {
-    if (msg?.type === 'recheck') {
-      panel.dispose();
-      await vscode.commands.executeCommand('agentTaskPlayer.detectEngines');
-      await cmdShowSetupGuide(ctx);
-    } else if (msg?.type === 'done') {
-      panel.dispose();
-    } else if (msg?.type === 'setAnthropicKey') {
-      await vscode.commands.executeCommand('agentTaskPlayer.setAnthropicApiKey');
-      // The panel may have been closed while the input box was open.
-      if (!disposed) { panel.webview.html = await render(); }
-    } else if (msg?.type === 'connectOnosoo') {
-      await vscode.commands.executeCommand('agentTaskPlayer.connectOnosoo');
+    // Every branch awaits a command; a rejection becomes a message, never an unhandled rejection.
+    try {
+      if (msg?.type === 'recheck') {
+        panel.dispose();
+        await vscode.commands.executeCommand('agentTaskPlayer.detectEngines');
+        await cmdShowSetupGuide(ctx);
+      } else if (msg?.type === 'done') {
+        panel.dispose();
+      } else if (msg?.type === 'setAnthropicKey') {
+        await vscode.commands.executeCommand('agentTaskPlayer.setAnthropicApiKey');
+        // The panel may have been closed while the input box was open.
+        if (!disposed) { panel.webview.html = await render(); }
+      } else if (msg?.type === 'connectOnosoo') {
+        await vscode.commands.executeCommand('agentTaskPlayer.connectOnosoo');
+      }
+    } catch (err) {
+      void UserMsg.showError(UserMsg.actionFailed('finish that from the Setup Guide', err instanceof Error ? err.message : String(err)));
     }
   });
 
