@@ -1,13 +1,26 @@
 name: Publish
 
+# A release is a pushed tag vX.Y.Z on a commit whose package.json says X.Y.Z and
+# whose CHANGELOG.md has a "## [X.Y.Z] - YYYY-MM-DD" section. See docs/RELEASING.md.
 on:
   push:
     tags:
-      - 'v*'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: read
+
+# One release per tag at a time, and never cancel one half-way through.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  # The tag matches package.json and the changelog has notes for it.
+  check:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -15,27 +28,91 @@ jobs:
           node-version-file: .nvmrc
           cache: npm
       - run: npm ci
-      - run: npm run lint
-      - run: npm run compile
-      - run: npm run test:unit
+      - run: npm run compile:ext
+      - name: Release notes from CHANGELOG.md
+        run: node scripts/release-notes.js "$GITHUB_REF_NAME" > notes.md
+      - id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
 
-      - name: Package extension
-        run: npx @vscode/vsce package -o moag.vsix
-      # Tests run against the repo's out/; the VSIX holds only what .vscodeignore lets
-      # through. 0.9.13 and 0.9.14 shipped an extension that could not activate
-      # ("Cannot find module '../server/secrets'") while every test passed. The smoke
-      # script unzips this exact file, checks its contents, loads package.json main
-      # with a stub vscode, and runs bin.moag --help and a verify (scripts/smoke-vsix.mjs).
+  # The whole CI workflow (lint, build, unit and integration tests on three
+  # platforms, the packaging smoke test, the dependency audit) on the tagged commit.
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  # Package once. The file smoke-tested here is the file released and published.
+  package:
+    needs: [check, ci]
+    runs-on: ubuntu-latest
+    env:
+      VSIX: moag-${{ needs.check.outputs.version }}.vsix
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - name: Package the extension
+        run: npx @vscode/vsce package -o "$VSIX"
       - name: Smoke-test the packaged VSIX
-        run: npm run smoke:vsix -- --vsix moag.vsix
-      - name: Upload VSIX artifact
-        uses: actions/upload-artifact@v4
+        run: npm run smoke:vsix -- --vsix "$VSIX"
+      - uses: actions/upload-artifact@v4
         with:
           name: vsix
-          path: moag.vsix
+          path: ${{ env.VSIX }}
+          if-no-files-found: error
 
-      - name: Publish to Marketplace
+  # A GitHub release carrying that VSIX and the changelog section.
+  release:
+    needs: [check, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: vsix
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+      - name: Create the GitHub release
+        run: gh release create "$GITHUB_REF_NAME" "moag-$VERSION.vsix" --title "MOAG $VERSION" --notes-file notes.md --verify-tag
+
+  # The same VSIX to the Marketplace. Without the VSCE_PAT secret this warns and
+  # skips; the GitHub release above still stands. Re-run this job alone once the
+  # secret is set (docs/RELEASING.md).
+  marketplace:
+    needs: [check, release]
+    runs-on: ubuntu-latest
+    env:
+      VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - name: No VSCE_PAT secret
+        if: env.VSCE_PAT == ''
+        run: echo "::warning::VSCE_PAT is not set, so MOAG $VERSION was not published to the Marketplace. Add the secret and re-run this job."
+      - uses: actions/checkout@v4
         if: env.VSCE_PAT != ''
-        run: npx @vscode/vsce publish --packagePath moag.vsix -p ${{ secrets.VSCE_PAT }}
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      - uses: actions/setup-node@v4
+        if: env.VSCE_PAT != ''
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+        if: env.VSCE_PAT != ''
+      - uses: actions/download-artifact@v4
+        if: env.VSCE_PAT != ''
+        with:
+          name: vsix
+      - name: Publish to the Marketplace
+        if: env.VSCE_PAT != ''
+        # vsce reads the token from VSCE_PAT; it never appears on the command line.
+        run: npx @vscode/vsce publish --packagePath "moag-$VERSION.vsix"
