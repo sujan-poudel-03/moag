@@ -61,6 +61,19 @@ describe('walkthrough — agentTaskPlayer.getStarted', () => {
     assert.ok(media.includes(guide), 'media links the guide');
   });
 
+  it('pairs through the Connect command (and moag pair after Install Command-Line Tool)', () => {
+    const step = getStarted!.steps.find(s => s.id === 'connectOnosoo')!;
+    assert.ok(step.description.includes('](command:agentTaskPlayer.connectOnosoo)'));
+    assert.ok(step.description.includes('](command:agentTaskPlayer.installCli)'));
+    assert.ok(step.description.includes('moag pair'));
+  });
+
+  it('no media page points at a developer checkout path', () => {
+    for (const f of fs.readdirSync(path.join(ROOT, 'media')).filter(n => n.endsWith('.md'))) {
+      assert.ok(!fs.readFileSync(path.join(ROOT, 'media', f), 'utf-8').includes('Projects'), `${f} mentions a Projects path`);
+    }
+  });
+
   it('names both key file locations and warns against setx and in-project keys', () => {
     const step = getStarted!.steps.find(s => s.id === 'connectOnosoo')!;
     assert.ok(step.description.includes('%APPDATA%\\moag\\onosoo.json'));

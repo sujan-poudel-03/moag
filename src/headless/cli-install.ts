@@ -199,28 +199,50 @@ try {
   $cur = [string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
   $parts = @($cur -split ';' | Where-Object { $_ -ne '' })
   $want = $dir.TrimEnd('\')
-  if (@($parts | Where-Object { $_.TrimEnd('\') -ieq $want }).Count -gt 0) { exit 0 }
+  # An entry already there counts whether it is written out in full or still holds an
+  # unexpanded variable such as %LOCALAPPDATA%.
+  $present = @($parts | Where-Object {
+    $_.TrimEnd('\') -ieq $want -or ([Environment]::ExpandEnvironmentVariables($_)).TrimEnd('\') -ieq $want
+  }).Count -gt 0
+  if ($present) { exit 0 }
   $new = (@($parts) + $dir) -join ';'
   $key.SetValue('Path', $new, [Microsoft.Win32.RegistryValueKind]::ExpandString)
 } finally {
   $key.Close()
 }
-Add-Type -Namespace MoagPath -Name Native -MemberDefinition '[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
-$result = [UIntPtr]::Zero
-[void][MoagPath.Native]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+# PATH is written. Telling running programs is best-effort: exit 10 says only that failed.
+try {
+  Add-Type -Namespace MoagPath -Name Native -MemberDefinition '[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Auto)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint Msg, UIntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);'
+  $result = [UIntPtr]::Zero
+  [void][MoagPath.Native]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
+} catch {
+  exit 10
+}
 exit 0
 `;
 
-/** Add `binDir` to the Windows user PATH. Resolves true on success; never throws. */
-export async function addToWindowsUserPath(binDir: string, exec: typeof execFileAsync = execFileAsync): Promise<boolean> {
+/** Exit code of WINDOWS_PATH_SCRIPT when PATH was written but the change broadcast failed. */
+export const PATH_WRITTEN_NO_BROADCAST = 10;
+
+/**
+ * How the PATH update went: 'ok' (written, or already there), 'restart-terminals'
+ * (written, but running programs were not told; new terminals after a restart see it),
+ * or 'failed' (not written).
+ */
+export type PathUpdateResult = 'ok' | 'restart-terminals' | 'failed';
+
+/** Add `binDir` to the Windows user PATH. Never throws. */
+export async function addToWindowsUserPath(binDir: string, exec: typeof execFileAsync = execFileAsync): Promise<PathUpdateResult> {
   try {
     const r = await exec(
       'powershell.exe',
       ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', WINDOWS_PATH_SCRIPT],
       { env: { ...process.env, MOAG_BIN_DIR: binDir }, timeoutMs: 30_000 },
     );
-    return r.exitCode === 0;
+    if (r.exitCode === 0) { return 'ok'; }
+    if (r.exitCode === PATH_WRITTEN_NO_BROADCAST) { return 'restart-terminals'; }
+    return 'failed';
   } catch {
-    return false;
+    return 'failed';
   }
 }

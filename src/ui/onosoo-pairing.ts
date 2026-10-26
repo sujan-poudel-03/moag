@@ -50,6 +50,15 @@ export async function cmdConnectOnosoo(deps: OnosooPairingDeps, arg?: { url?: un
   const url = typeof arg?.url === 'string' && arg.url.length > 0 ? arg.url : undefined;
   const loc = location(deps);
 
+  if (deps.isLive()) {
+    const go = await vscode.window.showWarningMessage(
+      'A run is being relayed to ONOSOO. Change the device key now? The run in progress finishes on the old key, and its unsent events are kept.',
+      { modal: true },
+      'Change Key',
+    );
+    if (go !== 'Change Key') { return; }
+  }
+
   const before = inspectPairing({ ...loc, key });
   if (before.keyChanged && before.unsentEvents > 0) {
     const n = before.unsentEvents;

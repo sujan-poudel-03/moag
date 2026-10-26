@@ -90,7 +90,7 @@ describe('Install Command-Line Tool: installer core', () => {
         calls.push({ cmd, args, env: o?.env });
         return { exitCode: 0, stdout: '', stderr: '', timedOut: false } as ExecFileAsyncResult;
       });
-      assert.equal(ok, true);
+      assert.equal(ok, 'ok');
       assert.equal(calls[0].cmd, 'powershell.exe');
       assert.equal(calls[0].env?.MOAG_BIN_DIR, 'C:\\Users\\a\\AppData\\Local\\moag\\bin');
       assert.ok(!calls[0].args.join(' ').includes('moag\\bin'), 'the folder leaked into the command line');
@@ -112,9 +112,19 @@ describe('Install Command-Line Tool: installer core', () => {
       }
     });
 
-    it('a rejected or failed exec returns false', async () => {
-      assert.equal(await addToWindowsUserPath('C:\\b', async () => { throw new Error('ENOENT'); }), false);
-      assert.equal(await addToWindowsUserPath('C:\\b', async () => ({ exitCode: 1, stdout: '', stderr: 'x', timedOut: false })), false);
+    it('an unexpanded %LOCALAPPDATA%\\moag\\bin entry counts as already present', () => {
+      assert.match(WINDOWS_PATH_SCRIPT, /\[Environment\]::ExpandEnvironmentVariables\(\$_\)\)\.TrimEnd\('\\'\) -ieq \$want/);
+    });
+
+    it('PATH written but the broadcast failed: exit 10 maps to restart-terminals, not failure', async () => {
+      assert.match(WINDOWS_PATH_SCRIPT, /catch \{\s*exit 10\s*\}/);
+      const r = await addToWindowsUserPath('C:\\b', async () => ({ exitCode: 10, stdout: '', stderr: 'Add-Type failed', timedOut: false }));
+      assert.equal(r, 'restart-terminals');
+    });
+
+    it('a rejected or failed exec returns failed', async () => {
+      assert.equal(await addToWindowsUserPath('C:\\b', async () => { throw new Error('ENOENT'); }), 'failed');
+      assert.equal(await addToWindowsUserPath('C:\\b', async () => ({ exitCode: 1, stdout: '', stderr: 'x', timedOut: false })), 'failed');
     });
   });
 

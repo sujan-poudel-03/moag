@@ -82,6 +82,21 @@ describe('moag launcher', () => {
       assert.equal(pickCli({ extensionsDirs: [EXT], fixedCli: fixed }, f), fixed);
     });
 
+    it('skips a folder VS Code listed in .obsolete, case-insensitively', () => {
+      const f = memFs({
+        [cliOf('0.9.14')]: '', [cliOf('0.9.15')]: '',
+        [path.join(EXT, '.obsolete')]: JSON.stringify({ 'MOAG.agent-task-player-0.9.15': true, 'other.ext-1.0.0': true }),
+      });
+      assert.equal(pickCli({ extensionsDirs: [EXT] }, f), cliOf('0.9.14'));
+    });
+
+    it('an unreadable or odd .obsolete is ignored', () => {
+      const f = memFs({ [cliOf('0.9.15')]: '', [path.join(EXT, '.obsolete')]: 'not json' });
+      assert.equal(pickCli({ extensionsDirs: [EXT] }, f), cliOf('0.9.15'));
+      const g = memFs({ [cliOf('0.9.15')]: '', [path.join(EXT, '.obsolete')]: JSON.stringify({ 'moag.agent-task-player-0.9.15': false }) });
+      assert.equal(pickCli({ extensionsDirs: [EXT] }, g), cliOf('0.9.15'));
+    });
+
     it('returns null when nothing is found', () => {
       const f = memFs({});
       assert.equal(pickCli({ extensionsDirs: [EXT], fixedCli: path.resolve('/nope/cli.js') }, f), null);

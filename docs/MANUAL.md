@@ -34,7 +34,7 @@ routing by cost or capability is a configuration decision, not a code change.
 | `gemini` | Gemini CLI | |
 | `ollama` | Local models | No API cost |
 | `copilot` | GitHub Copilot | **IDE-only.** Uses `vscode.lm`, so it cannot run headless at all |
-| `anthropic` | Anthropic API directly | No CLI required |
+| `anthropic` | Anthropic API directly | No CLI required. Key: **MOAG: Set Anthropic API Key** (secret storage), else `ANTHROPIC_API_KEY` |
 | `custom` | Any command you define | Escape hatch |
 
 **Every engine pipes its prompt over stdin**, never as a command-line argument.
@@ -575,6 +575,7 @@ and this one is injected at high priority, so it would rot every future run.
 | `queue.jsonl` | Parked work — append-only |
 | `knowledge/facts.json` | Proven facts about this repo |
 | `errors.jsonl` | Internal error log |
+| `usage-log.jsonl`, `usage-log.1.jsonl` | Per-call usage for the Contribution Ledger; local, rotated at 5 MB (git email only with `contributionLedger.recordDeveloperEmail`) |
 | `verification-*.json` | PRD verification reports. A command gate is stored as it ran (`exitCode`, `passed`). The `moag:standards` row has no `passed` key: it has `standards` (`stopped`, `no blocking rules configured` or `nothing blocking`) and `standardsOpen` (what the check left open, in words) |
 | `screenshots/` | Browser UAT captures |
 
@@ -677,7 +678,10 @@ prints a proposed profile; it writes the file, as the next version, only with
 per-version metrics. `--dry-run` uses a fake engine and costs nothing; a paid
 run needs `--max-usd`. See docs/benchmark.md.
 
-`moag` reaches your PATH via `npm link` from the repository root.
+`moag` reaches your PATH through **MOAG: Install Command-Line Tool**, which runs the
+CLI bundled in the newest installed extension (from a checkout, `npm link` from the
+repository root works too). `moag pair` saves the ONOSOO device key; pass it on stdin
+(`moag pair < key.txt`, or paste it at the prompt) to keep it out of shell history.
 
 ### IDE commands worth knowing
 
@@ -692,14 +696,20 @@ run needs `--max-usd`. See docs/benchmark.md.
 | Manage AI Rules | Rule editor |
 | Show History | Session list |
 | Setup Guide | First-run walkthrough |
+| Set Anthropic API Key / Clear Anthropic API Key | Store or remove the Anthropic API key in VS Code's secret storage |
+| Connect to ONOSOO Builds / Disconnect from ONOSOO | Pair this machine with ONOSOO Builds, or remove the pairing |
+| Install Command-Line Tool | Put `moag` on your PATH |
+| Export Diagnostics | Save a redacted support report |
+| Report Issue to GitHub | A public issue on the MOAG repository, shown in full before it is posted |
 
 ---
 
 # Part 8 — When something looks wrong
 
 **A panel is blank.** The script did not load. `Ctrl+Shift+P` →
-`Developer: Open Webview Developer Tools`. Source maps ship, so the console
-points at the TypeScript. Likely a CSP violation or a bad script URI.
+`Developer: Open Webview Developer Tools`. Source maps are not shipped
+(`.vscodeignore` excludes `**/*.map`); the console shows compiled JS. Likely a
+CSP violation or a bad script URI.
 
 **Nothing committed after a run.** Check `git.autoCommit` is on, and read the
 run output — delivery refuses loudly on a dirty tree, a detached HEAD, or a
@@ -709,7 +719,8 @@ non-repository, and names which.
 not create them. Turn on `git.autoCommit`.
 
 **Verification fails with no model call.** Working as designed — a deterministic
-gate failed, and it says which of the four.
+gate failed, and it says which of the five (task status, changed files,
+project standards, gate commands, artifacts).
 
 **A run stopped and you cannot see why.** `moag queue`. Every halt is parked
 with the decision it is waiting on.

@@ -35,7 +35,7 @@ describe('MOAG: Install Command-Line Tool', () => {
     let pathCalls = 0;
     await mod.cmdInstallCli({
       extensionPath: 'C:\\ext\\moag.agent-task-player-1.0.0', platform: 'win32', env: { LOCALAPPDATA: 'C:\\L' }, homedir: 'C:\\U',
-      write: okWrite(false), addToPath: async () => { pathCalls++; return true; },
+      write: okWrite(false), addToPath: async () => { pathCalls++; return 'ok' as const; },
     });
     assert.equal(pathCalls, 0);
     assert.ok(shown.some((s) => /Add C:\\L\\moag\\bin to your user PATH\?/.test(s.text)));
@@ -47,7 +47,7 @@ describe('MOAG: Install Command-Line Tool', () => {
     const added: string[] = [];
     await mod.cmdInstallCli({
       extensionPath: 'C:\\ext\\e', platform: 'win32', env: { LOCALAPPDATA: 'C:\\L' }, homedir: 'C:\\U',
-      write: okWrite(false), addToPath: async (d: string) => { added.push(d); return true; },
+      write: okWrite(false), addToPath: async (d: string) => { added.push(d); return 'ok' as const; },
     });
     assert.deepEqual(added, ['C:\\L\\moag\\bin']);
     assert.ok(shown.some((s) => s.text.includes('moag --version')));
@@ -57,10 +57,20 @@ describe('MOAG: Install Command-Line Tool', () => {
     const { mod, shown } = load('Add to PATH');
     await mod.cmdInstallCli({
       extensionPath: 'C:\\ext\\e', platform: 'win32', env: { LOCALAPPDATA: 'C:\\L' }, homedir: 'C:\\U',
-      write: okWrite(false), addToPath: async () => false,
+      write: okWrite(false), addToPath: async () => 'failed' as const,
     });
     assert.ok(shown.some((s) => s.kind === 'error'));
     assert.ok(!shown.some((s) => s.text.startsWith('Installed. Open a new terminal')));
+  });
+
+  it('PATH written but not broadcast: says to restart terminals, not that it failed', async () => {
+    const { mod, shown } = load('Add to PATH');
+    await mod.cmdInstallCli({
+      extensionPath: 'C:\\ext\\e', platform: 'win32', env: { LOCALAPPDATA: 'C:\\L' }, homedir: 'C:\\U',
+      write: okWrite(false), addToPath: async () => 'restart-terminals' as const,
+    });
+    assert.ok(!shown.some((s) => s.kind === 'error'));
+    assert.ok(shown.some((s) => /PATH updated; restart terminals/.test(s.text)));
   });
 
   it('a failed copy shows an error and no success message', async () => {

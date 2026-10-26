@@ -201,6 +201,26 @@ describe('self-reporting: bug reports go to the MOAG repository', () => {
     assert.ok(!panel.html.includes(ant), 'the Anthropic key reached the panel HTML');
   });
 
+  it('a browser fallback that fails shows an error and keeps the panel (Copy still works)', async () => {
+    h = load({ ghSignedIn: false });
+    const errors: string[] = [];
+    const savedErr = vscodeMock.window.showErrorMessage;
+    const savedOpen = vscodeMock.env.openExternal;
+    vscodeMock.window.showErrorMessage = (m: string) => { errors.push(m); return Promise.resolve(undefined); };
+    vscodeMock.env.openExternal = async () => { throw new Error('no browser'); };
+    try {
+      await h.mod.cmdReportIssue();
+      const panel = h.panels[0];
+      await panel.send({ type: 'submitReport', description: 'x' });
+      await panel.send({ type: 'confirmPost' }); // resolves: no unhandled rejection
+      assert.deepEqual(errors, ['MOAG could not post the report: no browser.']);
+      assert.equal(panel.disposed, false);
+    } finally {
+      vscodeMock.window.showErrorMessage = savedErr;
+      vscodeMock.env.openExternal = savedOpen;
+    }
+  });
+
   it('posts nothing to a panel the user already closed', async () => {
     h = load({ ghSignedIn: true });
     await h.mod.cmdReportIssue();

@@ -25,6 +25,7 @@ import { RunSession } from '../models/run-session';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 import { buildReportRedactor } from './report-redaction';
 import { formatUsd } from '../utils/cost-format';
+import * as UserMsg from '../utils/user-messages';
 
 /** What a run cost in friction: retries, escalations, auto-fixes. */
 export interface RunFrictionReport {
@@ -742,6 +743,10 @@ export async function openReportPanel(
         try {
           const viaGh = await postReport(pending, cwd);
           if (viaGh) { prepared?.onPosted?.(); }
+        } catch (err) {
+          // The browser fallback (clipboard, openExternal) can reject: say so, keep the panel for Copy.
+          void UserMsg.showError(UserMsg.actionFailed('post the report', err instanceof Error ? err.message : String(err)));
+          return;
         } finally {
           posting = false;
         }
@@ -750,8 +755,12 @@ export async function openReportPanel(
       }
       case 'copy': {
         if (!pending) { return; }
-        await vscode.env.clipboard.writeText(`${pending.title}\n\n${pending.body}`);
-        void vscode.window.showInformationMessage('Report copied to the clipboard.');
+        try {
+          await vscode.env.clipboard.writeText(`${pending.title}\n\n${pending.body}`);
+          void vscode.window.showInformationMessage('Report copied to the clipboard.');
+        } catch (err) {
+          void UserMsg.showError(UserMsg.actionFailed('copy the report', err instanceof Error ? err.message : String(err)));
+        }
         return;
       }
       case 'cancel':

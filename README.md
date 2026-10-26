@@ -4,9 +4,10 @@
 [![Visual Studio Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
 [![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Website](https://img.shields.io/badge/moag.dev-website-blue)](https://moag.dev)
 
-> **Run AI agents like a playlist.** Build a plan, pick your engines, hit Play — Claude, Codex, Gemini, and Ollama execute your tasks while you watch.
+> **Run AI agents like a playlist.** Build a plan, pick your engines, hit Play — Claude Code, Codex, Gemini, Ollama, GitHub Copilot or the Anthropic API execute your tasks while you watch.
+
+<!-- screenshot: media/screenshots/hero.gif | alt: "MOAG running a plan: the sidebar plan, Play, and the Dashboard streaming live output" -->
 
 ---
 
@@ -26,7 +27,7 @@
 
 Search **"MOAG"** in VS Code Extensions, or grab it from the [Marketplace](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player).
 
-You need at least one agent CLI:
+You need at least one engine. Either an agent CLI:
 
 ```bash
 npm i -g @anthropic-ai/claude-code   # Claude Code
@@ -35,6 +36,10 @@ npm i -g @google/gemini-cli          # Gemini CLI
 # Or install Ollama from https://ollama.com
 ```
 
+or no CLI at all: run **MOAG: Set Anthropic API Key** (the key is kept in VS Code's secret storage), or use GitHub Copilot through the Copilot Chat extension. **MOAG: Setup Guide** shows what is found and what is missing.
+
+<!-- screenshot: media/screenshots/setup-guide.png | alt: "The MOAG Setup Guide listing six engines, with the Anthropic API row configured" -->
+
 ### 2. Create a Plan
 
 - **Smart Plan** (recommended): `Ctrl+Shift+P` → `MOAG: Smart New Plan` → describe your goal → get a full plan
@@ -42,9 +47,15 @@ npm i -g @google/gemini-cli          # Gemini CLI
 - **From GitHub Issue**: `MOAG: Plan from GitHub Issue` → paste an issue URL
 - **Manual**: Click the rocket icon in the Activity Bar → New Plan → add playlists and tasks
 
+<!-- screenshot: media/screenshots/smart-plan.png | alt: "Smart New Plan turning a PRD into playlists and tasks" -->
+
 ### 3. Hit Play
 
 Click **Play** in the title bar. MOAG opens the Dashboard, validates engines, and starts executing. Tasks stream live output, run verification commands, and auto-fix failures.
+
+<!-- screenshot: media/screenshots/dashboard.png | alt: "The MOAG Dashboard with live task output and task cards" -->
+
+<!-- screenshot: media/screenshots/plan-tree.png | alt: "A plan in the sidebar with playlists and tasks in mixed statuses" -->
 
 ---
 
@@ -79,6 +90,12 @@ Click **Play** in the title bar. MOAG opens the Dashboard, validates engines, an
 | **Dashboard** | Live output, progress bar, ETA, diffs | `MOAG: Show Dashboard` |
 | **Cost Tracking** | Token usage and cost by engine | `MOAG: Show Cost & Usage Summary` |
 | **Execution History** | Timestamped logs with stdout/stderr | `MOAG: Show History` |
+| **Anthropic API key** | Store or remove the key for the Anthropic API engine (secret storage, never settings) | `MOAG: Set Anthropic API Key` / `MOAG: Clear Anthropic API Key` |
+| **ONOSOO Builds** | Pair this machine with ONOSOO, or remove the pairing | `MOAG: Connect to ONOSOO Builds` / `MOAG: Disconnect from ONOSOO` |
+| **Command-line tool** | Put `moag` on your PATH, running the CLI bundled in the extension | `MOAG: Install Command-Line Tool` |
+| **Diagnostics** | Save a redacted support report (versions, engines, settings, recent errors) | `MOAG: Export Diagnostics` |
+
+<!-- screenshot: media/screenshots/cost-summary.png | alt: "The cost and usage summary, with a cost unknown row" -->
 
 ---
 
@@ -137,7 +154,7 @@ Toggle `MOAG: Watch Mode` to re-run tasks when source files change. Edit a spec,
 |--------|---------|-------------|
 | **Plan from Issue** | `MOAG: Plan from GitHub Issue` | Paste an issue URL, get a runnable plan |
 | **Create PR** | `MOAG: Create PR` | Opens a pull request with an execution summary |
-| **Share Plan** | `MOAG: Share Plan` | Uploads plan as a GitHub Gist, copies link |
+| **Share Plan** | `MOAG: Share Plan` | Uploads the plan (redacted) as a **public** GitHub Gist, copies link |
 | **Import Plan** | `MOAG: Import Plan from URL` | Load from gist, raw GitHub URL, or any JSON endpoint |
 | **Review Changes** | `MOAG: Review Changes` | Inline diff viewer for all file changes |
 
@@ -161,11 +178,8 @@ smoke gate), **`release`** (tag + GitHub release), and **`monitor`** (health pro
 an incident on breach). Shipping is **gated** — a `manual` approval task halts the run
 (exit 3) until a human approves.
 
-Build & install the extension + CLI on any platform:
-
-```bash
-./scripts/install-linux.sh      # or install-macos.sh  /  install-windows.ps1
-```
+The CLI ships inside the extension: run **MOAG: Install Command-Line Tool** once, open a new
+terminal, and `moag --version` works. Updating the extension updates `moag` too.
 
 📖 **Full operator's guide:** [docs/AUTONOMOUS.md](docs/AUTONOMOUS.md) — commands, config,
 task-type reference, JSONL output, systemd/cron, and the safety model.
@@ -180,9 +194,11 @@ Connect a machine to the **Builds** app in ONOSOO and the workspace can follow a
 - **Control:** start, stop, approve, skip and retry runs from ONOSOO, through `moag daemon` on Linux/WSL.
 - **Open it live:** open a running branch inside ONOSOO, through `moag host` on Linux/WSL with Docker.
 
-The device key stays in your user folder and never reaches the AI agents. Remote runs execute as a separate locked-down account.
+Pair in one step: **MOAG: Connect to ONOSOO Builds** in VS Code, or `moag pair` in a terminal, with the key from **Builds › Pair machine**. The device key stays in your user folder and never reaches the AI agents. Remote runs execute as a separate locked-down account.
 
 📖 **End-to-end setup, both sides:** [docs/onosoo-builds.md](docs/onosoo-builds.md)
+
+<!-- screenshot: media/screenshots/onosoo-run.png | alt: "A MOAG run in ONOSOO Builds with its tasks, changes and cost" -->
 
 ---
 
@@ -194,10 +210,10 @@ Switch with `MOAG: Switch Profile` or the status bar icon:
 
 | Profile | Engine | Timeout | Auto-Fix | Best For |
 |---------|--------|---------|----------|----------|
-| **Fast** | Claude (fast) | 3 min | Off | Quick iterations |
-| **Balanced** | Claude (balanced) | 10 min | On | Daily work |
-| **Quality** | Claude (deep) | 20 min | On | Critical tasks |
-| **Budget** | Ollama (local) | 5 min | Off | Free, offline |
+| **Fast** | Claude (fast) | 10 min | Off | Quick iterations |
+| **Balanced** | Claude (balanced) | 30 min | On | Daily work |
+| **Quality** | Claude (deep) | 45 min | On | Critical tasks |
+| **Budget** | Ollama (local) | 10 min | Off | Free, offline |
 
 ### Settings
 
@@ -206,8 +222,8 @@ Open `Ctrl+,` → search `agentTaskPlayer`:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `defaultEngine` | `claude` | Default agent engine |
-| `autoplayDelay` | `2000` | Delay between tasks (ms) |
-| `taskTimeoutMs` | `600000` | Per-task timeout (default 10 min) |
+| `autoplayDelay` | `500` | Delay between tasks (ms) |
+| `taskTimeoutMs` | `1800000` | Per-task timeout (30 min) |
 | `parallelPlaylists` | `1` | Concurrent playlists (1-8) |
 | `costBudgetUsd` | `10` | Hard spend ceiling (USD); calls that report no cost are not counted |
 | `maxHistoryEntries` | `200` | History entries to retain |
@@ -236,6 +252,8 @@ Open `Ctrl+,` → search `agentTaskPlayer`:
 | **Codex** | `codex` | `npm i -g @openai/codex` |
 | **Gemini** | `gemini` | `npm i -g @google/gemini-cli` |
 | **Ollama** | `ollama run <model>` | [ollama.com](https://ollama.com) |
+| **GitHub Copilot** | none | Uses the GitHub Copilot Chat extension; install it and sign in |
+| **Anthropic API** | none | An API key, set with `MOAG: Set Anthropic API Key` (or `ANTHROPIC_API_KEY` for the CLI) |
 | **Custom** | Configurable | Any CLI that accepts a prompt |
 
 Engine priority: **task** > **playlist** > **plan `defaultEngine`** > **VS Code setting** > **execution profile**.
@@ -244,7 +262,7 @@ Engine priority: **task** > **playlist** > **plan `defaultEngine`** > **VS Code 
 
 ## Plan File Format
 
-Plans are `.agent-plan.json` files. MOAG auto-loads the first one found in your workspace.
+A new plan is saved as `.moag/plan.json`; `.moag/.agent-plan.json` is loaded too (and wins when both exist). A legacy `*.agent-plan.json` at the workspace root is moved into `.moag/` on load.
 
 ```json
 {
@@ -276,7 +294,7 @@ Plans are `.agent-plan.json` files. MOAG auto-loads the first one found in your 
 | `id` | Yes | Unique identifier |
 | `name` | Yes | Display name |
 | `prompt` | Yes | Instruction sent to the agent |
-| `type` | No | `agent`, `command`, `service`, `check`, or `review` |
+| `type` | No | `agent` (default), `command`, `service`, `check`, `review`, `validate`, `manual`, `visual-test`, `deploy`, `release`, or `monitor` |
 | `engine` | No | Override engine for this task |
 | `command` | No | Shell command (for command/service/check types) |
 | `verifyCommand` | No | Validation command (exit 0 = pass) |
@@ -298,6 +316,27 @@ Plans are `.agent-plan.json` files. MOAG auto-loads the first one found in your 
 | `parallel` | No | Run all tasks concurrently (default: false) |
 | `autoplay` | No | Auto-advance to next task (default: true) |
 | `autoplayDelay` | No | Delay between tasks (ms) |
+
+---
+
+## Data & privacy
+
+MOAG sends **no product telemetry**. Data leaves your machine only for a feature you use:
+
+- **AI engines** — each prompt goes to the engine that runs it: the Claude Code, Codex or Gemini CLI (to their vendors), `api.anthropic.com` for the Anthropic API engine, VS Code's language-model API for Copilot, and your local or configured Ollama host.
+- **ONOSOO Builds, only when paired** — run events: plan, project and task names, statuses, changed file names with line counts and redacted diffs, error tails, cost, branch, PR URL, a device id and the MOAG version. Secrets and absolute paths are removed first. Turn it off with `agentTaskPlayer.onosoo.relay`; **MOAG: Disconnect from ONOSOO** removes the key.
+- **GitHub, through `gh`** — Issues Sync (reads issues; can comment, label and close them), Create PR, releases, monitor incidents, and **Share Plan, which makes a public, redacted gist**. Plan from GitHub Issue reads public issues from `api.github.com`.
+- **Bug reports and feedback** — public issues on [sujan-poudel-03/moag](https://github.com/sujan-poudel-03/moag/issues), redacted and shown to you in full before anything is posted.
+
+What stays local: `.moag/` in your workspace (MOAG asks before adding it to `.gitignore`), run history in VS Code's workspace storage, and the Anthropic key in VS Code's secret storage. Details: [PRIVACY.md](PRIVACY.md). Security problems: [SECURITY.md](SECURITY.md).
+
+---
+
+## Support
+
+- **Questions and bugs:** [GitHub Issues](https://github.com/sujan-poudel-03/moag/issues), or **MOAG: Report Issue to GitHub** from VS Code (you see the full, redacted report before it is posted).
+- **Attach diagnostics:** **MOAG: Export Diagnostics** saves a redacted report (versions, engines, changed settings, recent errors) to a file you choose.
+- **Security:** report privately, see [SECURITY.md](SECURITY.md).
 
 ---
 

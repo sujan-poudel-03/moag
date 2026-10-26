@@ -19,7 +19,7 @@
 # (or put them in ~/.config/moag/onosoo.json, mode 0600).
 set -euo pipefail
 
-SOURCE="/mnt/d/Projects/moag"
+SOURCE="${MOAG_SOURCE:-$(cd "$(dirname "$0")/.." && pwd)}"
 BRANCH="feat/sdlc-automation"
 while [ $# -gt 0 ]; do
   case "$1" in

@@ -110,6 +110,30 @@ describe('ONOSOO pairing: writePairing / removePairing', () => {
     assert.equal(fs.existsSync(path.join(stateDir(), 'onosoo-spool')), false);
   });
 
+  it('a changed key never wipes a run a relay still holds (this process, or a live one)', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const spoolMod = require('../../../headless/onosoo-spool');
+    await writePairing({ key: KEY, env, platform: 'linux', homedir: () => home });
+    const dir = path.join(stateDir(), 'onosoo-spool', 'ws1');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'mine-live.jsonl'), '{"meta":{}}\n{"seq":1}\n');
+    fs.writeFileSync(path.join(dir, 'other-live.jsonl'), `{"meta":{"pid":424242}}\n{"seq":1}\n`);
+    fs.writeFileSync(path.join(dir, 'other-dead.jsonl'), `{"meta":{"pid":535353}}\n{"seq":1}\n`);
+    fs.writeFileSync(path.join(dir, 'old.jsonl'), '{"meta":{}}\n{"seq":1}\n');
+    fs.writeFileSync(path.join(dir, 'old.ack'), '{"acked":0}');
+    spoolMod.registerLiveRelayRun('mine-live');
+    try {
+      const r = await writePairing({
+        key: KEY2, env, platform: 'linux', homedir: () => home,
+        liveness: { isPidAlive: (pid: number) => pid === 424242 },
+      });
+      assert.equal(r.spoolDiscarded, 2);
+      assert.deepEqual(fs.readdirSync(dir).sort(), ['mine-live.jsonl', 'other-live.jsonl']);
+    } finally {
+      spoolMod.releaseLiveRelayRun('mine-live');
+    }
+  });
+
   it('on win32 locks the folder with icacls (no shell, the folder and the user as arguments)', async () => {
     const r = await writePairing({ key: KEY, env, platform: 'win32', homedir: () => home, exec: okExec });
     assert.equal(r.aclApplied, true);

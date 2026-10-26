@@ -63,9 +63,13 @@ export async function cmdInstallCli(deps: CliInstallDeps): Promise<void> {
       void vscode.window.showInformationMessage(`Installed at ${plan.shimPath}. It is not on PATH, so run it by that full path.`);
       return;
     }
-    const ok = await (deps.addToPath ?? addToWindowsUserPath)(plan.binDir);
-    if (!ok) {
+    const outcome = await (deps.addToPath ?? addToWindowsUserPath)(plan.binDir);
+    if (outcome === 'failed') {
       void vscode.window.showErrorMessage(`Installed, but ${plan.binDir} could not be added to your user PATH. Add it in System Properties › Environment Variables.`);
+      return;
+    }
+    if (outcome === 'restart-terminals') {
+      void vscode.window.showInformationMessage('Installed. PATH updated; restart terminals (and VS Code, for its own terminals) to pick it up, then run `moag --version`.');
       return;
     }
     void vscode.window.showInformationMessage(DONE_TEXT);

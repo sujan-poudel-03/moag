@@ -2908,6 +2908,32 @@ describe('headless CLI: --version, help, pair', () => {
     assert.match(text, /^Usage: moag/);
   });
 
+  it('readFirstLine returns at the first newline even when stdin never closes', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { PassThrough } = require('stream');
+    const s = new PassThrough();
+    s.write('the-key-1234\nmore later');
+    const r = await cli.readFirstLine(s, 5000);
+    assert.deepEqual(r, { line: 'the-key-1234', timedOut: false });
+    assert.equal(s.listenerCount('data'), 0, 'stops listening');
+  });
+
+  it('readFirstLine gives up after the timeout on a stdin that sends nothing and never closes', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { PassThrough } = require('stream');
+    const s = new PassThrough();
+    const r = await cli.readFirstLine(s, 50);
+    assert.deepEqual(r, { line: '', timedOut: true });
+  });
+
+  it('readFirstLine takes the whole input when it ends without a newline', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { PassThrough } = require('stream');
+    const s = new PassThrough();
+    s.end('only-line');
+    assert.deepEqual(await cli.readFirstLine(s, 5000), { line: 'only-line', timedOut: false });
+  });
+
   it('parseArgs reads --url', () => {
     assert.equal(parseArgs(['pair', 'k', '--url', 'https://x.example.com']).url, 'https://x.example.com');
   });

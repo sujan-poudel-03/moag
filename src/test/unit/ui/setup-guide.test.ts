@@ -10,6 +10,7 @@ const webviewAssets = proxyquire('../../../ui/webview-assets', { vscode: vscodeM
 const { cmdShowSetupGuide, ONOSOO_GUIDE_URL } = proxyquire('../../../ui/setup-guide', {
   vscode: vscodeMock,
   './webview-assets': webviewAssets,
+  '../utils/user-messages': proxyquire('../../../utils/user-messages', { vscode: vscodeMock }),
 }) as
   typeof import('../../../ui/setup-guide');
 
@@ -142,6 +143,15 @@ describe('setup-guide — every engine, theme colours, the Anthropic key', () =>
     assert.match(panel.webview.html, /id="setAnthropicKeyBtn"/);
     await send({ type: 'setAnthropicKey' });
     assert.ok(exec.calledWith('agentTaskPlayer.setAnthropicApiKey'));
+  });
+
+  it('a command that rejects behind a button shows an error instead of an unhandled rejection', async () => {
+    sinon.stub(vscodeMock.commands, 'executeCommand').rejects(new Error('command not found'));
+    const err = sinon.stub(vscodeMock.window, 'showErrorMessage').resolves(undefined);
+    const { send } = await openGuide([]);
+    await send({ type: 'connectOnosoo' }); // resolves: the handler caught it
+    assert.equal(err.callCount, 1);
+    assert.match(String(err.firstCall.args[0]), /MOAG could not finish that from the Setup Guide: command not found/);
   });
 
   it('a panel closed while the key prompt was open is not written to', async () => {
