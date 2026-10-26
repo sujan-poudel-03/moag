@@ -44,6 +44,8 @@ export interface RunSession {
   totalTokensIn: number;
   totalTokensOut: number;
   totalCost: number;
+  /** Engine calls in this run that reported no cost; totalCost leaves them out. Absent in older sessions. */
+  costUnknownCalls?: number;
   validationProfile?: ValidationProfile;
   validationTargets?: ValidationTarget[];
   contextBudget?: ContextBudget;

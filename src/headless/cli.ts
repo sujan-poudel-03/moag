@@ -117,6 +117,7 @@ import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
 import { OnosooRelay, RelayHttpClient } from './onosoo-relay';
+import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from '../utils/budget-notice';
 import {
   buildRunMeta, forgetRelayEnv, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
 } from './run-reporter';
@@ -356,6 +357,9 @@ export function wireRunnerStandards(runner: any, cwd: string, opts: { standards?
  * `mementoPath` puts the runner's history somewhere other than `<cwd>/.moag` (the remote
  * child keeps it outside the worktree). Exported for the remote child.
  */
+/** The budget notice is subscribed once per process, however many times setup() runs. */
+let budgetNoticeWired = false;
+
 export async function setup(args: Args, opts: { mementoPath?: string } = {}): Promise<Ctx> {
   installVscodeShim(args.cwd);
   const { loadPlan } = require('../models/plan');
@@ -369,6 +373,14 @@ export async function setup(args: Args, opts: { mementoPath?: string } = {}): Pr
     await vscode.workspace.getConfiguration('agentTaskPlayer').update('fullAuto', true);
   }
   registerAllEngines();
+  // Once per process: the ceiling cannot stop calls that report no cost, so say so on stderr.
+  if (!budgetNoticeWired) {
+    budgetNoticeWired = true;
+    watchUnenforceableBudget({
+      budget: () => vscode.workspace.getConfiguration('agentTaskPlayer').get('costBudgetUsd', 10),
+      onFirst: () => { process.stderr.write(`moag: ${BUDGET_UNENFORCEABLE_TEXT}\n`); },
+    });
+  }
 
   const memento = new FileMemento(opts.mementoPath ?? path.join(args.cwd, '.moag', 'headless-state.json'));
   const runner = new TaskRunner(new HistoryStore(memento));

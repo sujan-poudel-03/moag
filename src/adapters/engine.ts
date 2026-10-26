@@ -120,7 +120,8 @@ export function withCostAccounting(adapter: EngineAdapter): EngineAdapter {
         throw err;
       }
       const cost = result.tokenUsage?.estimatedCost;
-      if (typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
+      const known = result.tokenUsage?.costSource !== 'unknown';
+      if (known && typeof cost === 'number' && Number.isFinite(cost) && cost >= 0) {
         costLedger.record(result.tokenUsage, {
           engineId: adapter.id,
           label: options.costLabel,

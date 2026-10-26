@@ -80,7 +80,7 @@ function shouldReplaceLegacyModel(configuredModel: string, modelId?: string): bo
   return /^gpt-4([.-]|$)/i.test(configuredModel) || /^gpt-4o([.-]|$)/i.test(configuredModel);
 }
 
-/** Parse token usage from Codex CLI output (stdout + stderr) */
+/** Parse token counts from Codex CLI output (stdout + stderr); the cost is always unknown. */
 function parseCodexTokenUsage(stdout: string, stderr: string): TokenUsage | undefined {
   const combined = (stderr || '') + '\n' + (stdout || '');
   if (!combined.trim()) { return undefined; }
@@ -102,9 +102,6 @@ function parseCodexTokenUsage(stdout: string, stderr: string): TokenUsage | unde
     usage.totalTokens = usage.inputTokens + usage.outputTokens;
   }
 
-  const costMatch = combined.match(/(?:cost[:\s]*)\$([0-9]+\.?[0-9]*)/i)
-    || combined.match(/\$([0-9]+\.[0-9]{2,})/);
-  if (costMatch) { usage.estimatedCost = parseFloat(costMatch[1]); found = true; }
-
-  return found ? usage : undefined;
+  // Never a cost from the output: a "$" figure there is the agent's prose, not billing.
+  return found ? { ...usage, costSource: 'unknown' } : undefined;
 }

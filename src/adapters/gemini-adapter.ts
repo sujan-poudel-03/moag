@@ -63,5 +63,6 @@ function parseGeminiTokenUsage(stdout: string, stderr: string): TokenUsage | und
     usage.totalTokens = usage.inputTokens + usage.outputTokens;
   }
 
-  return found ? usage : undefined;
+  // Gemini CLI reports no cost.
+  return found ? { ...usage, costSource: 'unknown' } : undefined;
 }

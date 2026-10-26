@@ -24,6 +24,7 @@ import { getMoagDir } from '../workspace/moag-paths';
 import { RunSession } from '../models/run-session';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
 import { buildReportRedactor } from './report-redaction';
+import { formatUsd } from '../utils/cost-format';
 
 /** What a run cost in friction: retries, escalations, auto-fixes. */
 export interface RunFrictionReport {
@@ -306,7 +307,8 @@ export function buildFrictionIssueBody(report: RunFrictionReport, notes: string)
   const durationStr = report.summary.durationMs > 0
     ? `${Math.floor(report.summary.durationMs / 60000)}m ${Math.floor((report.summary.durationMs % 60000) / 1000)}s`
     : 'n/a';
-  const costStr = report.summary.estimatedCostUsd > 0 ? `$${report.summary.estimatedCostUsd.toFixed(2)}` : 'n/a';
+  // The friction report has no count of unknown-cost calls, so zero reads "not reported", never "$0".
+  const costStr = report.summary.estimatedCostUsd > 0 ? formatUsd(report.summary.estimatedCostUsd) : 'not reported';
 
   const frictionTable = report.friction.length > 0
     ? `| Task | Attempts | Auto-fixed | Escalated | Error |\n` +

@@ -107,12 +107,19 @@ describe('morning-review — shipped work', () => {
     assert.ok(row.includes('—'), 'unknown cost must not render as a number');
   });
 
-  it('flags that a night with commits but no recorded cost was not free', () => {
-    const md = renderReviewMarkdown(digest({ shipped: [commit({ costUsd: undefined })] }), NOW);
-    assert.ok(md.includes('No cost was recorded'));
+  it('a night with commits but no recorded cost reads "unknown", never $0.0000', () => {
+    const md = renderReviewMarkdown(digest({ shipped: [commit({ costUsd: undefined }), commit({ sha: 'def67890', costUsd: undefined })], totalCostUsd: 0 }), NOW);
+    assert.ok(md.includes('## Total cost: unknown for 2 calls'), md);
+    assert.ok(!md.includes('$0.0000'), md);
+  });
+
+  it('a mixed night names the unknown calls next to the known total', () => {
+    const md = renderReviewMarkdown(digest({ shipped: [commit({ costUsd: 0.25 }), commit({ sha: 'def67890', costUsd: undefined })], totalCostUsd: 0.25 }), NOW);
+    assert.ok(md.includes('## Total cost: $0.2500 + 1 call of unknown cost'), md);
   });
 
   it('makes no such claim when nothing shipped', () => {
-    assert.ok(!renderReviewMarkdown(digest(), NOW).includes('No cost was recorded'));
+    const md = renderReviewMarkdown(digest(), NOW);
+    assert.ok(!md.includes('unknown'), md);
   });
 });

@@ -191,7 +191,7 @@ describe('onosoo-relay-host', () => {
     captured!.onRunRelayed!(plan([undefined], 'claude'));
     captured!.onRunRelayed!(plan([undefined], 'claude'));
     assert.equal(show.callCount, 1);
-    assert.ok(String(show.firstCall.args[0]).startsWith('ONOSOO will show $0.00 for Claude runs'));
+    assert.ok(String(show.firstCall.args[0]).startsWith('ONOSOO shows $0.00 for Claude runs in text mode because Claude reports cost only in JSON output'));
     assert.deepEqual(show.firstCall.args.slice(1), ['Open Setting', "Don't Show Again"]);
   });
 

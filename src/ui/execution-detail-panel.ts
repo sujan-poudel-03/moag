@@ -13,6 +13,7 @@ import { getEngine } from '../adapters/index';
 import { generateId } from '../models/plan';
 import { designSystemCssTokens } from './design-system';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
+import { formatTotal, formatUsageCost } from '../utils/cost-format';
 
 /** Tracks open panels by threadId so clicking the same thread reuses its panel. */
 const openPanels = new Map<string, ExecutionDetailPanel>();
@@ -467,12 +468,6 @@ function timeAgo(isoDate: string): string {
   return `${days}d ago`;
 }
 
-function formatCost(cost: number): string {
-  if (cost === 0) { return 'Free'; }
-  if (cost < 0.01) { return `$${cost.toFixed(4)}`; }
-  return `$${cost.toFixed(2)}`;
-}
-
 function formatTokens(count: number): string {
   if (count >= 1_000_000) { return `${(count / 1_000_000).toFixed(1)}M`; }
   if (count >= 1_000) { return `${(count / 1_000).toFixed(1)}K`; }
@@ -553,7 +548,7 @@ function buildSessionListHtml(webview: vscode.Webview, threadHeads: HistoryEntry
       <div class="active-run-stats">
         <span>${activeSession.tasksCompleted}/${activeSession.taskCount} tasks</span>
         <span>${activeSession.engines.map(e => `<span class="engine-pill ${engineBadgeClass(e)}">${escHtml(e)}</span>`).join(' ')}</span>
-        <span>${formatCost(activeSession.totalCost)}</span>
+        <span>${formatTotal(activeSession.totalCost, activeSession.costUnknownCalls ?? 0)}</span>
       </div>
       <button class="active-run-open" data-run-id="${escHtml(activeSession.id)}">View Details</button>
     </div>`;
@@ -593,7 +588,7 @@ function buildSessionListHtml(webview: vscode.Webview, threadHeads: HistoryEntry
           <span class="token-info">
             ${formatTokens(session.totalTokensIn)} in / ${formatTokens(session.totalTokensOut)} out
           </span>
-          <span class="cost-info">${formatCost(session.totalCost)}</span>
+          <span class="cost-info">${formatTotal(session.totalCost, session.costUnknownCalls ?? 0)}</span>
           <span class="time-ago">${timeAgo(session.startedAt)}</span>
         </div>
       </div>`;
@@ -697,7 +692,7 @@ function buildThreadHtml(webview: vscode.Webview, entries: HistoryEntry[]): stri
   const threadId = entries.length > 0 ? escHtml(entries[0].threadId ?? entries[0].id) : '';
 
   // Compute thread-level summary
-  let totalTokensIn = 0, totalTokensOut = 0, totalCost = 0, totalDuration = 0;
+  let totalTokensIn = 0, totalTokensOut = 0, totalCost = 0, totalDuration = 0, unknownCostCalls = 0;
   const enginesUsed = new Set<string>();
   const modelsUsed = new Set<string>();
 
@@ -708,6 +703,7 @@ function buildThreadHtml(webview: vscode.Webview, entries: HistoryEntry[]): stri
       totalTokensIn += entry.result.tokenUsage.inputTokens ?? 0;
       totalTokensOut += entry.result.tokenUsage.outputTokens ?? 0;
       totalCost += entry.result.tokenUsage.estimatedCost ?? 0;
+      if (entry.result.tokenUsage.costSource === 'unknown') { unknownCostCalls++; }
     }
     totalDuration += entry.result.durationMs;
   }
@@ -724,7 +720,7 @@ function buildThreadHtml(webview: vscode.Webview, entries: HistoryEntry[]): stri
     <span class="engine-pill ${engineBadgeClass(engine as EngineId)}">${escHtml(engine)}</span>
     <span class="summary-stat">${turnCount} turn${turnCount !== 1 ? 's' : ''}</span>
     <span class="summary-stat">${formatTokens(totalTokensIn)} in / ${formatTokens(totalTokensOut)} out</span>
-    <span class="summary-stat">${formatCost(totalCost)}</span>
+    <span class="summary-stat">${formatTotal(totalCost, unknownCostCalls)}</span>
     <span class="summary-stat">${formatDuration(totalDuration)}</span>
   </div>` : '';
 
@@ -803,7 +799,7 @@ function buildTurnCard(entry: HistoryEntry): string {
     const parts: string[] = [];
     if (u.inputTokens !== undefined) { parts.push(`${formatTokens(u.inputTokens)} in`); }
     if (u.outputTokens !== undefined) { parts.push(`${formatTokens(u.outputTokens)} out`); }
-    if (u.estimatedCost !== undefined) { parts.push(formatCost(u.estimatedCost)); }
+    if (u.estimatedCost !== undefined || u.costSource === 'unknown') { parts.push(formatUsageCost(u)); }
     tokenLine = parts.join(' &middot; ');
   }
 
@@ -931,14 +927,15 @@ function buildRunDetailHtml(webview: vscode.Webview, session: RunSession | null,
   }
 
   // Model breakdown
-  const modelCounts = new Map<string, { count: number; tokensIn: number; tokensOut: number; cost: number }>();
+  const modelCounts = new Map<string, { count: number; tokensIn: number; tokensOut: number; cost: number; unknown: number }>();
   for (const entry of entries) {
     const mid = entry.modelId || 'unknown';
-    const existing = modelCounts.get(mid) ?? { count: 0, tokensIn: 0, tokensOut: 0, cost: 0 };
+    const existing = modelCounts.get(mid) ?? { count: 0, tokensIn: 0, tokensOut: 0, cost: 0, unknown: 0 };
     existing.count++;
     existing.tokensIn += entry.result.tokenUsage?.inputTokens ?? 0;
     existing.tokensOut += entry.result.tokenUsage?.outputTokens ?? 0;
     existing.cost += entry.result.tokenUsage?.estimatedCost ?? 0;
+    if (entry.result.tokenUsage?.costSource === 'unknown') { existing.unknown++; }
     modelCounts.set(mid, existing);
   }
 
@@ -951,7 +948,7 @@ function buildRunDetailHtml(webview: vscode.Webview, session: RunSession | null,
         <td>${escHtml(name)}</td>
         <td>${stats.count}</td>
         <td>${formatTokens(stats.tokensIn)} / ${formatTokens(stats.tokensOut)}</td>
-        <td>${formatCost(stats.cost)}</td>
+        <td>${formatTotal(stats.cost, stats.unknown)}</td>
       </tr>`;
     }).join('');
 
@@ -999,7 +996,7 @@ function buildRunDetailHtml(webview: vscode.Webview, session: RunSession | null,
     </div>
     <div class="run-summary-row">
       <span class="summary-stat">${formatTokens(session.totalTokensIn)} in / ${formatTokens(session.totalTokensOut)} out</span>
-      <span class="summary-stat cost-highlight">${formatCost(session.totalCost)}</span>
+      <span class="summary-stat cost-highlight">${formatTotal(session.totalCost, session.costUnknownCalls ?? 0)}</span>
       <span class="summary-stat time-ago">${timeAgo(session.startedAt)}</span>
     </div>
   </div>

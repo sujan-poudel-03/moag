@@ -598,10 +598,13 @@ export class TaskRunner {
         taskName: task.name,
         engine: engineId,
         prompt: task.prompt?.trim() || task.name,
-        tokenUsageAvailable: result.tokenUsage !== undefined,
+        // Tokens are available only when the engine counted some; an empty usage block is not usage.
+        tokenUsageAvailable: ((result.tokenUsage?.inputTokens ?? 0) + (result.tokenUsage?.outputTokens ?? 0)
+          + (result.tokenUsage?.totalTokens ?? 0)) > 0,
         inputTokens: result.tokenUsage?.inputTokens ?? 0,
         outputTokens: result.tokenUsage?.outputTokens ?? 0,
         estimatedCostUsd: result.tokenUsage?.estimatedCost ?? 0,
+        costKnown: typeof result.tokenUsage?.estimatedCost === 'number' && result.tokenUsage.costSource !== 'unknown',
       };
       this._usageRecorder(record);
     } catch { /* a throwing recorder must never break task execution */ }

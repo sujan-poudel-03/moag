@@ -75,6 +75,8 @@ import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
 import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
 import { costLedger } from './utils/cost-ledger';
 import { isOwnStack } from './utils/error-log';
+import { formatTotal, formatUsageCost } from './utils/cost-format';
+import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from './utils/budget-notice';
 
 // ─── Shared state ───
 
@@ -158,6 +160,8 @@ let progressResolve: (() => void) | null = null;
 let progressReport: vscode.Progress<{ message?: string; increment?: number }> | null = null;
 
 const NO_ENGINES_PROMPT_KEY = 'agentTaskPlayer.noEnginesPromptShown';
+/** globalState: the user dismissed the "ceiling cannot stop unreported cost" warning for good. */
+const BUDGET_NOTICE_DISMISSED_KEY = 'agentTaskPlayer.budgetUnenforceableNoticeDismissed';
 const RECENT_PLANS_KEY = 'moag.recentPlans';
 const CLAUDE_INSTALL_URL = 'https://www.npmjs.com/package/@anthropic-ai/claude-code';
 const CODEX_INSTALL_URL = 'https://www.npmjs.com/package/@openai/codex';
@@ -428,7 +432,11 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
           errorLines: classification?.errorLines.slice(0, 5),
           attemptCount: taskEntries.length > 1 ? taskEntries.length : undefined,
           tokenUsage: latestEntry?.result.tokenUsage
-            ? { totalTokens: latestEntry.result.tokenUsage.totalTokens, estimatedCost: latestEntry.result.tokenUsage.estimatedCost }
+            ? {
+              totalTokens: latestEntry.result.tokenUsage.totalTokens,
+              estimatedCost: latestEntry.result.tokenUsage.estimatedCost,
+              costSource: latestEntry.result.tokenUsage.costSource,
+            }
             : undefined,
           sourceIssueNumber: task.sourceIssueNumber,
           sourceIssueRepo: task.sourceIssueRepo,
@@ -1470,6 +1478,21 @@ export function activate(context: vscode.ExtensionContext): void {
   // costBudgetUsd), so the user is never stuck without reloading the window.
   setCeilingGuard(() => !ceilingBlocked);
   context.subscriptions.push({ dispose: () => setCeilingGuard(null) });
+  // The ceiling counts recorded cost only: say once when a call it cannot see happens.
+  const offBudgetNotice = watchUnenforceableBudget({
+    budget: () => vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('costBudgetUsd', 10),
+    onFirst: () => {
+      if (context.globalState.get<boolean>(BUDGET_NOTICE_DISMISSED_KEY, false)) { return; }
+      void vscode.window.showWarningMessage(BUDGET_UNENFORCEABLE_TEXT, 'Open Setting', "Don't Show Again").then((choice) => {
+        if (choice === 'Open Setting') {
+          void vscode.commands.executeCommand('workbench.action.openSettings', 'agentTaskPlayer.engines.claude.outputFormat');
+        } else if (choice === "Don't Show Again") {
+          void Promise.resolve(context.globalState.update(BUDGET_NOTICE_DISMISSED_KEY, true)).catch(() => undefined);
+        }
+      }, () => undefined);
+    },
+  });
+  context.subscriptions.push({ dispose: offBudgetNotice });
   runner.setPromptLibrary(promptLibraryStore);
 
   // Contribution Ledger: record per-engine-call usage facts to
@@ -1825,6 +1848,7 @@ export function activate(context: vscode.ExtensionContext): void {
           totalTokensIn: session.totalTokensIn + (usage?.inputTokens || 0),
           totalTokensOut: session.totalTokensOut + (usage?.outputTokens || 0),
           totalCost: session.totalCost + (usage?.estimatedCost || 0),
+          costUnknownCalls: (session.costUnknownCalls ?? 0) + (usage?.costSource === 'unknown' ? 1 : 0),
         });
       }
     }
@@ -1897,6 +1921,7 @@ export function activate(context: vscode.ExtensionContext): void {
           totalTokensIn: session.totalTokensIn + (usage?.inputTokens || 0),
           totalTokensOut: session.totalTokensOut + (usage?.outputTokens || 0),
           totalCost: session.totalCost + (usage?.estimatedCost || 0),
+          costUnknownCalls: (session.costUnknownCalls ?? 0) + (usage?.costSource === 'unknown' ? 1 : 0),
         });
       }
     }
@@ -6856,12 +6881,12 @@ function cmdShowCostSummary(): void {
   }
 
   // Aggregate stats by engine
-  const stats = new Map<string, { runs: number; totalMs: number; inputTokens: number; outputTokens: number; totalTokens: number; cost: number }>();
+  const stats = new Map<string, { runs: number; totalMs: number; inputTokens: number; outputTokens: number; totalTokens: number; cost: number; unknown: number }>();
 
   for (const entry of entries) {
     let s = stats.get(entry.engine);
     if (!s) {
-      s = { runs: 0, totalMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 };
+      s = { runs: 0, totalMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, unknown: 0 };
       stats.set(entry.engine, s);
     }
     s.runs++;
@@ -6872,6 +6897,7 @@ function cmdShowCostSummary(): void {
       s.outputTokens += usage.outputTokens ?? 0;
       s.totalTokens += usage.totalTokens ?? 0;
       s.cost += usage.estimatedCost ?? 0;
+      if (usage.costSource === 'unknown') { s.unknown++; }
     }
   }
 
@@ -6882,6 +6908,7 @@ function cmdShowCostSummary(): void {
   let grandTotalMs = 0;
   let grandTotalTokens = 0;
   let grandTotalCost = 0;
+  let grandUnknown = 0;
 
   doc += `| Engine | Runs | Total Time | Tokens (In/Out/Total) | Est. Cost |\n`;
   doc += `|--------|------|------------|----------------------|----------|\n`;
@@ -6890,15 +6917,16 @@ function cmdShowCostSummary(): void {
     grandTotalMs += s.totalMs;
     grandTotalTokens += s.totalTokens;
     grandTotalCost += s.cost;
+    grandUnknown += s.unknown;
     const time = formatDuration(s.totalMs);
     const tokens = s.totalTokens > 0 ? `${s.inputTokens} / ${s.outputTokens} / ${s.totalTokens}` : 'N/A';
-    const cost = s.cost > 0 ? `$${s.cost.toFixed(4)}` : 'N/A';
+    const cost = s.cost > 0 || s.unknown > 0 ? formatTotal(s.cost, s.unknown) : 'N/A';
     doc += `| ${engine} | ${s.runs} | ${time} | ${tokens} | ${cost} |\n`;
   }
 
   doc += `\n**Grand Total:** ${formatDuration(grandTotalMs)}`;
   if (grandTotalTokens > 0) { doc += ` | ${grandTotalTokens} tokens`; }
-  if (grandTotalCost > 0) { doc += ` | $${grandTotalCost.toFixed(4)}`; }
+  if (grandTotalCost > 0 || grandUnknown > 0) { doc += ` | ${formatTotal(grandTotalCost, grandUnknown)}`; }
   doc += `\n\n---\n\n`;
 
   // Recent entries detail
@@ -6910,7 +6938,7 @@ function cmdShowCostSummary(): void {
     const time = formatDuration(e.result.durationMs);
     const usage = e.result.tokenUsage;
     const tokens = usage?.totalTokens ? String(usage.totalTokens) : '-';
-    const cost = usage?.estimatedCost ? `$${usage.estimatedCost.toFixed(4)}` : '-';
+    const cost = usage && (usage.costSource === 'unknown' || typeof usage.estimatedCost === 'number') ? formatUsageCost(usage) : '-';
     const status = e.status === 'completed' ? 'Pass' : 'Fail';
     doc += `| ${e.taskName} | ${e.engine} | ${time} | ${tokens} | ${cost} | ${status} |\n`;
   }

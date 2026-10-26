@@ -100,7 +100,7 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
       if (!planUsesClaude(plan)) { return; }
       shownThisSession = true;
       void vscode.window.showInformationMessage(
-        'ONOSOO will show $0.00 for Claude runs: Claude reports its cost only in JSON output. Set agentTaskPlayer.engines.claude.outputFormat to "json" to see real cost (live output then appears when each call ends).',
+        'ONOSOO shows $0.00 for Claude runs in text mode because Claude reports cost only in JSON output, and MOAG never guesses a cost. Set agentTaskPlayer.engines.claude.outputFormat to "json" to see real cost (live output then appears when each call ends).',
         'Open Setting',
         "Don't Show Again",
       ).then((choice) => {

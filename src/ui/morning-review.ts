@@ -74,10 +74,14 @@ export function renderReviewMarkdown(d: Digest, now: string): string {
     out.push('');
   }
 
-  out.push(`## Total cost: $${d.totalCostUsd.toFixed(4)}`);
-  // Never let an unknown read as free.
-  if (d.shipped.length > 0 && d.totalCostUsd === 0) {
-    out.push('', '_No cost was recorded on these commits._');
+  // Never let an unknown read as free: a commit with no recorded cost is counted as unknown.
+  const unknownCalls = d.shipped.filter((c) => typeof c.costUsd !== 'number').length;
+  if (unknownCalls > 0 && d.totalCostUsd === 0) {
+    out.push(`## Total cost: unknown for ${unknownCalls} call${unknownCalls === 1 ? '' : 's'}`);
+  } else if (unknownCalls > 0) {
+    out.push(`## Total cost: $${d.totalCostUsd.toFixed(4)} + ${unknownCalls} call${unknownCalls === 1 ? '' : 's'} of unknown cost`);
+  } else {
+    out.push(`## Total cost: $${d.totalCostUsd.toFixed(4)}`);
   }
   return out.join('\n');
 }

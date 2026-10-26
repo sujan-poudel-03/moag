@@ -30,6 +30,11 @@ export interface EngineCallUsage {
   inputTokens: number;
   outputTokens: number;
   estimatedCostUsd: number;
+  /**
+   * False when the engine reported no cost (estimatedCostUsd is then 0, not a
+   * real zero). Absent in entries written before MOAG recorded it.
+   */
+  costKnown?: boolean;
 }
 
 /** A usage event with the resolved developer identity attached. */

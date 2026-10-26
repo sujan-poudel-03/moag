@@ -186,6 +186,22 @@ describe('withCostAccounting', () => {
     assert.equal(unreported.length, 2);
   });
 
+  it('a cost tagged unknown is unreported once and never recorded, even with a number attached', async () => {
+    const seen = collect();
+    const unreported = collectUnreported();
+    const wrapped = withCostAccounting(makeCostAdapter('claude', async () => ({
+      stdout: '', stderr: '', exitCode: 0, durationMs: 1, tokenUsage: { costSource: 'unknown' },
+    })));
+    await wrapped.runTask({ prompt: 'p', cwd: '.', costLabel: 'task' });
+    const odd = withCostAccounting(makeCostAdapter('codex', async () => ({
+      stdout: '', stderr: '', exitCode: 0, durationMs: 1, tokenUsage: { estimatedCost: 3, costSource: 'unknown' },
+    })));
+    await odd.runTask({ prompt: 'p', cwd: '.', costLabel: 'task' });
+    assert.equal(seen.length, 0);
+    assert.deepEqual(unreported, [{ engineId: 'claude', label: 'task' }, { engineId: 'codex', label: 'task' }]);
+    assert.equal(costLedger.getLifetimeUsd(), 0);
+  });
+
   it('a reported cost is recorded once and never also reported as unreported', async () => {
     const unreported = collectUnreported();
     const sources: string[] = [];

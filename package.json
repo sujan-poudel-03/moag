@@ -1279,7 +1279,7 @@
           "type": "number",
           "default": 10,
           "minimum": 0,
-          "description": "Hard spend ceiling in USD, counted across every engine call in the process — plan tasks and authoring calls alike. When it is passed the run stops and parks, rather than warning and continuing. Raise it for a long unattended run; set it to 0 only if you genuinely want no ceiling at all."
+          "description": "Hard spend ceiling in USD, counted across every engine call in the process — plan tasks and authoring calls alike. When it is passed the run stops and parks, rather than warning and continuing. Raise it for a long unattended run; set it to 0 only if you genuinely want no ceiling at all. Engines that report no cost (Claude in text mode, Codex, Gemini, Copilot, custom) are not counted, so the ceiling cannot stop them."
         },
         "agentTaskPlayer.prdLoop.maxFixIterations": {
           "type": "number",
