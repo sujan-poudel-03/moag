@@ -122,8 +122,10 @@ async function migrateOnce(context: SecretsContext): Promise<void> {
   if (found.length === 0) { return; }
 
   const existing = await context.secrets.get(SECRET_KEYS.anthropicApiKey);
-  if (!existing) {
-    // Throws on failure, so the settings are left as they were.
+  // A key in settings that differs from the stored one is the newer one: the user
+  // just typed it there. Throws on failure, so the settings are left as they were.
+  const replaced = !!existing && existing !== found[0].value;
+  if (!existing || replaced) {
     await context.secrets.store(SECRET_KEYS.anthropicApiKey, found[0].value);
   }
 
@@ -134,9 +136,11 @@ async function migrateOnce(context: SecretsContext): Promise<void> {
   if (cleared.length === 0) { return; }
 
   const where = cleared.map((s) => s.label).join(', ');
-  const lead = existing
-    ? `Removed the Anthropic API key from ${where}. MOAG keeps the key it already had in VS Code's secret storage.`
-    : `Moved the Anthropic API key from ${where} to VS Code's secret storage.`;
+  const lead = replaced
+    ? `MOAG moved your new Anthropic key into secure storage (from ${where}), replacing the one stored before.`
+    : existing
+      ? `Removed the Anthropic API key from ${where}. It matches the key already in VS Code's secret storage.`
+      : `Moved the Anthropic API key from ${where} to VS Code's secret storage.`;
   const rotate = cleared.some((s) => s.inRepository)
     ? ' It was in a workspace settings file that may be committed to git: rotate the key in the Anthropic console.'
     : '';

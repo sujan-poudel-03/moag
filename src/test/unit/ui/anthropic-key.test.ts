@@ -102,13 +102,31 @@ describe('Anthropic key: settings migration', () => {
     assert.match(w.notices[0], /Folder settings \(app\)/);
   });
 
-  it('an existing secret is not overwritten, but the scopes are still cleared', async () => {
-    const w = world({ global: 'sk-ant-global-key-1234' }, { secret: 'sk-ant-already-stored' });
+  it('a settings key equal to the stored secret: nothing is written, the scope is still cleared', async () => {
+    const w = world({ global: 'sk-ant-already-stored' }, { secret: 'sk-ant-already-stored' });
     await w.mod.migrateAnthropicKeySetting(w.context);
     assert.equal(w.secrets.get(SECRET), 'sk-ant-already-stored');
     assert.deepEqual(w.stores, []);
     assert.equal(w.updates.length, 1);
     assert.equal(w.notices.length, 1);
+    assert.match(w.notices[0], /matches the key already/);
+  });
+
+  it('a settings key that differs from the stored secret is the newer one: it replaces the secret', async () => {
+    const w = world({ workspace: 'sk-ant-newly-typed-key' }, { secret: 'sk-ant-older-stored-key' });
+    await w.mod.migrateAnthropicKeySetting(w.context);
+    assert.equal(w.secrets.get(SECRET), 'sk-ant-newly-typed-key');
+    assert.deepEqual(w.stores, ['sk-ant-newly-typed-key']);
+    assert.deepEqual(w.updates, [{ target: Target.Workspace, value: undefined }]);
+    assert.match(w.notices[0], /^MOAG moved your new Anthropic key into secure storage/);
+    assert.ok(!w.notices[0].includes('sk-ant'), 'no key in the notice');
+  });
+
+  it('a differing key whose store fails keeps both the old secret and the setting', async () => {
+    const w = world({ global: 'sk-ant-newly-typed-key' }, { secret: 'sk-ant-older-stored-key', storeRejects: true });
+    await assert.rejects(w.mod.migrateAnthropicKeySetting(w.context));
+    assert.equal(w.secrets.get(SECRET), 'sk-ant-older-stored-key');
+    assert.equal(w.scopes.global, 'sk-ant-newly-typed-key');
   });
 
   it('with no value anywhere: no store, no update, no notice', async () => {
