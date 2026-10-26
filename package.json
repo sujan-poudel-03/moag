@@ -416,6 +416,16 @@
         "category": "MOAG"
       },
       {
+        "command": "agentTaskPlayer.connectOnosoo",
+        "title": "Connect to ONOSOO Builds",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.disconnectOnosoo",
+        "title": "Disconnect from ONOSOO",
+        "category": "MOAG"
+      },
+      {
         "command": "agentTaskPlayer.shareRunFeedback",
         "title": "Share Run Feedback with MOAG",
         "category": "MOAG",

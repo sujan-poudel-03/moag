@@ -39,6 +39,8 @@ describe('onosoo-relay-host', () => {
   let globalStore: Map<string, unknown>;
   let update: sinon.SinonStub;
   let subscriptions: Array<{ dispose(): unknown }>;
+  let handle: ReturnType<HostModule['initOnosooRelayHost']> | null;
+  let live: boolean;
 
   beforeEach(() => {
     item = {
@@ -53,6 +55,8 @@ describe('onosoo-relay-host', () => {
     globalStore = new Map();
     update = sinon.stub().callsFake(async (k: string, v: unknown) => { globalStore.set(k, v); });
     subscriptions = [];
+    handle = null;
+    live = false;
     sinon.stub(vscodeMock.window, 'createStatusBarItem').returns(item);
     sinon.stub(vscodeMock.workspace, 'onDidChangeConfiguration').callsFake((...args: unknown[]) => {
       configListener = args[0] as typeof configListener;
@@ -76,12 +80,12 @@ describe('onosoo-relay-host', () => {
       '../headless/host-run-relay': {
         createHostRunRelay: (d: HostRunRelayDeps) => {
           captured = d;
-          return { dispose: controllerDispose, status: 'none', live: false };
+          return { dispose: controllerDispose, status: 'none', get live() { return live; } };
         },
         probeRelayStatus: probe,
       },
     }) as HostModule;
-    mod.initOnosooRelayHost({
+    handle = mod.initOnosooRelayHost({
       context: {
         globalState: { get: <T>(k: string, d: T): T => (globalStore.has(k) ? globalStore.get(k) as T : d), update, keys: () => [], setKeysForSync: () => undefined },
         subscriptions,
@@ -96,6 +100,23 @@ describe('onosoo-relay-host', () => {
   }
 
   // ─── status bar ───
+
+  it('reprobe() redraws the status bar without a restart: hidden, then "ONOSOO" once a key is saved', () => {
+    probe.returns('none');
+    init();
+    assert.equal(item.visible, false);
+    probe.returns('on');
+    handle!.reprobe();
+    assert.equal(item.visible, true);
+    assert.equal(item.text, '$(cloud) ONOSOO');
+  });
+
+  it('isLive() follows the controller', () => {
+    init();
+    assert.equal(handle!.isLive(), false);
+    live = true;
+    assert.equal(handle!.isLive(), true);
+  });
 
   it('renders every status, and hides for none', () => {
     init();

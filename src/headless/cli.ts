@@ -20,7 +20,11 @@
  *   moag standards propose [--stack <id>] [--write [--force]]
  *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
  *   moag host   [run | init | draft <project> | status | stop <env> | remove <env>]
+ *   moag pair   [<key>] [--url <base>]
+ *   moag --version | moag help
  *
+ * `pair`  saves the ONOSOO device key to the user-level onosoo.json (the key from stdin when
+ *          omitted, so it stays out of shell history) and checks it with ONOSOO.
  * `host`  runs approved project branches as live environments for ONOSOO previews, behind a
  *          gateway only workspace members get through (src/host/, docs/host-agent.md).
  * `run`   executes a single plan file, or a one-shot prompt (`--prompt`) which is
@@ -116,7 +120,8 @@ import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
-import { OnosooRelay, RelayHttpClient } from './onosoo-relay';
+import { OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
+import { checkPairing, PairError, writePairing } from './onosoo-pair';
 import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from '../utils/budget-notice';
 import {
   buildRunMeta, forgetRelayEnv, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
@@ -194,6 +199,8 @@ export interface Args {
   stack?: string;
   /** `standards check` only: check the static rules but run none of the profile's commands. */
   noCommands?: boolean;
+  /** `pair` only: the ONOSOO base URL (default: the hosted ONOSOO). */
+  url?: string;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -262,6 +269,7 @@ export function parseArgs(argv: string[]): Args {
       a.maxUsd = Number.isFinite(n) && n > 0 ? n : NaN;
     }
     else if (arg === '--into') { const v = rest[++i]; if (v) { a.into = v; } }
+    else if (arg === '--url') { const v = rest[++i]; if (v) { a.url = v; } }
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
     // Resolved after the loop so a later --cwd still applies, whatever the flag order.
@@ -2114,7 +2122,137 @@ async function cmdConfig(args: Args): Promise<number> {
   return 2;
 }
 
+// ─── moag pair ───────────────────────────────────────────────────────────────
+
+const PAIR_USAGE = 'Usage: moag pair [<key>] [--url <base>]   (without <key>, the key is read from stdin)\n';
+
+/** What `moag pair` reads and writes; injectable for tests. */
+export interface PairDeps {
+  /** One line from stdin (a TTY prompts with echo off). */
+  readKey?: () => Promise<string>;
+  http?: RelayHttpClient;
+  /** Where onosoo.json lives (default: process.env). */
+  env?: NodeJS.ProcessEnv;
+  out?: (s: string) => void;
+  err?: (s: string) => void;
+}
+
+/**
+ * Read the device key: on a TTY, a prompt with echo off; otherwise the first
+ * line of stdin. Resolves '' when nothing was given.
+ */
+function readKeyFromStdin(): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    return new Promise((resolve) => {
+      let buf = '';
+      stdin.setEncoding('utf-8');
+      stdin.on('data', (c: string) => { buf += c; });
+      stdin.on('end', () => resolve((buf.split(/\r?\n/)[0] ?? '').trim()));
+      stdin.on('error', () => resolve(''));
+    });
+  }
+  return new Promise((resolve) => {
+    process.stderr.write('Paste the ONOSOO device key: ');
+    let key = '';
+    stdin.setRawMode?.(true);
+    stdin.setEncoding('utf-8');
+    stdin.resume();
+    const done = (value: string): void => {
+      stdin.off('data', onData);
+      stdin.setRawMode?.(false);
+      stdin.pause();
+      process.stderr.write('\n');
+      resolve(value.trim());
+    };
+    const onData = (chunk: string): void => {
+      for (const ch of chunk) {
+        if (ch === '\r' || ch === '\n') { done(key); return; }
+        if (ch === '\u0003' || ch === '\u0004') { done(''); return; } // Ctrl+C / Ctrl+D: nothing entered
+        if (ch === '\u007f' || ch === '\b') { key = key.slice(0, -1); continue; }
+        key += ch;
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+/**
+ * `moag pair [<key>] [--url <base>]`: save the device key to onosoo.json, then
+ * check it with ONOSOO. Exit 0 accepted (or saved but not confirmed, with a
+ * warning), 1 refused, 2 usage error or an invalid key / URL. Never prints the
+ * key; never throws.
+ */
+export async function cmdPair(args: Args, deps: PairDeps = {}): Promise<number> {
+  const out = deps.out ?? ((s: string): void => { process.stdout.write(s); });
+  const err = deps.err ?? ((s: string): void => { process.stderr.write(s); });
+  const env = deps.env ?? process.env;
+  try {
+    const key = (args.positionals[0] ?? '').trim() || await (deps.readKey ?? readKeyFromStdin)();
+    if (!key) {
+      err(PAIR_USAGE);
+      return 2;
+    }
+    let result: Awaited<ReturnType<typeof writePairing>>;
+    try {
+      result = await writePairing({ key, url: args.url, env });
+    } catch (e) {
+      if (e instanceof PairError) {
+        err(`${e.message}\n${PAIR_USAGE}`);
+        return 2;
+      }
+      err('Could not save the ONOSOO pairing.\n');
+      return 2;
+    }
+    if (result.spoolDiscarded > 0) {
+      out(`The key changed: discarded ${result.spoolDiscarded} unsent run file${result.spoolDiscarded === 1 ? '' : 's'} from the previous pairing.\n`);
+    }
+    if (result.aclApplied === false) {
+      err('Warning: could not restrict the MOAG config folder to your user account (icacls failed).\n');
+    }
+    if (relayConfigEnv().MOAG_ONOSOO_KEY) {
+      err('MOAG_ONOSOO_KEY in this environment overrides the saved key.\n');
+    }
+    const outcome = await checkPairing(result.saved, deps.http);
+    if (outcome === 'accepted') {
+      out('Paired. ONOSOO accepted the key.\n');
+      return 0;
+    }
+    if (outcome === 'refused') {
+      out('Saved, but ONOSOO refused the key: it was revoked or mistyped. Pair again with a new key.\n');
+      return 1;
+    }
+    out(`Saved. Could not confirm with ONOSOO (${outcome.unverified}); runs will relay when it is reachable.\n`);
+    return 0;
+  } catch {
+    err('Could not pair with ONOSOO.\n');
+    return 2;
+  }
+}
+
 // ─── entry ───────────────────────────────────────────────────────────────────
+
+const MAIN_USAGE =
+  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|bench> ...\n' +
+  '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
+  '       moag --version | moag help\n' +
+  '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
+  '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
+  '                       no standards gate (static rules and profile commands) in verification\n' +
+  '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
+  '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>] [--no-standards] [--base <ref>]\n' +
+  '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
+  '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
+  '  moag config <get-engine | set-engine <id>>\n' +
+  '  moag queue <list | resolve <id>>\n' +
+  '  moag digest [--since <when>]\n' +
+  '  moag land [--into <branch>] [--merge]\n' +
+  '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n' +
+  '  moag standards show\n' +
+  '  moag standards check [--base <ref>] [--no-commands]     exit 0 ok · 1 blocking failure · 5 nothing checked · 6 blocking not checked\n' +
+  '  moag standards propose [--stack <id>] [--write [--force]]\n' +
+  '  moag pair [<key>] [--url <base>]   save the ONOSOO device key (read from stdin when omitted) and check it\n' +
+  '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n';
 
 /** The CLI entry point. Exported so a test can drive dispatch. */
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
@@ -2125,7 +2263,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     // It reads the device key from the captured snapshot, like the relay.
     return require('../host/cli').cmdHost(argv.slice(1), relayConfigEnv());
   }
+  if (argv[0] === '-v' || argv[0] === '--version' || argv[0] === 'version') {
+    process.stdout.write(readMoagVersion() + '\n');
+    return 0;
+  }
+  if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
+    process.stdout.write(MAIN_USAGE);
+    return 0;
+  }
   const args = parseArgs(argv);
+  if (args.command === 'pair') {
+    // No setup() and no shim: pairing writes one user-level file and makes one HTTP call.
+    return cmdPair(args);
+  }
   // Hidden: the ONOSOO remote child, started by `moag daemon` through sudo (docs/onosoo-remote.md).
   if (args.command === 'remote-child') {
     return require('./remote-child').remoteChildMain();
@@ -2186,26 +2336,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     // No setup() and no shim: the standards file is read, checked and proposed without the runner.
     return cmdStandards(args);
   }
-  process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench> ...\n' +
-    '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
-    '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
-    '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
-    '                       no standards gate (static rules and profile commands) in verification\n' +
-    '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
-    '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>] [--no-standards] [--base <ref>]\n' +
-    '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
-    '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
-    '  moag config <get-engine | set-engine <id>>\n' +
-    '  moag queue <list | resolve <id>>\n' +
-    '  moag digest [--since <when>]\n' +
-    '  moag land [--into <branch>] [--merge]\n' +
-    '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n' +
-    '  moag standards show\n' +
-    '  moag standards check [--base <ref>] [--no-commands]     exit 0 ok · 1 blocking failure · 5 nothing checked · 6 blocking not checked\n' +
-    '  moag standards propose [--stack <id>] [--write [--force]]\n' +
-    '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n',
-  );
+  process.stderr.write(MAIN_USAGE);
   return 2;
 }
 

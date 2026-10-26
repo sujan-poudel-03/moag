@@ -41,8 +41,16 @@ export interface OnosooRelayHostDeps {
   log(line: string): void;
 }
 
+/** What activate() keeps: the pairing commands and the PR follow-up use it. */
+export interface OnosooRelayHost {
+  /** Re-read the pairing and redraw the status bar (after Connect / Disconnect). */
+  reprobe(): void;
+  /** True while a run is being relayed. */
+  isLive(): boolean;
+}
+
 /** Call once during activate(), after the runner exists. */
-export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
+export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost {
   const env = (): NodeJS.ProcessEnv => ({ ...process.env, ...deps.relayEnv });
   const cwd = (): string | null => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? null;
   const enabled = (): boolean => vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('onosoo.relay', true);
@@ -130,4 +138,8 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): void {
   });
 
   deps.context.subscriptions.push(item, configListener, foldersListener, { dispose: () => controller.dispose() });
+  return {
+    reprobe,
+    isLive: () => controller.live,
+  };
 }

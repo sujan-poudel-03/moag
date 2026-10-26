@@ -24,6 +24,14 @@ import { writeFileAtomicSync } from '../utils/file-io';
 /** Path of the ingest function under the configured base URL. */
 export const EVENTS_PATH = '/functions/v1/builds/events';
 
+/**
+ * The hosted ONOSOO backend. Only pairing (`moag pair`, MOAG: Connect to ONOSOO
+ * Builds) fills it in, and it always writes `url` to onosoo.json: a key with no
+ * URL still leaves the relay off here, so a key-only environment never quietly
+ * targets production.
+ */
+export const DEFAULT_ONOSOO_URL = 'https://jcudchpeetqutfplksre.supabase.co';
+
 export interface OnosooConfig {
   key: string;
   baseUrl: string;
@@ -126,7 +134,7 @@ export function resolveOnosooConfig(opts: ResolveOnosooOptions): OnosooConfig | 
     if (!endpoint) {
       stderr(rawUrl
         ? 'ONOSOO relay is off: MOAG_ONOSOO_URL must be an https URL (http only for localhost) with no query, fragment or credentials.\n'
-        : 'ONOSOO relay is off: a device key is set but no URL (set MOAG_ONOSOO_URL or "url" in onosoo.json).\n');
+        : 'ONOSOO relay is off: a device key is set but no URL (set MOAG_ONOSOO_URL or "url" in onosoo.json). Run `moag pair`.\n');
       return null;
     }
 

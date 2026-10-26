@@ -19,7 +19,8 @@ import { cmdResolveParkedItem, cmdShowMorningReview } from './ui/morning-review'
 import { cmdShowSetupGuide } from './ui/setup-guide';
 import { takeRelayEnv } from './headless/run-reporter';
 import { resolveOnosooConfig } from './headless/onosoo-config';
-import { initOnosooRelayHost } from './ui/onosoo-relay-host';
+import { initOnosooRelayHost, OnosooRelayHost } from './ui/onosoo-relay-host';
+import { cmdConnectOnosoo, cmdDisconnectOnosoo, OnosooPairingDeps } from './ui/onosoo-pairing';
 import { cmdClearAnthropicKey, cmdSetAnthropicKey, migrateAnthropicKeySetting, SECRET_KEYS } from './ui/anthropic-key';
 import { setHost } from './core/host';
 import { TaskRunner, classifyFailure } from './runner/runner';
@@ -124,6 +125,9 @@ let watchModeActive = false;
 let watchWatcher: vscode.FileSystemWatcher | null = null;
 let watchStatusBarItem: vscode.StatusBarItem | null = null;
 let watchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+// ─── ONOSOO relay host (status bar, pairing, PR follow-up) ───
+let relayHost: OnosooRelayHost | null = null;
 
 // ─── Process-level error capture ───
 // Kept so deactivate() can take them off the shared extension-host process.
@@ -1519,7 +1523,22 @@ export function activate(context: vscode.ExtensionContext): void {
   // Before a run's first task: remember where the tree stood, so the standards check still
   // sees work the run committed (git.autoCommit, or an agent that commits).
   runner.setRunStartHook((cwd) => rememberStandardsBase(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? cwd));
-  initOnosooRelayHost({ context, runner, relayEnv: onosooRelayEnv, planPath: () => currentPlanPath, loadedPlan: () => currentPlan, log: (l) => moagOutputChannel?.appendLine(l) });
+  relayHost = initOnosooRelayHost({ context, runner, relayEnv: onosooRelayEnv, planPath: () => currentPlanPath, loadedPlan: () => currentPlan, log: (l) => moagOutputChannel?.appendLine(l) });
+  const pairingDeps: OnosooPairingDeps = {
+    relayEnv: onosooRelayEnv,
+    reprobe: () => relayHost?.reprobe(),
+    isLive: () => relayHost?.isLive() ?? false,
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('agentTaskPlayer.connectOnosoo', (arg?: { url?: unknown }) =>
+      cmdConnectOnosoo(pairingDeps, arg).catch((err: unknown) => {
+        void vscode.window.showErrorMessage(`Could not connect to ONOSOO: ${err instanceof Error ? err.message : String(err)}`);
+      })),
+    vscode.commands.registerCommand('agentTaskPlayer.disconnectOnosoo', () =>
+      cmdDisconnectOnosoo(pairingDeps).catch((err: unknown) => {
+        void vscode.window.showErrorMessage(`Could not disconnect from ONOSOO: ${err instanceof Error ? err.message : String(err)}`);
+      })),
+  );
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
