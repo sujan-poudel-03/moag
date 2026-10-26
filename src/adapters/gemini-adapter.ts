@@ -43,26 +43,25 @@ export class GeminiAdapter implements EngineAdapter {
 /** Parse token usage from Gemini CLI output */
 function parseGeminiTokenUsage(stdout: string, stderr: string): TokenUsage | undefined {
   const combined = (stderr || '') + '\n' + (stdout || '');
-  if (!combined.trim()) { return undefined; }
+  if (!combined.trim()) { return { costSource: 'unknown' }; }
 
   const usage: TokenUsage = {};
-  let found = false;
 
   const inputMatch = combined.match(/input[_ ]?tokens[:\s]+([0-9,]+)/i)
     || combined.match(/prompt[_ ]?tokens[:\s]+([0-9,]+)/i);
-  if (inputMatch) { usage.inputTokens = parseInt(inputMatch[1].replace(/,/g, ''), 10); found = true; }
+  if (inputMatch) { usage.inputTokens = parseInt(inputMatch[1].replace(/,/g, ''), 10); }
 
   const outputMatch = combined.match(/output[_ ]?tokens[:\s]+([0-9,]+)/i)
     || combined.match(/candidates?[_ ]?tokens[:\s]+([0-9,]+)/i);
-  if (outputMatch) { usage.outputTokens = parseInt(outputMatch[1].replace(/,/g, ''), 10); found = true; }
+  if (outputMatch) { usage.outputTokens = parseInt(outputMatch[1].replace(/,/g, ''), 10); }
 
   const totalMatch = combined.match(/total[_ ]?tokens[:\s]+([0-9,]+)/i);
-  if (totalMatch) { usage.totalTokens = parseInt(totalMatch[1].replace(/,/g, ''), 10); found = true; }
+  if (totalMatch) { usage.totalTokens = parseInt(totalMatch[1].replace(/,/g, ''), 10); }
 
   if (usage.inputTokens && usage.outputTokens && !usage.totalTokens) {
     usage.totalTokens = usage.inputTokens + usage.outputTokens;
   }
 
   // Gemini CLI reports no cost.
-  return found ? { ...usage, costSource: 'unknown' } : undefined;
+  return { ...usage, costSource: 'unknown' };
 }

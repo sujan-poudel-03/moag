@@ -44,3 +44,38 @@ export function formatTotal(usd: number, unknownCalls: number): string {
 export function isCostKnown(u?: CostLike | null): boolean {
   return !!u && u.costSource !== 'unknown' && typeof u.estimatedCost === 'number' && Number.isFinite(u.estimatedCost);
 }
+
+/** Task types whose run makes an engine call (the others run a command, a check, a gate…). */
+export const ENGINE_TASK_TYPES: readonly string[] = ['agent', 'review', 'visual-test'];
+
+/**
+ * True when this task made an engine call whose cost is not known: no usage at all
+ * (Copilot, custom), usage with no cost (Codex and Gemini token counts), or a cost
+ * tagged unknown. A task that calls no engine never counts. An absent type is an agent task.
+ */
+export function isUnknownCostCall(u: CostLike | null | undefined, taskType?: string): boolean {
+  if (taskType !== undefined && !ENGINE_TASK_TYPES.includes(taskType)) { return false; }
+  return !isCostKnown(u);
+}
+
+/** The usage fields a run session adds up. */
+export interface SessionCostTotals {
+  totalTokensIn: number;
+  totalTokensOut: number;
+  totalCost: number;
+  costUnknownCalls?: number;
+}
+
+/** A run session's totals after one more settled task. Pure. */
+export function sessionUsageDelta(
+  s: SessionCostTotals,
+  u: (CostLike & { inputTokens?: number; outputTokens?: number }) | null | undefined,
+  taskType?: string,
+): Required<SessionCostTotals> {
+  return {
+    totalTokensIn: s.totalTokensIn + (u?.inputTokens || 0),
+    totalTokensOut: s.totalTokensOut + (u?.outputTokens || 0),
+    totalCost: s.totalCost + (isCostKnown(u) ? (u!.estimatedCost as number) : 0),
+    costUnknownCalls: (s.costUnknownCalls ?? 0) + (isUnknownCostCall(u, taskType) ? 1 : 0),
+  };
+}

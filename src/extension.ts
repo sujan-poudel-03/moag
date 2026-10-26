@@ -78,7 +78,7 @@ import { createUsageRecorder, readAllUsageEntries } from './utils/usage-log';
 import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
 import { costLedger } from './utils/cost-ledger';
 import { isOwnStack } from './utils/error-log';
-import { formatTotal, formatUsageCost } from './utils/cost-format';
+import { formatTotal, formatUsageCost, isCostKnown, isUnknownCostCall, sessionUsageDelta } from './utils/cost-format';
 import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from './utils/budget-notice';
 
 // ─── Shared state ───
@@ -469,9 +469,10 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
             ? {
               totalTokens: latestEntry.result.tokenUsage.totalTokens,
               estimatedCost: latestEntry.result.tokenUsage.estimatedCost,
-              costSource: latestEntry.result.tokenUsage.costSource,
+              costSource: isUnknownCostCall(latestEntry.result.tokenUsage, latestEntry.taskType) ? 'unknown' : latestEntry.result.tokenUsage.costSource,
             }
-            : undefined,
+            // An engine call that reported no usage at all (Copilot, custom) is still a call of unknown cost.
+            : latestEntry && isUnknownCostCall(undefined, latestEntry.taskType) ? { costSource: 'unknown' } : undefined,
           sourceIssueNumber: task.sourceIssueNumber,
           sourceIssueRepo: task.sourceIssueRepo,
         };
@@ -1879,10 +1880,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const usage = entry?.result?.tokenUsage;
         runSessionStore.update(runner.currentRunId, {
           tasksCompleted: session.tasksCompleted + 1,
-          totalTokensIn: session.totalTokensIn + (usage?.inputTokens || 0),
-          totalTokensOut: session.totalTokensOut + (usage?.outputTokens || 0),
-          totalCost: session.totalCost + (usage?.estimatedCost || 0),
-          costUnknownCalls: (session.costUnknownCalls ?? 0) + (usage?.costSource === 'unknown' ? 1 : 0),
+          ...sessionUsageDelta(session, usage, getTaskType(task)),
         });
       }
     }
@@ -1952,10 +1950,7 @@ export function activate(context: vscode.ExtensionContext): void {
         runSessionStore.update(runner.currentRunId, {
           tasksCompleted: session.tasksCompleted + 1,
           tasksFailed: session.tasksFailed + 1,
-          totalTokensIn: session.totalTokensIn + (usage?.inputTokens || 0),
-          totalTokensOut: session.totalTokensOut + (usage?.outputTokens || 0),
-          totalCost: session.totalCost + (usage?.estimatedCost || 0),
-          costUnknownCalls: (session.costUnknownCalls ?? 0) + (usage?.costSource === 'unknown' ? 1 : 0),
+          ...sessionUsageDelta(session, usage, getTaskType(task)),
         });
       }
     }
@@ -6964,9 +6959,9 @@ function cmdShowCostSummary(): void {
       s.inputTokens += usage.inputTokens ?? 0;
       s.outputTokens += usage.outputTokens ?? 0;
       s.totalTokens += usage.totalTokens ?? 0;
-      s.cost += usage.estimatedCost ?? 0;
-      if (usage.costSource === 'unknown') { s.unknown++; }
+      if (isCostKnown(usage)) { s.cost += usage.estimatedCost ?? 0; }
     }
+    if (isUnknownCostCall(usage, entry.taskType)) { s.unknown++; }
   }
 
   // Build summary document
@@ -7006,7 +7001,7 @@ function cmdShowCostSummary(): void {
     const time = formatDuration(e.result.durationMs);
     const usage = e.result.tokenUsage;
     const tokens = usage?.totalTokens ? String(usage.totalTokens) : '-';
-    const cost = usage && (usage.costSource === 'unknown' || typeof usage.estimatedCost === 'number') ? formatUsageCost(usage) : '-';
+    const cost = isUnknownCostCall(usage, e.taskType) ? 'cost unknown' : isCostKnown(usage) ? formatUsageCost(usage) : '-';
     const status = e.status === 'completed' ? 'Pass' : 'Fail';
     doc += `| ${e.taskName} | ${e.engine} | ${time} | ${tokens} | ${cost} | ${status} |\n`;
   }

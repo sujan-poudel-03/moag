@@ -83,25 +83,24 @@ function shouldReplaceLegacyModel(configuredModel: string, modelId?: string): bo
 /** Parse token counts from Codex CLI output (stdout + stderr); the cost is always unknown. */
 function parseCodexTokenUsage(stdout: string, stderr: string): TokenUsage | undefined {
   const combined = (stderr || '') + '\n' + (stdout || '');
-  if (!combined.trim()) { return undefined; }
+  if (!combined.trim()) { return { costSource: 'unknown' }; }
 
   const usage: TokenUsage = {};
-  let found = false;
 
   // Match common patterns: "tokens: 1234", "input_tokens: N", "usage: {..."
   const inputMatch = combined.match(/input[_ ]?tokens[:\s]+([0-9,]+)/i);
-  if (inputMatch) { usage.inputTokens = parseInt(inputMatch[1].replace(/,/g, ''), 10); found = true; }
+  if (inputMatch) { usage.inputTokens = parseInt(inputMatch[1].replace(/,/g, ''), 10); }
 
   const outputMatch = combined.match(/output[_ ]?tokens[:\s]+([0-9,]+)/i);
-  if (outputMatch) { usage.outputTokens = parseInt(outputMatch[1].replace(/,/g, ''), 10); found = true; }
+  if (outputMatch) { usage.outputTokens = parseInt(outputMatch[1].replace(/,/g, ''), 10); }
 
   const totalMatch = combined.match(/total[_ ]?tokens[:\s]+([0-9,]+)/i);
-  if (totalMatch) { usage.totalTokens = parseInt(totalMatch[1].replace(/,/g, ''), 10); found = true; }
+  if (totalMatch) { usage.totalTokens = parseInt(totalMatch[1].replace(/,/g, ''), 10); }
 
   if (usage.inputTokens && usage.outputTokens && !usage.totalTokens) {
     usage.totalTokens = usage.inputTokens + usage.outputTokens;
   }
 
   // Never a cost from the output: a "$" figure there is the agent's prose, not billing.
-  return found ? { ...usage, costSource: 'unknown' } : undefined;
+  return { ...usage, costSource: 'unknown' };
 }

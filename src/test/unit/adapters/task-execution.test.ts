@@ -360,6 +360,22 @@ describe('Claude Task Execution', () => {
     assert.deepEqual(result.tokenUsage, { costSource: 'unknown' });
   });
 
+  it('Codex and Gemini with no token counts still tag the cost unknown (never undefined)', async () => {
+    for (const [mod, cls] of [['codex-adapter', 'CodexAdapter'], ['gemini-adapter', 'GeminiAdapter']] as const) {
+      const loaded = proxyquire(`../../../adapters/${mod}`, {
+        vscode: vscodeMock,
+        './base-cli': { runCli: () => Promise.resolve({ stdout: 'done', stderr: '', exitCode: 0, durationMs: 5 }) },
+      });
+      const result = await new loaded[cls]().runTask({ prompt: 'test', cwd: '/tmp' });
+      assert.deepEqual(result.tokenUsage, { costSource: 'unknown' }, mod);
+      const empty = proxyquire(`../../../adapters/${mod}`, {
+        vscode: vscodeMock,
+        './base-cli': { runCli: () => Promise.resolve({ stdout: '', stderr: '', exitCode: 0, durationMs: 5 }) },
+      });
+      assert.deepEqual((await new empty[cls]().runTask({ prompt: 'test', cwd: '/tmp' })).tokenUsage, { costSource: 'unknown' }, mod + ' (empty output)');
+    }
+  });
+
   it('agent prose with a dollar figure gives no cost (Codex)', async () => {
     const { CodexAdapter } = proxyquire('../../../adapters/codex-adapter', {
       vscode: vscodeMock,

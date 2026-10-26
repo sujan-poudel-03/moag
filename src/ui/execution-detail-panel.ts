@@ -13,7 +13,7 @@ import { getEngine } from '../adapters/index';
 import { generateId } from '../models/plan';
 import { designSystemCssTokens } from './design-system';
 import { webviewCsp, webviewNonce, webviewScriptUri } from './webview-assets';
-import { formatTotal, formatUsageCost } from '../utils/cost-format';
+import { formatTotal, formatUsageCost, isCostKnown, isUnknownCostCall } from '../utils/cost-format';
 
 /** Tracks open panels by threadId so clicking the same thread reuses its panel. */
 const openPanels = new Map<string, ExecutionDetailPanel>();
@@ -702,9 +702,9 @@ function buildThreadHtml(webview: vscode.Webview, entries: HistoryEntry[]): stri
     if (entry.result.tokenUsage) {
       totalTokensIn += entry.result.tokenUsage.inputTokens ?? 0;
       totalTokensOut += entry.result.tokenUsage.outputTokens ?? 0;
-      totalCost += entry.result.tokenUsage.estimatedCost ?? 0;
-      if (entry.result.tokenUsage.costSource === 'unknown') { unknownCostCalls++; }
+      if (isCostKnown(entry.result.tokenUsage)) { totalCost += entry.result.tokenUsage.estimatedCost ?? 0; }
     }
+    if (isUnknownCostCall(entry.result.tokenUsage, entry.taskType)) { unknownCostCalls++; }
     totalDuration += entry.result.durationMs;
   }
 
@@ -799,8 +799,10 @@ function buildTurnCard(entry: HistoryEntry): string {
     const parts: string[] = [];
     if (u.inputTokens !== undefined) { parts.push(`${formatTokens(u.inputTokens)} in`); }
     if (u.outputTokens !== undefined) { parts.push(`${formatTokens(u.outputTokens)} out`); }
-    if (u.estimatedCost !== undefined || u.costSource === 'unknown') { parts.push(formatUsageCost(u)); }
+    if (u.estimatedCost !== undefined || isUnknownCostCall(u, entry.taskType)) { parts.push(formatUsageCost(u)); }
     tokenLine = parts.join(' &middot; ');
+  } else if (isUnknownCostCall(undefined, entry.taskType)) {
+    tokenLine = 'cost unknown';
   }
 
   // Auto-selection reason
@@ -934,8 +936,8 @@ function buildRunDetailHtml(webview: vscode.Webview, session: RunSession | null,
     existing.count++;
     existing.tokensIn += entry.result.tokenUsage?.inputTokens ?? 0;
     existing.tokensOut += entry.result.tokenUsage?.outputTokens ?? 0;
-    existing.cost += entry.result.tokenUsage?.estimatedCost ?? 0;
-    if (entry.result.tokenUsage?.costSource === 'unknown') { existing.unknown++; }
+    if (isCostKnown(entry.result.tokenUsage)) { existing.cost += entry.result.tokenUsage?.estimatedCost ?? 0; }
+    if (isUnknownCostCall(entry.result.tokenUsage, entry.taskType)) { existing.unknown++; }
     modelCounts.set(mid, existing);
   }
 
