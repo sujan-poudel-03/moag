@@ -25,6 +25,23 @@ const REPORT_SECRET_ENV = [
   'MOAG_ONOSOO_KEY',
 ] as const;
 
+/**
+ * Replace a Windows path prefix written JSON-escaped (every backslash doubled, as in
+ * `"C:\\Users\\alice\\proj"`) with `replacement`, case-insensitively and only at a path
+ * boundary. scrubPaths handles the single-backslash and forward-slash forms; a JSON
+ * blob in an error message or a log line carries this one. Non-Windows paths: unchanged.
+ */
+export function scrubEscapedPrefix(text: string, prefix: string | null, replacement: string): string {
+  if (!prefix || !/^(?:[A-Za-z]:[\\/]|\\\\)/.test(prefix)) { return text; }
+  let trimmed = prefix;
+  while (/[\\/]$/.test(trimmed)) { trimmed = trimmed.slice(0, -1); }
+  if (/^[A-Za-z]:$/.test(trimmed)) { return text; } // a drive root is no prefix worth hiding
+  const doubled = trimmed.split(/[\\/]/).join('\\\\');
+  const escaped = doubled.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // The next character must end the folder name: a separator, a quote, or anything not part of a name.
+  return text.replace(new RegExp(`${escaped}(?=\\\\|$|[^A-Za-z0-9._-])`, 'gi'), replacement);
+}
+
 /** What a report says when redaction itself failed: never the unredacted text. */
 export const REDACTION_FAILED_TEXT = '[report redaction failed; nothing included]';
 
@@ -54,7 +71,11 @@ export function buildReportRedactor(o: ReportRedactorOptions): (text: string) =>
     const redactor = createRedactor(values);
     return (text: string): string => {
       try {
-        return scrubPaths(redactor.redact(text).text, o.cwd, o.home);
+        let out = redactor.redact(text).text;
+        // JSON-escaped first (C:\\Users\\alice), so the plain pass cannot leave half of it behind.
+        out = scrubEscapedPrefix(out, o.cwd, '.');
+        out = scrubEscapedPrefix(out, o.home, '~');
+        return scrubPaths(out, o.cwd, o.home);
       } catch {
         return REDACTION_FAILED_TEXT;
       }

@@ -39,9 +39,25 @@ export function renderSettingValue(key: string, value: unknown): string {
     || (typeof value === 'object' && value !== null && !Array.isArray(value) && Object.keys(value).length === 0);
   if (SECRET_SETTING_RE.test(key)) { return empty ? '[not set]' : '[set]'; }
   if (value === undefined) { return '(unset)'; }
-  let text: string;
-  try { text = typeof value === 'string' ? value : JSON.stringify(value); } catch { text = String(value); }
-  return cell(text ?? String(value));
+  return cell(plainText(value));
+}
+
+/**
+ * A value as plain text, arrays and objects element by element. Never JSON: JSON
+ * doubles every backslash, and `C:\\Users\\alice` would slip past the path scrubber.
+ */
+function plainText(value: unknown, depth = 0): string {
+  if (value === null) { return 'null'; }
+  if (typeof value !== 'object') { return String(value); }
+  if (depth > 3) { return '…'; }
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => plainText(v, depth + 1)).join(', ')}]`;
+  }
+  return `{${Object.entries(value as Record<string, unknown>).map(([k, v]) => {
+    // A secret-named key inside an object setting is masked like a top-level one.
+    if (SECRET_SETTING_RE.test(k)) { return `${k}: ${v === undefined || v === null || v === '' ? '[not set]' : '[set]'}`; }
+    return `${k}: ${plainText(v, depth + 1)}`;
+  }).join(', ')}}`;
 }
 
 /** A fenced block whose fence cannot be closed by its content. */

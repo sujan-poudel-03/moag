@@ -52,6 +52,24 @@ describe('buildDiagnosticsMarkdown', () => {
     assert.equal(renderSettingValue('a.b', 'x|y\nz'), 'x\\|y z');
   });
 
+  it('arrays and objects render element by element as plain text, never JSON', () => {
+    assert.equal(renderSettingValue('a.gateCommands', ['npm test', 'C:\\Users\\alice\\bin\\lint.cmd']), '[npm test, C:\\Users\\alice\\bin\\lint.cmd]');
+    assert.equal(renderSettingValue('a.env', { NODE_ENV: 'test', apiToken: 'abc123456' }), '{NODE_ENV: test, apiToken: [set]}');
+  });
+
+  it('end to end: no home path survives, in an array setting, a JSON error line, or in mixed case', () => {
+    const home = 'C:\\Users\\alice';
+    const md = buildDiagnosticsMarkdown(facts({
+      settings: [{ key: 'agentTaskPlayer.prdLoop.gateCommands', value: ['npm --prefix C:\\Users\\alice\\app test'], isDefault: false }],
+      errors: [{ ts: '2026-10-26T00:00:00Z', category: 'plan', message: 'bad plan {"path":"C:\\\\Users\\\\alice\\\\proj\\\\plan.json"}' }],
+      daemonLogTail: 'cwd c:\\USERS\\Alice\\AppData\\Local\\moag\\daemon and {"cwd":"c:\\\\users\\\\ALICE\\\\x"}',
+    }));
+    const out = buildReportRedactor({ cwd: null, home, env: {}, extraSecrets: [] })(md);
+    assert.ok(!/alice/i.test(out), out);
+    assert.match(out, /npm --prefix ~\\app test/);
+    assert.match(out, /"path":"~\\\\proj\\\\plan\.json"/);
+  });
+
   it('end to end: a key in a setting, an error, a relay URL and the daemon log appears nowhere after redaction', () => {
     const key = 'onosoo-device-key-Q7Q7Q7Q7';
     const ant = 'sk-ant-api03-' + 'K'.repeat(40);

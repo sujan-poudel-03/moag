@@ -2,7 +2,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { buildReportRedactor, REDACTION_FAILED_TEXT } from '../../../ui/report-redaction';
+import { buildReportRedactor, REDACTION_FAILED_TEXT, scrubEscapedPrefix } from '../../../ui/report-redaction';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const proxyquire = require('proxyquire').noCallThru();
@@ -76,5 +76,27 @@ describe('buildReportRedactor', () => {
       '../utils/redact': { createRedactor: () => { throw new Error('boom'); } },
     });
     assert.equal(build({ cwd: null, home: null, env: {}, extraSecrets: [] })('anything'), REDACTION_FAILED_TEXT);
+  });
+});
+
+describe('scrubEscapedPrefix', () => {
+  const BS = '\\';
+  const doubled = (p: string): string => p.split(BS).join(BS + BS);
+
+  it('replaces the JSON-escaped form of a Windows prefix, case-insensitively, at a boundary only', () => {
+    const text = `{"a":"${doubled('C:\\Users\\alice\\x.ts')}","b":"${doubled('c:\\USERS\\ALICE')}","c":"${doubled('C:\\Users\\alicea\\y')}"}`;
+    const out = scrubEscapedPrefix(text, 'C:\\Users\\alice', '~');
+    assert.equal(out, `{"a":"~${BS}${BS}x.ts","b":"~","c":"${doubled('C:\\Users\\alicea\\y')}"}`);
+  });
+
+  it('leaves POSIX prefixes and drive roots alone', () => {
+    assert.equal(scrubEscapedPrefix('/home/alice/x', '/home/alice', '~'), '/home/alice/x');
+    assert.equal(scrubEscapedPrefix('C:\\\\x', 'C:\\', '~'), 'C:\\\\x');
+  });
+
+  it('the report redactor removes a JSON-escaped home and workspace path', () => {
+    const r = buildReportRedactor({ cwd: 'C:\\Users\\alice\\work\\app', home: 'C:\\Users\\alice', env: {}, extraSecrets: [] });
+    const out = r(`error {"file":"${doubled('C:\\Users\\alice\\work\\app\\src\\a.ts')}","cache":"${doubled('c:\\users\\ALICE\\.cache')}"}`);
+    assert.ok(!/alice/i.test(out), out);
   });
 });
