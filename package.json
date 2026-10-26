@@ -394,6 +394,11 @@
         "icon": "$(bug)"
       },
       {
+        "command": "agentTaskPlayer.exportDiagnostics",
+        "title": "Export Diagnostics",
+        "category": "MOAG"
+      },
+      {
         "command": "agentTaskPlayer.planFromOpenIssues",
         "title": "Plan from Open GitHub Issues",
         "category": "MOAG",

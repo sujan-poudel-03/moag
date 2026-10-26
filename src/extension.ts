@@ -21,6 +21,7 @@ import { takeRelayEnv } from './headless/run-reporter';
 import { resolveOnosooConfig } from './headless/onosoo-config';
 import { initOnosooRelayHost, OnosooRelayHost } from './ui/onosoo-relay-host';
 import { cmdConnectOnosoo, cmdDisconnectOnosoo, OnosooPairingDeps } from './ui/onosoo-pairing';
+import { cmdExportDiagnostics } from './ui/diagnostics-command';
 import { cmdInstallCli } from './ui/cli-install-command';
 import { cmdClearAnthropicKey, cmdSetAnthropicKey, migrateAnthropicKeySetting, SECRET_KEYS } from './ui/anthropic-key';
 import { setHost } from './core/host';
@@ -127,8 +128,38 @@ let watchWatcher: vscode.FileSystemWatcher | null = null;
 let watchStatusBarItem: vscode.StatusBarItem | null = null;
 let watchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+// ─── Secrets an outbound report must never carry ───
+
+/**
+ * Exact values no bug report or diagnostics file may carry: the stored Anthropic
+ * key and the ONOSOO device key. The device key left process.env at activation,
+ * so it is read from the relay snapshot and the saved pairing.
+ */
+async function reportExtraSecrets(
+  context: Pick<vscode.ExtensionContext, 'secrets'>,
+  relayEnv: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string },
+): Promise<string[]> {
+  const out: string[] = [];
+  try {
+    const anthropic = await context.secrets.get(SECRET_KEYS.anthropicApiKey);
+    if (anthropic) { out.push(anthropic); }
+  } catch { /* no secret store */ }
+  if (relayEnv.MOAG_ONOSOO_KEY) { out.push(relayEnv.MOAG_ONOSOO_KEY); }
+  try {
+    const cfg = resolveOnosooConfig({
+      env: { ...process.env, ...relayEnv },
+      cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.tmpdir(),
+      stderr: () => { /* a report must not warn about relay config */ },
+    });
+    if (cfg?.key) { out.push(cfg.key); }
+  } catch { /* no pairing */ }
+  return out;
+}
+
 // ─── ONOSOO relay host (status bar, pairing, PR follow-up) ───
 let relayHost: OnosooRelayHost | null = null;
+/** The relay variables activate() took out of process.env (commands registered later read them). */
+let activationRelayEnv: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string } = {};
 
 // ─── Process-level error capture ───
 // Kept so deactivate() can take them off the shared extension-host process.
@@ -1343,6 +1374,7 @@ async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<voi
 export function activate(context: vscode.ExtensionContext): void {
   // Before anything in this host can spawn: engine probes, git, agents. The device key must never reach a child.
   const onosooRelayEnv = takeRelayEnv(process.env);
+  activationRelayEnv = onosooRelayEnv;
   extensionContext = context;
 
   // Bind the engine core to the VS Code environment (see src/core/host.ts).
@@ -1443,25 +1475,7 @@ export function activate(context: vscode.ExtensionContext): void {
     executionTaskCount: () => executionTaskCount,
     executionTasksFailed: () => executionTasksFailed,
     appendOutput: (line) => moagOutputChannel?.appendLine(line),
-    // Exact values no report may carry. The device key left process.env above,
-    // so it is read from the relay snapshot and the saved pairing.
-    extraSecrets: async () => {
-      const out: string[] = [];
-      try {
-        const anthropic = await context.secrets.get(SECRET_KEYS.anthropicApiKey);
-        if (anthropic) { out.push(anthropic); }
-      } catch { /* no secret store */ }
-      if (onosooRelayEnv.MOAG_ONOSOO_KEY) { out.push(onosooRelayEnv.MOAG_ONOSOO_KEY); }
-      try {
-        const cfg = resolveOnosooConfig({
-          env: { ...process.env, ...onosooRelayEnv },
-          cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir(),
-          stderr: () => { /* a report must not warn about relay config */ },
-        });
-        if (cfg?.key) { out.push(cfg.key); }
-      } catch { /* no pairing */ }
-      return out;
-    },
+    extraSecrets: () => reportExtraSecrets(context, onosooRelayEnv),
   });
 
   // Initialize template store
@@ -2234,6 +2248,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.splitTask', cmdSplitTask),
     vscode.commands.registerCommand('agentTaskPlayer.planFromGitHubIssue', cmdPlanFromGitHubIssue),
     vscode.commands.registerCommand('agentTaskPlayer.reportIssue', cmdReportIssue),
+    vscode.commands.registerCommand('agentTaskPlayer.exportDiagnostics', () =>
+      cmdExportDiagnostics({ context, relayEnv: activationRelayEnv, extraSecrets: () => reportExtraSecrets(context, activationRelayEnv) })
+        .catch((err: unknown) => {
+          void vscode.window.showErrorMessage(`Could not export diagnostics: ${err instanceof Error ? err.message : String(err)}`);
+        })),
     vscode.commands.registerCommand('agentTaskPlayer.planFromOpenIssues', cmdPlanFromOpenIssues),
     vscode.commands.registerCommand('agentTaskPlayer.ghSyncPollNow', () => {
       const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
