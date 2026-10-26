@@ -2707,7 +2707,7 @@ async function createPRFromRun(): Promise<void> {
 
   // The PR on the run's own ONOSOO build. Never affects the PR itself.
   if (outcome.url && relayHost?.notePrCreated) {
-    relayHost.notePrCreated(outcome.url, runner.currentRunId).catch((err: unknown) => {
+    relayHost.notePrCreated(outcome.url).catch((err: unknown) => {
       moagOutputChannel?.appendLine(`[onosoo] PR follow-up failed: ${err instanceof Error ? err.message : String(err)}`);
     });
   }

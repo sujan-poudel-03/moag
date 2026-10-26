@@ -15,6 +15,7 @@ import { reportingSecretValues, ReportingRunner, wireTaskReporting } from './tas
 import { resolveOnosooConfig } from './onosoo-config';
 import { OnosooRelay, RelayHttpClient, REVOKED_MESSAGE } from './onosoo-relay';
 import { OnosooSpool } from './onosoo-spool';
+import { hostSecret } from '../core/host';
 import { createRedactor, Redactor } from '../utils/redact';
 import { Plan, RunnerState } from '../models/types';
 import type { TaskRunner } from '../runner/runner';
@@ -23,7 +24,7 @@ import type { collectTaskChanges } from '../runner/task-changes';
 // ─── Types and constants ───
 
 /** The slice of a TaskRunner the controller uses. */
-export type HostRelayRunner = Pick<TaskRunner, 'on' | 'off' | 'state' | 'currentPlan' | 'currentRunTaskIds' | 'currentRunId' | 'setTaskSettledHook'>;
+export type HostRelayRunner = Pick<TaskRunner, 'on' | 'off' | 'state' | 'currentPlan' | 'currentRunTaskIds' | 'setTaskSettledHook'>;
 
 /** What the status bar shows: no key, relaying switched off, relaying, or the key was refused. */
 export type RelayStatus = 'none' | 'off' | 'on' | 'revoked';
@@ -38,13 +39,13 @@ export const HOST_COST_LABELS: ReadonlySet<string> = new Set(['task']);
 export const PR_FOLLOW_UP_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 /**
- * The run-finished code of a host run: 4 when a budget breach stopped it, 3 when it
- * ended while a manual gate was still waiting for approval, 1 when a task failed or
- * the run was stopped, else 0.
+ * The run-finished code of a host run: 4 when a budget breach stopped it, 1 when a task
+ * failed or the run was stopped, else 0. A host never reports 3: ONOSOO reads 3 as
+ * "awaiting approval" and offers Approve / Skip, which a run waiting at a gate in VS Code
+ * cannot act on. The manual-gate event carries the gate and HOST_MANUAL_GATE_NOTE instead.
  */
-export function hostRunFinishedCode(f: { budgetStopped: boolean; failed: number; stopped: boolean; gateWaiting?: boolean }): number {
+export function hostRunFinishedCode(f: { budgetStopped: boolean; failed: number; stopped: boolean }): number {
   if (f.budgetStopped) { return 4; }
-  if (f.gateWaiting) { return 3; }
   return f.failed > 0 || f.stopped ? 1 : 0;
 }
 
@@ -80,17 +81,19 @@ export interface HostRunRelay {
   /** True while a run is being relayed. */
   readonly live: boolean;
   /**
-   * Report a pull request opened for the last relayed run, on that run (same run id,
-   * the next seq). Only for the runner run that was relayed last, within 24 h of its
-   * end. Calls are serialised. Never rejects.
+   * Report a pull request opened after a relayed run, on that run (same ONOSOO run id, the
+   * next seq). Sent only when the most recent run this host played was relayed, has ended,
+   * and ended less than 24 h ago: any later run (relayed or not, playTask included) means
+   * the PR may be that run's work, so nothing is sent. Calls are serialised. Never rejects.
    */
-  notePrCreated(url: string, runnerRunId: string | null): Promise<void>;
+  notePrCreated(url: string): Promise<void>;
 }
 
 /** The last relayed run, kept so a follow-up event can continue it. */
 interface LastRun {
   relayRunId: string;
-  runnerRunId: string | null;
+  /** Which run start (counted over every run this host played) it was. */
+  runNumber: number;
   lastSeq: number;
   cwd: string;
   endedAt: number;
@@ -123,11 +126,16 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
   let offCost: (() => void) | null = null;
   let unwireReporting: (() => void) | null = null;
   let runCwd: string | null = null;
-  let runnerRunId: string | null = null;
-  /** The task a manual gate is waiting on during a relayed run; null when none. */
-  let gateWaitingId: string | null = null;
+  /** Every run start, relayed or not. The PR follow-up keys off it, never off runner ids. */
+  let runsStarted = 0;
   let last: LastRun | null = null;
   let prChain: Promise<void> = Promise.resolve();
+  /** The Anthropic key from the host's secret store, an exact-value secret for the redactor. */
+  let storedAnthropicKey: string | undefined;
+  const refreshStoredSecret = (): void => {
+    void hostSecret('anthropicApiKey').then((v) => { storedAnthropicKey = v; }, () => undefined);
+  };
+  refreshStoredSecret();
 
   const setStatus = (s: RelayStatus): void => {
     status = s;
@@ -147,8 +155,8 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     inRun = true;
     relay = null;
     scoped = null;
-    gateWaitingId = null;
-    runnerRunId = d.runner.currentRunId ?? null;
+    runsStarted++;
+    refreshStoredSecret();
     const cwd = d.cwd();
     runCwd = cwd;
     if (!cwd) { setStatus('none'); return; }
@@ -159,7 +167,8 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     if (!plan) { return; }
     const runPlan = scopePlan(plan, d.runner.currentRunTaskIds);
     const env = d.env();
-    const buildRedactor = (extra: string[]): Redactor => createRedactor(reportingSecretValues(cwd, env, extra));
+    const buildRedactor = (extra: string[]): Redactor =>
+      createRedactor(reportingSecretValues(cwd, env, storedAnthropicKey ? [...extra, storedAnthropicKey] : extra));
     const redactorExtra: string[] = [];
     const started = startRunRelay({
       cwd,
@@ -200,18 +209,13 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     if (relay && scoped) {
       try { offCost?.(); } catch { /* ignore */ }
       const t = tallyPlan(scoped);
-      const gateWaiting = gateWaitingId !== null;
-      rec({
-        event: 'run-finished', ...t, manualGateHit: gateWaiting,
-        code: hostRunFinishedCode({ budgetStopped, failed: t.failed, stopped, gateWaiting }),
-      });
+      rec({ event: 'run-finished', ...t, manualGateHit: false, code: hostRunFinishedCode({ budgetStopped, failed: t.failed, stopped }) });
       try { unwireReporting?.(); } catch { /* ignore */ }
       const r = relay;
       relay = null;
       const closing = r.close().catch(() => undefined);
-      last = { relayRunId: r.runId, runnerRunId, lastSeq: r.lastSeq, cwd: runCwd ?? '', endedAt: Date.now(), closing };
+      last = { relayRunId: r.runId, runNumber: runsStarted, lastSeq: r.lastSeq, cwd: runCwd ?? '', endedAt: Date.now(), closing };
     }
-    gateWaitingId = null;
     relay = null;
     scoped = null;
     offCost = null;
@@ -249,21 +253,14 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
       }
       if (obj.event === 'budget-exceeded') { budgetSeen = true; }
       rec(obj);
-      if (obj.event === 'manual-gate' && relay && scoped) {
-        // ONOSOO derives "awaiting approval" only from run-finished code 3: say so now,
-        // provisionally. The run's real end sends the final run-finished on the same run.
-        gateWaitingId = typeof obj.id === 'string' ? obj.id : '';
-        rec({ event: 'run-finished', ...tallyPlan(scoped), manualGateHit: true, code: 3 });
-      } else if ((obj.event === 'task-completed' || obj.event === 'task-failed') && gateWaitingId !== null && obj.id === gateWaitingId) {
-        gateWaitingId = null;
-      }
     } catch { /* the relay never disturbs the run */ }
   };
 
   /** One follow-up: a short-lived relay on the last run's id that sends `pr-created`. */
-  const sendPrCreated = async (url: string, forRunnerRunId: string | null): Promise<void> => {
+  const sendPrCreated = async (url: string): Promise<void> => {
     const prev = last;
-    if (!prev || !d.enabled() || !forRunnerRunId || prev.runnerRunId !== forRunnerRunId) { return; }
+    // Only the most recent run, and only once it has ended: a later run may own this PR.
+    if (!prev || !d.enabled() || inRun || prev.runNumber !== runsStarted) { return; }
     if (Date.now() - prev.endedAt > PR_FOLLOW_UP_WINDOW_MS) { return; }
     // The run's own close drops its spool file once acked; a relay opened before that
     // settles would see its new events deleted (and two relays would share one run id).
@@ -275,7 +272,7 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
       config: cfg,
       spool: new OnosooSpool(cfg.stateDir, prev.cwd, { isPidAlive: d.isPidAlive }),
       http: d.http,
-      redactor: createRedactor(reportingSecretValues(prev.cwd, env, [cfg.key])),
+      redactor: createRedactor(reportingSecretValues(prev.cwd, env, storedAnthropicKey ? [cfg.key, storedAnthropicKey] : [cfg.key])),
       stderr: (s: string): void => { d.log(s.replace(/\n$/, '')); },
       runId: prev.relayRunId,
       seqStart: prev.lastSeq,
@@ -308,8 +305,8 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     },
     get status(): RelayStatus { return status; },
     get live(): boolean { return relay !== null; },
-    notePrCreated(url: string, forRunnerRunId: string | null): Promise<void> {
-      const next = prChain.then(() => sendPrCreated(url, forRunnerRunId)).catch(() => undefined);
+    notePrCreated(url: string): Promise<void> {
+      const next = prChain.then(() => sendPrCreated(url)).catch(() => undefined);
       prChain = next;
       return next;
     },
