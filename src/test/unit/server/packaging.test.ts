@@ -1,8 +1,8 @@
 // ─── Server packaging: Dockerfile, .dockerignore, VSIX exclusion, operator docs ───
 //
 // Static checks only (Docker is not needed to run them). The security-relevant
-// image properties — Node 20, non-root, CI never set, data on a volume, a
-// health check — must not drift silently.
+// image properties — Node 24 pinned by digest, non-root, CI never set, data on a
+// volume, a health check — must not drift silently.
 
 import { strict as assert } from 'assert';
 import * as fs from 'fs';
@@ -16,10 +16,15 @@ describe('server packaging', () => {
   const lines = docker.split(/\r?\n/).filter((l) => !/^\s*#/.test(l));
   const body = lines.join('\n');
 
-  it('builds and runs on node:20', () => {
+  it('builds and runs on node:24-bookworm-slim, pinned by one digest in both stages', () => {
     const froms = lines.filter((l) => /^FROM\s/i.test(l));
     assert.ok(froms.length >= 2, 'multi-stage build');
-    for (const f of froms) { assert.match(f, /^FROM\s+node:20[-\w.]*/i, f); }
+    const digests = froms.map((f) => {
+      const m = /^FROM\s+node:24-bookworm-slim@(sha256:[0-9a-f]{64})(\s|$)/.exec(f);
+      assert.ok(m, `not a digest-pinned node:24-bookworm-slim: ${f}`);
+      return m[1];
+    });
+    assert.equal(new Set(digests).size, 1, `the stages use different digests: ${digests.join(', ')}`);
   });
 
   it('runs as a non-root user', () => {

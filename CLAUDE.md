@@ -15,21 +15,20 @@ npm run deploy           # Compile + install VSIX into local VS Code
 npm run deploy:watch     # deploy + watch for changes
 
 # Run a single test file
-npx mocha --require ts-node/register "src/test/unit/runner/runner.test.ts"
+node --import tsx ./node_modules/mocha/bin/mocha.js "src/test/unit/runner/runner.test.ts"
 ```
 
-**Node version.** CI pins Node 20 and `.nvmrc` matches it. On Node 22.6+ the runtime
-strips TypeScript natively and loads `.ts` as ESM, which breaks `ts-node/register`
-with `require is not defined in ES module scope`. If you are on a newer Node, `nvm use`.
-Prefixing `NODE_OPTIONS=--no-experimental-strip-types` does **not** fix `npm test`
-(checked on Node 24.16); pass the flags to `node` directly instead:
+**Node version.** Node 24 LTS, pinned in `.nvmrc`; CI and the Docker image read the same
+major (`node-version-file: .nvmrc`, `node:24-bookworm-slim` by digest). The unit suite
+loads TypeScript through tsx (`node --import tsx`), so plain `npm test` works on Node
+20.6+ through 24 with no extra flags.
+
+**Broken IPv6.** On a machine whose IPv6 route is broken, npm, `npx` and the
+`vscode-test` download hang. Set this before any command that touches the network:
 
 ```bash
-node --no-experimental-strip-types --no-experimental-detect-module node_modules/mocha/bin/mocha.js --require ts-node/register --require ./src/test/unit/test-setup.ts "src/test/unit/**/*.test.ts" --ignore "src/test/unit/**/*live.test.ts"
+export NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection"
 ```
-
-`--no-experimental-strip-types` does not exist on Node 20 (`bad option`), so it must not
-go into the npm scripts.
 
 ## Architecture
 
