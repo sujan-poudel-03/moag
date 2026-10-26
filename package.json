@@ -1769,7 +1769,7 @@
     "watch:webview": "tsc -watch -p tsconfig.webview.json"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0"
+    "@anthropic-ai/sdk": "~0.137.0"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.0",
