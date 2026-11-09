@@ -77,6 +77,21 @@ describe('scripts/bundle.js', () => {
     ]);
   });
 
+  it('refuses require.resolve of a package (a bundle ships no node_modules), but not of a built-in or a relative path', () => {
+    const dir = out('require.resolve("@anthropic-ai/sdk"); require.resolve("path"); require.resolve("./x");', '');
+    assert.deepEqual(bundle.checkBuild({ inputs: CLEAN_INPUTS }, dir), [
+      'out/bundle/extension.js calls require.resolve("@anthropic-ai/sdk"), which cannot find a package inside a bundle',
+    ]);
+  });
+
+  it('the bundled Anthropic adapter does not look the SDK up on disk', () => {
+    const ext = path.join(REPO, bundle.OUTDIR, 'extension.js');
+    if (!fs.existsSync(ext)) { assert.fail('out/bundle/extension.js is missing; run `npm run compile` before the unit suite.'); }
+    // The availability check must not look the SDK up on disk: inside the VSIX there is none.
+    const text = fs.readFileSync(ext, 'utf-8');
+    assert.ok(!/require\.resolve\(\s*['"]@anthropic-ai\/sdk['"]/.test(text), 'the bundle resolves the SDK on disk');
+  });
+
   it('the built bundles require nothing but built-ins, vscode and the bench edge', () => {
     const outdir = path.join(REPO, bundle.OUTDIR);
     if (!fs.existsSync(path.join(outdir, 'cli.js'))) { assert.fail('out/bundle/cli.js is missing; run `npm run compile` before the unit suite.'); }

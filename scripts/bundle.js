@@ -78,6 +78,14 @@ function checkBuild(metafile, outdirAbs) {
       if (BUILTINS.has(spec) || allowed.has(spec)) { continue; }
       problems.push(`${OUTDIR}/${file} requires "${spec}", which is neither a built-in nor external by design`);
     }
+    // require.resolve looks the module up on disk at run time. A bundle ships no node_modules,
+    // so resolving a package always fails there (the Anthropic engine once reported itself
+    // unavailable in every VSIX this way).
+    for (const m of text.matchAll(/\brequire\.resolve\(\s*(['"])([^'"]+)\1/g)) {
+      const spec = m[2];
+      if (BUILTINS.has(spec) || spec.startsWith('.')) { continue; }
+      problems.push(`${OUTDIR}/${file} calls require.resolve("${spec}"), which cannot find a package inside a bundle`);
+    }
   }
   return [...new Set(problems)];
 }

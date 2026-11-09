@@ -156,8 +156,10 @@ export class AnthropicAdapter implements EngineAdapter {
   async checkAvailability(): Promise<boolean> {
     const key = (await hostSecret('anthropicApiKey')) || process.env.ANTHROPIC_API_KEY;
     if (!key) { return false; }
+    // A plain require, not require.resolve: the shipped extension and CLI are esbuild bundles
+    // that inline the SDK and carry no node_modules, so resolving it on disk always fails there.
     try {
-      require.resolve('@anthropic-ai/sdk');
+      require('@anthropic-ai/sdk');
       return true;
     } catch {
       return false;

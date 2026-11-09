@@ -35,7 +35,7 @@ starts nothing.
 | Job | Proves | Fails when |
 |---|---|---|
 | `check` | The tag names the version in `package.json`, and `CHANGELOG.md` has a non-empty section for it (`scripts/release-notes.js`). | The tag is on the wrong commit, or the notes are missing or empty. |
-| `ci` | The tagged commit passes the whole CI workflow: lint, build, the unit suite on Linux, Windows and macOS, integration tests on the current VS Code (three platforms) and on the minimum one (`engines.vscode`, Linux), the packaging smoke test, and the dependency audit. | Any of those fails. A flaky integration run or a high-severity advisory blocks the release on purpose: re-run, or fix it. |
+| `ci` | The tagged commit passes the whole CI workflow: lint, build, the unit suite on Linux, Windows and macOS, integration tests on the current VS Code (three platforms) and on the minimum one (`engines.vscode`, Linux), the packaging smoke test, and the dependency audit. | Any of those fails. A flaky integration run blocks the release on purpose: re-run, or fix it. The dependency audit reports but does not block yet (`continue-on-error`); it starts blocking once a clean run on master lets us remove that. |
 | `package` | One VSIX, `moag-X.Y.Z.vsix`, built by `vsce package` and checked by `npm run smoke:vsix -- --vsix <file>`: fewer than 60 files, no `node_modules`, no source maps, `main` loads with a stub `vscode`, `bin.moag --help` runs and `bin.moag verify` reports a missing plan. | The package would not load, or carries what it should not. |
 | `release` | A GitHub release `vX.Y.Z` titled "MOAG X.Y.Z", with that exact VSIX attached and the changelog section as notes. `--verify-tag` refuses to create a tag that is not already pushed. | The release already exists, or the tag is gone. |
 | `marketplace` | The same VSIX on the Marketplace, published with the `VSCE_PAT` secret. | The token is wrong or expired, or the Marketplace refuses the version. |
@@ -53,7 +53,7 @@ environment; vsce reads it from `VSCE_PAT`, so it never appears on a command lin
 - **`marketplace` was skipped or failed:** the GitHub release already exists and is correct.
   Fix the cause (add or renew the `VSCE_PAT` secret: an Azure DevOps personal access token
   with the Marketplace "Manage" scope for the `moag` publisher), then open the workflow run
-  and use **Re-run failed jobs** (or re-run just `marketplace`). It downloads the same
+  and re-run just the `marketplace` job (open it, then **Re-run job**). A missing secret only skips the job with a warning, so **Re-run failed jobs** has nothing to re-run. It downloads the same
   VSIX artifact, so what reaches the Marketplace is byte-for-byte what was released.
   Artifacts are kept for 90 days by default.
 

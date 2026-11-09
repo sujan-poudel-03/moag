@@ -8,15 +8,38 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-09
+
 ### Upgrade notes
 
 - **VS Code 1.90 or newer is required** (was 1.85). Older VS Code keeps the version of MOAG it has.
 - **MOAG does not run in Restricted Mode.** It runs agent CLIs and shell commands that a workspace's plan files define, so it now activates only after you trust the workspace (and never in a virtual workspace).
+- **Your Anthropic API key moves to VS Code's secure storage.** A key found in settings is moved there once and removed from every settings scope. Use **MOAG: Set Anthropic API Key** to change it.
+- **Your email is no longer recorded** in `.moag/usage-log.jsonl` unless you turn on `agentTaskPlayer.contributionLedger.recordDeveloperEmail`.
+- **MOAG asks before it edits your `.gitignore`.** It asks once per workspace and remembers your answer.
+
+### Added
+
+- **MOAG: Connect to ONOSOO Builds** and **Disconnect from ONOSOO**, plus `moag pair`: pair a machine in one step, with no JSON to write by hand.
+- **MOAG: Install Command-Line Tool**: puts `moag` on your PATH from the installed extension, and keeps working across updates. New `moag --version` and `moag help`.
+- **MOAG: Export Diagnostics**: one file with versions, engines, settings (secrets redacted), recent errors and the ONOSOO status, to attach to a bug report.
+- **MOAG: Set / Clear Anthropic API Key**.
+- The Setup Guide lists every engine and follows your colour theme.
+- `PRIVACY.md` and `SECURITY.md`, and README sections on data, privacy and support.
 
 ### Changed
 
+- **Report Issue** always files with MOAG (github.com/sujan-poudel-03/moag), never in your own repository or backlog. It shows the full report, with secrets and your home folder removed, before anything is posted, and works without `gh` (browser or clipboard).
+- **Cost is honest.** MOAG never reads cost from an agent's text. A call that reports no cost shows as "cost unknown", not $0.00. When the budget can't be enforced you're told each run, with a one-click switch to Claude's JSON output to enforce it.
+- Runs from the VS Code panel report the pull request they produced to ONOSOO.
 - The extension and the `moag` CLI ship as two bundled files. The package drops from 686 files to about 30 and carries no `node_modules`.
 - `@anthropic-ai/sdk` 0.137 (was 0.39), bundled into the extension.
+
+### Fixed
+
+- PRD verify and fix-task generation refuse to run with no folder open, instead of running in VS Code's own directory.
+- A plan file that fails to load at startup now shows an error naming the file, instead of being silently ignored.
+- MOAG only records its own errors; other extensions' crashes no longer land in MOAG's error log or bug reports.
 
 ## [0.9.15] - 2026-10-24
 
@@ -498,7 +521,8 @@ _No separate commit: this work shipped in 66dd50c together with 0.5.0 and 0.6.0.
 - Configurable autoplay delay
 - `.agent-plan.json` file format with auto-load on workspace open
 
-[Unreleased]: https://github.com/sujan-poudel-03/moag/compare/v0.9.15...HEAD
+[Unreleased]: https://github.com/sujan-poudel-03/moag/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/sujan-poudel-03/moag/compare/v0.9.15...v0.10.0
 [0.9.15]: https://github.com/sujan-poudel-03/moag/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/sujan-poudel-03/moag/compare/v0.9.13...v0.9.14
 [0.9.13]: https://github.com/sujan-poudel-03/moag/compare/v0.9.12...v0.9.13

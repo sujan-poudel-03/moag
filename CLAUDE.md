@@ -15,7 +15,7 @@ npm run deploy           # Compile + install VSIX into local VS Code
 npm run deploy:watch     # deploy + watch for changes
 
 # Run a single test file
-node --import tsx ./node_modules/mocha/bin/mocha.js "src/test/unit/runner/runner.test.ts"
+node --import tsx ./node_modules/mocha/bin/mocha.js --require ./src/test/unit/test-setup.ts "src/test/unit/runner/runner.test.ts"   # test-setup is required: it installs the host and isolates the real MOAG/ONOSOO config
 ```
 
 **Node version.** Node 24 LTS, pinned in `.nvmrc`; CI and the Docker image read the same
