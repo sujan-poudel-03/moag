@@ -1809,8 +1809,8 @@
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch",
     "compile:ext": "tsc -p ./",
-    "compile:webview": "tsc -p tsconfig.webview.json && tsc -p tsconfig.webview.back-nav.json && tsc -p tsconfig.webview.dashboard.json && tsc -p tsconfig.webview.prd-panel.json && tsc -p tsconfig.webview.report-panel.json && tsc -p tsconfig.webview.rule-editor.json && tsc -p tsconfig.webview.run-detail.json && tsc -p tsconfig.webview.session-list.json && tsc -p tsconfig.webview.setup-guide.json && tsc -p tsconfig.webview.task-editor.json && tsc -p tsconfig.webview.thread-view.json",
-    "watch:webview": "tsc -watch -p tsconfig.webview.json"
+    "compile:webview": "tsc -p src/webview/tsconfig.sidebar.json && tsc -p src/webview/tsconfig.back-nav.json && tsc -p src/webview/tsconfig.dashboard.json && tsc -p src/webview/tsconfig.prd-panel.json && tsc -p src/webview/tsconfig.report-panel.json && tsc -p src/webview/tsconfig.rule-editor.json && tsc -p src/webview/tsconfig.run-detail.json && tsc -p src/webview/tsconfig.session-list.json && tsc -p src/webview/tsconfig.setup-guide.json && tsc -p src/webview/tsconfig.task-editor.json && tsc -p src/webview/tsconfig.thread-view.json",
+    "watch:webview": "tsc -watch -p src/webview/tsconfig.sidebar.json"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "~0.137.0"

@@ -1,6 +1,6 @@
 // ─── Dashboard webview script ───────────────────────────────────────────────
 //
-// Runs in the webview, not the extension host. Compiled by tsconfig.webview.json
+// Runs in the webview, not the extension host. Compiled by src/webview/tsconfig.dashboard.json
 // and loaded with <script src>. It used to live inside a template literal in
 // ui/dashboard-panel.ts, where the compiler never saw it.
 //

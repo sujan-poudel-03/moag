@@ -1,6 +1,6 @@
 // ─── report-panel webview script ────────────────────────────────────────────
 //
-// Runs in the webview. Compiled by tsconfig.webview.report-panel.json and
+// Runs in the webview. Compiled by src/webview/tsconfig.report-panel.json and
 // loaded with <script src>. Lifted from ui/self-reporting.ts, where it lived
 // inside a template literal the compiler never parsed.
 //

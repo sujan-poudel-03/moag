@@ -1,6 +1,6 @@
 // ─── thread-view webview script ─────────────────────────────────────
 //
-// Runs in the webview. Compiled by tsconfig.webview.thread-view.json and loaded
+// Runs in the webview. Compiled by src/webview/tsconfig.thread-view.json and loaded
 // with <script src>. It used to be returned as a string from a function in
 // ui/execution-detail-panel.ts, which is a template literal by another name —
 // the compiler never parsed it either way.

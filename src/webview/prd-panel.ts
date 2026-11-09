@@ -1,6 +1,6 @@
 // ─── PRD panel webview script ───────────────────────────────────────────────
 //
-// Runs in the webview. Compiled by tsconfig.webview.prd-panel.json and loaded
+// Runs in the webview. Compiled by src/webview/tsconfig.prd-panel.json and loaded
 // with <script src>. It used to live inside a template literal in
 // ui/prd-authoring.ts, where the compiler never parsed it.
 //

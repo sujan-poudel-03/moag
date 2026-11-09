@@ -1,6 +1,0 @@
-{
-  "extends": "./tsconfig.webview.base.json",
-  "include": [
-    "src/webview/rule-editor.ts"
-  ]
-}
