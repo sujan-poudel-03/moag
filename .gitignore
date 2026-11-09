@@ -1,6 +1,8 @@
 out/
 node_modules/
 *.vsix
+/build/
+debug.log
 .vscode-test/
 
 # Claude Code — ignore local session state, track shared agent/command definitions

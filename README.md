@@ -349,7 +349,7 @@ npm run compile      # build
 npm run watch        # dev mode
 npm test             # unit tests (Mocha + Sinon)
 npm run lint         # ESLint
-npm run package      # build .vsix
+npm run package      # build build/agent-task-player-<version>.vsix
 ```
 
 ---

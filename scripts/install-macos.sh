@@ -46,7 +46,8 @@ say "Compiling…"; npm run compile
 
 # ── Package VSIX ──
 VERSION="$(node -p "require('./package.json').version")"
-VSIX="agent-task-player-${VERSION}.vsix"
+mkdir -p build
+VSIX="build/agent-task-player-${VERSION}.vsix"
 say "Packaging ${VSIX}…"
 npx --yes vsce package --allow-missing-repository --skip-license -o "$VSIX"
 

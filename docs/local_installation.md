@@ -1,9 +1,13 @@
-Install locally as a packaged extension
-If you want a local installable .vsix:
+# Install locally as a packaged extension
 
-Package it:
-`vsce package`
+Package it (writes `build/agent-task-player-<version>.vsix`; `build/` is not committed):
+
+```bash
+npm run package
+```
 
 Install it:
 
-`code --install-extension ./agent-task-player-0.9.2.vsix`
+```bash
+code --install-extension build/agent-task-player-<version>.vsix --force
+```

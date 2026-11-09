@@ -1801,7 +1801,7 @@
     "test:live": "node --import tsx ./node_modules/mocha/bin/mocha.js \"src/test/unit/**/*live.test.ts\"",
     "test:integration": "vscode-test",
     "pretest:integration": "npm run compile",
-    "package": "vsce package",
+    "package": "node -e \"require('fs').mkdirSync('build',{recursive:true})\" && vsce package -o build/",
     "moag": "node ./out/headless/cli.js",
     "server": "node ./out/server/main.js",
     "smoke:vsix": "node scripts/smoke-vsix.mjs",
