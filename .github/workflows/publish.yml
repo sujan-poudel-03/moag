@@ -77,10 +77,10 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: vsix
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-notes
       - name: Create the GitHub release
@@ -108,7 +108,7 @@ jobs:
           cache: npm
       - run: npm ci
         if: env.VSCE_PAT != ''
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         if: env.VSCE_PAT != ''
         with:
           name: vsix
