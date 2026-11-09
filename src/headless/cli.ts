@@ -1453,6 +1453,25 @@ function createDaemonRemoteHost(
       runs,
       tmpDir: path.join(cfg.stateDir, 'remote', 'tmp'),
       importBranch: (file: string) => branch.importRunBranch(req.project.path, file, req.record.branch, branchPrefix, branch.spawnBranchGit),
+      // The optional last step: push the branch and open a DRAFT pull request, when this project's
+      // delivery setting (machine-local projects.json) asks for it. Off by default.
+      deliver: (exitCode: number | null) => {
+        const delivery = require('./remote-delivery');
+        const taskNames: string[] = [];
+        for (const pl of (req.record.snapshot?.playlists ?? []) as any[]) { for (const t of (pl.tasks ?? []) as any[]) { if (typeof t.name === 'string') { taskNames.push(t.name); } } }
+        return delivery.deliverBranch({
+          mode: req.project.delivery ?? 'off',
+          projectPath: req.project.path,
+          branch: req.record.branch,
+          branchPrefix,
+          base: req.project.prBase ?? null,
+          projectName: req.project.name,
+          planName: typeof req.record.snapshot?.name === 'string' ? req.record.snapshot.name : '',
+          taskNames,
+          exitCode,
+          runId: req.record.runId,
+        }, delivery.realDeliveryDeps);
+      },
       forceKill: async () => {
         const user = runnerUser();
         if (user && user !== 'root') { await runHelper(iso.forceKillCommand(user), null); }

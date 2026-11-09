@@ -6,7 +6,7 @@ import * as path from 'path';
 import { getConfig } from '../core/host';
 import { EngineAdapter, EngineRunOptions } from './engine';
 import { EngineResult, EngineId } from '../models/types';
-import { runCli } from './base-cli';
+import { probeCommand, runCli } from './base-cli';
 
 // Tools Claude Code CLI needs permission to use. Written to settings.local.json
 // before spawn so the CLI flag is not the only gate.
@@ -20,6 +20,34 @@ const CLAUDE_ALLOW_ALL = [
 // Detected in output stream → surfaces a clear error instead of a silent hang.
 const PERMISSION_PROMPT_RE = /do you want to (allow|proceed|run|continue)|press .* to (allow|continue)|\[y\/n\]|awaiting your (permission|approval)/i;
 
+/**
+ * Settings that authenticate Claude Code without `claude auth login`: an API key, a long-lived OAuth
+ * token, a gateway, or a cloud provider. When any is set the sign-in state is not ours to judge.
+ */
+const OTHER_AUTH_ENV = [
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_BASE_URL',
+  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+] as const;
+
+/** The reason shown when Claude Code is installed but has no credentials. One sentence, under 160 characters. */
+export const CLAUDE_SIGNED_OUT_REASON =
+  'Claude Code is not signed in. Run "claude auth login" as the account that runs MOAG, or set CLAUDE_CODE_OAUTH_TOKEN.';
+
+/**
+ * Read `claude auth status` output (JSON). Only an explicit "logged out, no method" is
+ * 'signed-out'; anything else, including text from an older CLI, is 'unknown'.
+ */
+export function parseClaudeAuthStatus(output: string): 'signed-in' | 'signed-out' | 'unknown' {
+  try {
+    const v = JSON.parse(output) as { loggedIn?: unknown; authMethod?: unknown } | null;
+    if (v && typeof v === 'object') {
+      if (v.loggedIn === true) { return 'signed-in'; }
+      if (v.loggedIn === false && v.authMethod === 'none') { return 'signed-out'; }
+    }
+  } catch { /* not JSON: an older CLI, or an error message */ }
+  return 'unknown';
+}
+
 export class ClaudeAdapter implements EngineAdapter {
   readonly id: EngineId = 'claude';
   readonly displayName = 'Claude Code';
@@ -27,6 +55,17 @@ export class ClaudeAdapter implements EngineAdapter {
   getCommand(): string {
     return getConfig('agentTaskPlayer.engines.claude')
       .get<string>('command', 'claude');
+  }
+
+  /**
+   * Whether the CLI has credentials, from `claude auth status` (a local check, about half a second,
+   * no network call). Fails open: see {@link EngineAdapter.checkLogin}.
+   */
+  async checkLogin(): Promise<{ ok: false; reason: string } | null> {
+    if (OTHER_AUTH_ENV.some((k) => (process.env[k] ?? '').length > 0)) { return null; }
+    const result = await probeCommand(this.getCommand(), ['auth', 'status']);
+    if (!result) { return null; }
+    return parseClaudeAuthStatus(result.output) === 'signed-out' ? { ok: false, reason: CLAUDE_SIGNED_OUT_REASON } : null;
   }
 
   async runTask(options: EngineRunOptions): Promise<EngineResult> {

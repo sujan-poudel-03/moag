@@ -113,7 +113,7 @@ describe('remote supervisor', () => {
     assert.ok(s.relayed.every((l) => l.run_id === 'run-1'));
     assert.deepEqual(s.relayed.map((l) => l.event), ['run-started', 'task-started', 'task-completed', 'manual-gate', 'run-finished']);
     assert.ok(!s.relayed.some((l) => String(l.event).startsWith('remote-')), 'remote-* lines are never relayed');
-    assert.deepEqual(s.relayMeta, { plan_name: 'Remote', project: 'Web app', tasks: [{ id: 'a', name: 'Build' }, { id: 'gate', name: 'Gate' }], branch: 'moag/remote-1' });
+    assert.deepEqual(s.relayMeta, { plan_name: 'Remote', project: 'Web app', tasks: [{ id: 'a', name: 'Build', stage: 'Tasks', kind: 'agent' }, { id: 'gate', name: 'Gate', stage: 'Tasks', kind: 'manual' }], branch: 'moag/remote-1' });
     assert.equal(s.relayClosed, 1);
 
     const rec = s.runs.get('run-1')!;
@@ -150,6 +150,81 @@ describe('remote supervisor', () => {
     await bad.sup.exit;
     assert.deepEqual(bad.imports, []);
     assert.match(bad.runs.get('run-1')!.importError!, /damaged/);
+  });
+
+  describe('delivery (the optional step after the branch is imported)', () => {
+    const OUT = Buffer.from('OUTBOUND BUNDLE');
+    const sendBundle = async (h: ReturnType<typeof setup>): Promise<void> => {
+      h.sup.start();
+      h.child.line({ event: 'run-started' });
+      h.child.line({ event: 'remote-bundle-chunk', data: OUT.toString('base64') });
+      h.child.line({ event: 'remote-bundle-end', bytes: OUT.length, sha256: createHash('sha256').update(OUT).digest('hex') });
+      await tick();
+    };
+
+    it("runs after a successful import with the run's exit code, tells ONOSOO through the run's own relay before it closes, and records what it did", async () => {
+      const calls: Array<number | null> = [];
+      const h = setup({
+        deliver: async (code) => { calls.push(code); return { event: { event: 'pr-created', url: 'https://github.com/o/r/pull/7' }, note: 'pushed and opened a draft PR' }; },
+      });
+      await sendBundle(h);
+      h.child.exit(0);
+      await h.sup.exit;
+      assert.deepEqual(calls, [0]);
+      const pr = h.relayed.find((l) => l.event === 'pr-created');
+      assert.ok(pr, 'the pr-created event reached the relay');
+      assert.equal(pr!.url, 'https://github.com/o/r/pull/7');
+      assert.equal(pr!.run_id, 'run-1');
+      assert.match(String(pr!.ts), /^\d{4}-\d{2}-\d{2}T/);
+      assert.equal(h.relayClosed, 1, 'the relay closed once, after the event');
+      assert.equal(h.runs.get('run-1')!.delivery, 'pushed and opened a draft PR');
+    });
+
+    it('a delivery with nothing to report sends no event but is still recorded', async () => {
+      const h = setup({ deliver: async () => ({ event: null, note: 'pushed moag/remote-1' }) });
+      await sendBundle(h);
+      h.child.exit(0);
+      await h.sup.exit;
+      assert.equal(h.relayed.some((l) => l.event === 'pr-created' || l.event === 'pr-skipped'), false);
+      assert.equal(h.runs.get('run-1')!.delivery, 'pushed moag/remote-1');
+    });
+
+    it('is not called when nothing was imported: a damaged bundle, or no bundle at all', async () => {
+      let calls = 0;
+      const damaged = setup({ deliver: async () => { calls++; return { event: null, note: 'x' }; } });
+      damaged.sup.start();
+      damaged.child.line({ event: 'run-started' });
+      damaged.child.line({ event: 'remote-bundle-chunk', data: OUT.toString('base64') });
+      damaged.child.line({ event: 'remote-bundle-end', bytes: OUT.length, sha256: 'f'.repeat(64) });
+      await tick();
+      damaged.child.exit(0);
+      await damaged.sup.exit;
+      const none = setup({ deliver: async () => { calls++; return { event: null, note: 'x' }; } });
+      none.sup.start();
+      none.child.line({ event: 'run-started' });
+      none.child.exit(0);
+      await none.sup.exit;
+      assert.equal(calls, 0);
+      assert.equal(damaged.runs.get('run-1')!.delivery, undefined);
+    });
+
+    it('a delivery that throws never disturbs the run: it finishes, the relay closes, the failure is on the record', async () => {
+      const h = setup({ deliver: async () => { throw new Error('gh exploded'); } });
+      await sendBundle(h);
+      h.child.exit(0);
+      const exit = await h.sup.exit;
+      assert.equal(exit.code, 0);
+      assert.equal(h.relayClosed, 1);
+      assert.match(h.runs.get('run-1')!.delivery!, /delivery failed: gh exploded/);
+    });
+
+    it('without a delivery hook the run ends exactly as before', async () => {
+      const h = setup();
+      await sendBundle(h);
+      h.child.exit(0);
+      await h.sup.exit;
+      assert.equal(h.runs.get('run-1')!.delivery, undefined);
+    });
   });
 
   it('spend: a clean early failure settles what was reported; a killed child is charged in full; the runner is swept', async () => {

@@ -32,6 +32,44 @@ function load(doc: unknown, opts?: Parameters<typeof loadApprovedProjects>[1]): 
   return loadApprovedProjects(stateWith(doc), opts);
 }
 
+describe('ONOSOO approved projects — delivery settings', () => {
+  const entry = (dir: string, extra: Record<string, unknown> = {}) => ({ id: 'web', name: 'Web', path: dir, ...extra });
+
+  it('delivery is off unless the machine owner says otherwise, and the key is absent then', () => {
+    const out = load(v1([entry(repo())]));
+    assert.equal(out.projects.length, 1);
+    assert.equal(out.projects[0].delivery, undefined);
+    assert.equal(out.projects[0].prBase, undefined);
+    assert.deepEqual(out.errors, []);
+  });
+
+  it('reads "branch" and "draft-pr", and a plain pr_base', () => {
+    const a = load(v1([entry(repo(), { delivery: 'branch' })]));
+    assert.equal(a.projects[0].delivery, 'branch');
+    const b = load(v1([entry(repo(), { delivery: 'draft-pr', pr_base: 'dev' })]));
+    assert.equal(b.projects[0].delivery, 'draft-pr');
+    assert.equal(b.projects[0].prBase, 'dev');
+    assert.deepEqual(b.errors, []);
+    assert.equal(load(v1([entry(repo(), { delivery: 'off' })])).projects[0].delivery, undefined);
+  });
+
+  it('fails closed: an unknown mode or an unsafe base keeps delivery off, with a note, and the project still loads', () => {
+    for (const delivery of ['auto-merge', 'PR', true, 1]) {
+      const out = load(v1([entry(repo(), { delivery })]));
+      assert.equal(out.projects.length, 1, JSON.stringify(delivery));
+      assert.equal(out.projects[0].delivery, undefined, JSON.stringify(delivery));
+      assert.match(out.errors.join('\n'), /delivery must be/);
+    }
+    for (const pr_base of ['../main', 'a b', '-x', '', 'x'.repeat(120), 5, 'a..b']) {
+      const out = load(v1([entry(repo(), { delivery: 'draft-pr', pr_base })]));
+      assert.equal(out.projects.length, 1);
+      assert.equal(out.projects[0].delivery, 'draft-pr', 'a bad base does not switch delivery off');
+      assert.equal(out.projects[0].prBase, undefined, JSON.stringify(pr_base));
+      assert.match(out.errors.join('\n'), /pr_base must be a plain branch name/);
+    }
+  });
+});
+
 describe('ONOSOO approved projects — file level', () => {
   it('pins the exported constants', () => {
     assert.equal(PROJECTS_FILE, 'projects.json');

@@ -87,6 +87,8 @@ function harness(opts: {
   timers?: { setTimeout(fn: () => void, ms: number): unknown; clearTimeout(h: unknown): void }; stderr?: (s: string) => void;
   /** The project's tip of the parent branch (null = no branch); when set, the host uses it instead of branchExists. */
   projectTip?: string | null; drain?: () => Promise<void>;
+  /** Reasons the probe gives for installed engines that cannot be used. */
+  engineIssues?: Record<string, string>;
 } = {}) {
   const exports: Array<Record<string, unknown>> = [];
   const stateDir = opts.stateDir ?? tmp();
@@ -99,7 +101,7 @@ function harness(opts: {
     stateDir,
     loadProjects: () => current,
     platform: opts.platform ?? 'linux',
-    probe: async () => ({ ok: true, uid: 1001, engines: ['claude', 'ollama'], mirrors: {} }),
+    probe: async () => ({ ok: true, uid: 1001, engines: ['claude', 'ollama'], mirrors: {}, ...(opts.engineIssues ? { engineIssues: opts.engineIssues } : {}) }),
     supervisorFactory: (req) => { const s = new FakeSupervisor(req, opts.behaviour ?? 'starts'); sups.push(s); return s; },
     exportBundle: async (_p, o) => {
       exports.push({ ...o });
@@ -172,6 +174,15 @@ describe('ONOSOO command host', () => {
     await h.host.tick();
     assert.equal(h.control.caps.length, 2);
     assert.equal(h.control.caps[1].projects[0].name, 'Web (renamed)');
+  });
+
+  it('capabilities carry why an installed engine is not offered, and omit the key when there is nothing to say', async () => {
+    const withIssue = harness({ engineIssues: { gemini: 'Not signed in.' } });
+    await withIssue.host.tick();
+    assert.deepEqual(withIssue.control.caps[0].engine_issues, { gemini: 'Not signed in.' });
+    const without = harness();
+    await without.host.tick();
+    assert.equal('engine_issues' in without.control.caps[0], false);
   });
 
   it('every rejection is audited and nothing is spawned', async () => {

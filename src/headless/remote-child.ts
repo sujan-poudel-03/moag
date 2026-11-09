@@ -343,6 +343,8 @@ export interface RemoteChildDeps {
   buildFullPlanPrompt(prdText: string): string;
   parseGeneratedPlan(stdout: string): { ok: true; plan: Plan } | { ok: false; error: string };
   detectEngines(): Promise<string[]>;
+  /** Optional richer form of detectEngines: the usable engines and why installed ones are not. */
+  detectEngineReport?(): Promise<{ engines: string[]; issues: Record<string, string> }>;
   costLedger: {
     onRecord(fn: (e: { estimatedCostUsd: number; engineId: string }) => void): () => void;
     onUnreported(fn: (e: { engineId: string }) => void): () => void;
@@ -404,7 +406,16 @@ async function runProbe(spec: RemoteProbeSpec, deps: RemoteChildDeps): Promise<n
   const unreadable: Record<string, boolean> = {};
   for (const p of spec.protectedPaths) { unreadable[p] = !canRead(p); }
   let engines: string[] = [];
-  try { engines = await deps.detectEngines(); } catch { engines = []; }
+  let engineIssues: Record<string, string> = {};
+  try {
+    if (deps.detectEngineReport) {
+      const report = await deps.detectEngineReport();
+      engines = report.engines;
+      engineIssues = report.issues;
+    } else {
+      engines = await deps.detectEngines();
+    }
+  } catch { engines = []; engineIssues = {}; }
   if (spec.engineEnv.ANTHROPIC_API_KEY) { engines.push('anthropic'); }
   engines = [...new Set(engines)].filter((e) => !REMOTE_EXCLUDED_ENGINES.has(e));
   const mirrors: Record<string, string[]> = {};
@@ -414,7 +425,7 @@ async function runProbe(spec: RemoteProbeSpec, deps: RemoteChildDeps): Promise<n
     const out = await deps.git(['for-each-ref', '--format=%(objectname)'], mirror);
     if (out) { mirrors[id] = [...new Set(out.split('\n').map((s) => s.trim()).filter((s) => SHA.test(s)))].slice(0, 100); }
   }
-  deps.emit({ event: 'remote-probe', uid: deps.uid, unreadable, engines, mirrors, home: deps.home });
+  deps.emit({ event: 'remote-probe', uid: deps.uid, unreadable, engines, engineIssues, mirrors, home: deps.home });
   return 0;
 }
 
@@ -727,6 +738,11 @@ export async function remoteChildMain(): Promise<number> {
     buildFullPlanPrompt: (prd) => require('../runner/prd-plan').buildFullPlanPrompt(prd),
     parseGeneratedPlan: (stdout) => require('../runner/prd-plan').parseGeneratedPlan(stdout),
     detectEngines: async () => (await require('../engine-detection').detectEngines()).available,
+    detectEngineReport: async () => {
+      const detection = require('../engine-detection');
+      const result = await detection.detectEngines();
+      return { engines: result.available, issues: detection.engineIssues(result) };
+    },
     costLedger: require('../utils/cost-ledger').costLedger,
     setWorkspaceRoot: (root) => shim.__setWorkspaceRoot(root),
     armWatchdog: () => {

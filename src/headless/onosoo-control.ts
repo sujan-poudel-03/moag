@@ -45,6 +45,8 @@ export interface Capabilities {
   remote_start: boolean;
   projects: Array<{ id: string; name: string; kinds: string[] }>;
   engines: string[];
+  /** engine id → why an installed engine cannot be used (not signed in). Only present when there is one. */
+  engine_issues?: Record<string, string>;
 }
 
 export interface OnosooControlOptions {

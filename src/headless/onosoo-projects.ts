@@ -25,6 +25,10 @@ export interface ApprovedProject {
   name: string;
   kinds: string[];
   path: string;
+  /** What to do with a finished run's branch: nothing (default), push it, or push it and open a draft PR. */
+  delivery?: 'off' | 'branch' | 'draft-pr';
+  /** The branch a delivered pull request targets; the repository default when absent. */
+  prBase?: string;
 }
 
 export interface ApprovedProjects {
@@ -188,6 +192,18 @@ export function loadApprovedProjects(stateDir: string, opts: LoadApprovedProject
       if (!stat.isDirectory()) { reject(`path is not a directory: ${p}`); return; }
       if (!fs.existsSync(path.join(p, '.git'))) { reject(`path is not the top level of a git repository (no .git): ${p}`); return; }
 
+      // Delivery is opt-in and fails closed: anything unrecognised leaves it off, with a note.
+      let delivery: 'off' | 'branch' | 'draft-pr' = 'off';
+      if (entry.delivery !== undefined) {
+        if (entry.delivery === 'off' || entry.delivery === 'branch' || entry.delivery === 'draft-pr') { delivery = entry.delivery; }
+        else { errors.push(`${label}: delivery must be "off", "branch" or "draft-pr" (got ${JSON.stringify(entry.delivery)}); delivery stays off.`); }
+      }
+      let prBase: string | undefined;
+      if (entry.pr_base !== undefined) {
+        if (typeof entry.pr_base === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(entry.pr_base) && !entry.pr_base.includes('..')) { prBase = entry.pr_base; }
+        else { errors.push(`${label}: pr_base must be a plain branch name (got ${JSON.stringify(entry.pr_base)}); the repository default is used.`); }
+      }
+
       let real: string;
       try { real = realpath(p); } catch { reject(`path could not be resolved: ${p}`); return; }
       const cmp = comparable(real, platform);
@@ -196,7 +212,7 @@ export function loadApprovedProjects(stateDir: string, opts: LoadApprovedProject
         return;
       }
 
-      accepted.push({ project: { id, name: name.slice(0, MAX_NAME), kinds, path: real }, cmp, label });
+      accepted.push({ project: { id, name: name.slice(0, MAX_NAME), kinds, path: real, ...(delivery !== 'off' ? { delivery } : {}), ...(prBase ? { prBase } : {}) }, cmp, label });
     });
 
     // Overlapping repositories reject both: a run in one would touch the other.

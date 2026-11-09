@@ -223,7 +223,7 @@ The Linux build server is set up from a clone of MOAG:
 git clone https://github.com/sujan-poudel-03/moag && bash moag/scripts/setup-build-server.sh
 ```
 
-It asks for your Linux password where it needs `sudo`, and is safe to run again. It installs Node 20,
+It asks for your Linux password where it needs `sudo`, and is safe to run again. It installs Node 24 (`--node 20` for another major),
 a current git and Docker with Compose, builds MOAG read-only at `/opt/moag` with a `moag` command, and
 creates the `moag-runner` account and the exact `sudoers` rule for it (validated before it is
 installed). It also writes `~/.config/moag/projects.json` with remote starts **off**, and makes a
