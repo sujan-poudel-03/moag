@@ -19,6 +19,23 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Known vulnerabilities in what ships: runtime dependencies only (the SDK, which
+  # the bundle inlines). High or critical fails the job. It is non-blocking for
+  # now (continue-on-error) until a run on master has shown it clean; the next
+  # change (A12 in the release plan) removes continue-on-error so it blocks CI and
+  # therefore releases. docs/RELEASING.md has the escape hatch.
+  audit:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm audit --omit=dev --audit-level=high
+
   lint:
     runs-on: ubuntu-latest
     steps:
