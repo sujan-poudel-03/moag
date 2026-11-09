@@ -72,3 +72,27 @@ export function readRecentErrors(moagDir: string, n = 10): InternalError[] {
       .filter((e): e is InternalError => e !== null);
   } catch { return []; }
 }
+
+/**
+ * True when a stack trace has a frame inside this extension's install folder.
+ * The process-wide error handlers see every extension's errors in the shared
+ * extension host; only our own belong in .moag/errors.jsonl.
+ * @param stack          The error's stack (undefined → false)
+ * @param extensionPath  Absolute path of the extension (context.extensionPath)
+ * @param platform       Defaults to process.platform; win32 compares case-insensitively
+ */
+export function isOwnStack(
+  stack: string | undefined,
+  extensionPath: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (!stack || !extensionPath) { return false; }
+  const norm = (s: string): string => {
+    const slashed = s.replace(/\\/g, '/');
+    return platform === 'win32' ? slashed.toLowerCase() : slashed;
+  };
+  let root = norm(extensionPath);
+  while (root.endsWith('/')) { root = root.slice(0, -1); }
+  if (!root) { return false; }
+  return norm(stack).includes(root + '/');
+}

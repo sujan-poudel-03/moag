@@ -10,7 +10,7 @@
 
 import { createHash } from 'crypto';
 import { BUILT_IN_RULES } from '../ai-rules/built-in-rules';
-import { STACK_IDS, StackId } from '../server/stacks';
+import { STACK_IDS, StackId } from '../shared/stacks';
 import {
   DesignSystem,
   MAX_DESIGN_DOC_CHARS,

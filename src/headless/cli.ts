@@ -20,7 +20,11 @@
  *   moag standards propose [--stack <id>] [--write [--force]]
  *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
  *   moag host   [run | init | draft <project> | status | stop <env> | remove <env>]
+ *   moag pair   [<key>] [--url <base>]
+ *   moag --version | moag help
  *
+ * `pair`  saves the ONOSOO device key to the user-level onosoo.json (the key from stdin when
+ *          omitted, so it stays out of shell history) and checks it with ONOSOO.
  * `host`  runs approved project branches as live environments for ONOSOO previews, behind a
  *          gateway only workspace members get through (src/host/, docs/host-agent.md).
  * `run`   executes a single plan file, or a one-shot prompt (`--prompt`) which is
@@ -110,13 +114,20 @@ import { profileHash, renderStandardsText, StandardsDocument } from '../standard
 import { clearStandardsBase, rememberStandardsBase, resolveStandardsBase } from '../runner/standards-base';
 import { detectedStackId, proposeProfile } from '../standards/propose';
 import { detectConventions } from '../ai-rules/project-detector';
-import { STACK_IDS, isStackId } from '../server/stacks';
+import { STACK_IDS, isStackId } from '../shared/stacks';
 import type { Plan } from '../models/types';
 import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
-import { OnosooRelay, RelayHttpClient, RunMeta } from './onosoo-relay';
+import { OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
+import { checkPairing, PairError, writePairing } from './onosoo-pair';
+import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from '../utils/budget-notice';
+import {
+  buildRunMeta, forgetRelayEnv, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
+} from './run-reporter';
+
+export { buildRunMeta, forgetRelayEnv };
 
 /** How long a freshly launched headless sandbox gets to report `running`. */
 const UAT_SANDBOX_READY_TIMEOUT_MS = 120_000;
@@ -188,6 +199,8 @@ export interface Args {
   stack?: string;
   /** `standards check` only: check the static rules but run none of the profile's commands. */
   noCommands?: boolean;
+  /** `pair` only: the ONOSOO base URL (default: the hosted ONOSOO). */
+  url?: string;
 }
 
 /** The closed set of UAT modes, as a runtime guard for untrusted config values. */
@@ -256,6 +269,7 @@ export function parseArgs(argv: string[]): Args {
       a.maxUsd = Number.isFinite(n) && n > 0 ? n : NaN;
     }
     else if (arg === '--into') { const v = rest[++i]; if (v) { a.into = v; } }
+    else if (arg === '--url') { const v = rest[++i]; if (v) { a.url = v; } }
     else if (arg === '--pr') { a.pr = true; }
     else if (arg === '--pr-base') { const b = rest[++i]; if (b) { a.prBase = b; } }
     // Resolved after the loop so a later --cwd still applies, whatever the flag order.
@@ -351,6 +365,9 @@ export function wireRunnerStandards(runner: any, cwd: string, opts: { standards?
  * `mementoPath` puts the runner's history somewhere other than `<cwd>/.moag` (the remote
  * child keeps it outside the worktree). Exported for the remote child.
  */
+/** The budget notice is subscribed once per process, however many times setup() runs. */
+let budgetNoticeWired = false;
+
 export async function setup(args: Args, opts: { mementoPath?: string } = {}): Promise<Ctx> {
   installVscodeShim(args.cwd);
   const { loadPlan } = require('../models/plan');
@@ -364,6 +381,14 @@ export async function setup(args: Args, opts: { mementoPath?: string } = {}): Pr
     await vscode.workspace.getConfiguration('agentTaskPlayer').update('fullAuto', true);
   }
   registerAllEngines();
+  // Once per process: the ceiling cannot stop calls that report no cost, so say so on stderr.
+  if (!budgetNoticeWired) {
+    budgetNoticeWired = true;
+    watchUnenforceableBudget({
+      budget: () => vscode.workspace.getConfiguration('agentTaskPlayer').get('costBudgetUsd', 10),
+      onFirst: () => { process.stderr.write(`moag: ${BUDGET_UNENFORCEABLE_TEXT}\n`); },
+    });
+  }
 
   const memento = new FileMemento(opts.mementoPath ?? path.join(args.cwd, '.moag', 'headless-state.json'));
   const runner = new TaskRunner(new HistoryStore(memento));
@@ -386,29 +411,16 @@ export function wireEvents(runner: any): RunnerEventState {
   let manualGateHit = false;
   let manualGateTaskId: string | null = null;
   let budgetHit = false;
-  runner.on('state-changed', (state: string) => emit({ event: 'state', state }));
-  runner.on('task-started', (t: any) => emit({ event: 'task-started', id: t.id, name: t.name }));
-  // The final status says which: task-completed also fires for a Skipped task, task-failed
-  // for a Blocked one (a failed dependency, or failurePolicy "mark-blocked").
-  runner.on('task-completed', (t: any) => emit({ event: 'task-completed', id: t.id, name: t.name, status: t.status }));
-  runner.on('task-failed', (t: any) => emit({ event: 'task-failed', id: t.id, name: t.name, status: t.status }));
-  runner.on('task-escalate', (t: any, category: string) => emit({ event: 'task-escalate', id: t.id, name: t.name, category }));
-  runner.on('incident', (t: any, summary: string, issueUrl: string | null) => emit({ event: 'incident', id: t.id, name: t.name, summary, issueUrl }));
-  runner.on('error', (err: Error) => emit({ event: 'error', message: err.message }));
-  // Automatic dependency installs: the event already carries every field of the protocol line.
-  runner.on('dependencies-installed', (_t: any, ev: Record<string, unknown>) => emit(ev));
-  runner.on('dependencies-install-failed', (_t: any, ev: Record<string, unknown>) => emit(ev));
-  runner.on('dependencies-not-installed', (_t: any, ev: Record<string, unknown>) => emit(ev));
+  // The lines first (run-reporter.ts), so each policy listener below runs after its event's line.
+  wireRunEventLines(runner, emit);
   // Headless has no human to answer a Continue/Stop prompt, so a breached ceiling always stops.
-  runner.on('budget-exceeded', (d: any) => {
+  runner.on('budget-exceeded', () => {
     budgetHit = true;
-    emit({ event: 'budget-exceeded', totalCost: d.totalCost, budget: d.budget });
     runner.stop();
   });
   runner.on('manual-gate', (t: any) => {
     manualGateHit = true;
     manualGateTaskId = t.id;
-    emit({ event: 'manual-gate', id: t.id, name: t.name, note: 'Halting for human approval (ship gate).' });
     // Deferred on purpose (as in src/server/run-worker.ts): stop() inside this
     // emit aborts the task signal BEFORE runManualTask attaches its abort
     // listener, so the gate promise never settles and play() never resolves —
@@ -423,12 +435,7 @@ export function wireEvents(runner: any): RunnerEventState {
 }
 
 function tally(plan: any, TaskStatus: any): { total: number; completed: number; failed: number } {
-  const tasks = plan.playlists.flatMap((pl: any) => pl.tasks);
-  return {
-    total: tasks.length,
-    completed: tasks.filter((t: any) => t.status === TaskStatus.Completed).length,
-    failed: tasks.filter((t: any) => t.status === TaskStatus.Failed).length,
-  };
+  return tallyPlan(plan, TaskStatus);
 }
 
 // ─── verify helpers (pure — unit-testable without booting the CLI) ───────────
@@ -922,11 +929,24 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
     makeRedactor: () => buildRedactor(redactorExtra),
   });
   let relay: OnosooRelay | null = null;
+  // Claude reports a call's cost only in JSON mode, and headless prints no live engine
+  // output anyway: when ONOSOO is connected and the user has not chosen a format, use JSON
+  // for this run — in-process through the shim, never written to the project's config.
+  const claudeFormatKey = 'agentTaskPlayer.engines.claude.outputFormat';
+  const shim = ctx.vscode as { __setConfigOverride?: (k: string, v: unknown) => void; __configFileSets?: (k: string) => boolean };
+  let overrodeClaudeFormat = false;
   try {
     const started = startRelay(args, ctx, plan, env, buildRedactor);
     // main() already did this; a caller that bypassed main() still must not leak the key to children.
     if (!ctx.relayDeps?.env) { forgetRelayEnv(process.env); }
     if (started) {
+      if (typeof shim.__setConfigOverride === 'function' && typeof shim.__configFileSets === 'function'
+        && !shim.__configFileSets(claudeFormatKey)) {
+        shim.__setConfigOverride(claudeFormatKey, 'json');
+        overrodeClaudeFormat = true;
+        (ctx.relayDeps?.stderr ?? ((s: string): void => { process.stderr.write(s); }))(
+          'ONOSOO: using Claude JSON output so ONOSOO shows real cost (set agentTaskPlayer.engines.claude.outputFormat to override).\n');
+      }
       relay = started.relay;
       // The device key is a secret of its own: it never appears in a reported diff or tail.
       redactorExtra.push(started.key);
@@ -935,15 +955,10 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
     return await runAfterWiring(args, ctx, plan, planPath, events);
   } finally {
     emitTap = null;
+    if (overrodeClaudeFormat) { shim.__setConfigOverride?.(claudeFormatKey, undefined); }
     if (relay) { await relay.close(); }
     unwireReporting();
   }
-}
-
-/** Remove the ONOSOO relay variables from `env` (the device key must not reach child processes). */
-export function forgetRelayEnv(env: NodeJS.ProcessEnv): void {
-  delete env.MOAG_ONOSOO_KEY;
-  delete env.MOAG_ONOSOO_URL;
 }
 
 /** The relay variables as main() found them, before it removed them from process.env. */
@@ -955,11 +970,7 @@ let relayEnvSnapshot: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string } | n
  * command spawns — ever inherits the device key.
  */
 export function captureRelayEnv(env: NodeJS.ProcessEnv = process.env): void {
-  relayEnvSnapshot = {
-    ...(env.MOAG_ONOSOO_KEY !== undefined ? { MOAG_ONOSOO_KEY: env.MOAG_ONOSOO_KEY } : {}),
-    ...(env.MOAG_ONOSOO_URL !== undefined ? { MOAG_ONOSOO_URL: env.MOAG_ONOSOO_URL } : {}),
-  };
-  forgetRelayEnv(env);
+  relayEnvSnapshot = takeRelayEnv(env);
 }
 
 /** The env the relay configuration reads: process.env with main()'s captured relay variables over it. */
@@ -980,45 +991,21 @@ function startRelay(
   buildRedactor: (extra: string[]) => Redactor,
 ): { relay: OnosooRelay; key: string } | null {
   const deps = ctx.relayDeps;
-  const stderr = deps?.stderr ?? ((s: string): void => { process.stderr.write(s); });
-  try {
-    const cfg = resolveOnosooConfig({ env, cwd: args.cwd, stderr });
-    if (!cfg) { return null; }
-    let redactor: Redactor;
-    try {
-      redactor = buildRedactor([cfg.key]);
-    } catch {
-      // Every relayed event then carries { redaction_failed: true } instead of its data.
-      redactor = { redact: (): never => { throw new Error('redactor unavailable'); } };
-    }
-    const spool = new OnosooSpool(cfg.stateDir, args.cwd, { isPidAlive: deps?.isPidAlive });
-    const relay = new OnosooRelay({
-      config: cfg, spool, http: deps?.http, redactor, stderr, closeDeadlineMs: deps?.closeDeadlineMs, cwd: args.cwd,
-    });
-    relay.start(buildRunMeta(plan, args.cwd));
-    return { relay, key: cfg.key };
-  } catch (err) {
-    stderr(`ONOSOO relay could not start: ${err instanceof Error ? err.message : String(err)}\n`);
-    return null;
-  }
+  return startRunRelay({
+    cwd: args.cwd,
+    plan,
+    env,
+    buildRedactor,
+    stderr: deps?.stderr ?? ((s: string): void => { process.stderr.write(s); }),
+    http: deps?.http,
+    isPidAlive: deps?.isPidAlive,
+    closeDeadlineMs: deps?.closeDeadlineMs,
+  });
 }
 
-/**
- * The relay-only `run-meta` facts for a plan: its name, the project's package.json
- * name (else the folder's base name — never a path), and each task's id and name in
- * plan order. Caps and redaction are the relay's.
- */
-export function buildRunMeta(plan: any, cwd: string): RunMeta {
-  let project = '';
-  try {
-    const pkg: unknown = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf-8'));
-    const name = (pkg as { name?: unknown } | null)?.name;
-    if (typeof name === 'string' && name.trim().length > 0) { project = name; }
-  } catch { /* no package.json */ }
-  if (!project) { project = path.basename(path.resolve(cwd)); }
-  const tasks = (plan?.playlists ?? []).flatMap((pl: any) => pl?.tasks ?? [])
-    .map((t: any) => ({ id: String(t?.id), name: String(t?.name ?? '') }));
-  return { plan_name: String(plan?.name ?? ''), project, tasks };
+/** Emit a `cost` line per engine call during a run; returns the unsubscribe. Never throws. */
+function subscribeRunCost(): () => void {
+  return subscribeRunCostLines(emit);
 }
 
 /** What a caller other than cmdRun adds to the run: the delivery branch an ONOSOO remote run commits to. */
@@ -1050,13 +1037,20 @@ export async function runAfterWiring(
   // Headless runs do not save the plan, except for requirement trace evidence (commits,
   // release stamps) the run recorded — that is persisted only when it actually changed.
   const persistTrace = !args.prompt && args.planPath ? tracePersister(plan, args.planPath) : (): void => undefined;
+  // Every engine call's cost, in the hosted worker's shape (run-worker.ts subscribeCost), so ONOSOO
+  // can total what the run spent. A call that reported no cost is counted as `source: 'none'`.
+  const offCost = subscribeRunCost();
   try { await ctx.runner.play(plan); }
-  catch (err) { persistTrace(); emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
+  catch (err) { offCost(); persistTrace(); emit({ event: 'error', message: err instanceof Error ? err.message : String(err) }); return 2; }
+  offCost();
   persistTrace();
 
   const t = tally(plan, ctx.TaskStatus);
-  emit({ event: 'run-finished', ...t, manualGateHit: events.manualGateHit() });
   const runCode = events.manualGateHit() ? 3 : (t.failed > 0 ? 1 : 0);
+  // `code` is the run's own outcome, as the hosted worker reports it: ONOSOO derives the run's
+  // status from it (0 completed, 1 gaps, 3 awaiting approval, 4 budget) and treats a missing one
+  // as a failure.
+  emit({ event: 'run-finished', ...t, manualGateHit: events.manualGateHit(), code: events.budgetHit() ? 4 : runCode });
 
   if (args.pr) { await openPullRequest(args, plan, prBaseRef); }
 
@@ -2128,7 +2122,172 @@ async function cmdConfig(args: Args): Promise<number> {
   return 2;
 }
 
+// ─── moag pair ───────────────────────────────────────────────────────────────
+
+const PAIR_USAGE = 'Usage: moag pair [<key>] [--url <base>]   (without <key>, the key is read from stdin)\n';
+
+/** What `moag pair` reads and writes; injectable for tests. */
+export interface PairDeps {
+  /** One line from stdin (a TTY prompts with echo off). */
+  readKey?: () => Promise<string>;
+  http?: RelayHttpClient;
+  /** Where onosoo.json lives (default: process.env). */
+  env?: NodeJS.ProcessEnv;
+  out?: (s: string) => void;
+  err?: (s: string) => void;
+}
+
+/** How long `moag pair` waits for a key on a non-TTY stdin. */
+export const PAIR_STDIN_TIMEOUT_MS = 30_000;
+
+/**
+ * The first line of `stream`: resolves as soon as a newline arrives (the stream may
+ * never close), at end of input, or after `timeoutMs` with what came so far and
+ * `timedOut`. Stops reading and removes its listeners either way. Never rejects.
+ */
+export function readFirstLine(stream: NodeJS.ReadableStream, timeoutMs: number): Promise<{ line: string; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    let buf = '';
+    let settled = false;
+    const finish = (timedOut: boolean): void => {
+      if (settled) { return; }
+      settled = true;
+      clearTimeout(timer);
+      stream.removeListener('data', onData);
+      stream.removeListener('end', onEnd);
+      stream.removeListener('error', onEnd);
+      try { stream.pause(); } catch { /* ignore */ }
+      resolve({ line: (buf.split(/\r?\n/)[0] ?? '').trim(), timedOut });
+    };
+    const onData = (c: string | Buffer): void => {
+      buf += String(c);
+      if (/\r?\n/.test(buf)) { finish(false); }
+    };
+    const onEnd = (): void => finish(false);
+    const timer = setTimeout(() => finish(true), timeoutMs);
+    timer.unref?.();
+    stream.on('data', onData);
+    stream.on('end', onEnd);
+    stream.on('error', onEnd);
+    stream.resume();
+  });
+}
+
+/**
+ * Read the device key: on a TTY, a prompt with echo off; otherwise the first
+ * line of stdin (30 s at most). Resolves '' when nothing was given.
+ */
+function readKeyFromStdin(): Promise<string> {
+  const stdin = process.stdin;
+  if (!stdin.isTTY) {
+    return readFirstLine(stdin, PAIR_STDIN_TIMEOUT_MS).then(({ line, timedOut }) => {
+      if (timedOut) {
+        process.stderr.write(`No device key arrived on stdin within ${PAIR_STDIN_TIMEOUT_MS / 1000} s.\n`);
+      }
+      return line;
+    });
+  }
+  return new Promise((resolve) => {
+    process.stderr.write('Paste the ONOSOO device key: ');
+    let key = '';
+    stdin.setRawMode?.(true);
+    stdin.setEncoding('utf-8');
+    stdin.resume();
+    const done = (value: string): void => {
+      stdin.off('data', onData);
+      stdin.setRawMode?.(false);
+      stdin.pause();
+      process.stderr.write('\n');
+      resolve(value.trim());
+    };
+    const onData = (chunk: string): void => {
+      for (const ch of chunk) {
+        if (ch === '\r' || ch === '\n') { done(key); return; }
+        if (ch === '\u0003' || ch === '\u0004') { done(''); return; } // Ctrl+C / Ctrl+D: nothing entered
+        if (ch === '\u007f' || ch === '\b') { key = key.slice(0, -1); continue; }
+        key += ch;
+      }
+    };
+    stdin.on('data', onData);
+  });
+}
+
+/**
+ * `moag pair [<key>] [--url <base>]`: save the device key to onosoo.json, then
+ * check it with ONOSOO. Exit 0 accepted (or saved but not confirmed, with a
+ * warning), 1 refused, 2 usage error or an invalid key / URL. Never prints the
+ * key; never throws.
+ */
+export async function cmdPair(args: Args, deps: PairDeps = {}): Promise<number> {
+  const out = deps.out ?? ((s: string): void => { process.stdout.write(s); });
+  const err = deps.err ?? ((s: string): void => { process.stderr.write(s); });
+  const env = deps.env ?? process.env;
+  try {
+    const key = (args.positionals[0] ?? '').trim() || await (deps.readKey ?? readKeyFromStdin)();
+    if (!key) {
+      err(PAIR_USAGE);
+      return 2;
+    }
+    let result: Awaited<ReturnType<typeof writePairing>>;
+    try {
+      result = await writePairing({ key, url: args.url, env });
+    } catch (e) {
+      if (e instanceof PairError) {
+        err(`${e.message}\n${PAIR_USAGE}`);
+        return 2;
+      }
+      err('Could not save the ONOSOO pairing.\n');
+      return 2;
+    }
+    if (result.spoolDiscarded > 0) {
+      out(`The key changed: discarded ${result.spoolDiscarded} unsent run file${result.spoolDiscarded === 1 ? '' : 's'} from the previous pairing.\n`);
+    }
+    if (result.aclApplied === false) {
+      err('Warning: could not restrict the MOAG config folder to your user account (icacls failed).\n');
+    }
+    if (relayConfigEnv().MOAG_ONOSOO_KEY) {
+      err('MOAG_ONOSOO_KEY in this environment overrides the saved key.\n');
+    }
+    const outcome = await checkPairing(result.saved, deps.http);
+    if (outcome === 'accepted') {
+      out('Paired. ONOSOO accepted the key.\n');
+      return 0;
+    }
+    if (outcome === 'refused') {
+      out('Saved, but ONOSOO refused the key: it was revoked or mistyped. Pair again with a new key.\n');
+      return 1;
+    }
+    out(`Saved. Could not confirm with ONOSOO (${outcome.unverified}); runs will relay when it is reachable.\n`);
+    return 0;
+  } catch {
+    err('Could not pair with ONOSOO.\n');
+    return 2;
+  }
+}
+
 // ─── entry ───────────────────────────────────────────────────────────────────
+
+const MAIN_USAGE =
+  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|bench> ...\n' +
+  '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
+  '       moag --version | moag help\n' +
+  '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
+  '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
+  '                       no standards gate (static rules and profile commands) in verification\n' +
+  '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
+  '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>] [--no-standards] [--base <ref>]\n' +
+  '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
+  '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
+  '  moag config <get-engine | set-engine <id>>\n' +
+  '  moag queue <list | resolve <id>>\n' +
+  '  moag digest [--since <when>]\n' +
+  '  moag land [--into <branch>] [--merge]\n' +
+  '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n' +
+  '  moag standards show\n' +
+  '  moag standards check [--base <ref>] [--no-commands]     exit 0 ok · 1 blocking failure · 5 nothing checked · 6 blocking not checked\n' +
+  '  moag standards propose [--stack <id>] [--write [--force]]\n' +
+  '  moag pair [<key>] [--url <base>]   save the ONOSOO device key (read from stdin when omitted) and check it\n' +
+  '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n';
 
 /** The CLI entry point. Exported so a test can drive dispatch. */
 export async function main(argv: string[] = process.argv.slice(2)): Promise<number> {
@@ -2139,7 +2298,19 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     // It reads the device key from the captured snapshot, like the relay.
     return require('../host/cli').cmdHost(argv.slice(1), relayConfigEnv());
   }
+  if (argv[0] === '-v' || argv[0] === '--version' || argv[0] === 'version') {
+    process.stdout.write(readMoagVersion() + '\n');
+    return 0;
+  }
+  if (argv[0] === 'help' || argv[0] === '--help' || argv[0] === '-h') {
+    process.stdout.write(MAIN_USAGE);
+    return 0;
+  }
   const args = parseArgs(argv);
+  if (args.command === 'pair') {
+    // No setup() and no shim: pairing writes one user-level file and makes one HTTP call.
+    return cmdPair(args);
+  }
   // Hidden: the ONOSOO remote child, started by `moag daemon` through sudo (docs/onosoo-remote.md).
   if (args.command === 'remote-child') {
     return require('./remote-child').remoteChildMain();
@@ -2150,7 +2321,16 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       process.stderr.write('Usage: moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]  (--max-usd must be a positive number)\n');
       return 2;
     }
-    return require('../bench/harness').cmdBench(args);
+    // The bench is a development tool and is not in the VSIX (.vscodeignore: out/bench/**).
+    let harness: { cmdBench(a: Args): Promise<number> };
+    try {
+      harness = require('../bench/harness');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') { throw err; }
+      process.stderr.write('moag bench runs from a MOAG source checkout (npm run compile); it is not part of the installed extension.\n');
+      return 2;
+    }
+    return harness.cmdBench(args);
   }
   if (args.command === 'run') {
     if (!args.planPath && !args.prompt) {
@@ -2191,26 +2371,7 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
     // No setup() and no shim: the standards file is read, checked and proposed without the runner.
     return cmdStandards(args);
   }
-  process.stderr.write(
-    'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|bench> ...\n' +
-    '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
-    '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
-    '      --no-standards   project standards off for this invocation: no standards block in task prompts,\n' +
-    '                       no standards gate (static rules and profile commands) in verification\n' +
-    '  moag run --prompt "<text>" [--engine <id>] [--full-auto]\n' +
-    '  moag verify <plan.json> [--prd <file>] [--fix] [--gate "<cmd>"] [--max-iterations <n>] [--no-standards] [--base <ref>]\n' +
-    '  moag loop --repo <owner/repo> [--label <l>] [--interval <sec>] [--once] [--full-auto]\n' +
-    '  moag daemon [--config <.moag/daemon.json>] [--interval <sec>] [--max-ticks <n>] [--full-auto]\n' +
-    '  moag config <get-engine | set-engine <id>>\n' +
-    '  moag queue <list | resolve <id>>\n' +
-    '  moag digest [--since <when>]\n' +
-    '  moag land [--into <branch>] [--merge]\n' +
-    '  moag trace [<plan.json> | --plan <path>] [--req R-<n>]\n' +
-    '  moag standards show\n' +
-    '  moag standards check [--base <ref>] [--no-commands]     exit 0 ok · 1 blocking failure · 5 nothing checked · 6 blocking not checked\n' +
-    '  moag standards propose [--stack <id>] [--write [--force]]\n' +
-    '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n',
-  );
+  process.stderr.write(MAIN_USAGE);
   return 2;
 }
 

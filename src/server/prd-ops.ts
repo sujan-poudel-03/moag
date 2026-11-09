@@ -5,7 +5,6 @@
 // a result or a refusal carrying the HTTP status the route should send. No I/O.
 
 import { createHash } from 'crypto';
-import * as path from 'path';
 import {
   EngineId, Plan, PlanFilePlaylist, PlanFileTask, PrdVersion, SemverBump, TaskStatus,
 } from '../models/types';
@@ -14,6 +13,13 @@ import {
   relabelLastPrdVersion,
 } from '../models/requirements';
 import { appendPrdVersion } from '../models/plan';
+import { StrippedGeneratedEntry, cwdEscapesWorkspace } from '../shared/generated-plan';
+
+// The generated-plan checks and the ship gate are in shared/: the ONOSOO remote child
+// ships in the extension and applies them too, and the server does not ship.
+export type { StrippedGeneratedField, StrippedGeneratedEntry } from '../shared/generated-plan';
+export { STRIPPED_GENERATED_FIELDS, stripGeneratedSideEffects, cwdEscapesWorkspace } from '../shared/generated-plan';
+export { SHIP_GATE_NAME, SHIPPING_TASK_TYPES, shippingTaskIds, appendShipGate } from '../shared/ship-gate';
 
 export const MAX_PRD_TEXT_CHARS = 200_000;
 /** Engines a server run may never use: copilot needs a VS Code host, custom runs an arbitrary command. */
@@ -181,10 +187,6 @@ export interface ReviewItem {
   value: string;
 }
 
-/** Task fields a generated plan may never carry: removed before hashing and review. */
-export const STRIPPED_GENERATED_FIELDS = ['env', 'inheritEnvFiles', 'githubRelease', 'releaseTag'] as const;
-export type StrippedGeneratedField = typeof STRIPPED_GENERATED_FIELDS[number];
-
 export interface PendingPlaylistReview {
   ok: boolean;
   /** Engine, `parallel` and `cwd` violations; non-empty means the playlist must not be approved. */
@@ -192,42 +194,7 @@ export interface PendingPlaylistReview {
   /** Every command, cwd override and side-effect field in the playlist, verbatim. */
   commands: ReviewItem[];
   /** Side-effect fields the server removed from the generated tasks. */
-  stripped?: Array<{ taskId: string; taskName: string; field: StrippedGeneratedField }>;
-}
-
-/**
- * Remove {@link STRIPPED_GENERATED_FIELDS} from every task of a generated
- * playlist: env injection, env-file inheritance and git tag/push are never
- * model-chosen. Mutates `pl`; returns what was removed.
- */
-export function stripGeneratedSideEffects(pl: PlanFilePlaylist): NonNullable<PendingPlaylistReview['stripped']> {
-  const stripped: NonNullable<PendingPlaylistReview['stripped']> = [];
-  for (const t of (pl.tasks ?? []) as PlanFileTask[]) {
-    for (const field of STRIPPED_GENERATED_FIELDS) {
-      if (Object.prototype.hasOwnProperty.call(t, field)) {
-        delete t[field];
-        stripped.push({ taskId: t.id, taskName: t.name, field });
-      }
-    }
-  }
-  return stripped;
-}
-
-/**
- * Does a task `cwd` leave the project workspace? The runner joins a relative
- * cwd onto the workspace root and uses an absolute one as-is, so an absolute
- * path (POSIX, Windows drive, drive-relative `C:x` or UNC) escapes, and so does
- * a relative path whose `..` segments climb above the root at any point.
- * Either separator counts: the plan may run on Windows or POSIX.
- */
-export function cwdEscapesWorkspace(cwd: string): boolean {
-  if (path.posix.isAbsolute(cwd) || path.win32.isAbsolute(cwd) || /^[A-Za-z]:/.test(cwd)) { return true; }
-  let depth = 0;
-  for (const seg of cwd.split(/[\\/]+/)) {
-    if (seg === '..') { depth--; if (depth < 0) { return true; } }
-    else if (seg !== '' && seg !== '.') { depth++; }
-  }
-  return false;
+  stripped?: StrippedGeneratedEntry[];
 }
 
 /**
@@ -341,80 +308,6 @@ export function redactStringsDeep(value: unknown, redact: (text: string) => stri
 
 /** Review error shown when a generated playlist carried a server credential. */
 export const CREDENTIAL_IN_PLAYLIST_ERROR = 'The generated plan contained a server credential. It was redacted, and this plan cannot be approved. Request a new plan.';
-
-// ─── Ship gate (server-owned) ───
-
-export const SHIP_GATE_NAME = 'Ship approval';
-
-const SHIP_GATE_PROMPT = 'Ship gate: an approver reviews the completed work for this PRD version and approves shipping it. '
-  + 'Added by the server to every generated plan; the run halts here until a human decides.';
-
-/** Task types that ship: they run only after the ship gate is approved. */
-export const SHIPPING_TASK_TYPES: ReadonlySet<string> = new Set(['release', 'deploy']);
-
-/**
- * Ids of every `release`/`deploy` task in `tasks` plus everything that
- * (transitively, via `dependsOn`) depends on one — the work that ships.
- */
-export function shippingTaskIds(tasks: readonly PlanFileTask[]): Set<string> {
-  const shipping = new Set(tasks.filter((t) => SHIPPING_TASK_TYPES.has(t.type ?? 'agent')).map((t) => t.id));
-  let grew = shipping.size > 0;
-  while (grew) {
-    grew = false;
-    for (const t of tasks) {
-      if (!shipping.has(t.id) && (t.dependsOn ?? []).some((d) => shipping.has(d))) {
-        shipping.add(t.id);
-        grew = true;
-      }
-    }
-  }
-  return shipping;
-}
-
-/**
- * Add the server-owned ship gate to a generated playlist: a `manual` task named
- * {@link SHIP_GATE_NAME} that carries every requirement id the playlist cites.
- * Generated plans never contain one on their own, so without this the "gated
- * at ship" policy would be unreachable.
- *
- * The gate gates SHIPPING: it depends on every leaf of the non-shipping work
- * (so, transitively, on every task that is not a release/deploy task or
- * downstream of one), and every release/deploy task — and everything that
- * depends on one — gains a `dependsOn` on the gate. The playlist is reordered
- * to non-shipping tasks, then the gate, then shipping tasks (a stable
- * partition: planner order within each group is preserved), because the sequential runner executes in array order
- * and would otherwise reach a release before its gate. With no release/deploy
- * task the gate is terminal and last. Mutates `pl`; returns the gate.
- */
-export function appendShipGate(pl: PlanFilePlaylist, gateId: string): PlanFileTask {
-  const tasks = pl.tasks ?? [];
-  const taken = new Set(tasks.map((t) => t.id));
-  let id = gateId;
-  for (let n = 2; taken.has(id); n++) { id = `${gateId}-${n}`; }
-  const shipping = shippingTaskIds(tasks);
-  const before = tasks.filter((t) => !shipping.has(t.id));
-  const after = tasks.filter((t) => shipping.has(t.id));
-  // Leaves of the non-shipping work. A non-shipping task never depends on a
-  // shipping one (shipping is closed over dependents), so no cycle can form.
-  const dependedOnBefore = new Set(before.flatMap((t) => t.dependsOn ?? []));
-  const leaves = before.filter((t) => !dependedOnBefore.has(t.id)).map((t) => t.id);
-  const reqNum = (r: string): number => Number(r.replace(/^\D+/, '')) || 0;
-  const requirementIds = [...new Set(tasks.flatMap((t) => t.requirementIds ?? []))].sort((a, b) => reqNum(a) - reqNum(b) || (a < b ? -1 : a > b ? 1 : 0));
-  const gate: PlanFileTask = {
-    id,
-    name: SHIP_GATE_NAME,
-    prompt: SHIP_GATE_PROMPT,
-    type: 'manual',
-    ...(leaves.length > 0 ? { dependsOn: leaves } : {}),
-    ...(requirementIds.length > 0 ? { requirementIds } : {}),
-  };
-  for (const t of after) {
-    const deps = t.dependsOn ?? [];
-    if (!deps.includes(id)) { t.dependsOn = [...deps, id]; }
-  }
-  pl.tasks = [...before, gate, ...after];
-  return gate;
-}
 
 /** Deterministic JSON (sorted keys) so equal content always hashes equally. */
 export function stableStringify(value: unknown): string {

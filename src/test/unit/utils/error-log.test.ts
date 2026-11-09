@@ -2,7 +2,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import { appendErrorLog, readRecentErrors, InternalError } from '../../../utils/error-log';
+import { appendErrorLog, readRecentErrors, InternalError, isOwnStack } from '../../../utils/error-log';
 
 describe('appendErrorLog', () => {
   let tmpDir: string;
@@ -122,5 +122,36 @@ describe('readRecentErrors', () => {
   it('returns empty array on completely unreadable directory', () => {
     const result = readRecentErrors('/this/path/does/not/exist');
     assert.deepEqual(result, []);
+  });
+});
+
+describe('isOwnStack', () => {
+  it('is true for a stack with a frame under the extension path', () => {
+    const stack = 'Error: x\n    at f (/home/u/.vscode/extensions/moag.agent-task-player-0.9.15/out/extension.js:10:5)';
+    assert.equal(isOwnStack(stack, '/home/u/.vscode/extensions/moag.agent-task-player-0.9.15', 'linux'), true);
+  });
+
+  it('is false for another extension\'s stack', () => {
+    const stack = 'Error: x\n    at f (/home/u/.vscode/extensions/other.ext-1.0.0/out/main.js:1:1)';
+    assert.equal(isOwnStack(stack, '/home/u/.vscode/extensions/moag.agent-task-player-0.9.15', 'linux'), false);
+  });
+
+  it('does not match a sibling folder that merely shares a prefix', () => {
+    const stack = 'Error: x\n    at f (/ext/moag-old/out/x.js:1:1)';
+    assert.equal(isOwnStack(stack, '/ext/moag', 'linux'), false);
+  });
+
+  it('is false for an undefined stack or an empty path', () => {
+    assert.equal(isOwnStack(undefined, '/ext/moag', 'linux'), false);
+    assert.equal(isOwnStack('at /ext/moag/x.js', '', 'linux'), false);
+  });
+
+  it('on win32 ignores case and slash direction', () => {
+    const stack = 'Error: x\n    at f (c:/users/Alice/.VSCODE/extensions/moag.agent-task-player-0.9.15/out/extension.js:1:1)';
+    assert.equal(isOwnStack(stack, 'C:\\Users\\alice\\.vscode\\extensions\\moag.agent-task-player-0.9.15', 'win32'), true);
+  });
+
+  it('on linux stays case-sensitive', () => {
+    assert.equal(isOwnStack('at /Ext/Moag/x.js', '/ext/moag', 'linux'), false);
   });
 });

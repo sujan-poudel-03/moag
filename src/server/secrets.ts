@@ -23,21 +23,15 @@ import * as path from 'path';
 import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'crypto';
 import { EngineId } from '../models/types';
 import { writeFileAtomicSync } from '../utils/file-io';
+import { API_KEY_RE, KEYED_ENGINE_ENV } from '../shared/engine-keys';
 
 export const SECRETS_FILE = 'secrets.json';
 export const HKDF_INFO = 'moag-engine-keys-v1';
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
-/** Printable ASCII, no spaces: API keys are tokens, and this keeps control characters out of a child env. */
-export const API_KEY_RE = /^[\x21-\x7e]{8,512}$/;
 
-/**
- * Engines whose credentials the server stores, and the env var each is injected
- * as. Closed map: S3 covers `anthropic` only.
- */
-export const KEYED_ENGINE_ENV: Readonly<Partial<Record<EngineId, string>>> = Object.freeze({
-  anthropic: 'ANTHROPIC_API_KEY',
-});
+// The key shape and the keyed-engine map live in shared/: the headless CLI ships in the extension, the server does not.
+export { API_KEY_RE, KEYED_ENGINE_ENV } from '../shared/engine-keys';
 
 /** Engines in {@link KEYED_ENGINE_ENV}. */
 export const KEYED_ENGINES: readonly EngineId[] = Object.freeze(Object.keys(KEYED_ENGINE_ENV) as EngineId[]);

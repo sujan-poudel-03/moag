@@ -16,9 +16,14 @@ interface Document {
   getElementById(elementId: string): any;
 }
 const vscode = acquireVsCodeApi();
-document.getElementById('recheckBtn').addEventListener('click', function() {
-  vscode.postMessage({ type: 'recheck' });
-});
-document.getElementById('doneBtn').addEventListener('click', function() {
-  vscode.postMessage({ type: 'done' });
-});
+
+/** Post `type` when the button with `id` is clicked (a button the host left out is skipped). */
+function onClick(id: string, type: string): void {
+  const btn = document.getElementById(id);
+  if (btn) { btn.addEventListener('click', function() { vscode.postMessage({ type }); }); }
+}
+
+onClick('recheckBtn', 'recheck');
+onClick('doneBtn', 'done');
+onClick('setAnthropicKeyBtn', 'setAnthropicKey');
+onClick('connectOnosooBtn', 'connectOnosoo');

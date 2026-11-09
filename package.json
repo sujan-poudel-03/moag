@@ -2,7 +2,7 @@
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
   "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
-  "version": "0.9.12",
+  "version": "0.10.0",
   "publisher": "moag",
   "license": "MIT",
   "icon": "media/icon.png",
@@ -15,7 +15,17 @@
     "url": "https://github.com/sujan-poudel-03/moag/issues"
   },
   "engines": {
-    "vscode": "^1.85.0"
+    "vscode": "^1.90.0"
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "MOAG runs AI agent CLIs and shell commands defined by the workspace's plan files. It is disabled until you trust the workspace."
+    },
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "MOAG spawns local processes against files on disk."
+    }
   },
   "galleryBanner": {
     "color": "#1e1e2e",
@@ -29,9 +39,11 @@
     }
   ],
   "categories": [
-    "Machine Learning",
-    "Other"
+    "AI",
+    "Machine Learning"
   ],
+  "qna": "https://github.com/sujan-poudel-03/moag/issues",
+  "pricing": "Free",
   "keywords": [
     "ai",
     "agent",
@@ -51,9 +63,9 @@
     "workspaceContains:.moag/plan.json",
     "workspaceContains:**/*.agent-plan.json"
   ],
-  "main": "./out/extension.js",
+  "main": "./out/bundle/extension.js",
   "bin": {
-    "moag": "./out/headless/cli.js"
+    "moag": "./out/bundle/cli.js"
   },
   "contributes": {
     "commands": [
@@ -394,6 +406,11 @@
         "icon": "$(bug)"
       },
       {
+        "command": "agentTaskPlayer.exportDiagnostics",
+        "title": "Export Diagnostics",
+        "category": "MOAG"
+      },
+      {
         "command": "agentTaskPlayer.planFromOpenIssues",
         "title": "Plan from Open GitHub Issues",
         "category": "MOAG",
@@ -404,6 +421,31 @@
         "title": "Setup Guide",
         "category": "MOAG",
         "icon": "$(getting-started)"
+      },
+      {
+        "command": "agentTaskPlayer.setAnthropicApiKey",
+        "title": "Set Anthropic API Key",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.clearAnthropicApiKey",
+        "title": "Clear Anthropic API Key",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.connectOnosoo",
+        "title": "Connect to ONOSOO Builds",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.disconnectOnosoo",
+        "title": "Disconnect from ONOSOO",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.installCli",
+        "title": "Install Command-Line Tool",
+        "category": "MOAG"
       },
       {
         "command": "agentTaskPlayer.shareRunFeedback",
@@ -506,12 +548,6 @@
         "title": "Switch Execution Profile",
         "category": "MOAG",
         "icon": "$(symbol-event)"
-      },
-      {
-        "command": "agentTaskPlayer.watchMode",
-        "title": "Toggle Watch Mode",
-        "category": "MOAG",
-        "icon": "$(eye)"
       },
       {
         "command": "agentTaskPlayer.managePromptSnippets",
@@ -1224,7 +1260,7 @@
         "agentTaskPlayer.issueRepo": {
           "type": "string",
           "default": "",
-          "description": "GitHub repo (owner/repo) where MOAG bug reports are filed via the Report Bug button. Example: myorg/moag. Leave blank to prompt each time."
+          "description": "GitHub repository (owner/repo) that GitHub Issues Sync imports tasks from. MOAG bug reports always go to sujan-poudel-03/moag."
         },
         "agentTaskPlayer.issueSync.enabled": {
           "type": "boolean",
@@ -1269,7 +1305,7 @@
           "type": "number",
           "default": 10,
           "minimum": 0,
-          "description": "Hard spend ceiling in USD, counted across every engine call in the process — plan tasks and authoring calls alike. When it is passed the run stops and parks, rather than warning and continuing. Raise it for a long unattended run; set it to 0 only if you genuinely want no ceiling at all."
+          "description": "Hard spend ceiling in USD, counted across every engine call in the process — plan tasks and authoring calls alike. When it is passed the run stops and parks, rather than warning and continuing. Raise it for a long unattended run; set it to 0 only if you genuinely want no ceiling at all. Engines that report no cost (Claude in text mode, Codex, Gemini, Copilot, custom) are not counted, so the ceiling cannot stop them."
         },
         "agentTaskPlayer.prdLoop.maxFixIterations": {
           "type": "number",
@@ -1347,7 +1383,18 @@
         "agentTaskPlayer.contributionLedger.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Record per-engine-call usage (task, developer, prompt, tokens/cost) to .moag/usage-log.jsonl and show the Contribution Ledger in the dashboard."
+          "description": "Record per-engine-call usage (task, prompt, tokens/cost) to .moag/usage-log.jsonl (local; rotated at 5 MB) and show the Contribution Ledger in the dashboard."
+        },
+        "agentTaskPlayer.contributionLedger.recordDeveloperEmail": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also record your git user.email with each usage entry, so the Contribution Ledger can attribute work per developer. Off by default: the usage log may be shared."
+        },
+        "agentTaskPlayer.onosoo.relay": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "description": "Relay runs started from VS Code to ONOSOO Builds when this machine is paired (device key in MOAG_ONOSOO_KEY or the user-level moag/onosoo.json). Off: nothing is sent. Does not affect the moag CLI."
         },
         "agentTaskPlayer.contributionLedger.leads": {
           "type": "array",
@@ -1612,7 +1659,8 @@
         "agentTaskPlayer.engines.anthropic.apiKey": {
           "type": "string",
           "default": "",
-          "description": "Anthropic API key for the direct API engine. If empty, falls back to the ANTHROPIC_API_KEY environment variable."
+          "description": "Anthropic API key for the direct API engine. If empty, falls back to the ANTHROPIC_API_KEY environment variable.",
+          "markdownDeprecationMessage": "Deprecated: settings files can be synced or committed. Run **MOAG: Set Anthropic API Key** instead; MOAG moves a key found here into VS Code's secret storage and clears it from settings."
         },
         "agentTaskPlayer.engines.anthropic.model": {
           "type": "string",
@@ -1727,6 +1775,15 @@
               "altText": "Advanced features overview",
               "markdown": "media/walkthrough-advanced.md"
             }
+          },
+          {
+            "id": "connectOnosoo",
+            "title": "Connect to ONOSOO Builds (optional)",
+            "description": "Watch your runs live in **ONOSOO Builds**. With a Linux or WSL machine you can also control runs and open live previews from ONOSOO.\n\n1. In ONOSOO open **Builds** → **Pair machine** and copy the key. It is shown **once**.\n2. [Connect to ONOSOO Builds](command:agentTaskPlayer.connectOnosoo) and paste the key. For a terminal, [Install Command-Line Tool](command:agentTaskPlayer.installCli) and run ``moag pair``. The key is saved in ``%APPDATA%\\moag\\onosoo.json`` (Windows) or ``~/.config/moag/onosoo.json`` (Linux/WSL): never inside a project, and never with ``setx``.\n3. Run any plan, from this panel or with ``moag run``, and it appears in ONOSOO.\n\n[Read the full ONOSOO Builds guide](https://github.com/sujan-poudel-03/moag/blob/master/docs/onosoo-builds.md)",
+            "media": {
+              "altText": "Connecting MOAG to ONOSOO Builds",
+              "markdown": "media/walkthrough-onosoo.md"
+            }
           }
         ]
       }
@@ -1734,17 +1791,20 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "npm run compile:ext && npm run compile:webview",
+    "compile": "npm run compile:ext && npm run compile:webview && npm run bundle",
+    "bundle": "node scripts/bundle.js --production",
+    "watch:bundle": "node scripts/bundle.js --watch",
     "watch": "tsc -watch -p ./",
     "lint": "eslint src --ext ts",
     "test": "npm run test:unit",
-    "test:unit": "mocha --timeout 10000 --require ts-node/register --require ./src/test/unit/test-setup.ts \"src/test/unit/**/*.test.ts\" --ignore \"src/test/unit/**/*live.test.ts\"",
-    "test:live": "mocha --require ts-node/register \"src/test/unit/**/*live.test.ts\"",
+    "test:unit": "node --import tsx ./node_modules/mocha/bin/mocha.js --timeout 10000 --require ./src/test/unit/test-setup.ts \"src/test/unit/**/*.test.ts\" --ignore \"src/test/unit/**/*live.test.ts\"",
+    "test:live": "node --import tsx ./node_modules/mocha/bin/mocha.js \"src/test/unit/**/*live.test.ts\"",
     "test:integration": "vscode-test",
     "pretest:integration": "npm run compile",
     "package": "vsce package",
     "moag": "node ./out/headless/cli.js",
     "server": "node ./out/server/main.js",
+    "smoke:vsix": "node scripts/smoke-vsix.mjs",
     "headless:smoke": "npm run compile && node ./out/headless/cli.js run .moag/sample.plan.json --no-interactive --full-auto",
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch",
@@ -1753,24 +1813,26 @@
     "watch:webview": "tsc -watch -p tsconfig.webview.json"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0"
+    "@anthropic-ai/sdk": "~0.137.0"
   },
   "devDependencies": {
     "@types/mocha": "^10.0.0",
     "@types/node": "^20.11.0",
     "@types/proxyquire": "^1.3.31",
     "@types/sinon": "^17.0.0",
-    "@types/vscode": "^1.85.0",
+    "@types/vscode": "~1.90.0",
     "@typescript-eslint/eslint-plugin": "^7.0.0",
     "@typescript-eslint/parser": "^7.0.0",
-    "@vscode/test-cli": "^0.0.10",
-    "@vscode/test-electron": "^2.3.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
     "@vscode/vsce": "^2.22.0",
+    "esbuild": "^0.28.2",
     "eslint": "^8.56.0",
     "mocha": "^10.7.0",
     "proxyquire": "^2.1.3",
     "sinon": "^17.0.0",
     "ts-node": "^10.9.0",
+    "tsx": "^4.23.15",
     "typescript": "^5.3.0"
   }
 }

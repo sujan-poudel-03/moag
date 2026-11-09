@@ -35,14 +35,16 @@ CODE="$(find_code || true)"
 say "VS Code CLI : $CODE"
 
 # ── Build ──
-[ -d node_modules ] || { say "Installing dependencies…"; npm install; }
+# Always npm ci: the build needs every devDependency (esbuild bundles the
+# extension), and an older clone's node_modules may predate one.
+say "Installing dependencies…"; npm ci
 say "Compiling…"; npm run compile
 
 # ── Package VSIX ──
 VERSION="$(node -p "require('./package.json').version")"
 VSIX="agent-task-player-${VERSION}.vsix"
 say "Packaging ${VSIX}…"
-npx --yes vsce package --no-dependencies --allow-missing-repository --skip-license -o "$VSIX"
+npx --yes vsce package --allow-missing-repository --skip-license -o "$VSIX"
 
 # ── Install / update the extension ──
 say "Installing extension into VS Code…"

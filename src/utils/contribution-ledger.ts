@@ -62,6 +62,8 @@ export interface ContributionLedgerPayload {
   windowEnd: string;
   totalTokens: number;
   totalCostUsd: number;
+  /** Calls in the window whose engine reported no cost (costKnown === false); not in totalCostUsd. */
+  unknownCostCalls: number;
   contributorCount: number;
   leaderboard: ContributionLeaderboardRow[];
   isTopThisWeek: boolean;
@@ -128,9 +130,11 @@ export function rollupContributionLedger(
   // Team-wide totals: every entry in the window, regardless of status/availability.
   let totalTokens = 0;
   let totalCostUsd = 0;
+  let unknownCostCalls = 0;
   for (const e of windowEntries) {
     totalTokens += (e.inputTokens ?? 0) + (e.outputTokens ?? 0);
     totalCostUsd += e.estimatedCostUsd ?? 0;
+    if (e.costKnown === false) { unknownCostCalls++; }
   }
 
   // Group by taskId so multiple calls (retry / fallback / consensus) sum
@@ -228,6 +232,7 @@ export function rollupContributionLedger(
     windowEnd: opts.now.toISOString(),
     totalTokens,
     totalCostUsd,
+    unknownCostCalls,
     contributorCount: acc.size,
     leaderboard,
     isTopThisWeek,

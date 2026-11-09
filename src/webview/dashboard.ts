@@ -660,7 +660,15 @@ function renderContributionLedger(msg) {
     : '';
 
   tokensEl.textContent = clFormatTokens(msg.totalTokens || 0);
-  if (costEl) { costEl.textContent = clFormatCost(msg.totalCostUsd || 0); }
+  if (costEl) {
+    // Calls that reported no cost are named, never folded into a total that reads as complete.
+    const unknown = msg.unknownCostCalls || 0;
+    costEl.textContent = unknown > 0
+      ? ((msg.totalCostUsd || 0) > 0
+        ? clFormatCost(msg.totalCostUsd) + ' + ' + unknown + ' call' + (unknown === 1 ? '' : 's') + ' of unknown cost'
+        : 'cost unknown')
+      : clFormatCost(msg.totalCostUsd || 0);
+  }
   if (contributorsEl) { contributorsEl.textContent = String(msg.contributorCount || 0); }
 
   // Zero-data state: neutral empty message, no error styling, no fallback badge.

@@ -36,14 +36,16 @@ if (-not $code) { throw "VS Code CLI ('code') not found on PATH or in standard i
 Say "VS Code CLI : $code"
 
 # ── Build ──
-if (-not (Test-Path 'node_modules')) { Say 'Installing dependencies...'; npm install }
+# Always npm ci: the build needs every devDependency (esbuild bundles the
+# extension), and an older clone's node_modules may predate one.
+Say 'Installing dependencies...'; npm ci
 Say 'Compiling...'; npm run compile
 
 # ── Package VSIX ──
 $version = node -p "require('./package.json').version"
 $vsix = "agent-task-player-$version.vsix"
 Say "Packaging $vsix..."
-npx --yes vsce package --no-dependencies --allow-missing-repository --skip-license -o $vsix
+npx --yes vsce package --allow-missing-repository --skip-license -o $vsix
 
 # ── Install / update the extension ──
 Say 'Installing extension into VS Code...'

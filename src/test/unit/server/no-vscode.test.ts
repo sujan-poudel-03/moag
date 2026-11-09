@@ -132,9 +132,11 @@ describe('G4: server modules never load vscode', () => {
     });
   }
 
-  it('run-worker.ts has exactly the four allowed top-level imports', () => {
+  it('run-worker.ts has exactly the five allowed top-level imports', () => {
     const specs = topLevelSpecifiers(path.join(SERVER, 'run-worker.ts')).sort();
-    assert.deepEqual(specs, ['../headless/install-shim', './worker-protocol', 'fs', 'path']);
+    assert.deepEqual(specs, ['../headless/install-shim', '../shared/worker-pipes', './worker-protocol', 'fs', 'path']);
+    // The shared pipe guard (moved out of run-worker so the shipped remote child can use it) imports nothing.
+    assert.deepEqual(topLevelSpecifiers(path.join(SERVER, '..', 'shared', 'worker-pipes.ts')), []);
   });
 
   it("the string 'vscode' never appears as a module specifier in run-worker.ts", () => {
@@ -178,12 +180,14 @@ const RELAY_MODULES = [
   'headless/onosoo-config.ts',
   'headless/onosoo-spool.ts',
   'headless/onosoo-relay.ts',
+  'headless/run-reporter.ts',
+  'headless/host-run-relay.ts',
 ];
 
 describe('ONOSOO relay modules never load vscode', function () {
   this.timeout(20000);
 
-  it('finds all six modules (non-vacuous)', () => {
+  it('finds every relay module (non-vacuous)', () => {
     for (const rel of RELAY_MODULES) {
       assert.ok(fs.existsSync(path.join(SRC, rel)), rel);
     }

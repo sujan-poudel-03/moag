@@ -592,6 +592,33 @@ describe('headless CLI: cmdRun persists only requirement trace', () => {
     assert.ok(String(tail.tail).includes('[REDACTED]'));
     assert.ok(!lines.join('').includes(secret));
     assert.equal(runner.listenerCount('task-failed'), 1, 'reporting listeners are removed when the run ends');
+    assert.equal(events.find((e) => e.event === 'run-finished')!.code, 1, 'run-finished carries the run exit code');
+  });
+
+  it('run-finished carries code 0 for a clean run, and every engine call cost is a cost line', async () => {
+    const { dir, planFile } = writePlanFile();
+    const { costLedger } = require('../../../utils/cost-ledger');
+    const { EventEmitter } = require('events');
+    const runner = new EventEmitter();
+    runner.stop = () => undefined;
+    runner.play = async (plan: Plan) => {
+      const t = plan.playlists[0].tasks[0];
+      runner.emit('task-started', t);
+      costLedger.record({ estimatedCost: 0.0123, costSource: 'reported' }, { engineId: 'claude' });
+      costLedger.recordUnreported({ engineId: 'gemini' });
+      t.status = TaskStatus.Completed;
+      runner.emit('task-completed', t, { stdout: '', stderr: '' });
+    };
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]), { ...fakeCtx(), runner, relayDeps: { env: {} } });
+    assert.equal(code, 0);
+    const events = lines.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const costs = events.filter((e) => e.event === 'cost');
+    assert.deepEqual(costs.map((c) => [c.usd, c.source]), [[0.0123, 'reported'], [0, 'none']]);
+    assert.equal(events.find((e) => e.event === 'run-finished')!.code, 0);
+    // After the run, the subscription is gone: a later engine call is not reported as this run's.
+    const before = lines.length;
+    costLedger.record({ estimatedCost: 1 }, { engineId: 'claude' });
+    assert.equal(lines.length, before);
   });
 
   it('a run that recorded no trace does not touch the plan file', async () => {
@@ -1022,15 +1049,12 @@ describe('headless CLI: moag daemon with ONOSOO', function () {
     const port = (server.address() as { port: number }).port;
     const dir = fs.realpathSync(tmpDir());
     const configDir = fs.realpathSync(tmpDir());
-    const nodeFlags = ['--no-experimental-strip-types', '--no-experimental-detect-module']
-      .filter((f) => process.allowedNodeEnvironmentFlags.has(f));
     let child: ChildProcess;
     try {
-      child = spawn(process.execPath, [...nodeFlags, '-r', 'ts-node/register', path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'daemon', '--cwd', dir], {
+      child = spawn(process.execPath, ['--import', 'tsx', path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'daemon', '--cwd', dir], {
         cwd: path.join(__dirname, '..', '..', '..', '..'),
         env: {
           ...process.env, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: `http://127.0.0.1:${port}`, APPDATA: configDir, XDG_CONFIG_HOME: configDir,
-          TS_NODE_TRANSPILE_ONLY: 'true',
         },
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
@@ -1046,7 +1070,7 @@ describe('headless CLI: moag daemon with ONOSOO', function () {
     child.on('exit', (code: number | null) => { exited = code ?? -1; });
     try {
       const polls = (): number => seen.filter((s) => s.url.endsWith('/commands/poll')).length;
-      // Start-up (ts-node compiling the CLI) can be slow; then two polls 5 s apart.
+      // Start-up (tsx loading the CLI) can be slow; then two polls 5 s apart.
       await until(() => polls() >= 2 || exited !== null, 200_000);
       assert.equal(exited, null, `the daemon exited (${exited}): ${stderrText.slice(-500)}`);
       await new Promise((r) => setTimeout(r, 1_000));
@@ -2183,7 +2207,7 @@ describe('headless CLI: moag standards', () => {
 
   it('the verb is listed in the top-level usage and the header comment', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'utf-8');
-    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|bench>/);
+    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|pair\|bench>/);
     for (const line of ['moag standards show', 'moag standards check [--base <ref>] [--no-commands]', 'moag standards propose [--stack <id>] [--write [--force]]']) {
       assert.ok(source.split(line).length - 1 >= 2, `"${line}" appears in the header and in the usage text`);
     }
@@ -2834,5 +2858,140 @@ describe('headless CLI: moag standards — design system', () => {
   it('check: with the design rule promoted, the same finding exits 1', async () => {
     const dir = designedWorkspace(true);
     assert.equal(await run(checkCli(RAW_HEX), ['check', '--cwd', dir]), 1);
+  });
+});
+
+describe('headless CLI: --version, help, pair', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const cli = require('../../../headless/cli');
+
+  /** Run `fn` with stdout captured. */
+  async function captureStdout(fn: () => Promise<number>): Promise<{ code: number; out: string }> {
+    const write = process.stdout.write.bind(process.stdout);
+    let out = '';
+    (process.stdout as unknown as { write: (s: string) => boolean }).write = (chunk: string) => { out += String(chunk); return true; };
+    try {
+      const code = await fn();
+      return { code, out };
+    } finally {
+      (process.stdout as unknown as { write: typeof write }).write = write;
+    }
+  }
+
+  it('--version, -v and version print the package.json version and return 0', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const pkg = require('../../../../package.json');
+    for (const flag of ['--version', '-v', 'version']) {
+      const r = await captureStdout(() => cli.main([flag]));
+      assert.equal(r.code, 0, flag);
+      assert.equal(r.out.trim(), pkg.version, flag);
+    }
+  });
+
+  it('help, --help and -h print the usage, including pair, and return 0', async () => {
+    for (const flag of ['help', '--help', '-h']) {
+      const r = await captureStdout(() => cli.main([flag]));
+      assert.equal(r.code, 0, flag);
+      assert.match(r.out, /moag pair \[<key>\] \[--url <base>\]/);
+    }
+  });
+
+  it('an unknown command still prints the usage to stderr and returns 2', async () => {
+    const err = process.stderr.write.bind(process.stderr);
+    let text = '';
+    (process.stderr as unknown as { write: (s: string) => boolean }).write = (c: string) => { text += String(c); return true; };
+    try {
+      assert.equal(await cli.main(['no-such-command']), 2);
+    } finally {
+      (process.stderr as unknown as { write: typeof err }).write = err;
+    }
+    assert.match(text, /^Usage: moag/);
+  });
+
+  it('readFirstLine returns at the first newline even when stdin never closes', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { PassThrough } = require('stream');
+    const s = new PassThrough();
+    s.write('the-key-1234\nmore later');
+    const r = await cli.readFirstLine(s, 5000);
+    assert.deepEqual(r, { line: 'the-key-1234', timedOut: false });
+    assert.equal(s.listenerCount('data'), 0, 'stops listening');
+  });
+
+  it('readFirstLine gives up after the timeout on a stdin that sends nothing and never closes', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { PassThrough } = require('stream');
+    const s = new PassThrough();
+    const r = await cli.readFirstLine(s, 50);
+    assert.deepEqual(r, { line: '', timedOut: true });
+  });
+
+  it('readFirstLine takes the whole input when it ends without a newline', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { PassThrough } = require('stream');
+    const s = new PassThrough();
+    s.end('only-line');
+    assert.deepEqual(await cli.readFirstLine(s, 5000), { line: 'only-line', timedOut: false });
+  });
+
+  it('parseArgs reads --url', () => {
+    assert.equal(parseArgs(['pair', 'k', '--url', 'https://x.example.com']).url, 'https://x.example.com');
+  });
+
+  describe('cmdPair', () => {
+    const KEY = 'onosoo-device-key-ZZZZ9999';
+    let home: string;
+    let env: NodeJS.ProcessEnv;
+    beforeEach(() => {
+      home = tmpDir();
+      env = { APPDATA: home, XDG_CONFIG_HOME: home };
+    });
+    afterEach(() => { fs.rmSync(home, { recursive: true, force: true }); });
+
+    function run(argv: string[], deps: Record<string, unknown>): Promise<{ code: number; out: string; err: string }> {
+      let out = '';
+      let err = '';
+      return cli.cmdPair(parseArgs(['pair', ...argv]), {
+        env, out: (s: string) => { out += s; }, err: (s: string) => { err += s; }, ...deps,
+      }).then((code: number) => ({ code, out, err }));
+    }
+
+    it('a key from stdin that ONOSOO refuses (401): exit 1, saved, and the key is never printed', async () => {
+      const r = await run([], { readKey: async () => KEY, http: async () => ({ status: 401, body: '' }) });
+      assert.equal(r.code, 1);
+      assert.match(r.out, /ONOSOO refused the key/);
+      assert.ok(!(r.out + r.err).includes(KEY));
+      const saved = JSON.parse(fs.readFileSync(path.join(home, 'moag', 'onosoo.json'), 'utf-8'));
+      assert.equal(saved.key, KEY);
+    });
+
+    it('accepted: exit 0 and "Paired."', async () => {
+      const r = await run([KEY], { http: async () => ({ status: 200, body: '{}' }) });
+      assert.equal(r.code, 0);
+      assert.match(r.out, /^Paired\. ONOSOO accepted the key\./m);
+    });
+
+    it('unreachable: exit 0, saved, with the reason', async () => {
+      const r = await run([KEY], { http: async () => { throw new Error('ECONNREFUSED'); } });
+      assert.equal(r.code, 0);
+      assert.match(r.out, /Could not confirm with ONOSOO \(ECONNREFUSED\)/);
+    });
+
+    it('a missing key is a usage error (exit 2) and writes nothing', async () => {
+      const r = await run([], { readKey: async () => '', http: async () => ({ status: 200, body: '' }) });
+      assert.equal(r.code, 2);
+      assert.match(r.err, /Usage: moag pair/);
+      assert.equal(fs.existsSync(path.join(home, 'moag', 'onosoo.json')), false);
+    });
+
+    it('an invalid key or URL is exit 2, and the key is not echoed', async () => {
+      const bad = 'not a key at all';
+      const a = await run([], { readKey: async () => bad, http: async () => ({ status: 200, body: '' }) });
+      assert.equal(a.code, 2);
+      assert.ok(!(a.out + a.err).includes(bad));
+      const b = await run([KEY, '--url', 'http://insecure.example.com'], { http: async () => ({ status: 200, body: '' }) });
+      assert.equal(b.code, 2);
+      assert.ok(!(b.out + b.err).includes(KEY));
+    });
   });
 });

@@ -39,7 +39,7 @@ export interface PromptSidebarPlanGroup {
     errorCategory?: string;
     errorLines?: string[];
     attemptCount?: number;
-    tokenUsage?: { totalTokens?: number; estimatedCost?: number };
+    tokenUsage?: { totalTokens?: number; estimatedCost?: number; costSource?: 'reported' | 'estimated' | 'unknown' };
     sourceIssueNumber?: number;
     sourceIssueRepo?: string;
   }>;
@@ -58,7 +58,7 @@ export interface PromptSidebarChatMessage {
   durationMs?: number;
   verificationPassed?: boolean;
   exitCode?: number;
-  tokenUsage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number; estimatedCost?: number };
+  tokenUsage?: { totalTokens?: number; inputTokens?: number; outputTokens?: number; estimatedCost?: number; costSource?: 'reported' | 'estimated' | 'unknown' };
 }
 
 export interface PromptSidebarRunnerState {

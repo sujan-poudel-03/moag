@@ -155,9 +155,11 @@ describe('web assets (static scan)', () => {
   });
 
   it('the extension package excludes the web app and the server build', () => {
-    const ignore = read(path.join(REPO, '.vscodeignore')).split(/\r?\n/).map((l) => l.trim());
-    assert.ok(ignore.includes('web/**'));
-    assert.ok(ignore.includes('out/server/**'));
+    // .vscodeignore is an allowlist: `**` excludes everything, and only `!` lines ship.
+    const rules = read(path.join(REPO, '.vscodeignore')).split(/\r?\n/).map((l) => l.trim()).filter((l) => l !== '' && !l.startsWith('#'));
+    assert.equal(rules[0], '**');
+    const kept = rules.filter((l) => l.startsWith('!'));
+    assert.ok(!kept.some((l) => l.startsWith('!web') || l.startsWith('!out/server') || l === '!out/**' || l === '!**'), kept.join(', '));
   });
 });
 

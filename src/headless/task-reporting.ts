@@ -16,7 +16,7 @@
 // Imports nothing that loads `vscode`.
 
 import { collectTaskChanges, TaskChangesPayload, TaskSettledInfo } from '../runner/task-changes';
-import { KEYED_ENGINE_ENV } from '../server/secrets';
+import { KEYED_ENGINE_ENV } from '../shared/engine-keys';
 import { readEnvFileSecrets, Redactor } from '../utils/redact';
 
 /** Characters of output a `task-error-tail` line carries, as in the run worker. */

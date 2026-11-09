@@ -43,7 +43,7 @@ import { FORCE_STOPPED_MESSAGE, STOP_GRACE_MS } from './remote-supervisor';
 
 export const POLL_INTERVAL_MS = 5_000;
 /** The bound on the shutdown capabilities request. */
-export const HOST_CLOSE_DEADLINE_MS = 5_000;
+export const HOST_CLOSE_DEADLINE_MS = 20_000; // ONOSOO can take several seconds to answer (see REQUEST_TIMEOUT_MS)
 /** How long an import of a run's branch may take at shutdown. */
 export const IMPORT_WAIT_MS = 120_000;
 /** The bound on waiting for an active run to stop and finalize at shutdown. */

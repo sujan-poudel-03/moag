@@ -809,10 +809,11 @@ function renderPlanGroups(targetEl, groups) {
           editBtnHtml + previewBtnHtml;
       const tokenMeta = (() => {
         const u = task.tokenUsage;
-        if (!u || (!u.totalTokens && !u.estimatedCost)) { return ''; }
+        if (!u || (!u.totalTokens && !u.estimatedCost && u.costSource !== 'unknown')) { return ''; }
         const parts = [];
         if (u.totalTokens) { parts.push((u.totalTokens >= 1000 ? (u.totalTokens / 1000).toFixed(1) + 'K' : String(u.totalTokens)) + ' tok'); }
-        if (u.estimatedCost) { parts.push('$' + u.estimatedCost.toFixed(u.estimatedCost < 0.01 ? 4 : 2)); }
+        if (u.costSource === 'unknown') { parts.push('cost unknown'); }
+        else if (u.estimatedCost) { parts.push('$' + u.estimatedCost.toFixed(u.estimatedCost < 0.01 ? 4 : 2)); }
         return parts.length ? '<span class="item-subtitle token-meta">' + escHtml(parts.join(' · ')) + '</span>' : '';
       })();
       const errorCat = task.errorCategory || '';
@@ -1367,9 +1368,11 @@ function renderResultCard(msg) {
   const tokLabel = totalTok > 0
     ? (totalTok >= 1000 ? (totalTok / 1000).toFixed(1) + 'K' : String(totalTok)) + ' tok'
     : '';
-  const costLabel = u && u.estimatedCost > 0
-    ? '$' + u.estimatedCost.toFixed(u.estimatedCost < 0.01 ? 4 : 2)
-    : '';
+  const costLabel = u && u.costSource === 'unknown'
+    ? 'cost unknown'
+    : u && u.estimatedCost > 0
+      ? '$' + u.estimatedCost.toFixed(u.estimatedCost < 0.01 ? 4 : 2)
+      : '';
   const tokTitle = u && u.inputTokens
     ? 'In: ' + (u.inputTokens || 0).toLocaleString() + '  Out: ' + (u.outputTokens || 0).toLocaleString() + '  Total: ' + totalTok.toLocaleString()
     : '';

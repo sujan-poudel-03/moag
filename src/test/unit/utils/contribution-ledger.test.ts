@@ -154,12 +154,25 @@ describe('rollupContributionLedger', () => {
       windowEnd: NOW.toISOString(),
       totalTokens: 0,
       totalCostUsd: 0,
+      unknownCostCalls: 0,
       contributorCount: 0,
       leaderboard: [],
       isTopThisWeek: false,
       volumeThreshold: 3,
       coachingCards: [],
     });
+  });
+
+  it('counts calls whose engine reported no cost (costKnown === false) as unknown, outside the total', () => {
+    const entries = [
+      entry({ taskId: 'a', estimatedCostUsd: 0.5, costKnown: true }),
+      entry({ taskId: 'b', estimatedCostUsd: 0, costKnown: false }),
+      entry({ taskId: 'c', estimatedCostUsd: 0, costKnown: false }),
+      entry({ taskId: 'd', estimatedCostUsd: 0.25 }), // written before costKnown existed: not counted as unknown
+    ];
+    const payload = rollupContributionLedger(entries, { now: NOW, taskStatusById: new Map(), leads: [] });
+    assert.equal(payload.unknownCostCalls, 2);
+    assert.equal(payload.totalCostUsd, 0.75);
   });
 
   it('caps a pathologically long one-line prompt defensively, without needing a 4000-char budget', () => {

@@ -87,6 +87,16 @@ describe('costLedger', () => {
     });
   });
 
+  describe('record — unknown cost', () => {
+    it('ignores a usage tagged unknown even when it carries a number', () => {
+      let notified = 0;
+      listen(() => notified++);
+      costLedger.record({ estimatedCost: 1, costSource: 'unknown' }, { engineId: 'claude', label: 'task' });
+      assert.equal(costLedger.getLifetimeUsd(), 0);
+      assert.equal(notified, 0);
+    });
+  });
+
   describe('record — malformed usage', () => {
     const malformed: Array<[string, { estimatedCost?: number } | undefined]> = [
       ['undefined usage', undefined],

@@ -12,8 +12,11 @@ import * as sinon from 'sinon';
 import {
   BACKOFF_MAX_MS, BACKOFF_START_MS, classify, CLOSE_DEADLINE_MS, defaultHttpClient, HEARTBEAT_MS, MAX_BODY_BYTES, MAX_EVENTS,
   MAX_EVENT_DATA_BYTES, MAX_MEMORY_BYTES, OnosooRelay, protocolStatus, REPLAY_MEMORY_BYTES, RelayHttpClient, RelayHttpRequest, REQUEST_TIMEOUT_MS, REVOKED_MESSAGE, RunMeta, scrubPaths,
+  SPOOL_TOUCH_MS,
 } from '../../../headless/onosoo-relay';
-import { OnosooSpool, RelayEvent, SPOOL_OWNER_MAX_IDLE_MS } from '../../../headless/onosoo-spool';
+import {
+  isLiveRelayRun, OnosooSpool, RelayEvent, releaseLiveRelayRun, SPOOL_OWNER_MAX_IDLE_MS,
+} from '../../../headless/onosoo-spool';
 import type { OnosooConfig } from '../../../headless/onosoo-config';
 import { createRedactor, Redactor } from '../../../utils/redact';
 
@@ -120,16 +123,16 @@ describe('ONOSOO relay — constants and classify', () => {
   it('pins the limits and timings', () => {
     assert.equal(MAX_EVENTS, 100);
     assert.equal(MAX_BODY_BYTES, 262_144);
-    assert.equal(REQUEST_TIMEOUT_MS, 10_000);
+    assert.equal(REQUEST_TIMEOUT_MS, 30_000);
     assert.equal(HEARTBEAT_MS, 60_000);
-    assert.equal(CLOSE_DEADLINE_MS, 5_000);
+    assert.equal(CLOSE_DEADLINE_MS, 20_000);
     assert.equal(BACKOFF_START_MS, 5_000);
     assert.equal(BACKOFF_MAX_MS, 300_000);
     assert.equal(MAX_EVENT_DATA_BYTES, 90_000);
   });
 
   it('the revoked message is exact', () => {
-    assert.equal(REVOKED_MESSAGE, 'ONOSOO device key was revoked or is wrong — re-pair this machine in ONOSOO (Builds → Add machine).');
+    assert.equal(REVOKED_MESSAGE, 'ONOSOO device key was revoked or is wrong — re-pair this machine in ONOSOO (Builds → Pair machine).');
   });
 
   it('classifies every response class', () => {
@@ -167,7 +170,7 @@ describe('ONOSOO relay — wire format', () => {
     assert.equal(req.headers.Authorization, `Bearer ${KEY}`);
     assert.equal(req.headers['Content-Type'], 'application/json');
     assert.equal(req.headers['User-Agent'], `moag/${PKG_VERSION}`);
-    assert.ok(req.timeoutMs <= 10_000);
+    assert.ok(req.timeoutMs <= 30_000);
     assert.deepEqual(Object.keys(body).sort(), ['device_id', 'events', 'moag_version', 'protocol']);
     assert.equal(body.protocol, 1);
     assert.equal(body.device_id, 'dev-1');
@@ -305,7 +308,10 @@ describe('ONOSOO relay — acknowledgement and spool', () => {
     assert.equal(spooledBeforeSend, true);
     for (let i = 2; i < 5; i++) { a.relay.record(line('task-started', { id: `t${i}`, name: 'n' })); }
     await settle();
-    // No close(): relay A is abandoned as a killed process would be.
+    // No close(): relay A is abandoned as a killed process would be. A killed process's
+    // live-run registry dies with it; in this process it has to be cleared by hand.
+    assert.equal(isLiveRelayRun(a.relay.runId), true, 'an open relay is registered as live');
+    releaseLiveRelayRun(a.relay.runId);
 
     const b = recorder();
     const relayB = mkRelay(b.client, { fx });
@@ -539,6 +545,69 @@ describe('ONOSOO relay — acknowledgement and spool', () => {
     assert.deepEqual(calls[0].body.events[0].data, { redaction_failed: true });
     assert.ok(!allText(fx.stateDir).includes(SECRET));
   });
+
+  it('replayed task-completed / task-failed lines an older MOAG spooled in lowercase go out in ONOSOO\'s spelling', async () => {
+    const fx = fixture();
+    const old = fx.spool();
+    old.openRun('old-run');
+    old.append({ run_id: 'old-run', seq: 1, type: 'task-completed', at: 'a', data: { id: 't-1', status: 'completed' } });
+    old.append({ run_id: 'old-run', seq: 2, type: 'task-completed', at: 'a', data: { id: 't-2', status: 'skipped' } });
+    old.append({ run_id: 'old-run', seq: 3, type: 'task-failed', at: 'a', data: { id: 't-3', status: 'blocked' } });
+    old.append({ run_id: 'old-run', seq: 4, type: 'task-failed', at: 'a', data: { id: 't-4', status: 'Failed' } });
+    // Not a task outcome: a "status" field elsewhere is left alone.
+    old.append({ run_id: 'old-run', seq: 5, type: 'state', at: 'a', data: { status: 'completed' } });
+
+    const { calls, client } = recorder();
+    const { relay } = mkRelay(client, { fx, heartbeat: false });
+    relay.start();
+    relay.record(line('task-completed', { id: 'live', status: 'completed' }));
+    await settle();
+    await relay.close();
+
+    const sent = calls.flatMap((c) => c.body.events);
+    const old5 = sent.filter((e) => e.run_id === 'old-run').map((e) => [e.seq, e.data.status]);
+    assert.deepEqual(old5, [[1, 'Completed'], [2, 'Skipped'], [3, 'Blocked'], [4, 'Failed'], [5, 'completed']]);
+    const live = sent.filter((e) => e.run_id === relay.runId && e.type === 'task-completed');
+    assert.deepEqual(live.map((e) => e.data.status), ['Completed'], 'a live event is mapped once, as before');
+  });
+
+  it('a live run\'s own spooled outcome is already mapped, and a later replay of it sends the same spelling', async () => {
+    const fx = fixture();
+    const first = mkRelay(async () => ({ status: 500, body: '' }), { fx, heartbeat: false, closeDeadlineMs: 20 });
+    first.relay.start();
+    first.relay.record(line('task-failed', { id: 't', status: 'blocked' }));
+    await settle();
+    await first.relay.close();
+    const spooled = fs.readFileSync(path.join(first.spool.dir, `${first.relay.runId}.jsonl`), 'utf-8');
+    assert.ok(spooled.includes('"status":"Blocked"') && !spooled.includes('"status":"blocked"'));
+
+    const { calls, client } = recorder();
+    const second = mkRelay(client, { fx, heartbeat: false });
+    second.relay.start();
+    await settle();
+    await second.relay.close();
+    const replayed = calls.flatMap((c) => c.body.events).filter((e) => e.run_id === first.relay.runId && e.type === 'task-failed');
+    assert.deepEqual(replayed.map((e) => e.data.status), ['Blocked']);
+  });
+
+  it('an oversized spooled event met again after a restart is quarantined once, not twice', async function () {
+    this.timeout(60_000);
+    const fx = fixture();
+    const big = fx.spool();
+    big.openRun('big-run');
+    big.append({ run_id: 'big-run', seq: 1, type: 'state', at: 'a', data: { pad: 'x'.repeat(REPLAY_MEMORY_BYTES + 1) } });
+    big.append({ run_id: 'big-run', seq: 2, type: 'state', at: 'a', data: { n: 2 } });
+
+    // The server is down both times, so big-run is never acked and never dropped.
+    for (let i = 0; i < 2; i++) {
+      const { relay } = mkRelay(async () => ({ status: 500, body: '' }), { fx, heartbeat: false, closeDeadlineMs: 20 });
+      relay.start();
+      await settle();
+      await relay.close();
+    }
+    const rejected = fs.readFileSync(fx.spool().rejectedFile('big-run'), 'utf-8').trim().split('\n').map((l) => JSON.parse(l));
+    assert.deepEqual(rejected.map((r) => [r.event.seq, r.reason]), [[1, 'too_large']]);
+  });
 });
 
 describe('ONOSOO relay — absolute paths are scrubbed from the relay copy', () => {
@@ -750,6 +819,25 @@ describe('ONOSOO relay — failure handling (fake timers)', () => {
     assert.equal(fs.statSync(file).size, size, 'touched, not written');
     const closing = relay.close();
     await clock.tickAsync(0);
+    await closing;
+  });
+
+  it('the spool file is touched every 30 s (halves the stale window after a sleep/resume off Linux)', async () => {
+    assert.equal(SPOOL_TOUCH_MS, 30_000);
+    const { client } = recorder();
+    const { relay, spool } = mkRelay(client, { heartbeat: false });
+    relay.start();
+    const file = path.join(spool.dir, `${relay.runId}.jsonl`);
+    const touches = sinon.spy(spool, 'touchRun');
+    await clock.tickAsync(SPOOL_TOUCH_MS - 1);
+    assert.equal(touches.callCount, 0);
+    await clock.tickAsync(1);
+    assert.equal(touches.callCount, 1);
+    assert.ok(Math.abs(Date.now() - fs.statSync(file).mtimeMs) < 1000, 'the mtime is now');
+    await clock.tickAsync(4 * SPOOL_TOUCH_MS);
+    assert.equal(touches.callCount, 5);
+    const closing = relay.close();
+    await clock.tickAsync(CLOSE_DEADLINE_MS);
     await closing;
   });
 
@@ -1014,5 +1102,48 @@ describe('ONOSOO relay — default HTTP client (loopback only)', () => {
     const p = defaultHttpClient({ url: `http://127.0.0.1:${port}/x`, headers: {}, body: '{}', signal: ac.signal, timeoutMs: 5000 });
     setTimeout(() => ac.abort(), 20);
     await assert.rejects(p);
+  });
+});
+
+describe('ONOSOO relay — seqStart and lastSeq (continuing a finished run)', () => {
+  it('with seqStart 41 the first recorded event has seq 42, and lastSeq follows recording', async () => {
+    const rec = recorder();
+    const fx = fixture();
+    const relay = new OnosooRelay({
+      config: fx.config, spool: fx.spool(), http: rec.client, redactor: createRedactor([KEY]),
+      stderr: () => undefined, closeDeadlineMs: 2000, runId: 'run-continued', heartbeat: false, seqStart: 41,
+    });
+    assert.equal(relay.lastSeq, 41);
+    relay.start();
+    relay.record(line('pr-created', { url: 'https://github.com/o/r/pull/1' }));
+    assert.equal(relay.lastSeq, 42);
+    relay.record(line('pr-created', { url: 'https://github.com/o/r/pull/2' }));
+    assert.equal(relay.lastSeq, 43);
+    await relay.close();
+    const events = rec.calls.flatMap((c) => c.body.events);
+    assert.deepEqual(events.map((e) => [e.run_id, e.seq, e.type]), [['run-continued', 42, 'pr-created'], ['run-continued', 43, 'pr-created']]);
+  });
+
+  it('an invalid seqStart is ignored: the first event is seq 1', async () => {
+    for (const seqStart of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      const rec = recorder();
+      const fx = fixture();
+      const relay = new OnosooRelay({
+        config: fx.config, spool: fx.spool(), http: rec.client, redactor: createRedactor([KEY]),
+        stderr: () => undefined, closeDeadlineMs: 2000, heartbeat: false, seqStart,
+      });
+      assert.equal(relay.lastSeq, 0, String(seqStart));
+      relay.start();
+      relay.record(line('state-changed', { state: 'playing' }));
+      await relay.close();
+      assert.equal(rec.calls.flatMap((c) => c.body.events)[0].seq, 1, String(seqStart));
+    }
+  });
+
+  it('lastSeq counts run-meta too', () => {
+    const { relay } = mkRelay(recorder().client, { heartbeat: false });
+    relay.start({ plan_name: 'P', project: 'p', tasks: [] });
+    assert.equal(relay.lastSeq, 1);
+    void relay.close();
   });
 });

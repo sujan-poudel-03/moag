@@ -17,6 +17,13 @@ import { ghSync, ghAsync } from './utils/gh';
 import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
 import { cmdResolveParkedItem, cmdShowMorningReview } from './ui/morning-review';
 import { cmdShowSetupGuide } from './ui/setup-guide';
+import { takeRelayEnv } from './headless/run-reporter';
+import { resolveOnosooConfig } from './headless/onosoo-config';
+import { initOnosooRelayHost, OnosooRelayHost } from './ui/onosoo-relay-host';
+import { cmdConnectOnosoo, cmdDisconnectOnosoo, OnosooPairingDeps } from './ui/onosoo-pairing';
+import { cmdExportDiagnostics } from './ui/diagnostics-command';
+import { cmdInstallCli } from './ui/cli-install-command';
+import { cmdClearAnthropicKey, cmdSetAnthropicKey, migrateAnthropicKeySetting, SECRET_KEYS } from './ui/anthropic-key';
 import { setHost } from './core/host';
 import { TaskRunner, classifyFailure } from './runner/runner';
 import {
@@ -28,7 +35,7 @@ import { generateId } from './models/plan';
 import { isRoleId, resolveRoleCharter } from './models/roles';
 import { PlanTreeProvider, PlanTreeItem } from './ui/plan-tree';
 import { HistoryTreeProvider } from './ui/history-tree';
-import { DashboardPanel } from './ui/dashboard-panel';
+import { DashboardPanel, disposeDashboardLog } from './ui/dashboard-panel';
 import { ExecutionDetailPanel } from './ui/execution-detail-panel';
 import { TaskEditorPanel } from './ui/task-editor-panel';
 import { RuleEditorPanel } from './ui/rule-editor-panel';
@@ -67,9 +74,12 @@ import { standardsReportSection, verificationGateRows } from './ui/standards-rep
 import { createLocalStandardsProvider, loadLocalStandards } from './standards/local-store';
 import { captureScreenshot } from './sandbox/screenshot';
 import { resolveDeveloperEmail } from './utils/git-identity';
-import { appendUsageEntry, readAllUsageEntries } from './utils/usage-log';
+import { createUsageRecorder, readAllUsageEntries } from './utils/usage-log';
 import { rollupContributionLedger, ContributionLedgerPayload } from './utils/contribution-ledger';
 import { costLedger } from './utils/cost-ledger';
+import { isOwnStack } from './utils/error-log';
+import { formatTotal, formatUsageCost, isCostKnown, isUnknownCostCall, sessionUsageDelta } from './utils/cost-format';
+import { initBudgetNotice } from './ui/budget-notice-host';
 
 // ─── Shared state ───
 
@@ -118,6 +128,50 @@ let watchWatcher: vscode.FileSystemWatcher | null = null;
 let watchStatusBarItem: vscode.StatusBarItem | null = null;
 let watchDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
+// ─── Secrets an outbound report must never carry ───
+
+/**
+ * Exact values no bug report or diagnostics file may carry: the stored Anthropic
+ * key and the ONOSOO device key. The device key left process.env at activation,
+ * so it is read from the relay snapshot and the saved pairing.
+ */
+async function reportExtraSecrets(
+  context: Pick<vscode.ExtensionContext, 'secrets'>,
+  relayEnv: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string },
+): Promise<string[]> {
+  const out: string[] = [];
+  try {
+    const anthropic = await context.secrets.get(SECRET_KEYS.anthropicApiKey);
+    if (anthropic) { out.push(anthropic); }
+  } catch { /* no secret store */ }
+  if (relayEnv.MOAG_ONOSOO_KEY) { out.push(relayEnv.MOAG_ONOSOO_KEY); }
+  try {
+    const cfg = resolveOnosooConfig({
+      env: { ...process.env, ...relayEnv },
+      cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.tmpdir(),
+      stderr: () => { /* a report must not warn about relay config */ },
+    });
+    if (cfg?.key) { out.push(cfg.key); }
+  } catch { /* no pairing */ }
+  return out;
+}
+
+// ─── ONOSOO relay host (status bar, pairing, PR follow-up) ───
+let relayHost: OnosooRelayHost | null = null;
+/** The relay variables activate() took out of process.env (commands registered later read them). */
+let activationRelayEnv: { MOAG_ONOSOO_KEY?: string; MOAG_ONOSOO_URL?: string } = {};
+
+// ─── Process-level error capture ───
+// Kept so deactivate() can take them off the shared extension-host process.
+let uncaughtHandler: ((err: Error) => void) | null = null;
+let rejectionHandler: ((reason: unknown) => void) | null = null;
+
+/** Removes the process-wide error handlers activate() installed (idempotent). */
+function removeProcessErrorHandlers(): void {
+  if (uncaughtHandler) { process.off('uncaughtException', uncaughtHandler); uncaughtHandler = null; }
+  if (rejectionHandler) { process.off('unhandledRejection', rejectionHandler); rejectionHandler = null; }
+}
+
 // ─── Dev hot-reload watcher ───
 let devReloadWatcher: fs.FSWatcher | null = null;
 let devReloadTimer: ReturnType<typeof setTimeout> | null = null;
@@ -143,8 +197,6 @@ let progressReport: vscode.Progress<{ message?: string; increment?: number }> | 
 
 const NO_ENGINES_PROMPT_KEY = 'agentTaskPlayer.noEnginesPromptShown';
 const RECENT_PLANS_KEY = 'moag.recentPlans';
-const CLAUDE_INSTALL_URL = 'https://www.npmjs.com/package/@anthropic-ai/claude-code';
-const CODEX_INSTALL_URL = 'https://www.npmjs.com/package/@openai/codex';
 // MOAG's own GitHub repo — always the target for bug reports
 
 interface TaskLocation {
@@ -412,8 +464,13 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
           errorLines: classification?.errorLines.slice(0, 5),
           attemptCount: taskEntries.length > 1 ? taskEntries.length : undefined,
           tokenUsage: latestEntry?.result.tokenUsage
-            ? { totalTokens: latestEntry.result.tokenUsage.totalTokens, estimatedCost: latestEntry.result.tokenUsage.estimatedCost }
-            : undefined,
+            ? {
+              totalTokens: latestEntry.result.tokenUsage.totalTokens,
+              estimatedCost: latestEntry.result.tokenUsage.estimatedCost,
+              costSource: isUnknownCostCall(latestEntry.result.tokenUsage, latestEntry.taskType) ? 'unknown' : latestEntry.result.tokenUsage.costSource,
+            }
+            // An engine call that reported no usage at all (Copilot, custom) is still a call of unknown cost.
+            : latestEntry && isUnknownCostCall(undefined, latestEntry.taskType) ? { costSource: 'unknown' } : undefined,
           sourceIssueNumber: task.sourceIssueNumber,
           sourceIssueRepo: task.sourceIssueRepo,
         };
@@ -720,6 +777,11 @@ function getPromptSidebarChatState(): { title: string; messages: PromptSidebarCh
   return { title, messages, threadId: currentSidebarThreadId ?? '' };
 }
 
+/** A setup guide that failed to open says so instead of rejecting unhandled. */
+function showSetupGuideError(err: unknown): void {
+  void vscode.window.showErrorMessage(`Could not open the MOAG Setup Guide: ${err instanceof Error ? err.message : String(err)}`);
+}
+
 async function promptToInstallEngineOnce(
   context: vscode.ExtensionContext,
   available: EngineId[],
@@ -736,15 +798,15 @@ async function promptToInstallEngineOnce(
   await context.globalState.update(NO_ENGINES_PROMPT_KEY, true);
 
   const choice = await vscode.window.showInformationMessage(
-    'MOAG: No AI engines found. Install one to get started.',
-    'Install Claude',
-    'Install Codex',
+    'MOAG: No AI engines found. Install a coding CLI, or use an Anthropic API key (no install).',
+    'Open Setup Guide',
+    'Use an Anthropic API Key',
   );
 
-  if (choice === 'Install Claude') {
-    void vscode.env.openExternal(vscode.Uri.parse(CLAUDE_INSTALL_URL));
-  } else if (choice === 'Install Codex') {
-    void vscode.env.openExternal(vscode.Uri.parse(CODEX_INSTALL_URL));
+  if (choice === 'Open Setup Guide') {
+    void vscode.commands.executeCommand('agentTaskPlayer.setupGuide');
+  } else if (choice === 'Use an Anthropic API Key') {
+    void vscode.commands.executeCommand('agentTaskPlayer.setAnthropicApiKey');
   }
 }
 
@@ -1312,34 +1374,53 @@ async function maybePromptAiRules(context: vscode.ExtensionContext): Promise<voi
 }
 
 export function activate(context: vscode.ExtensionContext): void {
+  // Before anything in this host can spawn: engine probes, git, agents. The device key must never reach a child.
+  const onosooRelayEnv = takeRelayEnv(process.env);
+  activationRelayEnv = onosooRelayEnv;
   extensionContext = context;
 
   // Bind the engine core to the VS Code environment (see src/core/host.ts).
   setHost({
     getConfiguration: (section) => vscode.workspace.getConfiguration(section),
     warn: (message) => { void vscode.window.showWarningMessage(message); },
+    // The port must return a string. The process.cwd() fallback is unreachable from
+    // the execution entry points: each one calls requireWorkspaceRoot() first.
     workspaceRoot: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+    secret: (name) => Promise.resolve(context.secrets.get(SECRET_KEYS[name])),
   });
 
   // ── Output Channel + Global Error Capture ────────────────────────────────
   moagOutputChannel = vscode.window.createOutputChannel('MOAG');
   context.subscriptions.push(moagOutputChannel);
 
-  process.on('uncaughtException', (err: Error) => {
+  // A key left in settings by an older MOAG moves to SecretStorage.
+  migrateAnthropicKeySetting(context).catch((err: unknown) => {
+    moagOutputChannel?.appendLine(`[secrets] Anthropic key migration failed: ${err instanceof Error ? err.message : String(err)}`);
+  });
+
+  // The extension host is shared: these handlers see every extension's errors,
+  // so only stacks that pass through this extension's folder are recorded.
+  removeProcessErrorHandlers();
+  const extensionPath = context.extensionPath;
+  uncaughtHandler = (err: Error) => {
+    if (!isOwnStack(err?.stack, extensionPath)) { return; }
     appendErrorLog({
       ts: new Date().toISOString(), category: 'uncaught',
-      message: err.message.substring(0, 300),
+      message: String(err.message).substring(0, 300),
       stack: err.stack?.split('\n').slice(0, 3).join('\n'),
     });
-  });
-  process.on('unhandledRejection', (reason: unknown) => {
-    const msg = reason instanceof Error ? reason.message : String(reason);
+  };
+  rejectionHandler = (reason: unknown) => {
+    if (!(reason instanceof Error) || !isOwnStack(reason.stack, extensionPath)) { return; }
     appendErrorLog({
       ts: new Date().toISOString(), category: 'unhandled-rejection',
-      message: msg.substring(0, 300),
-      stack: reason instanceof Error ? reason.stack?.split('\n').slice(0, 3).join('\n') : undefined,
+      message: reason.message.substring(0, 300),
+      stack: reason.stack?.split('\n').slice(0, 3).join('\n'),
     });
-  });
+  };
+  process.on('uncaughtException', uncaughtHandler);
+  process.on('unhandledRejection', rejectionHandler);
+  context.subscriptions.push({ dispose: removeProcessErrorHandlers });
 
   // Register all engine adapters
   registerAllEngines();
@@ -1396,6 +1477,7 @@ export function activate(context: vscode.ExtensionContext): void {
     executionTaskCount: () => executionTaskCount,
     executionTasksFailed: () => executionTasksFailed,
     appendOutput: (line) => moagOutputChannel?.appendLine(line),
+    extraSecrets: () => reportExtraSecrets(context, onosooRelayEnv),
   });
 
   // Initialize template store
@@ -1417,24 +1499,29 @@ export function activate(context: vscode.ExtensionContext): void {
   // costBudgetUsd), so the user is never stuck without reloading the window.
   setCeilingGuard(() => !ceilingBlocked);
   context.subscriptions.push({ dispose: () => setCeilingGuard(null) });
+  // The ceiling counts recorded cost only: at each run whose engines report no cost
+  // (and on any unreported call in a run that was not flagged), say so.
+  const offBudgetNotice = initBudgetNotice({
+    workspaceState: context.workspaceState,
+    runner,
+    engineIdsForRun: () => (runner.currentPlan ? collectEngineIds(runner.currentPlan) : []),
+  });
+  context.subscriptions.push({ dispose: offBudgetNotice });
   runner.setPromptLibrary(promptLibraryStore);
 
   // Contribution Ledger: record per-engine-call usage facts to
-  // .moag/usage-log.jsonl. Best-effort — appendUsageEntry never throws, and
-  // the recorder itself is already wrapped by the runner's own try/catch.
-  // The recorded `record.prompt` is always the short human prompt the
-  // runner computes — never the assembled buildContext() prompt; this file
-  // is git-tracked, so anything wider than that would land in git history.
-  runner.setUsageRecorder((record) => {
-    const enabled = vscode.workspace.getConfiguration('agentTaskPlayer')
-      .get<boolean>('contributionLedger.enabled', true);
-    if (!enabled) { return; }
-    const moagDir = getMoagDir();
-    if (!moagDir) { return; }
-    const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-    const developerEmail = resolveDeveloperEmail(cwd);
-    appendUsageEntry(moagDir, { ...record, developerEmail });
-  });
+  // .moag/usage-log.jsonl (local, rotated at 5 MB). Best-effort — the append
+  // never throws, and the recorder itself is wrapped by the runner's own
+  // try/catch. `record.prompt` is always the short human prompt the runner
+  // computes — never the assembled buildContext() prompt. The developer's
+  // email is recorded only when contributionLedger.recordDeveloperEmail is on.
+  runner.setUsageRecorder(createUsageRecorder({
+    enabled: () => vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('contributionLedger.enabled', true),
+    recordEmail: () => vscode.workspace.getConfiguration('agentTaskPlayer').get<boolean>('contributionLedger.recordDeveloperEmail', false),
+    moagDir: getMoagDir,
+    cwd: () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd(),
+    resolveEmail: resolveDeveloperEmail,
+  }));
 
   // Initialize AI rules store
   aiRulesStore = new AiRulesStore(context.globalStorageUri.fsPath);
@@ -1443,6 +1530,22 @@ export function activate(context: vscode.ExtensionContext): void {
   // Before a run's first task: remember where the tree stood, so the standards check still
   // sees work the run committed (git.autoCommit, or an agent that commits).
   runner.setRunStartHook((cwd) => rememberStandardsBase(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? cwd));
+  relayHost = initOnosooRelayHost({ context, runner, relayEnv: onosooRelayEnv, planPath: () => currentPlanPath, loadedPlan: () => currentPlan, log: (l) => moagOutputChannel?.appendLine(l) });
+  const pairingDeps: OnosooPairingDeps = {
+    relayEnv: onosooRelayEnv,
+    reprobe: () => relayHost?.reprobe(),
+    isLive: () => relayHost?.isLive() ?? false,
+  };
+  context.subscriptions.push(
+    vscode.commands.registerCommand('agentTaskPlayer.connectOnosoo', (arg?: { url?: unknown }) =>
+      cmdConnectOnosoo(pairingDeps, arg).catch((err: unknown) => {
+        void vscode.window.showErrorMessage(`Could not connect to ONOSOO: ${err instanceof Error ? err.message : String(err)}`);
+      })),
+    vscode.commands.registerCommand('agentTaskPlayer.disconnectOnosoo', () =>
+      cmdDisconnectOnosoo(pairingDeps).catch((err: unknown) => {
+        void vscode.window.showErrorMessage(`Could not disconnect from ONOSOO: ${err instanceof Error ? err.message : String(err)}`);
+      })),
+  );
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
@@ -1768,9 +1871,7 @@ export function activate(context: vscode.ExtensionContext): void {
         const usage = entry?.result?.tokenUsage;
         runSessionStore.update(runner.currentRunId, {
           tasksCompleted: session.tasksCompleted + 1,
-          totalTokensIn: session.totalTokensIn + (usage?.inputTokens || 0),
-          totalTokensOut: session.totalTokensOut + (usage?.outputTokens || 0),
-          totalCost: session.totalCost + (usage?.estimatedCost || 0),
+          ...sessionUsageDelta(session, usage, getTaskType(task)),
         });
       }
     }
@@ -1840,9 +1941,7 @@ export function activate(context: vscode.ExtensionContext): void {
         runSessionStore.update(runner.currentRunId, {
           tasksCompleted: session.tasksCompleted + 1,
           tasksFailed: session.tasksFailed + 1,
-          totalTokensIn: session.totalTokensIn + (usage?.inputTokens || 0),
-          totalTokensOut: session.totalTokensOut + (usage?.outputTokens || 0),
-          totalCost: session.totalCost + (usage?.estimatedCost || 0),
+          ...sessionUsageDelta(session, usage, getTaskType(task)),
         });
       }
     }
@@ -1951,7 +2050,7 @@ export function activate(context: vscode.ExtensionContext): void {
       ).then(action => {
         if (action === issueLabel) { void cmdCloseSourceIssues(sourceIssues); }
         else if (action === 'Show Dashboard') { void vscode.commands.executeCommand('agentTaskPlayer.showDashboard'); }
-        else if (action === 'Create PR') { createPRFromRun(); }
+        else if (action === 'Create PR') { createPRFromRun().catch(showPrError); }
       });
       return;
     }
@@ -1967,7 +2066,7 @@ export function activate(context: vscode.ExtensionContext): void {
       } else if (action === 'Review Changes') {
         vscode.commands.executeCommand('agentTaskPlayer.reviewChanges');
       } else if (action === 'Create PR') {
-        createPRFromRun();
+        createPRFromRun().catch(showPrError);
       }
     });
   });
@@ -2135,6 +2234,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.splitTask', cmdSplitTask),
     vscode.commands.registerCommand('agentTaskPlayer.planFromGitHubIssue', cmdPlanFromGitHubIssue),
     vscode.commands.registerCommand('agentTaskPlayer.reportIssue', cmdReportIssue),
+    vscode.commands.registerCommand('agentTaskPlayer.exportDiagnostics', () =>
+      cmdExportDiagnostics({ context, relayEnv: activationRelayEnv, extraSecrets: () => reportExtraSecrets(context, activationRelayEnv) })
+        .catch((err: unknown) => {
+          void vscode.window.showErrorMessage(`Could not export diagnostics: ${err instanceof Error ? err.message : String(err)}`);
+        })),
     vscode.commands.registerCommand('agentTaskPlayer.planFromOpenIssues', cmdPlanFromOpenIssues),
     vscode.commands.registerCommand('agentTaskPlayer.ghSyncPollNow', () => {
       const cfg = vscode.workspace.getConfiguration('agentTaskPlayer');
@@ -2217,7 +2321,9 @@ export function activate(context: vscode.ExtensionContext): void {
       if (promptViewProvider) { schedulePromptProviderSidebarSync(); }
       vscode.window.showInformationMessage(`GitHub sync connected to ${repo.trim()} — polling for "${label.trim() || 'moag'}" issues.`);
     }),
-    vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.setupGuide', () => cmdShowSetupGuide(context).catch(showSetupGuideError)),
+    vscode.commands.registerCommand('agentTaskPlayer.setAnthropicApiKey', () => cmdSetAnthropicKey(context)),
+    vscode.commands.registerCommand('agentTaskPlayer.clearAnthropicApiKey', () => cmdClearAnthropicKey(context)),
     vscode.commands.registerCommand('agentTaskPlayer.planFromPrd', cmdPlanFromPRD),
     vscode.commands.registerCommand('agentTaskPlayer.generatePlanFromPrdText', (prdText: string) => generatePlanFromPrdText(prdText)),
     vscode.commands.registerCommand('agentTaskPlayer.generateDeltaPlan', (args?: { prdText?: string }) =>
@@ -2238,7 +2344,11 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('agentTaskPlayer.runContextEval', cmdRunContextEval),
     vscode.commands.registerCommand('agentTaskPlayer.analyzeContextWeights', cmdAnalyzeContextWeights),
     vscode.commands.registerCommand('agentTaskPlayer.reviewSelfIssues', cmdReviewSelfIssues),
-    vscode.commands.registerCommand('agentTaskPlayer.createPR', createPRFromRun),
+    vscode.commands.registerCommand('agentTaskPlayer.createPR', () => createPRFromRun().catch(showPrError)),
+    vscode.commands.registerCommand('agentTaskPlayer.installCli', () =>
+      cmdInstallCli({ extensionPath: context.extensionPath }).catch((err: unknown) => {
+        void vscode.window.showErrorMessage(`Could not install the MOAG command-line tool: ${err instanceof Error ? err.message : String(err)}`);
+      })),
     // The morning review: same digest the headless CLI prints, in the IDE.
     // The sidebar's New Chat button posts this; it was never registered, so the
     // button did nothing at all.
@@ -2474,15 +2584,32 @@ export function activate(context: vscode.ExtensionContext): void {
       const hasSeenSetup = context.globalState.get<boolean>('moag.setupGuideSeen', false);
       if (!hasSeenSetup && result.available.length === 0) {
         context.globalState.update('moag.setupGuideSeen', true);
-        cmdShowSetupGuide(context);
+        cmdShowSetupGuide(context).catch(showSetupGuideError);
       }
     })
     .catch(() => undefined);
 
   // Auto-load plan if one exists in workspace, then restore pause state
+  // MOAG edits .gitignore only after asking, once per workspace: when it first
+  // creates .moag/, or at startup when .moag/ already exists.
+  const offerGitignore = (): void => {
+    maybeOfferGitignore(context).catch((err: unknown) => {
+      moagOutputChannel?.appendLine(`[gitignore] ${err instanceof Error ? err.message : String(err)}`);
+    });
+  };
+  setMoagDirCreatedListener(offerGitignore);
+  context.subscriptions.push({ dispose: () => setMoagDirCreatedListener(null) });
+
   autoLoadPlan().then(() => {
     restorePauseState(context);
     startIssuePolling(context);
+    offerGitignore();
+  }).catch((err: unknown) => {
+    appendErrorLog({
+      ts: new Date().toISOString(), category: 'plan',
+      message: (err instanceof Error ? err.message : String(err)).substring(0, 300),
+      context: 'autoLoadPlan startup',
+    });
   });
 
   // Restart polling when issueSync settings change
@@ -2494,6 +2621,12 @@ export function activate(context: vscode.ExtensionContext): void {
     if (e.affectsConfiguration('agentTaskPlayer.costBudgetUsd')) {
       ceilingBlocked = false;
     }
+    // A key typed into settings moves to SecretStorage as soon as it lands there.
+    if (e.affectsConfiguration('agentTaskPlayer.engines.anthropic.apiKey')) {
+      migrateAnthropicKeySetting(context).catch((err: unknown) => {
+        moagOutputChannel?.appendLine(`[secrets] Anthropic key migration failed: ${err instanceof Error ? err.message : String(err)}`);
+      });
+    }
   }));
 
   // Watch for plan file changes — auto-reload on external edits
@@ -2503,12 +2636,20 @@ export function activate(context: vscode.ExtensionContext): void {
       try {
         const plan = loadPlan(currentPlanPath);
         setVisiblePlan(plan, currentPlanPath);
-      } catch {
-        // ignore reload errors
+      } catch (err) {
+        // Saving half-written JSON from an editor is normal: note it, don't interrupt.
+        moagOutputChannel?.appendLine(
+          `[plan] reload of ${path.basename(currentPlanPath)} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
       }
     }
   });
   context.subscriptions.push(planFileWatcher);
+}
+
+/** A failed Create PR reaches the user instead of the extension host's unhandled rejections. */
+function showPrError(err: unknown): void {
+  void vscode.window.showErrorMessage(`Could not create the pull request: ${err instanceof Error ? err.message : String(err)}`);
 }
 
 async function createPRFromRun(): Promise<void> {
@@ -2550,6 +2691,13 @@ async function createPRFromRun(): Promise<void> {
     return;
   }
 
+  // The PR on the run's own ONOSOO build. Never affects the PR itself.
+  if (outcome.url && relayHost?.notePrCreated) {
+    relayHost.notePrCreated(outcome.url).catch((err: unknown) => {
+      moagOutputChannel?.appendLine(`[onosoo] PR follow-up failed: ${err instanceof Error ? err.message : String(err)}`);
+    });
+  }
+
   const action = await vscode.window.showInformationMessage(`PR created: ${outcome.url}`, 'Open PR');
   if (action === 'Open PR' && outcome.url) {
     vscode.env.openExternal(vscode.Uri.parse(outcome.url));
@@ -2557,6 +2705,8 @@ async function createPRFromRun(): Promise<void> {
 }
 
 export function deactivate(): void {
+  removeProcessErrorHandlers();
+  disposeDashboardLog();
   extensionContext = null;
   promptViewProvider = null;
   runner?.stop();
@@ -2727,7 +2877,9 @@ import {
   resolvePlanPath,
   getNewPlanSavePath,
   MOAG_PLAN_FILE,
+  setMoagDirCreatedListener,
 } from './workspace/moag-paths';
+import { maybeOfferGitignore } from './ui/gitignore-consent';
 
 // ─── Auto-load plan ───
 
@@ -2745,8 +2897,15 @@ async function autoLoadPlan(): Promise<void> {
   try {
     const plan = loadPlan(planPath);
     setVisiblePlan(plan, planPath);
-  } catch {
-    // Silently ignore corrupt plan files on startup
+  } catch (err) {
+    // A plan that fails to load at startup is a real problem the user must see:
+    // otherwise MOAG looks empty and the next save could overwrite the file.
+    const msg = err instanceof Error ? err.message : String(err);
+    appendErrorLog({
+      ts: new Date().toISOString(), category: 'plan',
+      message: msg.substring(0, 300), context: `autoLoadPlan: ${planPath}`,
+    });
+    void UserMsg.showError(UserMsg.planLoadError(msg, planPath));
   }
 }
 
@@ -2939,6 +3098,20 @@ async function resolveRunPromptEngine(): Promise<EngineId | null> {
   return null;
 }
 
+/**
+ * Guard for every execution entry point: returns the first workspace folder's
+ * path, or shows the no-workspace error and returns null. Without it a run would
+ * fall back to the extension host's process.cwd() and edit files there.
+ */
+function requireWorkspaceRoot(): string | null {
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  if (!root) {
+    void UserMsg.showError(UserMsg.noWorkspace());
+    return null;
+  }
+  return root;
+}
+
 async function runPromptSubmission(
   prompt: string,
   selectedEngineId?: EngineId,
@@ -3086,6 +3259,7 @@ async function cmdRunPrompt(): Promise<void> {
 }
 
 async function cmdPlay(): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   const activePlan = getActivePlan();
   if (!activePlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
@@ -5189,9 +5363,9 @@ ${standardsReportSection(report.standards)}
  * only, and the HTML report is written and opened at the end.
  */
 async function runPrdLoopInteractive(options: { fix: boolean; title: string }): Promise<void> {
+  const cwd = requireWorkspaceRoot();
+  if (!cwd) { return; }
   const plan = getActivePlan();
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
   const activePlan: Plan = plan ?? createEmptyPlan('Unnamed Plan');
   const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
 
@@ -5323,9 +5497,9 @@ async function cmdVerifyAgainstPrd(): Promise<void> {
 }
 
 async function cmdSuggestCommit(): Promise<void> {
+  const cwd = requireWorkspaceRoot();
+  if (!cwd) { return; }
   const plan = currentPlan;
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
 
   if (!plan) {
     vscode.window.showWarningMessage('No active plan. Open a plan before committing.');
@@ -5395,9 +5569,9 @@ async function cmdSplitTask(item?: PlanTreeItem): Promise<void> {
   const task = playlist?.tasks[item.taskIndex];
   if (!task) { return; }
 
+  const cwd = requireWorkspaceRoot();
+  if (!cwd) { return; }
   const defaultEngine = vscode.workspace.getConfiguration('agentTaskPlayer').get<EngineId>('defaultEngine', 'claude' as EngineId);
-  const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-  const cwd = workspaceFolder?.uri.fsPath ?? process.cwd();
 
   let subTasks: Array<{ name: string; prompt: string }> = [];
 
@@ -5599,6 +5773,7 @@ async function cmdClearAllTasks(): Promise<void> {
 }
 
 async function cmdRetryTask(item?: PlanTreeItem | TaskLocation): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) { return; }
 
   let playlistIndex: number;
@@ -5641,6 +5816,7 @@ async function cmdRetryTask(item?: PlanTreeItem | TaskLocation): Promise<void> {
 }
 
 async function cmdRetryTaskWithNote(item?: PlanTreeItem | TaskLocation): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) { return; }
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy. Stop it first before retrying.');
@@ -5778,6 +5954,7 @@ async function cmdShowSmartFix(item?: PlanTreeItem | TaskLocation): Promise<void
 }
 
 async function cmdRetryTaskWithPrompt(item?: { playlistIndex: number; taskIndex: number; prompt: string }): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan || !item) { return; }
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy. Stop it first before retrying.');
@@ -5810,6 +5987,7 @@ async function cmdRetryTaskWithPrompt(item?: { playlistIndex: number; taskIndex:
 }
 
 async function cmdFixAllFailed(): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) { return; }
   if (runner.state !== RunnerState.Idle) {
     vscode.window.showWarningMessage('Runner is busy — stop it before running Fix All.');
@@ -6075,6 +6253,7 @@ function isTaskLikeItem(item: unknown): item is { kind?: string; playlistIndex: 
 }
 
 async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIndex: number }): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   const activePlan = getActivePlan();
   if (!activePlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
@@ -6127,6 +6306,7 @@ async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIn
 }
 
 async function cmdPlayTask(item?: PlanTreeItem | { kind?: string; playlistIndex: number; taskIndex: number }): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   const activePlan = getActivePlan();
   if (!activePlan) {
     vscode.window.showWarningMessage('No plan loaded. Open or create a plan first.');
@@ -6160,6 +6340,7 @@ async function cmdPlayTask(item?: PlanTreeItem | { kind?: string; playlistIndex:
 }
 
 async function cmdRunSelected(item?: PlanTreeItem, selectedItems?: PlanTreeItem[]): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   if (!currentPlan) {
     vscode.window.showWarningMessage('No plan loaded.');
     return;
@@ -6351,6 +6532,7 @@ async function cmdSaveTaskAsTemplate(item?: PlanTreeItem): Promise<void> {
 // ─── Quick Run: load + play in one shot, zero interaction ───
 
 async function cmdRunPlanFile(fileUri?: vscode.Uri): Promise<void> {
+  if (!requireWorkspaceRoot()) { return; }
   // If called from explorer context menu or command palette with a URI
   let planPath: string;
 
@@ -6754,12 +6936,12 @@ function cmdShowCostSummary(): void {
   }
 
   // Aggregate stats by engine
-  const stats = new Map<string, { runs: number; totalMs: number; inputTokens: number; outputTokens: number; totalTokens: number; cost: number }>();
+  const stats = new Map<string, { runs: number; totalMs: number; inputTokens: number; outputTokens: number; totalTokens: number; cost: number; unknown: number }>();
 
   for (const entry of entries) {
     let s = stats.get(entry.engine);
     if (!s) {
-      s = { runs: 0, totalMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0 };
+      s = { runs: 0, totalMs: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, cost: 0, unknown: 0 };
       stats.set(entry.engine, s);
     }
     s.runs++;
@@ -6769,8 +6951,9 @@ function cmdShowCostSummary(): void {
       s.inputTokens += usage.inputTokens ?? 0;
       s.outputTokens += usage.outputTokens ?? 0;
       s.totalTokens += usage.totalTokens ?? 0;
-      s.cost += usage.estimatedCost ?? 0;
+      if (isCostKnown(usage)) { s.cost += usage.estimatedCost ?? 0; }
     }
+    if (isUnknownCostCall(usage, entry.taskType)) { s.unknown++; }
   }
 
   // Build summary document
@@ -6780,6 +6963,7 @@ function cmdShowCostSummary(): void {
   let grandTotalMs = 0;
   let grandTotalTokens = 0;
   let grandTotalCost = 0;
+  let grandUnknown = 0;
 
   doc += `| Engine | Runs | Total Time | Tokens (In/Out/Total) | Est. Cost |\n`;
   doc += `|--------|------|------------|----------------------|----------|\n`;
@@ -6788,15 +6972,16 @@ function cmdShowCostSummary(): void {
     grandTotalMs += s.totalMs;
     grandTotalTokens += s.totalTokens;
     grandTotalCost += s.cost;
+    grandUnknown += s.unknown;
     const time = formatDuration(s.totalMs);
     const tokens = s.totalTokens > 0 ? `${s.inputTokens} / ${s.outputTokens} / ${s.totalTokens}` : 'N/A';
-    const cost = s.cost > 0 ? `$${s.cost.toFixed(4)}` : 'N/A';
+    const cost = s.cost > 0 || s.unknown > 0 ? formatTotal(s.cost, s.unknown) : 'N/A';
     doc += `| ${engine} | ${s.runs} | ${time} | ${tokens} | ${cost} |\n`;
   }
 
   doc += `\n**Grand Total:** ${formatDuration(grandTotalMs)}`;
   if (grandTotalTokens > 0) { doc += ` | ${grandTotalTokens} tokens`; }
-  if (grandTotalCost > 0) { doc += ` | $${grandTotalCost.toFixed(4)}`; }
+  if (grandTotalCost > 0 || grandUnknown > 0) { doc += ` | ${formatTotal(grandTotalCost, grandUnknown)}`; }
   doc += `\n\n---\n\n`;
 
   // Recent entries detail
@@ -6808,7 +6993,7 @@ function cmdShowCostSummary(): void {
     const time = formatDuration(e.result.durationMs);
     const usage = e.result.tokenUsage;
     const tokens = usage?.totalTokens ? String(usage.totalTokens) : '-';
-    const cost = usage?.estimatedCost ? `$${usage.estimatedCost.toFixed(4)}` : '-';
+    const cost = isUnknownCostCall(usage, e.taskType) ? 'cost unknown' : isCostKnown(usage) ? formatUsageCost(usage) : '-';
     const status = e.status === 'completed' ? 'Pass' : 'Fail';
     doc += `| ${e.taskName} | ${e.engine} | ${time} | ${tokens} | ${cost} | ${status} |\n`;
   }
@@ -7505,6 +7690,7 @@ function onWatchedFileChanged(relativePath: string): void {
     'Dismiss',
   ).then(action => {
     if (action !== 'Run') { return; }
+    if (!requireWorkspaceRoot()) { return; }
 
     if (matchingTasks.length === 1) {
       first.task.status = TaskStatus.Pending;

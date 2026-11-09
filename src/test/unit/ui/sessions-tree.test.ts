@@ -122,6 +122,27 @@ describe('SessionsTreeProvider search', () => {
     assert.equal(threadNodes[0].label, 'Rollback flow');
   });
 
+  it('a session whose calls reported no cost reads "cost unknown", not $0', () => {
+    const { runSessionStore, provider } = createProvider();
+    runSessionStore.create(makeSession({ id: 'run-u', totalCost: 0, costUnknownCalls: 2 }));
+    const roots = provider.getChildren();
+    const sessionsGroup = roots.find((item: { kind: string }) => item.kind === 'sessions-group');
+    assert.ok(sessionsGroup);
+    const node = provider.getChildren(sessionsGroup)[0];
+    assert.match(String(node.description), /cost unknown/);
+    const tooltip = (node.tooltip as { value?: string })?.value ?? String(node.tooltip);
+    assert.match(tooltip, /Cost: cost unknown/);
+    assert.doesNotMatch(tooltip, /\$0\.0000/);
+  });
+
+  it('a session with a known cost and some unknown calls names both', () => {
+    const { runSessionStore, provider } = createProvider();
+    runSessionStore.create(makeSession({ id: 'run-m', totalCost: 1.5, costUnknownCalls: 1 }));
+    const sessionsGroup = provider.getChildren().find((item: { kind: string }) => item.kind === 'sessions-group');
+    const node = provider.getChildren(sessionsGroup)[0];
+    assert.match(String(node.description), /\$1\.50 \+ 1 call of unknown cost/);
+  });
+
   it('shows an explicit empty state when a filter has no matches', () => {
     const { historyStore, runSessionStore, provider } = createProvider();
 

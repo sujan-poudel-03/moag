@@ -235,14 +235,14 @@ describe('adapter argument building', () => {
       assert.equal(r.tokenUsage, undefined, 'a missing total_cost_usd is unreported, not estimated');
     });
 
-    it('text mode is unchanged: still scrapes cost and adds no JSON flag', async () => {
+    it('text mode adds no JSON flag and never scrapes a cost: the cost is unknown', async () => {
       setMockConfig('agentTaskPlayer.engines.claude', { args: ['-p'], autoApprove: false });
       const c = claudeWith({ stdout: 'All done. cost: $0.04' });
       const r = await c.adapter.runTask({ prompt: 'p', cwd: '/tmp' });
       assert.deepEqual(c.captured().buildArgs({ prompt: 'p' }), ['-p']);
       assert.equal(r.stdout, 'All done. cost: $0.04');
-      assert.equal(r.tokenUsage?.estimatedCost, 0.04);
-      assert.equal(r.tokenUsage?.costSource, undefined);
+      assert.equal(r.tokenUsage?.estimatedCost, undefined);
+      assert.equal(r.tokenUsage?.costSource, 'unknown');
     });
   });
 

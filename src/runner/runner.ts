@@ -387,6 +387,8 @@ export class TaskRunner {
   private _currentPlaylistIndex = 0;
   private _currentTaskIndex = 0;
   private _plan: Plan | null = null;
+  /** Task ids a playTask/playTasks run is scoped to; null for a whole-plan play(). */
+  private _runTaskIds: string[] | null = null;
   private _pauseResolve: (() => void) | null = null;
   private _playLock = false;
   private _taskGitRefs = new Map<string, { ref: string; cwd: string }>();
@@ -596,10 +598,13 @@ export class TaskRunner {
         taskName: task.name,
         engine: engineId,
         prompt: task.prompt?.trim() || task.name,
-        tokenUsageAvailable: result.tokenUsage !== undefined,
+        // Tokens are available only when the engine counted some; an empty usage block is not usage.
+        tokenUsageAvailable: ((result.tokenUsage?.inputTokens ?? 0) + (result.tokenUsage?.outputTokens ?? 0)
+          + (result.tokenUsage?.totalTokens ?? 0)) > 0,
         inputTokens: result.tokenUsage?.inputTokens ?? 0,
         outputTokens: result.tokenUsage?.outputTokens ?? 0,
         estimatedCostUsd: result.tokenUsage?.estimatedCost ?? 0,
+        costKnown: typeof result.tokenUsage?.estimatedCost === 'number' && result.tokenUsage.costSource !== 'unknown',
       };
       this._usageRecorder(record);
     } catch { /* a throwing recorder must never break task execution */ }
@@ -615,6 +620,19 @@ export class TaskRunner {
 
   get currentRunId(): string | null {
     return this._currentRunId;
+  }
+
+  /** The plan of the current run; valid from the `playing` state-changed onward; never cleared. */
+  get currentPlan(): Plan | null {
+    return this._plan;
+  }
+
+  /**
+   * Task ids the current run is scoped to (playTask/playTasks), or null for a whole-plan play();
+   * valid from the `playing` state-changed onward; never cleared.
+   */
+  get currentRunTaskIds(): readonly string[] | null {
+    return this._runTaskIds;
   }
 
   getTaskGitRef(taskId: string): { ref: string; cwd: string } | undefined {
@@ -756,6 +774,11 @@ export class TaskRunner {
     this._playLock = true;
 
     this._plan = plan;
+    // A play from a later playlist runs playlists [index..end] only (runPlaylistsSequentially /
+    // runPlaylistsConcurrently start there), so that is the run's scope; from 0 it is the whole plan.
+    this._runTaskIds = playlistIndex > 0
+      ? plan.playlists.slice(playlistIndex).flatMap((pl) => pl.tasks.map((t) => t.id))
+      : null;
     this._currentPlaylistIndex = playlistIndex;
     this._currentTaskIndex = taskIndex;
     this._abortController = new AbortController();
@@ -801,10 +824,10 @@ export class TaskRunner {
     this._plan = plan;
     this._abortController = new AbortController();
     this.resetRunBudgetTracking();
-    this.setState(RunnerState.Playing);
-
     const playlist = plan.playlists[playlistIndex];
     const task = playlist.tasks[taskIndex];
+    this._runTaskIds = [task.id];
+    this.setState(RunnerState.Playing);
 
     try {
       const runStart = this.notifyRunStart();
@@ -832,6 +855,9 @@ export class TaskRunner {
     this._plan = plan;
     this._abortController = new AbortController();
     this.resetRunBudgetTracking();
+    this._runTaskIds = taskList
+      .map(({ playlistIndex, taskIndex }) => plan.playlists[playlistIndex]?.tasks[taskIndex]?.id)
+      .filter((id): id is string => typeof id === 'string');
     this.setState(RunnerState.Playing);
 
     try {
@@ -2040,7 +2066,7 @@ export class TaskRunner {
         stdout: '',
         stderr:
           '[Visual Test] The "anthropic" engine is not available.\n' +
-          'Configure ANTHROPIC_API_KEY or add it in Settings → agentTaskPlayer.engines.anthropic.apiKey',
+          'Run **MOAG: Set Anthropic API Key**, or set ANTHROPIC_API_KEY (command line).',
         exitCode: 1,
         durationMs: 0,
       };

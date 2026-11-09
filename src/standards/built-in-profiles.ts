@@ -21,7 +21,7 @@
 // test — and a built-in carries none. A rule becomes blocking only when a product owner or
 // an admin proposes the promotion and a reviewer approves it.
 
-import { STACK_IDS, StackId } from '../server/stacks';
+import { STACK_IDS, StackId } from '../shared/stacks';
 import { StandardsProfile } from './profile';
 import { rulebookDefaults } from './rulebook';
 

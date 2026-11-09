@@ -1,55 +1,24 @@
-.vscode/**
-.vscode-test/**
-.claude/**
-src/**
-# Dev dependencies only. vsce packages `dependencies` and never
-# `devDependencies`, so the blanket exclusion that used to be here also stripped
-# @anthropic-ai/sdk — which anthropic-adapter.ts requires at runtime. The
-# adapter fails gracefully, telling the user to npm install inside the extension
-# directory, which is not something a Marketplace install can reasonably do.
-node_modules/.bin/**
-node_modules/.cache/**
-# TypeScript declarations are a build-time artifact. They arrive here because
-# the sdk declares @types/node, and the hoisted layout pulls the rest in with it.
-node_modules/@types/**
-node_modules/**/*.ts
-node_modules/**/*.map
-.gitignore
-.gitattributes
-tsconfig.json
-tsconfig.test.json
-.vscode-test.mjs
-.eslintrc.json
-examples/**
-.github/**
-**/*.map
-**/*.ts
-**/*.d.ts.map
-media/icon.svg
-*.test.*
-*.vsix
-releases/**
-out/test/**
-.moag/**
-debug.log
-tmp_block.txt
-
-# Build configuration — the VSIX ships compiled output, never the recipe.
-tsconfig.webview*.json
-
-# Internal to developing MOAG, not to using it.
-CLAUDE.md
-scripts/**
-docs/**
-# ...except the manual, which is the one doc a user wants.
+# An allowlist: everything is excluded, then the shipped files are named.
+#
+# The extension and the headless CLI ship as two esbuild bundles
+# (out/bundle/extension.js and out/bundle/cli.js, scripts/bundle.js) with every
+# dependency inlined, so the VSIX carries no node_modules and no tsc output.
+# Adding a file the extension reads at run time means adding it here; the VSIX
+# closure test (src/test/unit/repo/vsix-closure.test.ts) checks that every path
+# package.json names is kept, and `npm run smoke:vsix` loads the packaged copy.
+**
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
+!PRIVACY.md
+!SECURITY.md
+# Top level only: media/screenshots/ is for the Marketplace README (served from GitHub).
+!media/*
 !docs/MANUAL.md
-
-# Hosted PO web server and its front-end: not part of the extension.
-web/**
-out/server/**
-Dockerfile
-.dockerignore
-
-# Benchmark harness and its scenarios: a development tool, not part of the extension.
-bench/**
-out/bench/**
+!out/bundle/*.js
+!out/webview/*.js
+# "MOAG: Install Command-Line Tool" copies these two out of the extension folder.
+# moag-launch.js is plain Node (built-ins only), so tsc's own output is shipped.
+!out/headless/moag-launch.js
+!scripts/install-daemon-windows.ps1

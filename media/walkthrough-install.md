@@ -25,4 +25,4 @@ claude -p "say hello"
 # Should print a response from Claude
 ```
 
-> The extension uses **non-interactive mode** — it passes your prompt as a CLI argument and captures the output. The agent reads and writes files in your workspace just like it would in a terminal.
+> The extension uses **non-interactive mode** — it sends your prompt on stdin and captures the output. The agent reads and writes files in your workspace just like it would in a terminal.

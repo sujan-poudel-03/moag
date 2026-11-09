@@ -11,7 +11,7 @@
 
 import type { ConventionDetection, DECLARED_TOOL_IDS, DesignSources } from '../ai-rules/project-detector';
 import { BUILT_IN_RULES } from '../ai-rules/built-in-rules';
-import { StackId, isStackId } from '../server/stacks';
+import { StackId, isStackId } from '../shared/stacks';
 import { builtInProfile } from './built-in-profiles';
 import {
   DEFAULT_DESIGN_PATHS,

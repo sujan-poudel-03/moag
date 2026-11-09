@@ -7,6 +7,7 @@ import { HistoryEntry, TaskStatus } from '../models/types';
 import { HistoryStore } from '../history/store';
 import { RunSession, RunSessionStore } from '../models/run-session';
 import { getModelSpec } from '../models/model-specs';
+import { formatTotal } from '../utils/cost-format';
 
 // ─── Tree item types ───
 
@@ -176,7 +177,8 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionsTre
     item.iconPath = new vscode.ThemeIcon(iconId, new vscode.ThemeColor(iconColor));
 
     // Description: tasks + cost
-    const costStr = session.totalCost > 0 ? ` | $${session.totalCost.toFixed(2)}` : '';
+    const unknownCalls = session.costUnknownCalls ?? 0;
+    const costStr = session.totalCost > 0 || unknownCalls > 0 ? ` | ${formatTotal(session.totalCost, unknownCalls)}` : '';
     const engines = session.engines.join(', ');
     item.description = `${progress} tasks | ${engines}${costStr}`;
 
@@ -191,7 +193,7 @@ export class SessionsTreeProvider implements vscode.TreeDataProvider<SessionsTre
       `Engines: ${engines}\n\n` +
       `Duration: ${duration}\n\n` +
       `Tokens: ${session.totalTokensIn.toLocaleString()} in / ${session.totalTokensOut.toLocaleString()} out\n\n` +
-      `Cost: $${session.totalCost.toFixed(4)}`
+      `Cost: ${formatTotal(session.totalCost, session.costUnknownCalls ?? 0)}`
     );
 
     item.contextValue = 'session';

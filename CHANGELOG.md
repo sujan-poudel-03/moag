@@ -1,10 +1,113 @@
 # Changelog
 
+All notable changes to MOAG. Each release is `## [x.y.z] - YYYY-MM-DD`, newest first; a
+version number that was skipped is `## [x.y.z] - not released`. A release that asks
+something of the user (a new minimum VS Code, a changed default, a moved setting) starts
+with `### Upgrade notes`. The release workflow publishes the section for the tag as the
+GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
+
 ## [Unreleased]
+
+## [0.10.0] - 2026-11-09
+
+### Upgrade notes
+
+- **VS Code 1.90 or newer is required** (was 1.85). Older VS Code keeps the version of MOAG it has.
+- **MOAG does not run in Restricted Mode.** It runs agent CLIs and shell commands that a workspace's plan files define, so it now activates only after you trust the workspace (and never in a virtual workspace).
+- **Your Anthropic API key moves to VS Code's secure storage.** A key found in settings is moved there once and removed from every settings scope. Use **MOAG: Set Anthropic API Key** to change it.
+- **Your email is no longer recorded** in `.moag/usage-log.jsonl` unless you turn on `agentTaskPlayer.contributionLedger.recordDeveloperEmail`.
+- **MOAG asks before it edits your `.gitignore`.** It asks once per workspace and remembers your answer.
+
+### Added
+
+- **MOAG: Connect to ONOSOO Builds** and **Disconnect from ONOSOO**, plus `moag pair`: pair a machine in one step, with no JSON to write by hand.
+- **MOAG: Install Command-Line Tool**: puts `moag` on your PATH from the installed extension, and keeps working across updates. New `moag --version` and `moag help`.
+- **MOAG: Export Diagnostics**: one file with versions, engines, settings (secrets redacted), recent errors and the ONOSOO status, to attach to a bug report.
+- **MOAG: Set / Clear Anthropic API Key**.
+- The Setup Guide lists every engine and follows your colour theme.
+- `PRIVACY.md` and `SECURITY.md`, and README sections on data, privacy and support.
+
+### Changed
+
+- **Report Issue** always files with MOAG (github.com/sujan-poudel-03/moag), never in your own repository or backlog. It shows the full report, with secrets and your home folder removed, before anything is posted, and works without `gh` (browser or clipboard).
+- **Cost is honest.** MOAG never reads cost from an agent's text. A call that reports no cost shows as "cost unknown", not $0.00. When the budget can't be enforced you're told each run, with a one-click switch to Claude's JSON output to enforce it.
+- Runs from the VS Code panel report the pull request they produced to ONOSOO.
+- The extension and the `moag` CLI ship as two bundled files. The package drops from 686 files to about 30 and carries no `node_modules`.
+- `@anthropic-ai/sdk` 0.137 (was 0.39), bundled into the extension.
+
+### Fixed
+
+- PRD verify and fix-task generation refuse to run with no folder open, instead of running in VS Code's own directory.
+- A plan file that fails to load at startup now shows an error naming the file, instead of being silently ignored.
+- MOAG only records its own errors; other extensions' crashes no longer land in MOAG's error log or bug reports.
+
+## [0.9.15] - 2026-10-24
+
+### Fixed
+
+- The extension failed to activate ("Cannot find module '../server/secrets'") in 0.9.13 and 0.9.14. Packaging is now smoke-tested in CI and before every publish.
+
+## [0.9.14] - 2026-10-22
+
+### Upgrade notes
+
+- **Panel runs report to ONOSOO once this machine is paired.** `agentTaskPlayer.onosoo.relay` is on by default and machine-scoped; turn it off on a machine whose panel runs should stay local.
+
+### ONOSOO Builds
+
+- **Runs from the VS Code panel appear in ONOSOO.** Play, Play playlist, Play task, retry, fix-all, prompt runs and the PRD loop all report to ONOSOO when this machine is paired, exactly as `moag run` does.
+  - A status-bar item shows **☁ ONOSOO**, **ONOSOO: off** or **ONOSOO: key revoked**.
+  - The new setting `agentTaskPlayer.onosoo.relay` (on by default, per machine) turns it off.
+  - The device key is removed from VS Code's environment when MOAG starts, so no agent or tool it launches can see it.
+- **The right outcome and cost in ONOSOO.**
+  - `moag run` now reports its exit code. Runs no longer show as Failed when they completed.
+  - It reports every AI call's cost, and uses Claude's JSON output when connected so the cost is real.
+  - The VS Code panel keeps live output; a one-time tip explains how to see cost there.
+- **Stay online on Windows.** `scripts/install-daemon-windows.ps1 -Install` starts a background `moag daemon` at logon, so the machine shows as online in ONOSOO. No admin rights are needed, and the key is never put into the task.
+- **Sturdier delivery.**
+  - Longer waits for a slow ONOSOO.
+  - Two runs started back to back no longer resend events.
+  - A run started from a later playlist reports only its own tasks.
+  - Old backlog is sent with the protocol's status names.
+  - A replayed backlog stays within memory limits.
+- **Onboarding.** The Get Started walkthrough has a new optional "Connect to ONOSOO Builds" step. The Setup Guide links the end-to-end guide (`docs/onosoo-builds.md`).
+- **Tests never use your real ONOSOO key.** MOAG's own test runs no longer read the developer's real config, so they can't send runs to a live ONOSOO.
+
+## [0.9.13] - 2026-10-20
+
+### ONOSOO Builds
+
+- **Watch runs in ONOSOO.** `moag run` reports each run to ONOSOO as it happens: task status, a redacted summary of what each task changed (files, line counts, a diff of up to 64 KB), error output, cost and the pull request. To turn it on, set `MOAG_ONOSOO_URL` / `MOAG_ONOSOO_KEY` or `~/.config/moag/onosoo.json` (on Windows, `%APPDATA%\moag\onosoo.json`). The key never goes inside a project.
+  - Events are spooled to disk and resent after a crash.
+  - Secrets (values from `.env` files, engine keys, common key formats) and absolute paths are stripped before anything leaves the machine.
+- **Remote commands.** `moag daemon` takes start-run, stop, retry, approve and skip from ONOSOO.
+  - Remote starts are off until `projects.json` switches them on and sets a daily budget.
+  - Only approved project folders run.
+  - Each run executes as a separate low-privilege OS account in its own git worktree. That account cannot read the device key.
+  - Every command is re-checked on the machine and written to a local audit log. Remote runs are Linux/WSL only.
+  - Setup: `docs/onosoo-remote.md` and `scripts/setup-build-server.sh`.
+- **Live previews.** `moag host` runs a project branch as a Docker Compose environment and serves it through an authenticated gateway and a Cloudflare tunnel.
+  - Compose files are checked against a strict allowlist before every start.
+  - Containers never get your environment or registry logins.
+  - See `docs/host-agent.md`.
 
 ### Automatic dependency installs
 
 - **Dependencies are installed before the step that needs them** — before a command, check, service, deploy or release task, a `verifyCommand`, a PRD-verify gate, a standards profile command or a benchmark acceptance gate, MOAG installs the project's dependencies when a manifest or lockfile changed since the last install (recorded in `.moag/dependencies.json`) or `node_modules` is missing. Commands come from a fixed table (`npm ci` / `npm install`, `pnpm install --frozen-lockfile`, `yarn install --frozen-lockfile` / `--immutable`, venv-only `pip install -r requirements.txt`, `go mod download`, `dotnet restore`); a failed install fails the step with the command and its output. Settings: `agentTaskPlayer.autoInstallDependencies`, `agentTaskPlayer.dependencyInstall.ignoreScripts`, `agentTaskPlayer.dependencyInstall.pythonVenv`; on the server `MOAG_AUTO_INSTALL_DEPENDENCIES` and `MOAG_INSTALL_IGNORE_SCRIPTS`. The plan review card states the rule before approval.
+
+## [0.9.12] - 2026-06-20
+
+No changelog was recorded at the time; this is reconstructed from commits 40b65b8 and 84fcf76.
+
+- **Headless CLI.** `moag` runs plans outside VS Code, with a daemon mode and a VS Code API shim.
+- **Install scripts** for Linux, macOS and Windows that build and install the extension from a checkout.
+- **GitHub issue sync** and a `gh` helper.
+- **Error log** (`.moag/errors.jsonl`) and context-builder, knowledge-graph and weights test coverage.
+- Dashboard and sidebar updates.
+
+## [0.9.11] - not released
+
+Version number skipped; no build was released.
 
 ## [0.9.10] - 2026-05-27
 
@@ -75,6 +178,8 @@
 
 ## [0.9.8] - 2026-05-09
 
+_No separate commit: this work shipped in 4573414 together with 0.9.7 and 0.9.9._
+
 ### PRD → Plan Generation
 
 - **PRD editor panel** — "Generate Plan from PRD" now opens a full-width dark-theme editor tab instead of VS Code's narrow QuickPick popup; paste long PRDs without width constraints, browse `.md`/`.txt` files directly
@@ -106,6 +211,8 @@
 - **Workspace state size fix** — reduced default storage budgets for history (3 MB → 400 KB) and run sessions (800 KB → 200 KB); per-entry output clamping lowered to 4 KB (was 12 KB); eliminates VS Code's "large extension state" workspace warning
 
 ## [0.9.7] - 2026-05-06
+
+_No separate commit: this work shipped in 4573414 together with 0.9.8 and 0.9.9._
 
 ### Sidebar UX Redesign
 - **Tabs with labels** — Chat / Plan / History tabs now show icon + text label in a compact column layout; previously icon-only
@@ -179,7 +286,7 @@
 ### Session Cost Display
 - Running session cost appears as a `$0.04` chip in the composer context bar, accumulating across all tasks; resets at the start of each new run
 
-## [0.9.0] - 2026-03-XX
+## [0.9.0] - 2026-03-21
 
 ### Validation Engine
 - New `validate` task type — unified entrypoint for cross-platform quality gates
@@ -224,9 +331,11 @@
 - Existing tasks without `type: "validate"` run exactly as before.
 - The `validate` task type is opt-in — no behavior changes for `agent`, `command`, `service`, `check`, or `review` tasks.
 
-## [1.0.0] - 2026-03-24
+### Workflow (previously mislabelled [1.0.0])
 
-### Workflow
+These features were listed under a `[1.0.0] - 2026-03-24` heading, but no 1.0.0 was ever released;
+they shipped in the 0.9.x line.
+
 - Task Editor webview form for streamlined task creation
 - Quick Add Task (Ctrl+Shift+T) — add tasks without leaving the keyboard
 - Add Task from Editor Selection — highlight code, create a task
@@ -348,6 +457,8 @@
 
 ## [0.5.0] - 2026-03-10
 
+_No separate commit: this work shipped in 66dd50c together with 0.4.0 and 0.6.0._
+
 ### Stability & Recovery
 
 ### Fixed
@@ -370,6 +481,8 @@
 - **Engine version check**: Availability checks verify engines actually work, not just that the command exists
 
 ## [0.4.0] - 2026-03-09
+
+_No separate commit: this work shipped in 66dd50c together with 0.5.0 and 0.6.0._
 
 ### Dashboard Redesign
 
@@ -407,3 +520,26 @@
 - Verification commands per task
 - Configurable autoplay delay
 - `.agent-plan.json` file format with auto-load on workspace open
+
+[Unreleased]: https://github.com/sujan-poudel-03/moag/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/sujan-poudel-03/moag/compare/v0.9.15...v0.10.0
+[0.9.15]: https://github.com/sujan-poudel-03/moag/compare/v0.9.14...v0.9.15
+[0.9.14]: https://github.com/sujan-poudel-03/moag/compare/v0.9.13...v0.9.14
+[0.9.13]: https://github.com/sujan-poudel-03/moag/compare/v0.9.12...v0.9.13
+[0.9.12]: https://github.com/sujan-poudel-03/moag/compare/v0.9.10...v0.9.12
+[0.9.10]: https://github.com/sujan-poudel-03/moag/compare/v0.9.9...v0.9.10
+[0.9.9]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
+[0.9.8]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
+[0.9.7]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
+[0.9.6]: https://github.com/sujan-poudel-03/moag/compare/v0.9.5...v0.9.6
+[0.9.5]: https://github.com/sujan-poudel-03/moag/compare/v0.9.4...v0.9.5
+[0.9.4]: https://github.com/sujan-poudel-03/moag/compare/a1f8e7e...v0.9.4
+[0.9.0]: https://github.com/sujan-poudel-03/moag/compare/f2654de...a1f8e7e
+[0.8.0]: https://github.com/sujan-poudel-03/moag/compare/v0.7.0...f2654de
+[0.7.0]: https://github.com/sujan-poudel-03/moag/compare/66dd50c...v0.7.0
+[0.6.0]: https://github.com/sujan-poudel-03/moag/compare/7540f78...66dd50c
+[0.5.0]: https://github.com/sujan-poudel-03/moag/compare/7540f78...66dd50c
+[0.4.0]: https://github.com/sujan-poudel-03/moag/compare/7540f78...66dd50c
+[0.3.0]: https://github.com/sujan-poudel-03/moag/compare/84036e6...7540f78
+[0.2.0]: https://github.com/sujan-poudel-03/moag/compare/60368b6...84036e6
+[0.1.0]: https://github.com/sujan-poudel-03/moag/tree/60368b6
