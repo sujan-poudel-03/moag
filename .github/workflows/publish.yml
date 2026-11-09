@@ -22,7 +22,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -50,7 +50,7 @@ jobs:
     env:
       VSIX: moag-${{ needs.check.outputs.version }}.vsix
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
@@ -99,7 +99,7 @@ jobs:
       - name: No VSCE_PAT secret
         if: env.VSCE_PAT == ''
         run: echo "::warning::VSCE_PAT is not set, so MOAG $VERSION was not published to the Marketplace. Add the secret and re-run this job."
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         if: env.VSCE_PAT != ''
       - uses: actions/setup-node@v4
         if: env.VSCE_PAT != ''
