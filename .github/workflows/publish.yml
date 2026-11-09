@@ -33,7 +33,7 @@ jobs:
         run: node scripts/release-notes.js "$GITHUB_REF_NAME" > notes.md
       - id: version
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-notes
           path: notes.md
@@ -60,7 +60,7 @@ jobs:
         run: npx @vscode/vsce package -o "$VSIX"
       - name: Smoke-test the packaged VSIX
         run: npm run smoke:vsix -- --vsix "$VSIX"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: vsix
           path: ${{ env.VSIX }}
