@@ -16,6 +16,7 @@ import {
   persistRequirementTrace,
   cmdTrace,
   wireEvents,
+  keyPromptInput,
 } from '../../../headless/cli';
 import * as sinon from 'sinon';
 import type { ChildProcess } from 'child_process';
@@ -2993,5 +2994,29 @@ describe('headless CLI: --version, help, pair', () => {
       assert.equal(b.code, 2);
       assert.ok(!(b.out + b.err).includes(KEY));
     });
+  });
+});
+
+describe('headless CLI: moag pair hidden key prompt', () => {
+  const KEY = 'onosoo_live_abcDEF123_xyz';
+
+  it('takes a key pasted with bracketed-paste markers (PowerShell leaves them on)', () => {
+    assert.deepEqual(keyPromptInput('', `\u001b[200~${KEY}\u001b[201~\r`), { key: KEY, end: 'enter' });
+  });
+
+  it('takes a bracketed paste split across chunks, then Enter on its own', () => {
+    let s = keyPromptInput('', `\u001b[200~${KEY.slice(0, 10)}`);
+    s = keyPromptInput(s.key, `${KEY.slice(10)}\u001b[201~`);
+    assert.deepEqual(s, { key: KEY });
+    assert.deepEqual(keyPromptInput(s.key, '\r'), { key: KEY, end: 'enter' });
+  });
+
+  it('drops arrow keys and other control characters, honours backspace', () => {
+    assert.deepEqual(keyPromptInput('', `ab\u001b[Dc\u001bOA\td\u007fe\n`), { key: 'abce', end: 'enter' });
+  });
+
+  it('Ctrl+C and Ctrl+D cancel with nothing entered', () => {
+    assert.deepEqual(keyPromptInput('partial', '\u0003'), { key: '', end: 'cancel' });
+    assert.deepEqual(keyPromptInput('partial', 'x\u0004'), { key: '', end: 'cancel' });
   });
 });

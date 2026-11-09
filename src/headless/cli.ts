@@ -2201,15 +2201,35 @@ function readKeyFromStdin(): Promise<string> {
       resolve(value.trim());
     };
     const onData = (chunk: string): void => {
-      for (const ch of chunk) {
-        if (ch === '\r' || ch === '\n') { done(key); return; }
-        if (ch === '\u0003' || ch === '\u0004') { done(''); return; } // Ctrl+C / Ctrl+D: nothing entered
-        if (ch === '\u007f' || ch === '\b') { key = key.slice(0, -1); continue; }
-        key += ch;
-      }
+      const step = keyPromptInput(key, chunk);
+      key = step.key;
+      if (step.end === 'enter') { done(key); } else if (step.end === 'cancel') { done(''); }
     };
     stdin.on('data', onData);
   });
+}
+
+/** A terminal escape sequence: CSI (`ESC [ … final`), SS3 (`ESC O x`) or a lone two-byte `ESC x`. */
+// eslint-disable-next-line no-control-regex -- matching ESC is the point
+const TERMINAL_ESCAPE = /\u001b(?:\[[0-9;?<=>]*[ -/]*[@-~]|O.|[^[O])?/g;
+
+/**
+ * One chunk of raw-mode input to the hidden key prompt, applied to what was typed
+ * so far. Terminal escape sequences are dropped: PowerShell (PSReadLine) leaves
+ * bracketed paste on, so a paste arrives as `ESC[200~<key>ESC[201~`, and those
+ * markers once made every pasted key "not a device key". Other control
+ * characters are ignored; Enter ends the prompt, Ctrl+C / Ctrl+D cancel it.
+ */
+export function keyPromptInput(sofar: string, chunk: string): { key: string; end?: 'enter' | 'cancel' } {
+  let key = sofar;
+  for (const ch of chunk.replace(TERMINAL_ESCAPE, '')) {
+    if (ch === '\r' || ch === '\n') { return { key, end: 'enter' }; }
+    if (ch === '\u0003' || ch === '\u0004') { return { key: '', end: 'cancel' }; }
+    if (ch === '\u007f' || ch === '\b') { key = key.slice(0, -1); continue; }
+    if (ch < ' ') { continue; }
+    key += ch;
+  }
+  return { key };
 }
 
 /**
