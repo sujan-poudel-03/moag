@@ -8,6 +8,17 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ## [Unreleased]
 
+### Added
+
+- **ONOSOO project identity (Builds protocol v1.2).** Every run tells ONOSOO which project it belongs to, with an id that is the same on every machine and survives renaming the folder: the repository's `origin` remote (`git:github.com/owner/repo`, plus a link), else its first commit (`root:…`), else, for a folder of several repositories, a `multi:…` id with the list of them. Credentials, ports and local paths are never sent. See "How a project gets into ONOSOO" in `docs/onosoo-builds.md`.
+- `docs/project-key-vectors.json`: example remotes and the id each one gives, checked by MOAG's tests and shared with ONOSOO.
+- Remote runs: an engine login check, the reason an installed engine is not offered, branch delivery, and each task's stage and kind in run-meta.
+
+### Fixed
+
+- `moag pair` accepts a key pasted into PowerShell (bracketed-paste markers are ignored).
+- An SSH host alias of GitHub, GitLab or Bitbucket (`git@github.com-personal:…`, `ssh.github.com`) gives the same project id as a normal clone.
+
 ## [0.10.0] - 2026-11-09
 
 ### Upgrade notes

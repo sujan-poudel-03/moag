@@ -61,6 +61,26 @@ const CHILD_CONCURRENCY = 4;
 // ─── Remote normalisation (pure) ───
 
 const URL_SCHEMES = new Set(['https', 'http', 'ssh', 'git', 'git+ssh', 'ssh+git']);
+const SSH_SCHEMES = new Set(['ssh', 'git+ssh', 'ssh+git']);
+
+/** Well-known hosts whose SSH aliases name the same repositories. */
+const SSH_CANONICAL_HOSTS = ['github.com', 'gitlab.com', 'bitbucket.org'];
+/** The SSH-over-443 endpoints of those hosts. */
+const SSH_ALT_HOSTS: Record<string, string> = { 'ssh.github.com': 'github.com', 'altssh.gitlab.com': 'gitlab.com', 'altssh.bitbucket.org': 'bitbucket.org' };
+
+/**
+ * The real host behind an SSH host as people write it: `github.com-personal` (a `Host` alias in
+ * ~/.ssh/config, the usual way to use two accounts) and `ssh.github.com` are `github.com`, so every
+ * clone of one repository gets one key. Any other host is returned unchanged.
+ */
+export function canonicalSshHost(host: string): string {
+  const h = host.toLowerCase();
+  if (SSH_ALT_HOSTS[h]) { return SSH_ALT_HOSTS[h]; }
+  for (const base of SSH_CANONICAL_HOSTS) {
+    if (h.startsWith(base + '-') && h.length > base.length + 1) { return base; }
+  }
+  return host;
+}
 
 /**
  * Normalise an `origin` URL to a `git:` key and a browsable https URL. Returns null for a local
@@ -83,9 +103,11 @@ export function normaliseRemote(raw: string): { key: string; repoUrl?: string } 
 
   const split = splitRemote(s);
   if (!split) { return null; }
-  const { host, repoPath } = split;
+  const { repoPath } = split;
 
-  if (!/^[A-Za-z0-9._-]+$/.test(host)) { return null; }
+  if (!/^[A-Za-z0-9._-]+$/.test(split.host)) { return null; }
+  // An SSH nickname for a well-known host (github.com-work, ssh.github.com) is that host.
+  const host = split.ssh ? canonicalSshHost(split.host) : split.host;
   // A loopback host names this machine, not a repository anyone else can reach.
   if (isLocalHost(host)) { return null; }
 
@@ -109,13 +131,14 @@ export function normaliseRemote(raw: string): { key: string; repoUrl?: string } 
  * userinfo is stripped up to the last `@` within the authority only; a port must be numeric.
  * Otherwise the scp form `[user@]host:path`. Null when neither parses.
  */
-function splitRemote(s: string): { host: string; repoPath: string } | null {
+function splitRemote(s: string): { host: string; repoPath: string; ssh: boolean } | null {
   const urlForm = /^([a-z][a-z0-9+.-]*):\/\//i.exec(s);
   if (!urlForm) {
     const scp = /^(?:[^@/]+@)?([^:/]+):(.+)$/.exec(s);
-    return scp ? { host: scp[1], repoPath: scp[2] } : null;
+    return scp ? { host: scp[1], repoPath: scp[2], ssh: true } : null;
   }
-  if (!URL_SCHEMES.has(urlForm[1].toLowerCase())) { return null; }
+  const scheme = urlForm[1].toLowerCase();
+  if (!URL_SCHEMES.has(scheme)) { return null; }
   const rest = s.slice(urlForm[0].length);
   const slash = rest.indexOf('/');
   if (slash < 0) { return null; }
@@ -128,7 +151,7 @@ function splitRemote(s: string): { host: string; repoPath: string } | null {
     if (!/^\d+$/.test(authority.slice(colon + 1))) { return null; }
     authority = authority.slice(0, colon);
   }
-  return { host: authority, repoPath: rest.slice(slash) };
+  return { host: authority, repoPath: rest.slice(slash), ssh: SSH_SCHEMES.has(scheme) };
 }
 
 /** True for a loopback or unspecified host: localhost, 0.0.0.0, or any 127.x address. */

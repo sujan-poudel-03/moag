@@ -186,7 +186,9 @@ machine and survives renaming the folder:
 
 Never sent: passwords or tokens in a remote URL, ports, and local paths (`C:\…`, `file://`,
 `localhost` remotes). A remote that would need any of them removed in a way that changes its ID is
-not used.
+not used. An SSH nickname for GitHub, GitLab or Bitbucket (`git@github.com-personal:…`)
+counts as the real host, so it gives the same project as a normal clone. The full list of examples is
+[project-key-vectors.json](project-key-vectors.json).
 
 In ONOSOO, an owner or admin can **rename** a project (the ONOSOO name then wins over the plan's
 name) and **merge** two projects that are really one (for example, runs from before and after the

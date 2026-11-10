@@ -63,6 +63,31 @@ describe('project identity — normaliseRemote', () => {
     });
   }
 
+  describe('shared vectors (docs/project-key-vectors.json, which ONOSOO checks too)', () => {
+    const vectors = JSON.parse(fs.readFileSync(path.join(__dirname, '../../../../docs/project-key-vectors.json'), 'utf8')) as {
+      cases: Array<{ remote: string; key: string | null; repo_url?: string }>;
+    };
+    it('has cases', () => { assert.ok(vectors.cases.length >= 20); });
+    for (const c of vectors.cases) {
+      it(`${c.remote} → ${c.key ?? 'no key'}`, () => {
+        const n = normaliseRemote(c.remote);
+        if (c.key === null) {
+          assert.equal(n, null);
+        } else {
+          assert.deepEqual(n, c.repo_url ? { key: c.key, repoUrl: c.repo_url } : { key: c.key });
+        }
+      });
+    }
+  });
+
+  it('an SSH host alias of a well-known host is that host; https and other hosts are unchanged', () => {
+    assert.equal(normaliseRemote('git@github.com-personal:o/r.git')?.key, 'git:github.com/o/r');
+    assert.equal(normaliseRemote('git@GitHub.com-Work:o/r.git')?.key, 'git:github.com/o/r');
+    assert.equal(normaliseRemote('git@github.com-:o/r.git')?.key, 'git:github.com-/o/r');
+    assert.equal(normaliseRemote('https://github.com-personal/o/r')?.key, 'git:github.com-personal/o/r');
+    assert.equal(normaliseRemote('git@githubXcom-x:o/r.git')?.key, 'git:githubxcom-x/o/r');
+  });
+
   it('keeps the path case in repo_url and lower-cases the host', () => {
     assert.equal(normaliseRemote('git@github.com:Owner/Repo.git')?.repoUrl, 'https://github.com/Owner/Repo');
     assert.equal(normaliseRemote('https://GitHub.com/Owner/Repo/')?.repoUrl, 'https://github.com/Owner/Repo');
