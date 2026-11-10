@@ -23,6 +23,10 @@ export interface PrRequest {
   /** Optional target branch; `gh` picks the repo default when omitted. */
   base?: string;
   draft?: boolean;
+  /** The branch to propose, when it is not the one checked out in `cwd` (a run's imported branch). */
+  head?: string;
+  /** The whole body, replacing the one built from the tasks and files. */
+  body?: string;
 }
 
 /**
@@ -105,7 +109,8 @@ export function createPullRequest(req: PrRequest, gh: GhRunner = ghSync): PrOutc
     return { ok: false, reason: 'gh-missing', message: GH_INSTALL_HINT };
   }
 
-  const args = ['pr', 'create', '--title', req.title, '--body', buildPrBody(req)];
+  const args = ['pr', 'create', '--title', req.title, '--body', req.body ?? buildPrBody(req)];
+  if (req.head) { args.push('--head', req.head); }
   if (req.base) { args.push('--base', req.base); }
   if (req.draft) { args.push('--draft'); }
 

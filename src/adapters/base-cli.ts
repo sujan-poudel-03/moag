@@ -83,25 +83,39 @@ export const PROBE_TIMEOUT_MS = 5000;
 /** Most output a probe keeps; only its first line is used. */
 const MAX_PROBE_OUTPUT = 64 * 1024;
 
+/** What a short probe of an engine CLI came to: its exit code and its output (stdout, else stderr). */
+export interface ProbeResult {
+  /** The exit code, or null when the process was ended by a signal. */
+  code: number | null;
+  /** Trimmed stdout, or trimmed stderr when stdout was empty. At most MAX_PROBE_OUTPUT characters. */
+  output: string;
+}
+
 /**
- * Run `<command> --version` exactly as a run would spawn the command ({@link engineSpawnShape}),
- * and return the first line of its output, or null when it cannot be started, exits non-zero
- * or does not finish within `timeoutMs` (its process tree is then killed).
+ * Run `<command> <args…>` exactly as a run would spawn the command ({@link engineSpawnShape}) and
+ * report how it ended. Resolves null when the command cannot be started or does not finish within
+ * `timeoutMs` (its process tree is then killed). A non-zero exit is NOT null: some CLIs print a
+ * meaningful answer and exit 1 (`claude auth status` when signed out), and the caller decides.
  *
- * Where the spawn goes through a shell (Windows), a command that is not
- * {@link isShellSafeCommand} is never put on a shell line: the probe returns null. The only
- * argument is the fixed `--version`. Never rejects.
+ * `extraEnv` is merged over the process environment. Where the spawn goes through a shell
+ * (Windows), a command that is not {@link isShellSafeCommand} is never put on a shell line: the
+ * probe returns null. Never rejects.
  */
-export function probeVersion(command: string, timeoutMs: number = PROBE_TIMEOUT_MS): Promise<string | null> {
+export function probeCommand(
+  command: string,
+  args: string[],
+  timeoutMs: number = PROBE_TIMEOUT_MS,
+  extraEnv?: NodeJS.ProcessEnv,
+): Promise<ProbeResult | null> {
   return new Promise((resolve) => {
-    const shape = engineSpawnShape(['--version']);
+    const shape = engineSpawnShape(args);
     if (!command || (shape.shell && !isShellSafeCommand(command))) {
       resolve(null);
       return;
     }
     let settled = false;
     let timer: NodeJS.Timeout | null = null;
-    const finish = (value: string | null): void => {
+    const finish = (value: ProbeResult | null): void => {
       if (settled) { return; }
       settled = true;
       if (timer) { clearTimeout(timer); }
@@ -114,6 +128,7 @@ export function probeVersion(command: string, timeoutMs: number = PROBE_TIMEOUT_
         shell: shape.shell,
         detached: SPAWN_DETACHED,
         windowsHide: true,
+        ...(extraEnv ? { env: { ...process.env, ...extraEnv } } : {}),
       });
     } catch {
       finish(null);
@@ -129,16 +144,20 @@ export function probeVersion(command: string, timeoutMs: number = PROBE_TIMEOUT_
     proc.stdout?.on('data', (chunk: Buffer) => { if (stdout.length < MAX_PROBE_OUTPUT) { stdout += chunk.toString(); } });
     proc.stderr?.on('data', (chunk: Buffer) => { if (stderr.length < MAX_PROBE_OUTPUT) { stderr += chunk.toString(); } });
     proc.on('error', () => finish(null));
-    proc.on('close', (code) => {
-      if (code !== 0) {
-        // Some CLIs only respond to --help; a failed --version reports no version.
-        finish(null);
-        return;
-      }
-      const output = (stdout.trim() || stderr.trim());
-      finish(output.split(/\r?\n/)[0]?.trim() || null);
-    });
+    proc.on('close', (code) => finish({ code, output: stdout.trim() || stderr.trim() }));
   });
+}
+
+/**
+ * Run `<command> --version` exactly as a run would spawn the command ({@link engineSpawnShape}),
+ * and return the first line of its output, or null when it cannot be started, exits non-zero
+ * or does not finish within `timeoutMs`. The only argument is the fixed `--version`. Never rejects.
+ */
+export async function probeVersion(command: string, timeoutMs: number = PROBE_TIMEOUT_MS): Promise<string | null> {
+  const result = await probeCommand(command, ['--version'], timeoutMs);
+  // Some CLIs only respond to --help; a failed --version reports no version.
+  if (!result || result.code !== 0) { return null; }
+  return result.output.split(/\r?\n/)[0]?.trim() || null;
 }
 
 /**

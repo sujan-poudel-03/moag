@@ -23,7 +23,7 @@ it starts.
 - Docker Engine with the Compose plugin **2.24.4 or newer** (`docker compose version`).
 - Images from **public registries only**: `moag host` gives Docker no registry credentials (see
   [Images: public registries only](#images-public-registries-only)).
-- Git **2.45.1 or newer**, Node 20, MOAG.
+- Git **2.45.1 or newer**, Node **24** (what the projects it builds need; ONOSOO's lock file installs only with npm 11), MOAG.
 - `cloudflared`, and a Cloudflare-managed domain for previews (e.g. `preview.onosoo.com`).
 - Always on: sleep off. Roughly 8 cores / 32 GB / 1 TB SSD for 3–4 environments at once.
 

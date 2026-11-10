@@ -63,6 +63,8 @@ export const RUN_META_KEY_MAX = 255;
 export const RUN_META_URL_MAX = 500;
 /** Most child repositories of a `multi:` key in run-meta. */
 export const RUN_META_REPOS_MAX = 20;
+/** A task type as MOAG names it: lower-case words, nothing that could carry text. */
+const TASK_KIND_RE = /^[a-z][a-z0-9-]{0,23}$/;
 /**
  * How often a live run's spool file is touched; far inside SPOOL_OWNER_MAX_IDLE_MS (10 min).
  * 30 s, not 60: off Linux, ownership rests on the file's mtime alone, and after a sleep/resume
@@ -213,7 +215,11 @@ function applyProtocolStatus(type: string, data: Record<string, unknown>): void 
 export interface RunMeta {
   plan_name: string;
   project: string;
-  tasks: Array<{ id: string; name: string }>;
+  /**
+   * Each task in plan order. `stage` is the playlist it sits in (Design, Development, Testing, Ship),
+   * `kind` its type (agent, command, check, manual, ...): together they let ONOSOO draw the run as stages.
+   */
+  tasks: Array<{ id: string; name: string; stage?: string; kind?: string }>;
   /** The branch a remote run delivers to; absent or null for a run started by hand. */
   branch?: string | null;
   /** Protocol v1.2: the stable, path-free project id (`git:`, `root:` or `multi:`). */
@@ -573,7 +579,11 @@ export class OnosooRelay {
       const rawProject = this.redactor.redact(String(meta.project ?? '')).text;
       const project = r(looksLikePath(rawProject) ? baseName(rawProject) : rawProject, 200);
       const all = Array.isArray(meta.tasks) ? meta.tasks : [];
-      const tasks = all.slice(0, RUN_META_TASKS).map((t) => ({ id: r(t?.id, 100), name: r(t?.name, 200) }));
+      const tasks = all.slice(0, RUN_META_TASKS).map((t) => {
+        const stage = typeof t?.stage === 'string' ? r(t.stage, 80).trim() : '';
+        const kind = typeof t?.kind === 'string' && TASK_KIND_RE.test(t.kind) ? t.kind : '';
+        return { id: r(t?.id, 100), name: r(t?.name, 200), ...(stage ? { stage } : {}), ...(kind ? { kind } : {}) };
+      });
       const data: Record<string, unknown> = { plan_name: r(meta.plan_name, 200), project, tasks };
       if (typeof meta.branch === 'string' && meta.branch.length > 0) { data.branch = r(meta.branch, 255); }
       this.addIdentity(meta, data);
@@ -582,7 +592,7 @@ export class OnosooRelay {
       // Keep the data within the per-event cap: drop tasks from the end until it fits.
       if (Buffer.byteLength(JSON.stringify(data), 'utf-8') > MAX_EVENT_DATA_BYTES) {
         let size = Buffer.byteLength(JSON.stringify({ ...data, tasks: [], tasks_truncated: true }), 'utf-8');
-        const kept: Array<{ id: string; name: string }> = [];
+        const kept: Array<{ id: string; name: string; stage?: string; kind?: string }> = [];
         for (const t of tasks) {
           const add = Buffer.byteLength(JSON.stringify(t), 'utf-8') + (kept.length > 0 ? 1 : 0);
           if (size + add > MAX_EVENT_DATA_BYTES) { break; }

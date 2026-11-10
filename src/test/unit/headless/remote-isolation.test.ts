@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  checkRunnerUid, checkStateSecurity, childCommand, childSpawnEnv, engineEnvFrom, forceKillCommand, isolationRefusal, NO_PROBE_ANSWER, parseProbe,
+  checkRunnerUid, checkStateSecurity, childCommand, childSpawnEnv, engineEnvFrom, forceKillCommand, isolationRefusal, NO_PROBE_ANSWER, parseProbe, cleanEngineIssues, MAX_ENGINE_ISSUE_CHARS,
   protectedStatePaths, resolveRunnerUid, SUDOERS_EXAMPLE, tightenStatePermissions,
 } from '../../../headless/remote-isolation';
 
@@ -58,6 +58,33 @@ describe('remote isolation — probe', () => {
   it('accepts a different non-root uid that could read none of the protected files; drops copilot/custom and bad shas', () => {
     const out = parseProbe(`noise\n${probeLine()}\n`, 1000, PROTECTED);
     assert.deepEqual(out, { ok: true, uid: 1001, engines: ['claude', 'ollama'], mirrors: { web: ['a'.repeat(40)] } });
+  });
+
+  it('relays the reasons an installed engine cannot be used, cleaned, and only for engines that are not usable', () => {
+    const out = parseProbe(probeLine({ engineIssues: { claude: 'Claude Code is not signed in.', gemini: 'Not signed in.' } }), 1000, PROTECTED);
+    // claude is usable in the default probeLine, gemini is not an engine it lists: only a non-usable one stays
+    assert.ok(out.ok);
+    if (out.ok) { assert.deepEqual(out.engineIssues, { gemini: 'Not signed in.' }); }
+  });
+
+  it('cleanEngineIssues keeps one short line per known-shaped engine id, at most ten, none for a usable engine', () => {
+    assert.deepEqual(cleanEngineIssues({ claude: 'Not signed in.' }, []), { claude: 'Not signed in.' });
+    assert.deepEqual(cleanEngineIssues({ claude: 'x' }, ['claude']), {}, 'a usable engine never has an issue');
+    assert.deepEqual(cleanEngineIssues({ custom: 'x', copilot: 'y' }, []), {}, 'excluded engines are not reported');
+    assert.deepEqual(cleanEngineIssues({ 'Bad Id': 'x', '../x': 'y', '': 'z' }, []), {});
+    assert.deepEqual(cleanEngineIssues({ claude: 'line one\nline two\u0007\u001b[31m' }, []), { claude: 'line one line two [31m' }, 'control characters become spaces');
+    assert.equal(cleanEngineIssues({ claude: 'a'.repeat(1000) }, []).claude.length, MAX_ENGINE_ISSUE_CHARS);
+    assert.deepEqual(cleanEngineIssues({ claude: '   ' }, []), {}, 'an empty reason is dropped');
+    for (const bad of [null, undefined, 'x', 3, [], ['claude']]) { assert.deepEqual(cleanEngineIssues(bad, []), {}); }
+    const many = Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`engine${i}`, 'x']));
+    assert.equal(Object.keys(cleanEngineIssues(many, [])).length, 10);
+    assert.deepEqual(cleanEngineIssues({ claude: 42, codex: {} }, []), {}, 'non-string reasons are dropped');
+  });
+
+  it('a probe with no engineIssues parses exactly as before', () => {
+    const out = parseProbe(probeLine(), 1000, PROTECTED);
+    assert.ok(out.ok);
+    if (out.ok) { assert.equal('engineIssues' in out, false); }
   });
 
   const refused: Array<[string, string]> = [

@@ -18,6 +18,18 @@ export interface DetectionResult {
 }
 
 /**
+ * Why installed engines are not usable (not signed in), keyed by engine id. Only engines that are
+ * installed and carry a reason appear; a missing engine is simply absent from `available`.
+ */
+export function engineIssues(result: DetectionResult): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [id, info] of result.availability) {
+    if (!info.available && typeof info.reason === 'string' && info.reason.length > 0) { out[id] = info.reason; }
+  }
+  return out;
+}
+
+/**
  * Pure detection: scan PATH for known CLIs and return results.
  * Does not modify any configuration or state.
  */

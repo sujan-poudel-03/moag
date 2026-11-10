@@ -137,7 +137,7 @@ const realTimers: HostTimers = {
   clearTimeout: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
 };
 
-type Isolation = { ok: true; engines: string[]; mirrors: Record<string, string[]> } | { ok: false; reason: string };
+type Isolation = { ok: true; engines: string[]; engineIssues: Record<string, string>; mirrors: Record<string, string[]> } | { ok: false; reason: string };
 
 interface LaunchRequest {
   project: ApprovedProject;
@@ -338,7 +338,7 @@ export class CommandHost {
     if (!force && this.isolation && t - this.isolationAt < ISOLATION_RECHECK_MS) { return this.isolation; }
     let out: ProbeOutcome;
     try { out = await this.o.probe(projects); } catch (err) { out = { ok: false, reason: `The isolation check failed: ${err instanceof Error ? err.message : String(err)}` }; }
-    this.isolation = out.ok ? { ok: true, engines: out.engines, mirrors: out.mirrors } : { ok: false, reason: out.reason };
+    this.isolation = out.ok ? { ok: true, engines: out.engines, engineIssues: out.engineIssues ?? {}, mirrors: out.mirrors } : { ok: false, reason: out.reason };
     this.isolationAt = t;
     return this.isolation;
   }
@@ -387,6 +387,10 @@ export class CommandHost {
         return { id: p.id, name: p.name, kinds: [...p.kinds], ...(key ? { key } : {}) };
       }),
       engines: ok ? [...(iso as { engines: string[] }).engines] : [],
+      // Why an installed engine is not offered, so ONOSOO can say "not signed in" instead of showing nothing.
+      ...(ok && Object.keys((iso as { engineIssues: Record<string, string> }).engineIssues).length > 0
+        ? { engine_issues: { ...(iso as { engineIssues: Record<string, string> }).engineIssues } }
+        : {}),
     };
   }
 

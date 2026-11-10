@@ -184,7 +184,7 @@ describe('run-reporter', () => {
       const first = rec.bodies[0].events[0];
       assert.equal(first.type, 'run-meta');
       assert.equal(first.seq, 1);
-      assert.deepEqual(first.data.tasks, [{ id: 'a', name: 'A' }]);
+      assert.deepEqual(first.data.tasks, [{ id: 'a', name: 'A', kind: 'agent' }]);
     });
 
     it('a throwing buildRedactor still starts, and run-meta carries redaction_failed', async () => {
@@ -276,7 +276,14 @@ describe('run-reporter', () => {
     it('package.json name, else the folder name; tasks flattened in plan order', () => {
       const dir = tmp('moag-rr-meta-');
       const plan = { name: 'P', playlists: [{ tasks: [{ id: 'a', name: 'A', prompt: 'x' }] }, { tasks: [{ id: 'b' }] }] };
-      assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A' }, { id: 'b', name: '' }] });
+      assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A', kind: 'agent' }, { id: 'b', name: '', kind: 'agent' }] });
+      // a named playlist is the task's stage, and a task's type is its kind
+      const staged = { name: 'P', playlists: [{ name: 'Development', tasks: [{ id: 'a', name: 'A', type: 'agent' }] }, { name: 'Testing', tasks: [{ id: 'b', name: 'B', type: 'command' }, { id: 'c', name: 'C', type: 'manual' }] }] };
+      assert.deepEqual(buildRunMeta(staged, dir).tasks, [
+        { id: 'a', name: 'A', stage: 'Development', kind: 'agent' },
+        { id: 'b', name: 'B', stage: 'Testing', kind: 'command' },
+        { id: 'c', name: 'C', stage: 'Testing', kind: 'manual' },
+      ]);
       fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@acme/app' }));
       assert.equal(buildRunMeta(plan, dir).project, '@acme/app');
       fs.writeFileSync(path.join(dir, 'package.json'), '{broken');

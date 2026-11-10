@@ -100,9 +100,9 @@ export function buildRunMeta(plan: any, cwd: string, identity?: ProjectIdentity 
   } catch { /* no package.json */ }
   if (!project) { project = path.basename(path.resolve(cwd)); }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const tasks = (plan?.playlists ?? []).flatMap((pl: any) => pl?.tasks ?? [])
+  const tasks = (plan?.playlists ?? []).flatMap((pl: any) => (pl?.tasks ?? [])
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    .map((t: any) => ({ id: String(t?.id), name: String(t?.name ?? '') }));
+    .map((t: any) => ({ id: String(t?.id), name: String(t?.name ?? ''), ...(typeof pl?.name === 'string' && pl.name.length > 0 ? { stage: pl.name } : {}), kind: typeof t?.type === 'string' ? t.type : 'agent' })));
   return { plan_name: String(plan?.name ?? ''), project, tasks, ...pickIdentity(identity) };
 }
 

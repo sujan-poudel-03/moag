@@ -38,6 +38,20 @@ describe('engine-detection', () => {
     });
   });
 
+  describe('engineIssues()', () => {
+    it('lists only installed engines that carry a reason, and nothing for missing or usable ones', () => {
+      const mod = loadModule({});
+      const availability = new Map<EngineId, EngineAvailability>([
+        ['claude', { available: false, command: 'claude', displayName: 'Claude', reason: 'Claude Code is not signed in.' }],
+        ['codex', { available: false, command: 'codex', displayName: 'Codex' }],
+        ['gemini', { available: true, command: 'gemini', displayName: 'Gemini' }],
+        ['ollama', { available: true, command: 'ollama', displayName: 'Ollama', reason: 'ignored while available' }],
+      ]);
+      const issues = mod.engineIssues({ availability, available: ['gemini', 'ollama'], autoSelected: 'gemini' });
+      assert.deepEqual(issues, { claude: 'Claude Code is not signed in.' });
+    });
+  });
+
   describe('detectEngines()', () => {
     it('should select claude when all engines are available (priority order)', async () => {
       const mod = loadModule({

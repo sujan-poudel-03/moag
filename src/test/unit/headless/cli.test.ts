@@ -846,7 +846,7 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const meta = sent[0].data as { plan_name: string; project: string; tasks: Array<{ id: string; name: string }> };
     assert.equal(meta.plan_name, 'Relay plan');
     assert.equal(meta.project, path.basename(dir));
-    assert.deepEqual(meta.tasks, [{ id: 't-1', name: 'First' }, { id: 't-2', name: 'Second' }]);
+    assert.deepEqual(meta.tasks, [{ id: 't-1', name: 'First', stage: 'Build', kind: 'agent' }, { id: 't-2', name: 'Second', stage: 'Build', kind: 'agent' }]);
     for (const c of calls) { assert.ok(!c.raw.includes(PROMPT), 'no prompt text in any request'); }
     // No request carries the absolute workspace path, in any spelling JSON gives it.
     for (const c of calls) {
@@ -1036,7 +1036,7 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const { buildRunMeta } = loadCli();
     const dir = fs.realpathSync(tmpDir());
     const plan = { name: 'P', playlists: [{ tasks: [{ id: 'a', name: 'A', prompt: 'x' }] }, { tasks: [{ id: 'b' }] }] };
-    assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A' }, { id: 'b', name: '' }] });
+    assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A', kind: 'agent' }, { id: 'b', name: '', kind: 'agent' }] });
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@acme/app' }));
     assert.equal(buildRunMeta(plan, dir).project, '@acme/app');
     fs.writeFileSync(path.join(dir, 'package.json'), '{broken');

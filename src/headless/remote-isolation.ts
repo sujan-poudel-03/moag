@@ -87,6 +87,8 @@ export interface ProbeReport {
   /** path → true when the runner account could NOT read it. */
   unreadable: Record<string, boolean>;
   engines: string[];
+  /** engine id → why an installed engine cannot be used (not signed in). Absent from older children. */
+  engineIssues?: Record<string, string>;
   /** projectId → commit shas its mirror already has (for thin bundles). */
   mirrors: Record<string, string[]>;
   /** The runner account's home (so the daemon can scrub its worktree paths from relayed events). */
@@ -94,7 +96,7 @@ export interface ProbeReport {
 }
 
 export type ProbeOutcome =
-  | { ok: true; uid: number; engines: string[]; mirrors: Record<string, string[]>; home?: string }
+  | { ok: true; uid: number; engines: string[]; engineIssues?: Record<string, string>; mirrors: Record<string, string[]>; home?: string }
   | { ok: false; reason: string };
 
 const SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
@@ -126,6 +128,7 @@ export function parseProbe(stdout: string, ownUid: number, protectedPaths: reado
   const engines = Array.isArray(report.engines)
     ? [...new Set(report.engines.filter((e): e is string => typeof e === 'string' && !REMOTE_EXCLUDED_ENGINES.has(e)))]
     : [];
+  const engineIssues = cleanEngineIssues(report.engineIssues, engines);
   const mirrors: Record<string, string[]> = {};
   if (report.mirrors && typeof report.mirrors === 'object') {
     for (const [id, shas] of Object.entries(report.mirrors)) {
@@ -133,7 +136,28 @@ export function parseProbe(stdout: string, ownUid: number, protectedPaths: reado
     }
   }
   const home = typeof report.home === 'string' && report.home.startsWith('/') && report.home.length < 512 ? report.home : undefined;
-  return { ok: true, uid: report.uid, engines, mirrors, ...(home ? { home } : {}) };
+  return { ok: true, uid: report.uid, engines, ...(Object.keys(engineIssues).length > 0 ? { engineIssues } : {}), mirrors, ...(home ? { home } : {}) };
+}
+
+const ENGINE_ID_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+/** Longest reason relayed to ONOSOO. */
+export const MAX_ENGINE_ISSUE_CHARS = 160;
+
+/**
+ * The reasons a probe child gave, made safe to relay: known-shaped engine ids only, one short line each,
+ * no control characters, at most ten, and none for an engine that is usable.
+ */
+export function cleanEngineIssues(raw: unknown, usable: readonly string[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) { return out; }
+  for (const [id, reason] of Object.entries(raw as Record<string, unknown>)) {
+    if (Object.keys(out).length >= 10) { break; }
+    if (!ENGINE_ID_RE.test(id) || usable.includes(id) || REMOTE_EXCLUDED_ENGINES.has(id) || typeof reason !== 'string') { continue; }
+    // eslint-disable-next-line no-control-regex
+    const line = reason.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, MAX_ENGINE_ISSUE_CHARS);
+    if (line.length > 0) { out[id] = line; }
+  }
+  return out;
 }
 
 /**

@@ -613,7 +613,7 @@ describe('host-run-relay', function () {
     setState(h.runner, 'idle');
     await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
     const sent = h.rec.sent();
-    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: 't-2', name: 'Second' }]);
+    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: 't-2', name: 'Second', stage: 'Build', kind: 'agent' }]);
     assert.equal(sent.find((e) => e.type === 'run-finished')!.data.total, 1);
     assert.equal(h.plan.playlists[0].tasks.length, 2, 'the runner\'s plan is not modified');
   });
@@ -633,7 +633,7 @@ describe('host-run-relay', function () {
     setState(h.runner, 'idle');
     await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
     const sent = h.rec.sent();
-    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: t3.id, name: 'Third' }]);
+    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: t3.id, name: 'Third', stage: 'Later', kind: 'agent' }]);
     const fin = sent.find((e) => e.type === 'run-finished')!.data;
     assert.deepEqual([fin.total, fin.completed, fin.failed, fin.code], [1, 1, 0, 0]);
   });
@@ -880,7 +880,7 @@ describe('host-run-relay', function () {
       await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
       const sent = [...h.rec.sent()].sort((a, b) => a.seq - b.seq);
       assert.equal(sent[0].type, 'run-meta');
-      assert.deepEqual(sent[0].data.tasks, [{ id: 't-2', name: 'Second' }]);
+      assert.deepEqual(sent[0].data.tasks, [{ id: 't-2', name: 'Second', stage: 'Build', kind: 'agent' }]);
       assert.equal(sent[0].data.project_key, ID_A.project_key);
       assert.equal(sent[1].type, 'run-started');
     });

@@ -690,6 +690,31 @@ describe('ONOSOO relay — run-meta', () => {
     assert.equal(calls[0].body.events[1].seq, 2);
   });
 
+  it('sends each task\'s stage and kind, scrubbed, and drops a kind that is not a plain word', async () => {
+    const { calls, client } = recorder();
+    const { relay } = mkRelay(client);
+    relay.start({
+      plan_name: 'p',
+      project: 'proj',
+      tasks: [
+        { id: 'a', name: 'A', stage: 'Development', kind: 'agent' },
+        { id: 'b', name: 'B', stage: 'Testing', kind: 'command' },
+        { id: 'c', name: 'C', stage: '   ', kind: 'Manual Gate!' },
+        { id: 'd', name: 'D', stage: 'x'.repeat(300), kind: '../etc' },
+        { id: 'e', name: 'E' },
+      ],
+    });
+    await settle();
+    await relay.close();
+    const tasks = calls[0].body.events[0].data.tasks as Array<Record<string, unknown>>;
+    assert.deepEqual(tasks[0], { id: 'a', name: 'A', stage: 'Development', kind: 'agent' });
+    assert.deepEqual(tasks[1], { id: 'b', name: 'B', stage: 'Testing', kind: 'command' });
+    assert.deepEqual(tasks[2], { id: 'c', name: 'C' }, 'a blank stage and an odd kind are left out');
+    assert.equal((tasks[3].stage as string).length, 80, 'a long stage is cut');
+    assert.equal('kind' in tasks[3], false);
+    assert.deepEqual(tasks[4], { id: 'e', name: 'E' }, 'a task with neither sends neither');
+  });
+
   it('drops tasks from the end when the event would not fit one body', async () => {
     const { calls, client } = recorder();
     const { relay } = mkRelay(client);

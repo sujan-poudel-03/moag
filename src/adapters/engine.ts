@@ -45,6 +45,13 @@ export interface EngineAdapter {
    * When present, checkEngineAvailability uses it instead of looking for getCommand().
    */
   checkAvailability?(): Promise<boolean>;
+  /**
+   * For an engine whose CLI can be installed without being signed in. Returns `{ ok: false, reason }`
+   * ONLY when the engine says plainly that it has no credentials. Anything else (an older CLI, a
+   * timeout, an unfamiliar answer, another way of authenticating) is null and counts as usable,
+   * so a check that cannot tell never blocks an engine that would have worked.
+   */
+  checkLogin?(): Promise<{ ok: false; reason: string } | null>;
 }
 
 // ─── Cost ceiling guard ──────────────────────────────────────────────────────
@@ -105,6 +112,7 @@ export function withCostAccounting(adapter: EngineAdapter): EngineAdapter {
     displayName: adapter.displayName,
     getCommand: () => adapter.getCommand(),
     ...(adapter.checkAvailability ? { checkAvailability: () => adapter.checkAvailability!() } : {}),
+    ...(adapter.checkLogin ? { checkLogin: () => adapter.checkLogin!() } : {}),
     async runTask(options: EngineRunOptions): Promise<EngineResult> {
       const label = options.costLabel ?? 'unattributed';
       if (!isAllowedByCeiling(adapter.id, label)) {
@@ -169,6 +177,8 @@ export interface EngineAvailability {
   displayName: string;
   /** Version string if the engine responded to --version / --help */
   version?: string;
+  /** Why an installed engine is not usable (it is not signed in), as one short sentence. */
+  reason?: string;
 }
 
 /**
@@ -206,11 +216,17 @@ export async function checkEngineAvailability(
       // so on Windows the version is that of the binary cmd resolves (a .cmd shim
       // earlier on PATH), not of a .exe a shell-less lookup would find instead.
       const version = await probeVersion(command);
+      // An installed CLI that is not signed in fails every run; say so here, not run by run.
+      let loginProblem: string | null = null;
+      if (adapter.checkLogin) {
+        try { loginProblem = (await adapter.checkLogin())?.reason ?? null; } catch { loginProblem = null; }
+      }
       results.set(id, {
-        available: true,
+        available: loginProblem === null,
         command,
         displayName: adapter.displayName,
         version: version || undefined,
+        ...(loginProblem !== null ? { reason: loginProblem } : {}),
       });
     })
   );
