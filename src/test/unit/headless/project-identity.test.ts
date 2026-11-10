@@ -83,7 +83,7 @@ describe('project identity — normaliseRemote', () => {
   it('an SSH host alias of a well-known host is that host; https and other hosts are unchanged', () => {
     assert.equal(normaliseRemote('git@github.com-personal:o/r.git')?.key, 'git:github.com/o/r');
     assert.equal(normaliseRemote('git@GitHub.com-Work:o/r.git')?.key, 'git:github.com/o/r');
-    assert.equal(normaliseRemote('git@github.com-:o/r.git')?.key, 'git:github.com-/o/r');
+    assert.equal(normaliseRemote('git@github.com-:o/r.git'), null);
     assert.equal(normaliseRemote('https://github.com-personal/o/r')?.key, 'git:github.com-personal/o/r');
     assert.equal(normaliseRemote('git@githubXcom-x:o/r.git')?.key, 'git:githubxcom-x/o/r');
   });

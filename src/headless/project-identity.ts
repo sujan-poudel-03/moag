@@ -106,6 +106,8 @@ export function normaliseRemote(raw: string): { key: string; repoUrl?: string } 
   const { repoPath } = split;
 
   if (!/^[A-Za-z0-9._-]+$/.test(split.host)) { return null; }
+  // Not a real host name: an empty label, or a label that starts or ends with a hyphen (github.com-).
+  if (split.host.split('.').some((label) => label === '' || label.startsWith('-') || label.endsWith('-'))) { return null; }
   // An SSH nickname for a well-known host (github.com-work, ssh.github.com) is that host.
   const host = split.ssh ? canonicalSshHost(split.host) : split.host;
   // A loopback host names this machine, not a repository anyone else can reach.

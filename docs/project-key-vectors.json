@@ -25,6 +25,9 @@
     { "remote": "ssh://git@localhost/owner/repo.git", "key": null },
     { "remote": "https://127.0.0.1/owner/repo", "key": null },
     { "remote": "ssh://git@host/C:/Users/me/repo", "key": null },
-    { "remote": "ftp://github.com/owner/repo", "key": null }
+    { "remote": "ftp://github.com/owner/repo", "key": null },
+    { "remote": "git@github.com-:owner/repo.git", "key": null },
+    { "remote": "https://-bad.example.com/owner/repo", "key": null },
+    { "remote": "https://github..com/owner/repo", "key": null }
   ]
 }
