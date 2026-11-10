@@ -164,6 +164,42 @@ Nothing secret leaves the machine. Values from `.env` / `.env.local`, engine key
 common key formats are redacted, and absolute paths are shortened. If ONOSOO is unreachable, events
 wait in a local spool (`<config>/moag/onosoo-spool/`) and are sent by the next run.
 
+#### How a project gets into ONOSOO
+
+There is no "Add project" button. **Running MOAG in a folder is what adds it:** the first run from
+that folder, from the VS Code panel or `moag run`, creates its project in ONOSOO.
+
+1. Open the project folder in VS Code (or `cd` into it for `moag run`).
+2. Generate or open a plan and press **Play**.
+3. In ONOSOO, open **Builds**: the run is listed under the project's name.
+
+MOAG tells ONOSOO which project a run belongs to with a **project ID** that is the same on every
+machine and survives renaming the folder:
+
+| Your folder | Project ID MOAG sends | In ONOSOO |
+|---|---|---|
+| A git repository with an `origin` remote (GitHub, GitLab, …) | `git:github.com/owner/repo`, plus a link to the repository | One project, with an "Open repository" link |
+| A subfolder of a monorepo (`frontend/`, `backend/`) | The repository's ID, whichever folder you run from | The same single project |
+| A folder holding several repositories (`backend/` and `frontend/`, each its own repo) | `multi:…`, plus the list of those repositories (up to 20) | One project, with its repositories listed |
+| A git repository with no remote | `root:<first commit>` | One project, the same for every clone |
+| Not a git repository, or a shallow clone with no remote | None | Grouped by the plan's project name |
+
+Never sent: passwords or tokens in a remote URL, ports, and local paths (`C:\…`, `file://`,
+`localhost` remotes). A remote that would need any of them removed in a way that changes its ID is
+not used.
+
+In ONOSOO, an owner or admin can **rename** a project (the ONOSOO name then wins over the plan's
+name) and **merge** two projects that are really one (for example, runs from before and after the
+repository got a remote).
+
+> **Availability.** MOAG sends the project ID from the release after 0.10.0. The **Projects** page in
+> ONOSOO Builds (the list, rename and merge) comes with ONOSOO's Builds protocol v1.2 update. Until
+> both are live, runs still appear under **Builds → Runs** with their project name, just not grouped
+> under a project.
+
+To **start runs from ONOSOO** on a project (Level 2), the project must also be approved on the
+machine: see [Approve projects and switch remote start on](#5-approve-projects-and-switch-remote-start-on).
+
 ### 5. Stay online
 
 ONOSOO shows a machine **Online** after any authenticated request in the last 3 minutes (events,
