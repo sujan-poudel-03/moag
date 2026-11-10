@@ -824,7 +824,7 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const { dir, planFile, configDir } = workspace();
     const { calls, http } = recorder();
     const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir, '--verify']),
-      ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000 }));
+      ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000, identity: async () => null }));
     assert.equal(code, 0);
     assert.ok(calls.length >= 1);
     for (const c of calls) { assert.equal(c.url, ENDPOINT); }
@@ -856,6 +856,64 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const started = sent.find((e) => e.type === 'run-started')!;
     assert.equal(started.data.planPath, 'plan.json', 'the relay copy is cwd-relative');
     assert.equal(out.find((e) => e.event === 'run-started')!.planPath, planFile, 'stdout keeps the absolute path');
+  });
+
+  it('protocol v1.2: run-meta (seq 1) carries the project identity, run-started follows, stdout never sees it', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const { calls, http } = recorder();
+    const asked: string[] = [];
+    const identity = async (cwd: string) => {
+      asked.push(cwd);
+      return { project_key: 'git:github.com/owner/repo', repo_url: 'https://github.com/Owner/Repo' };
+    };
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]),
+      ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000, identity }));
+    assert.equal(code, 0);
+    assert.deepEqual(asked, [dir]);
+    const sent = calls.flatMap((c) => c.body.events);
+    assert.equal(sent[0].seq, 1);
+    assert.equal(sent[0].type, 'run-meta');
+    assert.equal(sent[0].data.project_key, 'git:github.com/owner/repo');
+    assert.equal(sent[0].data.repo_url, 'https://github.com/Owner/Repo');
+    assert.equal(sent[1].type, 'run-started');
+    assert.equal(sent[1].seq, 2);
+    assert.ok(!lines.join('').includes('project_key'));
+    assert.ok(!lines.join('').includes('github.com/owner/repo'));
+  });
+
+  it('protocol v1.2: a null or rejecting identity leaves run-meta without the fields', async () => {
+    for (const identity of [async () => null, async () => { throw new Error('git broke'); }]) {
+      const { dir, planFile, configDir } = workspace();
+      const { calls, http } = recorder();
+      const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]),
+        ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000, identity }));
+      assert.equal(code, 0);
+      const meta = calls.flatMap((c) => c.body.events)[0];
+      assert.equal(meta.type, 'run-meta');
+      assert.deepEqual(Object.keys(meta.data).sort(), ['plan_name', 'project', 'tasks']);
+    }
+  });
+
+  it('protocol v1.2: the default resolver runs only with a device key (no git without one)', async () => {
+    const within: string[] = [];
+    class FakeCache {
+      within(cwd: string): Promise<null> { within.push(cwd); return Promise.resolve(null); }
+    }
+    const cli = proxyquire('../../../headless/cli', {
+      './project-identity': { ProjectIdentityCache: FakeCache, IDENTITY_WAIT_MS: 2000 },
+      '../runner/evidence': { detectPrdFile: () => null, captureBaseRef: async () => null, captureHeadRef: async () => null },
+      '../sandbox/project-detector': { detectProject: () => null },
+    });
+    const noKey = workspace();
+    assert.equal(await cli.cmdRun(parseArgs(['run', noKey.planFile, '--cwd', noKey.dir]),
+      ctxFor('ok', { env: { APPDATA: noKey.configDir, XDG_CONFIG_HOME: noKey.configDir }, closeDeadlineMs: 50 })), 0);
+    assert.deepEqual(within, []);
+
+    const withKey = workspace();
+    const { http } = recorder();
+    assert.equal(await cli.cmdRun(parseArgs(['run', withKey.planFile, '--cwd', withKey.dir]),
+      ctxFor('ok', { env: envWithKey(withKey.configDir), http, closeDeadlineMs: 2000 })), 0);
+    assert.deepEqual(within, [withKey.dir]);
   });
 
   const failing: Array<[string, () => (req: unknown) => Promise<{ status: number; body: string }>]> = [

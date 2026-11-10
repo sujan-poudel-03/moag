@@ -14,6 +14,7 @@ import { resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
 import { OnosooRelay, RelayHttpClient, RunMeta } from './onosoo-relay';
 import type { Redactor } from '../utils/redact';
+import type { ProjectIdentity } from './project-identity';
 import { TaskStatus } from '../models/types';
 
 // ─── Lines ───
@@ -69,12 +70,28 @@ export function wireRunEventLines(runner: any, emit: EmitLine, opts: { manualGat
 // ─── run-meta ───
 
 /**
+ * The protocol v1.2 identity fields of a run-meta, picked explicitly (nothing else of the
+ * identity object travels). Empty for a null or missing identity.
+ */
+export function pickIdentity(identity: ProjectIdentity | null | undefined): Pick<RunMeta, 'project_key' | 'repo_url' | 'repos'> {
+  if (!identity || typeof identity.project_key !== 'string' || identity.project_key.length === 0) { return {}; }
+  return {
+    project_key: identity.project_key,
+    ...(typeof identity.repo_url === 'string' ? { repo_url: identity.repo_url } : {}),
+    ...(Array.isArray(identity.repos)
+      ? { repos: identity.repos.map((r) => (typeof r.repo_url === 'string' ? { dir: r.dir, key: r.key, repo_url: r.repo_url } : { dir: r.dir, key: r.key })) }
+      : {}),
+  };
+}
+
+/**
  * The relay-only `run-meta` facts for a plan: its name, the project's package.json
  * name (else the folder's base name — never a path), and each task's id and name in
- * plan order. Caps and redaction are the relay's.
+ * plan order, plus the project identity when one is given. Synchronous and pure: it
+ * never runs git. Caps and redaction are the relay's.
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-export function buildRunMeta(plan: any, cwd: string): RunMeta {
+export function buildRunMeta(plan: any, cwd: string, identity?: ProjectIdentity | null): RunMeta {
   let project = '';
   try {
     const pkg: unknown = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf-8'));
@@ -86,7 +103,7 @@ export function buildRunMeta(plan: any, cwd: string): RunMeta {
   const tasks = (plan?.playlists ?? []).flatMap((pl: any) => pl?.tasks ?? [])
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     .map((t: any) => ({ id: String(t?.id), name: String(t?.name ?? '') }));
-  return { plan_name: String(plan?.name ?? ''), project, tasks };
+  return { plan_name: String(plan?.name ?? ''), project, tasks, ...pickIdentity(identity) };
 }
 
 // ─── Cost ───
@@ -141,6 +158,16 @@ export interface StartRunRelayOptions {
   http?: RelayHttpClient;
   isPidAlive?: (pid: number) => boolean;
   closeDeadlineMs?: number;
+  /** The project identity the run-meta carries (protocol v1.2); absent or null for none. */
+  identity?: ProjectIdentity | null;
+}
+
+/** A relay built but not started: {@link PreparedRunRelay.begin} sends run-meta (seq 1) and starts it. */
+export interface PreparedRunRelay {
+  relay: OnosooRelay;
+  key: string;
+  /** Start the relay with the run-meta for `identity`. Runs once; later calls do nothing. Never throws; false when the start failed or already ran. */
+  begin(identity?: ProjectIdentity | null): boolean;
 }
 
 /**
@@ -149,6 +176,16 @@ export interface StartRunRelayOptions {
  * Never throws: a relay that cannot start leaves the run exactly as it was.
  */
 export function startRunRelay(o: StartRunRelayOptions): { relay: OnosooRelay; key: string } | null {
+  const prepared = prepareRunRelay(o);
+  if (!prepared?.begin(o.identity)) { return null; }
+  return { relay: prepared.relay, key: prepared.key };
+}
+
+/**
+ * Build the ONOSOO relay without starting it, so a caller can send run-meta (seq 1) once the
+ * project identity is known. Null when no device key is configured. Never throws.
+ */
+export function prepareRunRelay(o: StartRunRelayOptions): PreparedRunRelay | null {
   const stderr = o.stderr;
   try {
     const cfg = resolveOnosooConfig({ env: o.env, cwd: o.cwd, stderr });
@@ -164,11 +201,31 @@ export function startRunRelay(o: StartRunRelayOptions): { relay: OnosooRelay; ke
     const relay = new OnosooRelay({
       config: cfg, spool, http: o.http, redactor, stderr, closeDeadlineMs: o.closeDeadlineMs, cwd: o.cwd,
     });
-    relay.start(buildRunMeta(o.plan, o.cwd));
-    return { relay, key: cfg.key };
+    let begun = false;
+    const begin = (identity?: ProjectIdentity | null): boolean => {
+      if (begun) { return false; }
+      begun = true;
+      try {
+        relay.start(buildRunMeta(o.plan, o.cwd, identity));
+        return true;
+      } catch (err) {
+        stderr(`ONOSOO relay could not start: ${err instanceof Error ? err.message : String(err)}\n`);
+        return false;
+      }
+    };
+    return { relay, key: cfg.key, begin };
   } catch (err) {
     stderr(`ONOSOO relay could not start: ${err instanceof Error ? err.message : String(err)}\n`);
     return null;
+  }
+}
+
+/** True when a device key is configured for `cwd`, so a run there will relay. Silent; never throws. */
+export function relayConfigured(env: NodeJS.ProcessEnv, cwd: string): boolean {
+  try {
+    return !!resolveOnosooConfig({ env, cwd, stderr: () => undefined });
+  } catch {
+    return false;
   }
 }
 

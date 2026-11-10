@@ -43,7 +43,8 @@ export type ResultOutcome = 'delivered' | 'final' | 'drop' | 'retry' | 'revoked'
 
 export interface Capabilities {
   remote_start: boolean;
-  projects: Array<{ id: string; name: string; kinds: string[] }>;
+  /** `key` (protocol v1.2) is the folder's project_key when known; never a path or a URL. */
+  projects: Array<{ id: string; name: string; kinds: string[]; key?: string }>;
   engines: string[];
 }
 

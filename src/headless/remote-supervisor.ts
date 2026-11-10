@@ -23,6 +23,8 @@ import type { RemoteLedger } from './remote-ledger';
 import type { RemoteRunRecord, RemoteRuns } from './remote-runs';
 import { BundleAssembler, writeBundleFile } from './remote-branch';
 import type { RunMeta } from './onosoo-relay';
+import type { ProjectIdentity } from './project-identity';
+import { pickIdentity } from './run-reporter';
 
 export const STOP_GRACE_MS = 30_000;
 export const REMOTE_RUN_MAX_MS = 4 * 60 * 60 * 1000;
@@ -69,6 +71,11 @@ export interface SupervisorOptions {
   record: RemoteRunRecord;
   /** The project's display name (never its path), for run-meta. */
   projectName: string;
+  /**
+   * The project identity for run-meta (protocol v1.2): from the approved project's own folder,
+   * never the worktree. Absent or null: run-meta carries no key.
+   */
+  projectIdentity?: ProjectIdentity | null;
   /** The job spec line (JSON, without newline). Must not contain the device key. */
   specLine: string;
   bundle: Buffer;
@@ -257,6 +264,7 @@ export class RemoteSupervisor {
             project: this.o.projectName,
             tasks: plan.playlists.flatMap((pl) => pl.tasks).map((t) => ({ id: t.id, name: t.name })),
             branch: r.branch,
+            ...pickIdentity(this.o.projectIdentity),
           });
         } catch (err) {
           this.lastError = `The run's plan could not be read: ${err instanceof Error ? err.message : String(err)}`;

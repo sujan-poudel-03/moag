@@ -37,6 +37,8 @@ import type { ProbeOutcome } from './remote-isolation';
 import { isolationRefusal, ISOLATION_RECHECK_MS } from './remote-isolation';
 import type { RemoteLedger } from './remote-ledger';
 import type { LockOutcome } from './remote-lock';
+import { IDENTITY_WAIT_MS, PROJECT_KEY_MAX } from './project-identity';
+import type { ProjectIdentity, ProjectIdentityCache } from './project-identity';
 import { isHandStarted, RemoteRunRecord, RemoteRuns } from './remote-runs';
 import type { RunExit } from './remote-supervisor';
 import { FORCE_STOPPED_MESSAGE, STOP_GRACE_MS } from './remote-supervisor';
@@ -78,6 +80,8 @@ export interface SupervisorRequest {
   bundle: Buffer;
   onStarted(runId: string): void;
   onExit(exit: RunExit): void;
+  /** The project identity for run-meta (protocol v1.2), from the approved project's folder; null for none. */
+  identity?: ProjectIdentity | null;
 }
 
 export interface HostTimers {
@@ -116,6 +120,16 @@ export interface CommandHostOptions {
   timers?: HostTimers;
   now?: () => Date;
   stderr?: (s: string) => void;
+  /**
+   * Project identities of the approved folders (protocol v1.2): warmed every tick, read for the
+   * capabilities and a run's meta. Absent: no git is run and no key is sent.
+   */
+  identities?: Pick<ProjectIdentityCache, 'peek' | 'warm' | 'within'>;
+  /**
+   * True when a project's key would reach ONOSOO unchanged by the relay's redaction and path
+   * scrub (keyPassesScrub). Absent: no key is ever sent in the capabilities.
+   */
+  keyPasses?(key: string, projectPath: string): boolean;
 }
 
 const realTimers: HostTimers = {
@@ -171,6 +185,8 @@ export class CommandHost {
   /** A boot started by a lock retry, so close() can wait for it. */
   private booting: Promise<void> | null = null;
   private closing: Promise<void> | null = null;
+  /** The last scrub verdict per project folder, so a key is checked once, not every tick. */
+  private readonly keyChecks = new Map<string, { key: string; ok: boolean }>();
 
   constructor(opts: CommandHostOptions) {
     this.o = opts;
@@ -258,6 +274,7 @@ export class CommandHost {
   async tick(): Promise<number | void> {
     if (this.stopped || this.lockedOut) { return; }
     const projects = this.o.loadProjects();
+    this.warmIdentities(projects);
     const iso = await this.checkIsolation(projects, false);
     await this.sendCapabilitiesIfChanged(projects, iso);
     const wait = await this.flushOutbox();
@@ -326,13 +343,49 @@ export class CommandHost {
     return this.isolation;
   }
 
+  /** Start (never await) a lookup of every approved folder's identity; a fresh one costs nothing. */
+  private warmIdentities(projects: ApprovedProjects): void {
+    const ids = this.o.identities;
+    if (!ids) { return; }
+    for (const p of projects.projects) {
+      try { void ids.warm(p.path).catch(() => undefined); } catch { /* identity never disturbs the loop */ }
+    }
+  }
+
+  /**
+   * The cached project_key of a folder, under the rule run-meta applies: dropped (never cut or
+   * mangled) when it is too long or when redaction or the path scrub would change it.
+   * Undefined when unknown or dropped. Never waits, never throws.
+   */
+  private knownKey(projectPath: string): string | undefined {
+    try {
+      const key = this.o.identities?.peek(projectPath)?.project_key;
+      if (typeof key !== 'string' || key.length === 0 || key.length > PROJECT_KEY_MAX) { return undefined; }
+      const memo = this.keyChecks.get(projectPath);
+      let ok: boolean;
+      if (memo?.key === key) {
+        ok = memo.ok;
+      } else {
+        // No checker means no key: a key is sent only once it is known to leave the machine unchanged.
+        ok = this.o.keyPasses ? this.o.keyPasses(key, projectPath) === true : false;
+        this.keyChecks.set(projectPath, { key, ok });
+      }
+      return ok ? key : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   private capabilities(projects: ApprovedProjects, iso: Isolation | null): Capabilities {
     const ok = iso?.ok === true;
     return {
       // Only what this machine would actually accept: switched on, isolated, and budgeted.
       remote_start: projects.remoteStart && ok && projects.dailyBudgetUsd !== null,
-      // Never a path: ONOSOO only ever sees id, name and kinds.
-      projects: projects.projects.map((p) => ({ id: p.id, name: p.name, kinds: [...p.kinds] })),
+      // Never a path or a URL: ONOSOO only ever sees id, name, kinds and the cached project key.
+      projects: projects.projects.map((p) => {
+        const key = this.knownKey(p.path);
+        return { id: p.id, name: p.name, kinds: [...p.kinds], ...(key ? { key } : {}) };
+      }),
       engines: ok ? [...(iso as { engines: string[] }).engines] : [],
     };
   }
@@ -565,11 +618,15 @@ export class CommandHost {
     await this.finalize(id, kind, { status: 'running', message: 'Preparing the run on this PC.', run_id: runId });
 
     const branch = r.continueBranch ?? r.resumeFromMirrorBranch ?? branchNameFor(this.o.branchPrefix, r.project.id, runId);
+    // The identity of the approved project's own folder (never the worktree), looked up alongside the bundle.
+    const identityP = lookupIdentityWithin(this.o.identities, r.project.path);
     const inbound = await this.o.exportBundle(r.project.path, {
       ...(r.continueBranch ? { continueBranch: r.continueBranch } : {}),
       ...(r.startSha ? { startSha: r.startSha } : {}),
       haveShas: r.iso.ok ? r.iso.mirrors[r.project.id] ?? [] : [],
     });
+    // Awaited before the shutdown check: a close() during the (bounded) wait must stop this launch.
+    const identity = await identityP;
     if (!inbound.ok || this.stopped) {
       this.o.ledger.settle(runId);
       await this.finalize(id, kind, { status: 'failed', message: inbound.ok ? 'MOAG is shutting down.' : inbound.reason, run_id: runId });
@@ -592,7 +649,7 @@ export class CommandHost {
     });
     let startedReported = false;
     const sup = this.o.supervisorFactory({
-      record, project: r.project, specLine, bundle: inbound.bundle,
+      record, project: r.project, specLine, bundle: inbound.bundle, identity,
       onStarted: (rid) => {
         startedReported = true;
         void this.finalize(id, kind, { status: 'succeeded', message: 'The run started on this PC.', run_id: rid });
@@ -611,6 +668,18 @@ export class CommandHost {
     sup.start();
     try { r.onLaunched?.(); } catch { /* the run is under way regardless */ }
     return true;
+  }
+}
+
+/** Bounded (IDENTITY_WAIT_MS) identity lookup of a project folder; null without a cache. Never rejects. */
+function lookupIdentityWithin(
+  identities: Pick<ProjectIdentityCache, 'within'> | undefined, projectPath: string,
+): Promise<ProjectIdentity | null> {
+  if (!identities) { return Promise.resolve(null); }
+  try {
+    return identities.within(projectPath, IDENTITY_WAIT_MS).catch(() => null);
+  } catch {
+    return Promise.resolve(null);
   }
 }
 

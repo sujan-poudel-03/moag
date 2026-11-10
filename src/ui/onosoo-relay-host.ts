@@ -9,6 +9,7 @@ import * as vscode from 'vscode';
 import { createHostRunRelay, HostRelayRunner, probeRelayStatus, RelayStatus } from '../headless/host-run-relay';
 import type { RelayEnvSnapshot } from '../headless/run-reporter';
 import { REVOKED_MESSAGE } from '../headless/onosoo-relay';
+import { ProjectIdentityCache } from '../headless/project-identity';
 import type { Plan } from '../models/types';
 
 /** globalState key: the user dismissed the text-mode cost notice for good. */
@@ -84,7 +85,17 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost 
     item.show();
   };
 
-  const reprobe = (): void => { render(probeRelayStatus(env(), cwd(), enabled(), deps.log)); };
+  // Project identity (protocol v1.2): warmed whenever relaying is on, so Play rarely waits for it.
+  const identities = new ProjectIdentityCache();
+
+  const reprobe = (): void => {
+    const s = probeRelayStatus(env(), cwd(), enabled(), deps.log);
+    render(s);
+    const c = cwd();
+    if (s === 'on' && c) {
+      try { void identities.warm(c); } catch { /* warming never disturbs the host */ }
+    }
+  };
   reprobe();
 
   const configListener = vscode.workspace.onDidChangeConfiguration((e) => {
@@ -137,6 +148,7 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost 
     log: deps.log,
     onStatus: render,
     onRunRelayed: maybeNotice,
+    identity: identities,
   });
 
   deps.context.subscriptions.push(item, configListener, foldersListener, { dispose: () => controller.dispose() });

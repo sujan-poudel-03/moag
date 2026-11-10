@@ -89,6 +89,32 @@ function setup(over: Partial<SupervisorOptions> = {}) {
 
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 
+describe('remote supervisor — project identity in run-meta (protocol v1.2)', () => {
+  async function metaFor(over: Partial<SupervisorOptions>): Promise<unknown> {
+    const s = setup(over);
+    s.sup.start();
+    s.child.line({ event: 'remote-plan', plan: planFile() });
+    await tick();
+    s.child.exit(0);
+    await s.sup.exit;
+    return s.relayMeta;
+  }
+  const TODAY = { plan_name: 'Remote', project: 'Web app', tasks: [{ id: 'a', name: 'Build' }, { id: 'gate', name: 'Gate' }], branch: 'moag/remote-1' };
+
+  it('a projectIdentity puts project_key, repo_url and repos on the meta, after the branch', async () => {
+    const meta = await metaFor({ projectIdentity: { project_key: 'git:github.com/o/web', repo_url: 'https://github.com/O/Web' } });
+    assert.deepEqual(meta, { ...TODAY, project_key: 'git:github.com/o/web', repo_url: 'https://github.com/O/Web' });
+    assert.deepEqual(Object.keys(meta as object), ['plan_name', 'project', 'tasks', 'branch', 'project_key', 'repo_url']);
+    const multi = await metaFor({ projectIdentity: { project_key: 'multi:' + 'f'.repeat(64), repos: [{ dir: 'api', key: 'root:' + 'a'.repeat(40) }] } });
+    assert.deepEqual((multi as { repos: unknown }).repos, [{ dir: 'api', key: 'root:' + 'a'.repeat(40) }]);
+  });
+
+  it('omitted or null: the meta is exactly today\'s', async () => {
+    assert.deepEqual(await metaFor({}), TODAY);
+    assert.deepEqual(await metaFor({ projectIdentity: null }), TODAY);
+  });
+});
+
 describe('remote supervisor', () => {
   it('writes the spec then the bundle; relays every non-remote line under the run id; onStarted gets that id', async () => {
     const s = setup();

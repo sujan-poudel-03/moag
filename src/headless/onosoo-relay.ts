@@ -57,6 +57,12 @@ export const REVOKED_MESSAGE = 'ONOSOO device key was revoked or is wrong — re
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const RUN_META_TASKS = 1000;
+/** Longest `project_key` (and child `key`/`dir`) in run-meta. Mirrors PROJECT_KEY_MAX in project-identity.ts. */
+export const RUN_META_KEY_MAX = 255;
+/** Longest `repo_url` in run-meta. Mirrors REPO_URL_MAX in project-identity.ts. */
+export const RUN_META_URL_MAX = 500;
+/** Most child repositories of a `multi:` key in run-meta. */
+export const RUN_META_REPOS_MAX = 20;
 /**
  * How often a live run's spool file is touched; far inside SPOOL_OWNER_MAX_IDLE_MS (10 min).
  * 30 s, not 60: off Linux, ownership rests on the file's mtime alone, and after a sleep/resume
@@ -210,6 +216,12 @@ export interface RunMeta {
   tasks: Array<{ id: string; name: string }>;
   /** The branch a remote run delivers to; absent or null for a run started by hand. */
   branch?: string | null;
+  /** Protocol v1.2: the stable, path-free project id (`git:`, `root:` or `multi:`). */
+  project_key?: string;
+  /** Protocol v1.2: a browsable https link to the repository; only with a `git:` key. */
+  repo_url?: string;
+  /** Protocol v1.2: the child repositories of a `multi:` key. */
+  repos?: Array<{ dir: string; key: string; repo_url?: string }>;
 }
 
 /** True when `s` looks like a file-system path rather than a project name. */
@@ -285,6 +297,42 @@ export function scrubPaths(s: string, cwd: string | null, home: string | null, o
     if (h && !isRoot(h)) { out = replacePrefix(out, h, '~'); }
   }
   return out;
+}
+
+// ─── Scrubbing outside a relay ───
+
+/** What a string is scrubbed against before it leaves the machine: a relay's own inputs. */
+export interface RelayScrubContext {
+  redactor: Redactor;
+  /** The workspace: absolute paths inside it become relative. */
+  cwd?: string | null;
+  /** The user's home, shown as `~`; defaults to os.homedir(). */
+  homedir?: string | null;
+  /** More home directories to show as `~`. */
+  otherHomes?: readonly string[];
+}
+
+/** The path-scrub targets of a relay (or a context), normalised the same way everywhere. */
+function scrubTargets(o: { cwd?: string | null; homedir?: string | null; otherHomes?: readonly string[] }): { cwd: string | null; home: string | null; otherHomes: string[] } {
+  const cwd = o.cwd ? path.resolve(o.cwd) : null;
+  let home: string | null = o.homedir ?? null;
+  if (home === null) { try { home = os.homedir(); } catch { home = null; } }
+  const otherHomes = (o.otherHomes ?? []).filter((h) => typeof h === 'string' && h.length > 1);
+  return { cwd, home: home || null, otherHomes };
+}
+
+/**
+ * True when `key` would leave the machine unchanged: the relay's redaction and path scrub
+ * leave it as it is. The rule run-meta applies to `project_key`, for senders outside a relay
+ * (the daemon's capabilities). Never throws: a failing redactor means false.
+ */
+export function keyPassesScrub(key: string, ctx: RelayScrubContext): boolean {
+  try {
+    const t = scrubTargets(ctx);
+    return scrubPaths(ctx.redactor.redact(key).text, t.cwd, t.home, t.otherHomes) === key;
+  } catch {
+    return false;
+  }
 }
 
 // ─── Relay ───
@@ -381,11 +429,10 @@ export class OnosooRelay {
     this.stderr = opts.stderr ?? ((s: string): void => { process.stderr.write(s); });
     this.now = opts.now ?? Date.now;
     this.closeDeadlineMs = opts.closeDeadlineMs ?? CLOSE_DEADLINE_MS;
-    this.cwd = opts.cwd ? path.resolve(opts.cwd) : null;
-    let home: string | null = opts.homedir ?? null;
-    if (home === null) { try { home = os.homedir(); } catch { home = null; } }
-    this.home = home || null;
-    this.otherHomes = (opts.otherHomes ?? []).filter((h) => typeof h === 'string' && h.length > 1);
+    const targets = scrubTargets(opts);
+    this.cwd = targets.cwd;
+    this.home = targets.home;
+    this.otherHomes = targets.otherHomes;
     if (typeof opts.seqStart === 'number' && Number.isSafeInteger(opts.seqStart) && opts.seqStart >= 0) {
       this.seq = opts.seqStart;
     }
@@ -529,6 +576,7 @@ export class OnosooRelay {
       const tasks = all.slice(0, RUN_META_TASKS).map((t) => ({ id: r(t?.id, 100), name: r(t?.name, 200) }));
       const data: Record<string, unknown> = { plan_name: r(meta.plan_name, 200), project, tasks };
       if (typeof meta.branch === 'string' && meta.branch.length > 0) { data.branch = r(meta.branch, 255); }
+      this.addIdentity(meta, data);
       if (all.length > RUN_META_TASKS) { data.tasks_truncated = true; }
 
       // Keep the data within the per-event cap: drop tasks from the end until it fits.
@@ -547,6 +595,42 @@ export class OnosooRelay {
       return data;
     } catch {
       return { redaction_failed: true };
+    }
+  }
+
+  /**
+   * Protocol v1.2 identity fields. A key the redactor or path scrubber would change, or one over
+   * RUN_META_KEY_MAX, is dropped with its URL and repos (never sent mangled or cut: a cut key is
+   * a wrong identity). A URL is sent only scrubbed, https, and whole (a cut URL is a broken link).
+   * Throws when redaction does (the caller turns that into `redaction_failed`).
+   */
+  private addIdentity(meta: RunMeta, data: Record<string, unknown>): void {
+    const k = meta.project_key;
+    if (typeof k !== 'string' || k.length === 0 || k.length > RUN_META_KEY_MAX) { return; }
+    if (this.scrubString(k) !== k || !/^(git|root|multi):/.test(k)) { return; }
+    data.project_key = k;
+    const httpsUrl = (u: unknown): string | null => {
+      if (typeof u !== 'string' || u.length === 0) { return null; }
+      const scrubbed = this.scrubString(u);
+      return scrubbed.startsWith('https://') && scrubbed.length <= RUN_META_URL_MAX ? scrubbed : null;
+    };
+    if (k.startsWith('git:')) {
+      const u = httpsUrl(meta.repo_url);
+      if (u) { data.repo_url = u; }
+    }
+    if (k.startsWith('multi:') && Array.isArray(meta.repos)) {
+      const repos: Array<{ dir: string; key: string; repo_url?: string }> = [];
+      for (const e of meta.repos.slice(0, RUN_META_REPOS_MAX)) {
+        const dir: unknown = e?.dir;
+        const key: unknown = e?.key;
+        if (typeof dir !== 'string' || dir.length === 0 || dir.length > RUN_META_KEY_MAX || /[\\/]/.test(dir)
+          || this.scrubString(dir) !== dir) { continue; }
+        if (typeof key !== 'string' || !/^(git|root):/.test(key) || key.length > RUN_META_KEY_MAX
+          || this.scrubString(key) !== key) { continue; }
+        const u = key.startsWith('git:') ? httpsUrl(e.repo_url) : null;
+        repos.push(u ? { dir, key, repo_url: u } : { dir, key });
+      }
+      if (repos.length > 0) { data.repos = repos; }
     }
   }
 

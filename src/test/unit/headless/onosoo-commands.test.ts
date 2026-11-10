@@ -7,7 +7,7 @@ import * as path from 'path';
 import { createEmptyPlan, createTask, dehydratePlan } from '../../../models/plan';
 import { PlanFile, TaskStatus } from '../../../models/types';
 import {
-  AUDIT_UNAVAILABLE, CommandHost, createCommandHost, RESTARTED_MESSAGE, SupervisorLike, SupervisorRequest,
+  AUDIT_UNAVAILABLE, CommandHost, CommandHostOptions, createCommandHost, RESTARTED_MESSAGE, SupervisorLike, SupervisorRequest,
 } from '../../../headless/onosoo-commands';
 import type { Capabilities, CommandResult, PolledCommand, ResultOutcome } from '../../../headless/onosoo-control';
 import type { ApprovedProjects } from '../../../headless/onosoo-projects';
@@ -18,6 +18,9 @@ import { DaemonLock, LockOutcome } from '../../../headless/remote-lock';
 import { mirrorBranchGoneMessage } from '../../../headless/remote-child';
 import { RemoteRunRecord, RemoteRuns } from '../../../headless/remote-runs';
 import type { RunExit } from '../../../headless/remote-supervisor';
+import { IDENTITY_WAIT_MS, ProjectIdentity, ProjectIdentityCache } from '../../../headless/project-identity';
+import { keyPassesScrub } from '../../../headless/onosoo-relay';
+import { createRedactor } from '../../../utils/redact';
 
 const PROJECT_PATH = '/srv/secret-layout/web';
 
@@ -87,6 +90,10 @@ function harness(opts: {
   timers?: { setTimeout(fn: () => void, ms: number): unknown; clearTimeout(h: unknown): void }; stderr?: (s: string) => void;
   /** The project's tip of the parent branch (null = no branch); when set, the host uses it instead of branchExists. */
   projectTip?: string | null; drain?: () => Promise<void>;
+  /** Project identities (protocol v1.2); absent by default. */
+  identities?: CommandHostOptions['identities'];
+  /** The capabilities key check; defaults to pass-all when identities are given; null leaves it out. */
+  keyPasses?: CommandHostOptions['keyPasses'] | null;
 } = {}) {
   const exports: Array<Record<string, unknown>> = [];
   const stateDir = opts.stateDir ?? tmp();
@@ -118,6 +125,8 @@ function harness(opts: {
     newRunId: () => `run-${opts.idPrefix ?? ''}${++ids}`,
     timers: opts.timers ?? { setTimeout: () => null, clearTimeout: () => undefined },
     stderr: opts.stderr ?? (() => undefined),
+    ...(opts.identities ? { identities: opts.identities } : {}),
+    ...(opts.identities && opts.keyPasses !== null ? { keyPasses: opts.keyPasses ?? (() => true) } : {}),
   });
   return {
     host, control, sups, stateDir, exports,
@@ -654,5 +663,210 @@ describe('ONOSOO command host', () => {
     await h.host.close();
     assert.equal(h.sups[0].stops, 1);
     assert.equal(h.control.caps[h.control.caps.length - 1].remote_start, false);
+  });
+});
+
+// ─── Protocol v1.2: project keys in capabilities and on a run's supervisor request ───
+
+describe('ONOSOO command host — project identity', () => {
+  const KEY_WEB = 'git:github.com/o/web';
+  const ID_WEB: ProjectIdentity = { project_key: KEY_WEB, repo_url: 'https://github.com/O/Web' };
+
+  /** A fake cache: `known` answers peek; warm and within are recorded and settle as configured. */
+  function fakeIdentities(opts: { settle?: boolean } = {}) {
+    const known = new Map<string, ProjectIdentity | null>();
+    const warms: string[] = [];
+    const withins: Array<{ dir: string; ms: number }> = [];
+    const never = new Promise<ProjectIdentity | null>(() => undefined);
+    const identities = {
+      peek: (dir: string) => known.get(dir),
+      warm: (dir: string) => { warms.push(dir); return opts.settle === false ? never : Promise.resolve(known.get(dir) ?? null); },
+      within: (dir: string, ms: number) => { withins.push({ dir, ms }); return opts.settle === false ? never : Promise.resolve(known.get(dir) ?? null); },
+    };
+    return { identities, known, warms, withins };
+  }
+
+  it('the first tick warms with no key; once known, exactly one resend carries the key; then no resend', async () => {
+    const f = fakeIdentities();
+    const h = harness({ identities: f.identities });
+    await h.host.tick();
+    assert.deepEqual(f.warms, [PROJECT_PATH]);
+    assert.equal(h.control.caps.length, 1);
+    assert.ok(!('key' in h.control.caps[0].projects[0]));
+    f.known.set(PROJECT_PATH, ID_WEB);
+    await h.host.tick();
+    assert.equal(h.control.caps.length, 2);
+    assert.deepEqual(h.control.caps[1].projects, [{ id: 'web', name: 'Web app', kinds: ['node'], key: KEY_WEB }]);
+    await h.host.tick();
+    await h.host.tick();
+    assert.equal(h.control.caps.length, 2);
+    const json = JSON.stringify(h.control.caps);
+    assert.ok(!json.includes(PROJECT_PATH));
+    assert.ok(!json.includes('https://'), 'repo_url never reaches capabilities');
+  });
+
+  it('a key over 255 characters is dropped from capabilities, never cut', async () => {
+    const f = fakeIdentities();
+    f.known.set(PROJECT_PATH, { project_key: 'git:' + 'k'.repeat(400) });
+    const h = harness({ identities: f.identities });
+    await h.host.tick();
+    assert.ok(!('key' in h.control.caps[0].projects[0]));
+  });
+
+  it('without a key check no key is ever sent (fail closed)', async () => {
+    const f = fakeIdentities();
+    f.known.set(PROJECT_PATH, ID_WEB);
+    const h = harness({ identities: f.identities, keyPasses: null });
+    await h.host.tick();
+    assert.ok(!('key' in h.control.caps[0].projects[0]));
+  });
+
+  it('the relay scrub rule: a key holding the home path or a secret is sent without key; a clean key is sent; checked once per key', async () => {
+    const SECRET = 'sk-ant-api03-' + 'Z'.repeat(40);
+    const home = os.homedir();
+    const f = fakeIdentities();
+    f.known.set('/srv/p/home', { project_key: 'git:' + path.join(home, 'repo') });
+    f.known.set('/srv/p/secret', { project_key: 'git:github.com/o/' + SECRET });
+    f.known.set('/srv/p/clean', { project_key: KEY_WEB });
+    let checks = 0;
+    const redactor = createRedactor([SECRET]);
+    const h = harness({
+      identities: f.identities,
+      keyPasses: (key, projectPath) => { checks++; return keyPassesScrub(key, { redactor, cwd: projectPath }); },
+    });
+    h.setProjects(projects({ projects: ['home', 'secret', 'clean'].map((id) => ({ id, name: id, kinds: [], path: '/srv/p/' + id })) }));
+    await h.host.tick();
+    await h.host.tick();
+    const sent = h.control.caps[h.control.caps.length - 1].projects;
+    assert.deepEqual(sent.map((p) => [p.id, p.key]), [['home', undefined], ['secret', undefined], ['clean', KEY_WEB]]);
+    const json = JSON.stringify(h.control.caps);
+    assert.ok(!json.includes(SECRET));
+    assert.ok(!json.includes(path.basename(home)), 'no part of the home path is sent');
+    assert.equal(checks, 3, 'each key is checked once, not every tick');
+  });
+
+  it('a real cache: one git lookup per project over 5 ticks; after the TTL a changed key is resent exactly once', async () => {
+    let now = 0;
+    const resolves: string[] = [];
+    let version = 1;
+    const cache = new ProjectIdentityCache({
+      now: () => now, ttlMs: 1000,
+      resolve: async (dir) => { resolves.push(dir); return { project_key: `git:github.com/o/${path.basename(dir)}-v${version}` }; },
+    });
+    const h = harness({ identities: cache });
+    const two = projects({ projects: [
+      { id: 'web', name: 'Web app', kinds: ['node'], path: PROJECT_PATH },
+      { id: 'api', name: 'API', kinds: [], path: '/srv/secret-layout/api' },
+    ] });
+    h.setProjects(two);
+    for (let i = 0; i < 5; i++) { await h.host.tick(); await tick(); }
+    assert.equal(resolves.length, 2, resolves.join(','));
+    const v1 = ['git:github.com/o/web-v1', 'git:github.com/o/api-v1'];
+    // The lookups may land before the first send or after it: either way the keys go out exactly once.
+    assert.ok(h.control.caps.length <= 2);
+    assert.equal(h.control.caps.filter((c) => JSON.stringify(c.projects.map((p) => p.key)) === JSON.stringify(v1)).length, 1);
+    assert.deepEqual(h.control.caps[h.control.caps.length - 1].projects.map((p) => p.key), v1);
+    const sentBefore = h.control.caps.length;
+
+    now = 5000;
+    version = 2;
+    for (let i = 0; i < 3; i++) { await h.host.tick(); await tick(); }
+    assert.equal(resolves.length, 4);
+    assert.equal(h.control.caps.length, sentBefore + 1, 'exactly one resend for the changed keys');
+    assert.deepEqual(h.control.caps[sentBefore].projects.map((p) => p.key), ['git:github.com/o/web-v2', 'git:github.com/o/api-v2']);
+    assert.ok(!JSON.stringify(h.control.caps).includes('/srv/secret-layout'));
+  });
+
+  it('200 projects: at most maxConcurrent lookups at once, and all 200 resolved after 3 ticks', async () => {
+    let open = 0;
+    let peak = 0;
+    let resolved = 0;
+    const cache = new ProjectIdentityCache({
+      maxConcurrent: 4,
+      resolve: (dir) => {
+        open++;
+        peak = Math.max(peak, open);
+        return new Promise((r) => setImmediate(() => { open--; resolved++; r({ project_key: `root:${'a'.repeat(39)}${path.basename(dir).slice(-1)}` }); }));
+      },
+    });
+    const h = harness({ identities: cache });
+    h.setProjects(projects({ projects: Array.from({ length: 200 }, (_, i) => ({ id: `p${i}`, name: `P${i}`, kinds: [], path: `/srv/p/${i}` })) }));
+    for (let i = 0; i < 3; i++) {
+      await h.host.tick();
+      for (let j = 0; j < 80; j++) { await tick(); }
+    }
+    assert.ok(peak <= 4, `peak ${peak}`);
+    assert.equal(resolved, 200);
+  });
+
+  it('close() never waits for git: with lookups that never settle it completes, with the known keys and remote_start false', async () => {
+    const f = fakeIdentities({ settle: false });
+    f.known.set(PROJECT_PATH, ID_WEB);
+    const h = harness({ identities: f.identities });
+    await h.host.tick();
+    await h.host.close();
+    const last = h.control.caps[h.control.caps.length - 1];
+    assert.equal(last.remote_start, false);
+    assert.equal(last.projects[0].key, KEY_WEB);
+    assert.ok(!JSON.stringify(h.control.caps).includes('https://'));
+  });
+
+  it('a run gets the identity of the approved project folder (bounded wait); none without identities', async () => {
+    const f = fakeIdentities();
+    f.known.set(PROJECT_PATH, ID_WEB);
+    const h = harness({ identities: f.identities });
+    h.control.polls.push([startRun('c1')]);
+    await h.host.tick();
+    await tick();
+    assert.equal(h.sups.length, 1);
+    assert.deepEqual(h.sups[0].req.identity, ID_WEB);
+    assert.deepEqual(f.withins, [{ dir: PROJECT_PATH, ms: IDENTITY_WAIT_MS }]);
+
+    const plain = harness();
+    plain.control.polls.push([startRun('c1')]);
+    await plain.host.tick();
+    await tick();
+    assert.equal(plain.sups[0].req.identity, null);
+  });
+
+  it('close() during the identity wait: the launch bails out, no supervisor, the reservation settled, no live record', async () => {
+    let release!: (v: ProjectIdentity | null) => void;
+    const pendingIdentity = new Promise<ProjectIdentity | null>((r) => { release = r; });
+    const identities = {
+      peek: () => undefined,
+      warm: async () => null,
+      within: () => pendingIdentity,
+    };
+    const h = harness({ identities });
+    h.control.polls.push([startRun('c1')]);
+    const ticking = h.host.tick();
+    for (let i = 0; i < 20; i++) { await tick(); }
+    assert.equal(h.exports.length, 1, 'the launch is waiting on the identity, after the export');
+    await h.host.close();
+    release(ID_WEB);
+    await ticking;
+    await tick();
+    assert.equal(h.sups.length, 0, 'no supervisor was built or started');
+    const entry = new RemoteLedger(h.stateDir).entries().find((e) => e.runId === 'run-1');
+    assert.ok(entry);
+    assert.equal(entry.open, false, 'the reservation was settled');
+    assert.equal(h.runs.get('run-1'), null, 'no record was written, so none is left live');
+    const results = finals(h.control, 'c1');
+    assert.deepEqual(results[results.length - 1], { status: 'failed', message: 'MOAG is shutting down.', run_id: 'run-1' });
+  });
+
+  it('a throwing identity cache never disturbs the loop or a run', async () => {
+    const throwing = {
+      peek: () => { throw new Error('peek'); },
+      warm: () => { throw new Error('warm'); },
+      within: () => { throw new Error('within'); },
+    };
+    const h = harness({ identities: throwing as unknown as CommandHostOptions['identities'] });
+    h.control.polls.push([startRun('c1')]);
+    await h.host.tick();
+    await tick();
+    assert.deepEqual(h.control.caps[0].projects, [{ id: 'web', name: 'Web app', kinds: ['node'] }]);
+    assert.equal(h.sups.length, 1);
+    assert.equal(h.sups[0].req.identity, null);
   });
 });

@@ -120,12 +120,13 @@ import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
-import { OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
+import { keyPassesScrub, OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
 import { checkPairing, PairError, writePairing } from './onosoo-pair';
 import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from '../utils/budget-notice';
 import {
-  buildRunMeta, forgetRelayEnv, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
+  buildRunMeta, forgetRelayEnv, relayConfigured, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
 } from './run-reporter';
+import type { ProjectIdentity, ProjectIdentityCache } from './project-identity';
 
 export { buildRunMeta, forgetRelayEnv };
 
@@ -336,6 +337,10 @@ export interface RelayDeps {
   onDaemonStop?: (stop: () => void) => void;
   /** `moag daemon` only: how a second stop signal exits (process.exit in production). */
   exit?: (code: number) => void;
+  /** `moag run` only: resolves the project identity of a folder (default: a fresh cache, bounded wait). */
+  identity?: (cwd: string) => Promise<ProjectIdentity | null>;
+  /** `moag daemon` only: the identity cache of the approved projects (default: a fresh one). */
+  identities?: Pick<ProjectIdentityCache, 'peek' | 'warm' | 'within'>;
 }
 
 /**
@@ -920,6 +925,11 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   // After wireEvents, so task-changes / task-error-tail follow the task's own line.
   // Injected in tests; otherwise process.env plus the relay variables main() took out of it.
   const env = ctx.relayDeps?.env ?? relayConfigEnv();
+  // Protocol v1.2: the project identity for run-meta, resolved only when the run will relay.
+  // Bounded (IDENTITY_WAIT_MS) and never rejects; null means no key.
+  const identityP: Promise<ProjectIdentity | null> = ctx.relayDeps?.identity
+    ? ctx.relayDeps.identity(args.cwd).catch(() => null)
+    : runIdentity(env, args.cwd);
   const redactorExtra: string[] = [];
   const buildRedactor = ctx.relayDeps?.makeRedactor
     ?? ((extra: string[]): Redactor => createRedactor(reportingSecretValues(args.cwd, env, extra)));
@@ -936,7 +946,8 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   const shim = ctx.vscode as { __setConfigOverride?: (k: string, v: unknown) => void; __configFileSets?: (k: string) => boolean };
   let overrodeClaudeFormat = false;
   try {
-    const started = startRelay(args, ctx, plan, env, buildRedactor);
+    const identity = await identityP;
+    const started = startRelay(args, ctx, plan, env, buildRedactor, identity);
     // main() already did this; a caller that bypassed main() still must not leak the key to children.
     if (!ctx.relayDeps?.env) { forgetRelayEnv(process.env); }
     if (started) {
@@ -958,6 +969,20 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
     if (overrodeClaudeFormat) { shim.__setConfigOverride?.(claudeFormatKey, undefined); }
     if (relay) { await relay.close(); }
     unwireReporting();
+  }
+}
+
+/**
+ * The project identity of `moag run`'s folder: resolved only when a device key is configured
+ * (no git spawn otherwise), within IDENTITY_WAIT_MS. Never rejects.
+ */
+function runIdentity(env: NodeJS.ProcessEnv, cwd: string): Promise<ProjectIdentity | null> {
+  if (!relayConfigured(env, cwd)) { return Promise.resolve(null); }
+  try {
+    const { ProjectIdentityCache: Cache, IDENTITY_WAIT_MS } = require('./project-identity');
+    return (new Cache() as ProjectIdentityCache).within(cwd, IDENTITY_WAIT_MS);
+  } catch {
+    return Promise.resolve(null);
   }
 }
 
@@ -989,6 +1014,7 @@ function startRelay(
   plan: any,
   env: NodeJS.ProcessEnv,
   buildRedactor: (extra: string[]) => Redactor,
+  identity: ProjectIdentity | null,
 ): { relay: OnosooRelay; key: string } | null {
   const deps = ctx.relayDeps;
   return startRunRelay({
@@ -1000,6 +1026,7 @@ function startRelay(
     http: deps?.http,
     isPidAlive: deps?.isPidAlive,
     closeDeadlineMs: deps?.closeDeadlineMs,
+    identity,
   });
 }
 
@@ -1379,15 +1406,20 @@ function createDaemonRemoteHost(
   const { spawn } = require('child_process');
   const { OnosooControl } = require('./onosoo-control');
   const { createCommandHost } = require('./onosoo-commands');
-  const { loadApprovedProjects } = require('./onosoo-projects');
+  const { loadApprovedProjects, MAX_PROJECTS } = require('./onosoo-projects');
   const { RemoteAudit } = require('./remote-audit');
   const { RemoteLedger } = require('./remote-ledger');
   const { RemoteRuns } = require('./remote-runs');
   const iso = require('./remote-isolation');
   const branch = require('./remote-branch');
   const { RemoteSupervisor } = require('./remote-supervisor');
+  const { ProjectIdentityCache: IdentityCache } = require('./project-identity');
 
   const http = ctx.relayDeps?.http;
+  // Project identities of the approved folders (protocol v1.2), shared by capabilities and runs.
+  // Sized past the approved-project cap, so a full projects.json never evicts and re-resolves every tick.
+  const identities: Pick<ProjectIdentityCache, 'peek' | 'warm' | 'within'> = ctx.relayDeps?.identities
+    ?? new IdentityCache({ maxEntries: MAX_PROJECTS + 64 });
   const control = new OnosooControl({ config: cfg, http, stderr });
   const ledger = new RemoteLedger(cfg.stateDir);
   const runs = new RemoteRuns(cfg.stateDir);
@@ -1433,6 +1465,7 @@ function createDaemonRemoteHost(
     supervisorFactory: (req: any) => new RemoteSupervisor({
       record: req.record,
       projectName: req.project.name,
+      projectIdentity: req.identity ?? null,
       specLine: req.specLine,
       bundle: req.bundle,
       spawnChild: () => {
@@ -1493,6 +1526,13 @@ function createDaemonRemoteHost(
       for (const problem of iso.tightenStatePermissions(cfg.stateDir)) { stderr(`ONOSOO: could not tighten permissions: ${problem}\n`); }
     },
     stderr: (line: string) => stderr(line.endsWith('\n') ? line : `${line}\n`),
+    identities,
+    // The capabilities' key gets run-meta's rule, against the same redactor and paths a run's relay uses.
+    keyPasses: (key: string, projectPath: string) => keyPassesScrub(key, {
+      redactor: redactorFor(projectPath),
+      cwd: projectPath,
+      otherHomes: runnerHome ? [runnerHome] : [],
+    }),
   });
 }
 
