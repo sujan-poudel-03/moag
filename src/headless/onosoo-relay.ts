@@ -63,6 +63,8 @@ export const RUN_META_KEY_MAX = 255;
 export const RUN_META_URL_MAX = 500;
 /** Most child repositories of a `multi:` key in run-meta. */
 export const RUN_META_REPOS_MAX = 20;
+/** The prefixes a run-meta `project_key` may have; a key with any other is dropped. */
+export const RUN_META_KEY_PREFIX = /^(git|root|multi):/;
 /** A task type as MOAG names it: lower-case words, nothing that could carry text. */
 const TASK_KIND_RE = /^[a-z][a-z0-9-]{0,23}$/;
 /**
@@ -338,6 +340,23 @@ export function keyPassesScrub(key: string, ctx: RelayScrubContext): boolean {
     return scrubPaths(ctx.redactor.redact(key).text, t.cwd, t.home, t.otherHomes) === key;
   } catch {
     return false;
+  }
+}
+
+/**
+ * The `repo_url` run-meta would carry with a `git:` key, for senders outside a relay: the URL
+ * redacted and path-scrubbed, kept only when it then starts with https:// and fits
+ * RUN_META_URL_MAX (the relay's own run-meta rule). Returns the scrubbed URL, or null.
+ * Never throws: a failing redactor means null.
+ */
+export function repoUrlAsSent(url: unknown, ctx: RelayScrubContext): string | null {
+  if (typeof url !== 'string' || url.length === 0) { return null; }
+  try {
+    const t = scrubTargets(ctx);
+    const scrubbed = scrubPaths(ctx.redactor.redact(url).text, t.cwd, t.home, t.otherHomes);
+    return scrubbed.startsWith('https://') && scrubbed.length <= RUN_META_URL_MAX ? scrubbed : null;
+  } catch {
+    return null;
   }
 }
 
@@ -617,7 +636,7 @@ export class OnosooRelay {
   private addIdentity(meta: RunMeta, data: Record<string, unknown>): void {
     const k = meta.project_key;
     if (typeof k !== 'string' || k.length === 0 || k.length > RUN_META_KEY_MAX) { return; }
-    if (this.scrubString(k) !== k || !/^(git|root|multi):/.test(k)) { return; }
+    if (this.scrubString(k) !== k || !RUN_META_KEY_PREFIX.test(k)) { return; }
     data.project_key = k;
     const httpsUrl = (u: unknown): string | null => {
       if (typeof u !== 'string' || u.length === 0) { return null; }

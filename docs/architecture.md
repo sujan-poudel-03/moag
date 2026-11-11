@@ -100,7 +100,7 @@ sequenceDiagram
     participant History as HistoryStore
     participant Dashboard as DashboardPanel
 
-    User->>Sidebar: click Play
+    User->>Sidebar: click Run Plan
     Sidebar->>EXT: postMessage { type: 'playPlan' }
     EXT->>Runner: runner.play(plan)
     Runner->>Runner: detectAndMarkCycles(plan)

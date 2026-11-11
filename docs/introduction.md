@@ -14,10 +14,10 @@ MOAG is a VS Code extension that turns your AI coding agents into a managed, tra
 
 - **Write your intent** — as a prompt, a PRD, or a GitHub issue
 - **Generate a plan** — structured playlists of tasks, with test phases auto-injected
-- **Hit Play** — MOAG runs each task through your chosen AI engine, streams output live, auto-fixes failures, and verifies the result
+- **Hit Run** — MOAG runs each task through your chosen AI engine, streams output live, auto-fixes failures, and verifies the result
 - **Ship with confidence** — PRD verification, visual regression testing, and a full audit trail before you create the PR
 
-Think of it as a **music player for AI tasks**: playlists of tasks, engines as instruments, Play/Pause/Stop controls, a live dashboard showing what's running, and a history of every session.
+Think of it as a **music player for AI tasks**: playlists of tasks, engines as instruments, Run/Pause/Stop controls, a live dashboard showing what's running, and a history of every session.
 
 ---
 
@@ -116,7 +116,7 @@ Every task produces an `EngineResult`: stdout, stderr, exit code, duration, toke
 ║     Add visual-test and verify steps                     ║
 ║                                                          ║
 ║  3. EXECUTE                                              ║
-║     Play → agent runs each task                          ║
+║     Run  → agent runs each task                          ║
 ║     Live output in Dashboard                             ║
 ║     Auto-fix loop on failure (up to 3 iterations)        ║
 ║     Fallback engine on rate limit                        ║
@@ -177,16 +177,16 @@ Every task produces an `EngineResult`: stdout, stderr, exit code, duration, toke
 ### Execution
 | Capability | How to Access |
 |-----------|--------------|
-| Play full plan | Toolbar → Play ▶ (always pinned) |
-| Play single playlist | Playlist row → ▶ button |
-| Play single task | Task row → ▶ button (hover) |
+| Run full plan | Toolbar → Run Plan ▶ (always pinned) |
+| Run single playlist | Playlist row → ▶ button |
+| Run single task | Task row → ▶ button (hover) |
 | Pause between tasks | Toolbar → Pause ⏸ |
 | Stop run | Toolbar → Stop ⏹ (always pinned) |
 | Dry run (no execution) | Toolbar → Dry Run |
 | Toggle full-auto mode | Toolbar → Toggle Full Auto ⚡ |
 | Switch execution profile | Toolbar → Switch Profile |
 | Switch AI engine | Toolbar → Switch Engine |
-| Resume/restart when progress exists | Play → prompted with Resume or Restart |
+| Resume/restart when progress exists | Run Plan → prompted with Resume or Restart |
 | Retry failed task with fix context | Failed task card → 🔨 Smart Fix |
 | Retry with custom note | Right-click task → Retry with Note |
 
@@ -412,7 +412,7 @@ docs/
    - **Start from a PRD** → Toolbar → Generate Plan from PRD
    - **Start from scratch** → Chat tab → type your goal → Generate Plan
 6. Review the generated plan in the Plan tab
-7. Click **Play ▶** — dashboard opens, tasks run
+7. Click **Run Plan ▶** — dashboard opens, tasks run
 8. If tasks fail → **🔨 Smart Fix** auto-repairs them
 9. When development tasks finish → test playlist runs automatically
 10. Click **Verify Against PRD** — see per-criterion pass/fail

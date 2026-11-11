@@ -10,7 +10,7 @@ import { pathToFileURL } from 'url';
 import * as sinon from 'sinon';
 import {
   GitResult, IDENTITY_GIT_BACKSTOP_MS, IDENTITY_GIT_TIMEOUT_MS, IdentityGitRunner, MAX_MULTI_SCAN, multiKey, normaliseRemote, ProjectIdentity,
-  ProjectIdentityCache, resolveProjectIdentity,
+  ProjectIdentityCache, ProjectIdentityResolution, resolveProjectIdentity, resolveProjectIdentityWithReason,
 } from '../../../headless/project-identity';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -241,6 +241,81 @@ describe('project identity — resolver (stubbed git)', () => {
     assert.equal(await resolveProjectIdentity(sub, { git }), null);
     assert.equal(git.calls.length, 1);
     assert.equal(git.calls[0].cwd, sub);
+  });
+});
+
+// ─── resolveProjectIdentityWithReason: why a folder has no identity ───
+
+describe('project identity — resolver reasons (stubbed git)', () => {
+  let dir: string;
+  beforeEach(() => { dir = tmp('moag-ident-reason-'); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  /** The reasoned result, and resolveProjectIdentity agreeing on the identity. */
+  async function both(target: string, git: IdentityGitRunner): Promise<ProjectIdentityResolution> {
+    const r = await resolveProjectIdentityWithReason(target, { git });
+    assert.deepEqual(await resolveProjectIdentity(target, { git }), r.identity);
+    return r;
+  }
+
+  it('a resolved identity has reason null', async () => {
+    const r = await both(dir, stubGit({ 'rev-parse': REPO(), remote: { ok: true, stdout: 'https://github.com/o/r.git\n' } }));
+    assert.deepEqual(r, { identity: { project_key: 'git:github.com/o/r', repo_url: 'https://github.com/o/r' }, reason: null });
+    const root = await both(dir, stubGit({ 'rev-parse': REPO(), remote: NO_ORIGIN, 'rev-list': { ok: true, stdout: SHA_A + '\n' } }));
+    assert.deepEqual(root, { identity: { project_key: 'root:' + SHA_A }, reason: null });
+  });
+
+  it('not_a_repo: rev-parse fails and no child holds a .git', function () {
+    if (hasGitAtOrAbove(dir)) { this.skip(); }
+    fs.mkdirSync(path.join(dir, 'plain'));
+    return both(dir, stubGit({})).then((r) => assert.deepEqual(r, { identity: null, reason: 'not_a_repo' }));
+  });
+
+  it('not_a_repo: every child repository fails', async function () {
+    if (hasGitAtOrAbove(dir)) { this.skip(); }
+    fs.mkdirSync(path.join(dir, 'a', '.git'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'b', '.git'), { recursive: true });
+    const git: IdentityGitRunner = async () => ({ ok: false, stdout: '' });
+    assert.deepEqual(await both(dir, git), { identity: null, reason: 'not_a_repo' });
+  });
+
+  it('a multi: folder with one usable child resolves with reason null', async function () {
+    if (hasGitAtOrAbove(dir)) { this.skip(); }
+    fs.mkdirSync(path.join(dir, 'a', '.git'), { recursive: true });
+    const git: IdentityGitRunner = async (cwd, args) => {
+      if (cwd === dir) { return { ok: false, stdout: '' }; }
+      return args[0] === 'rev-parse' ? REPO() : { ok: true, stdout: 'git@github.com:o/a.git' };
+    };
+    const r = await both(dir, git);
+    assert.equal(r.reason, null);
+    assert.match(r.identity?.project_key ?? '', /^multi:/);
+  });
+
+  it('git_unreadable: rev-parse fails while a .git sits in the folder', async () => {
+    fs.mkdirSync(path.join(dir, '.git'));
+    assert.deepEqual(await both(dir, stubGit({})), { identity: null, reason: 'git_unreadable' });
+  });
+
+  it('git_unreadable: rev-parse prints something unexpected', async () => {
+    assert.deepEqual(await both(dir, stubGit({ 'rev-parse': { ok: true, stdout: 'maybe\n' } })), { identity: null, reason: 'git_unreadable' });
+    assert.deepEqual(await both(dir, stubGit({ 'rev-parse': { ok: true, stdout: 'true\n--is-shallow-repository\n' } })), { identity: null, reason: 'git_unreadable' });
+  });
+
+  it('git_unreadable: the git runner throws', async () => {
+    const throwing: IdentityGitRunner = async () => { throw new Error('boom'); };
+    assert.deepEqual(await both(dir, throwing), { identity: null, reason: 'git_unreadable' });
+  });
+
+  it('no_commits: rev-list fails, or prints no usable sha', async () => {
+    assert.deepEqual(await both(dir, stubGit({ 'rev-parse': REPO(), remote: NO_ORIGIN, 'rev-list': { ok: false, stdout: '' } })), { identity: null, reason: 'no_commits' });
+    assert.deepEqual(await both(dir, stubGit({ 'rev-parse': REPO(), remote: NO_ORIGIN, 'rev-list': { ok: true, stdout: '' } })), { identity: null, reason: 'no_commits' });
+    assert.deepEqual(await both(dir, stubGit({ 'rev-parse': REPO(), remote: NO_ORIGIN, 'rev-list': { ok: true, stdout: 'c'.repeat(64) } })), { identity: null, reason: 'no_commits' });
+  });
+
+  it('shallow_no_origin: a shallow clone with no usable origin, without asking for its roots', async () => {
+    const git = stubGit({ 'rev-parse': REPO(true), remote: { ok: true, stdout: '/srv/local.git\n' }, 'rev-list': { ok: true, stdout: SHA_A + '\n' } });
+    assert.deepEqual(await both(dir, git), { identity: null, reason: 'shallow_no_origin' });
+    assert.equal(git.calls.some((c) => c.args[0] === 'rev-list'), false);
   });
 });
 

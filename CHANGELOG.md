@@ -13,6 +13,11 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 - **ONOSOO project identity (Builds protocol v1.2).** Every run tells ONOSOO which project it belongs to, with an id that is the same on every machine and survives renaming the folder: the repository's `origin` remote (`git:github.com/owner/repo`, plus a link), else its first commit (`root:…`), else, for a folder of several repositories, a `multi:…` id with the list of them. Credentials, ports and local paths are never sent. See "How a project gets into ONOSOO" in `docs/onosoo-builds.md`.
 - `docs/project-key-vectors.json`: example remotes and the id each one gives, checked by MOAG's tests and shared with ONOSOO.
 - Remote runs: an engine login check, the reason an installed engine is not offered, branch delivery, and each task's stage and kind in run-meta.
+- **Copy ONOSOO Project ID.** The command **MOAG: Copy ONOSOO Project ID** puts the ID runs from a folder report on the clipboard (with a folder picker in a multi-root workspace), and `moag project-id [--cwd <dir>] [--json]` prints it, exiting 1 with the reason when the folder has none. Both apply the same privacy filter as a run, so an ID a run would not send is never shown. While this machine is paired, the Dashboard status bar shows the ONOSOO project runs go to, with **Copy** and, for a repository with a link, **Open repository**.
+
+### Changed
+
+- Play and Execute are now **Run**: **Run Plan**, **Run Playlist**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
 
 ### Fixed
 

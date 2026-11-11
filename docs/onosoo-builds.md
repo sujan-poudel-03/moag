@@ -178,7 +178,7 @@ A project gets into ONOSOO in one of two ways:
 The automatic way:
 
 1. Open the project folder in VS Code (or `cd` into it for `moag run`).
-2. Generate or open a plan and press **Play**.
+2. Generate or open a plan and press **Run Plan**.
 3. In ONOSOO, open **Builds**: the run is listed under the project's name.
 
 MOAG tells ONOSOO which project a run belongs to with a **project ID** that is the same on every
@@ -211,8 +211,9 @@ In ONOSOO, open **Builds → Projects**. Owners and admins see these actions:
      sends, so later runs from any clone land in this project. A password or token in the address
      is never stored.
    - a **Project ID** (`git:…`, `root:…` or `multi:…`). This is the only way to add a repository
-     with no remote. To get it, run this in the repository and put `root:` in front of the result
-     (if it prints several lines, use the one that sorts first):
+     with no remote. Copy it with **MOAG: Copy ONOSOO Project ID** in VS Code, or print it with
+     `moag project-id` in the repository. Without MOAG at hand, run this in the repository and put
+     `root:` in front of the result (if it prints several lines, use the one that sorts first):
 
      ```sh
      git rev-list --max-parents=0 HEAD

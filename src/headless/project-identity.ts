@@ -19,6 +19,7 @@ import * as cp from 'child_process';
 import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import type { IdentityAbsenceReason } from './project-id';
 
 // ─── Types and limits ───
 
@@ -35,6 +36,14 @@ export interface ProjectIdentity {
   repo_url?: string;
   repos?: RepoIdentity[];
 }
+
+/**
+ * The identity of a folder, or why it has none. `identity` is exactly what
+ * {@link resolveProjectIdentity} returns.
+ */
+export type ProjectIdentityResolution =
+  | { identity: ProjectIdentity; reason: null }
+  | { identity: null; reason: IdentityAbsenceReason };
 
 /** Timeout of one git call. */
 export const IDENTITY_GIT_TIMEOUT_MS = 3_000;
@@ -252,29 +261,32 @@ function identityOf(key: string, repoUrl?: string): ProjectIdentity {
   return repoUrl ? { project_key: key, repo_url: repoUrl } : { project_key: key };
 }
 
+/** What resolving one folder as a repository found. */
+type RepoOutcome = 'not-repo' | { identity: ProjectIdentity } | { absent: IdentityAbsenceReason };
+
 /** Resolve one folder as a repository: `'not-repo'` when git says it is not inside one. */
-async function resolveRepo(dir: string, git: IdentityGitRunner): Promise<ProjectIdentity | null | 'not-repo'> {
+async function resolveRepo(dir: string, git: IdentityGitRunner): Promise<RepoOutcome> {
   const rp = await git(dir, ['rev-parse', '--is-inside-work-tree', '--is-shallow-repository']);
   if (!rp.ok) { return 'not-repo'; }
   const lines = rp.stdout.split(/\r?\n/);
-  if (lines[0] !== 'true' || (lines[1] !== 'true' && lines[1] !== 'false')) { return null; }
+  if (lines[0] !== 'true' || (lines[1] !== 'true' && lines[1] !== 'false')) { return { absent: 'git_unreadable' }; }
   const shallow = lines[1] === 'true';
 
   const origin = await git(dir, ['remote', 'get-url', 'origin']);
   if (origin.ok) {
     const n = normaliseRemote(origin.stdout.trim());
-    if (n) { return identityOf(n.key, n.repoUrl); }
+    if (n) { return { identity: identityOf(n.key, n.repoUrl) }; }
   }
 
   // A shallow clone's root is its shallow boundary, not the history's root.
-  if (shallow) { return null; }
+  if (shallow) { return { absent: 'shallow_no_origin' }; }
 
   const roots = await git(dir, ['rev-list', '--max-parents=0', 'HEAD']);
-  if (!roots.ok) { return null; }
+  if (!roots.ok) { return { absent: 'no_commits' }; }
   const shas = roots.stdout.split(/\r?\n/).map((l) => l.trim().toLowerCase()).filter((l) => l.length > 0);
-  if (shas.length === 0 || shas.some((sha) => !/^[0-9a-f]{40}$/.test(sha))) { return null; }
+  if (shas.length === 0 || shas.some((sha) => !/^[0-9a-f]{40}$/.test(sha))) { return { absent: 'no_commits' }; }
   shas.sort();
-  return { project_key: 'root:' + shas[0] };
+  return { identity: { project_key: 'root:' + shas[0] } };
 }
 
 /** True when `dir` or any ancestor has a `.git` entry. */
@@ -334,9 +346,9 @@ async function mapLimited<T, R>(items: readonly T[], limit: number, fn: (item: T
 }
 
 /** A folder that is not a repository: a `multi:` key from its immediate repository children. */
-async function resolveMulti(root: string, git: IdentityGitRunner): Promise<ProjectIdentity | null> {
+async function resolveMulti(root: string, git: IdentityGitRunner): Promise<ProjectIdentityResolution> {
   // Git refused a folder that really is (inside) a repository: no key rather than a wrong one.
-  if (await hasGitAtOrAbove(root)) { return null; }
+  if (await hasGitAtOrAbove(root)) { return { identity: null, reason: 'git_unreadable' }; }
   // The first MAX_MULTI_CHILDREN subdirectories by name that hold a `.git` entry.
   const names: string[] = [];
   for (const name of await scanSubdirs(root)) {
@@ -346,13 +358,32 @@ async function resolveMulti(root: string, git: IdentityGitRunner): Promise<Proje
   const resolved = await mapLimited(names, CHILD_CONCURRENCY, (name) => resolveRepo(path.join(root, name), git));
   const repos: RepoIdentity[] = [];
   names.forEach((name, i) => {
-    const r = resolved[i];
-    if (!r || r === 'not-repo') { return; }
+    const o = resolved[i];
+    if (!o || o === 'not-repo' || !('identity' in o)) { return; }
+    const r = o.identity;
     if (/[\/\\]/.test(name) || name.length > PROJECT_KEY_MAX) { return; }
     repos.push(r.repo_url ? { dir: name, key: r.project_key, repo_url: r.repo_url } : { dir: name, key: r.project_key });
   });
-  if (repos.length === 0) { return null; }
-  return { project_key: multiKey(repos.map((r) => r.key)), repos };
+  if (repos.length === 0) { return { identity: null, reason: 'not_a_repo' }; }
+  return { identity: { project_key: multiKey(repos.map((r) => r.key)), repos }, reason: null };
+}
+
+/**
+ * Resolve the identity of `dir`, or the reason it has none. A folder inside a repository gets the
+ * repository's key. Never rejects: an unexpected failure is `git_unreadable`.
+ */
+export async function resolveProjectIdentityWithReason(dir: string, opts: ResolveIdentityOptions = {}): Promise<ProjectIdentityResolution> {
+  try {
+    const git = opts.git ?? execFileGitRunner(opts.env ?? process.env);
+    const abs = path.resolve(dir);
+    const own = await resolveRepo(abs, git);
+    if (own !== 'not-repo') {
+      return 'identity' in own ? { identity: own.identity, reason: null } : { identity: null, reason: own.absent };
+    }
+    return await resolveMulti(abs, git);
+  } catch {
+    return { identity: null, reason: 'git_unreadable' };
+  }
 }
 
 /**
@@ -360,15 +391,7 @@ async function resolveMulti(root: string, git: IdentityGitRunner): Promise<Proje
  * rejects: any failure resolves null.
  */
 export async function resolveProjectIdentity(dir: string, opts: ResolveIdentityOptions = {}): Promise<ProjectIdentity | null> {
-  try {
-    const git = opts.git ?? execFileGitRunner(opts.env ?? process.env);
-    const abs = path.resolve(dir);
-    const own = await resolveRepo(abs, git);
-    if (own !== 'not-repo') { return own; }
-    return await resolveMulti(abs, git);
-  } catch {
-    return null;
-  }
+  return (await resolveProjectIdentityWithReason(dir, opts)).identity;
 }
 
 // ─── Cache ───
@@ -439,7 +462,7 @@ export class ProjectIdentityCache {
   /** The remembered identity of `dir`, fresh or stale; `undefined` when never resolved. */
   peek(dir: string): ProjectIdentity | null | undefined {
     try {
-      return this.entries.get(cacheKey(dir))?.value;
+      return this.entries.get(identityCacheKey(dir))?.value;
     } catch {
       return undefined;
     }
@@ -451,7 +474,7 @@ export class ProjectIdentityCache {
    */
   warm(dir: string, opts: { priority?: boolean } = {}): Promise<ProjectIdentity | null> {
     try {
-      const key = cacheKey(dir);
+      const key = identityCacheKey(dir);
       const entry = this.entries.get(key);
       if (entry && this.now() - entry.at < this.ttlMs) { return Promise.resolve(entry.value); }
       const running = this.inflight.get(key);
@@ -493,7 +516,7 @@ export class ProjectIdentityCache {
    */
   within(dir: string, ms: number): Promise<ProjectIdentity | null> {
     try {
-      const entry = this.entries.get(cacheKey(dir));
+      const entry = this.entries.get(identityCacheKey(dir));
       if (entry) {
         if (this.now() - entry.at >= this.ttlMs) { void this.warm(dir); }
         return Promise.resolve(entry.value);
@@ -540,7 +563,7 @@ export class ProjectIdentityCache {
 }
 
 /** The cache key of a folder: resolved, and lower-cased on Windows. */
-function cacheKey(dir: string): string {
+export function identityCacheKey(dir: string): string {
   const abs = path.resolve(dir);
   return process.platform === 'win32' ? abs.toLowerCase() : abs;
 }

@@ -182,6 +182,7 @@ const RELAY_MODULES = [
   'headless/onosoo-relay.ts',
   'headless/run-reporter.ts',
   'headless/project-identity.ts',
+  'headless/project-id.ts',
   'headless/host-run-relay.ts',
 ];
 

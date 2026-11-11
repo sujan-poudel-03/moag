@@ -144,6 +144,57 @@ export function conversationFailed(detail?: string): UserMessage {
   };
 }
 
+// ─── ONOSOO project ID ───
+
+/** Copy ONOSOO Project ID with no folder open. */
+export function noOnosooFolder(): UserMessage {
+  return {
+    text: 'Open a folder to get its ONOSOO project ID.',
+    actions: [{ label: 'Open Folder', command: 'vscode.openFolder' }],
+  };
+}
+
+/**
+ * The ONOSOO project ID is on the clipboard.
+ * @param key             The full project ID that was copied
+ * @param repoUrl         Its repository URL, when runs send one
+ * @param firstFolderName The first workspace folder's name, when the copied folder is another one
+ */
+export function onosooProjectIdCopied(key: string, repoUrl?: string, firstFolderName?: string): UserMessage {
+  const repo = repoUrl ? ` (repository: ${repoUrl})` : '';
+  const other = firstFolderName ? ` Runs started in VS Code report the first folder, ${firstFolderName}, not this one.` : '';
+  return {
+    text: `Copied ONOSOO project ID ${key}${repo}. Paste it into Add repository in ONOSOO (Builds → Projects).${other}`,
+  };
+}
+
+/** The folder's ID would be changed by the privacy filter, so runs report none. Never names the key. */
+export function onosooProjectIdNotSent(): UserMessage {
+  return {
+    text: "Nothing copied: this folder's ONOSOO project ID would not be sent to ONOSOO, because MOAG's privacy filter would change it. Runs from this folder report no project.",
+  };
+}
+
+/** The folder has no ONOSOO project ID; `reasonPhrase` is one of PROJECT_ID_REASON_PHRASES. */
+export function onosooProjectIdAbsent(reasonPhrase: string): UserMessage {
+  return {
+    text: `Nothing copied: this folder has no ONOSOO project ID — ${reasonPhrase}.`,
+  };
+}
+
+/** The clipboard refused the ID (the dashboard's Copy button). */
+export function onosooProjectIdCopyFailed(detail: string): UserMessage {
+  return { text: `Could not copy the ONOSOO project ID: ${truncate(detail, 120)}` };
+}
+
+/** The ID could not be resolved within the command's deadline. */
+export function onosooProjectIdTimeout(): UserMessage {
+  return {
+    text: 'Nothing copied: the ONOSOO project ID could not be resolved in time.',
+    actions: [{ label: 'Try Again', command: 'agentTaskPlayer.copyOnosooProjectId' }],
+  };
+}
+
 // ─── Display helpers ───
 
 export async function showError(msg: UserMessage): Promise<void> {

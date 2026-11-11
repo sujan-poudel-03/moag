@@ -19,6 +19,7 @@ import {
   isLiveRelayRun, OnosooSpool, RelayEvent, releaseLiveRelayRun, SPOOL_OWNER_MAX_IDLE_MS,
 } from '../../../headless/onosoo-spool';
 import type { OnosooConfig } from '../../../headless/onosoo-config';
+import { projectIdAsSent } from '../../../headless/project-id';
 import { createRedactor, Redactor } from '../../../utils/redact';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -850,6 +851,39 @@ describe('ONOSOO relay — run-meta project identity (protocol v1.2)', () => {
     const inHome = await sendMeta({ ...BASE, project_key: 'git:' + path.join(home, 'repo') }, { homedir: home });
     assert.ok(!('project_key' in inHome.data));
     assert.ok(!inHome.body.includes(home));
+  });
+
+  describe('projectIdAsSent agrees with run-meta (parity table)', () => {
+    const fx = fixture();
+    const home = tmp('moag-relay-home-');
+    const redactor = createRedactor([KEY, SECRET]);
+    const at255 = 'git:github.com/' + 'k'.repeat(RUN_META_KEY_MAX - 'git:github.com/'.length);
+    const cases: Array<{ name: string; key: string; url?: string; ok: boolean }> = [
+      { name: 'git: with an https URL', key: 'git:github.com/o/r', url: 'https://github.com/O/R', ok: true },
+      { name: 'git: with an http URL', key: 'git:github.com/o/r', url: 'http://github.com/o/r', ok: true },
+      { name: 'git: with a secret in the URL', key: 'git:github.com/o/r', url: 'https://github.com/o/r?t=' + SECRET, ok: true },
+      { name: 'root: + 40 hex', key: 'root:' + 'a'.repeat(40), url: 'https://github.com/o/r', ok: true },
+      { name: 'multi: + 64 hex', key: 'multi:' + 'f'.repeat(64), ok: true },
+      { name: 'key containing the workspace path', key: 'git:' + path.join(fx.cwd, 'x'), ok: false },
+      { name: 'key containing the home path', key: 'git:' + path.join(home, 'x'), ok: false },
+      { name: 'key containing a redacted secret', key: 'git:github.com/' + SECRET, url: 'https://github.com/o/r', ok: false },
+      { name: '256-char key', key: at255 + 'k', ok: false },
+      { name: '255-char key', key: at255, url: 'https://github.com/o/r', ok: true },
+      { name: 'unknown prefix', key: 'svn:x/y', ok: false },
+    ];
+    for (const c of cases) {
+      it(`${c.name}: ${c.ok ? 'sent' : 'not sent'} on both sides`, async () => {
+        const meta: RunMeta = { ...BASE, project_key: c.key, ...(c.url ? { repo_url: c.url } : {}) };
+        const { data } = await sendMeta(meta, { redactor, homedir: home, fx });
+        const check = projectIdAsSent({ project_key: c.key, ...(c.url ? { repo_url: c.url } : {}) }, { redactor, cwd: fx.cwd, homedir: home });
+        assert.equal(check.ok, 'project_key' in data);
+        assert.equal(check.ok, c.ok);
+        if (check.ok) {
+          assert.equal(check.project_key, data.project_key);
+          assert.equal(check.repo_url, (data.repo_url as string | undefined) ?? null);
+        }
+      });
+    }
   });
 
   describe('repos of a multi: key', () => {

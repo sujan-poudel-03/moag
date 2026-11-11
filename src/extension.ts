@@ -21,6 +21,7 @@ import { takeRelayEnv } from './headless/run-reporter';
 import { resolveOnosooConfig } from './headless/onosoo-config';
 import { initOnosooRelayHost, OnosooRelayHost } from './ui/onosoo-relay-host';
 import { cmdConnectOnosoo, cmdDisconnectOnosoo, OnosooPairingDeps } from './ui/onosoo-pairing';
+import { cmdCopyOnosooProjectId, createOnosooProjectSegment } from './ui/onosoo-project-id';
 import { cmdExportDiagnostics } from './ui/diagnostics-command';
 import { cmdInstallCli } from './ui/cli-install-command';
 import { cmdClearAnthropicKey, cmdSetAnthropicKey, migrateAnthropicKeySetting, SECRET_KEYS } from './ui/anthropic-key';
@@ -1545,7 +1546,18 @@ export function activate(context: vscode.ExtensionContext): void {
       cmdDisconnectOnosoo(pairingDeps).catch((err: unknown) => {
         void vscode.window.showErrorMessage(`Could not disconnect from ONOSOO: ${err instanceof Error ? err.message : String(err)}`);
       })),
+    vscode.commands.registerCommand('agentTaskPlayer.copyOnosooProjectId', () =>
+      cmdCopyOnosooProjectId(relayHost?.project).catch((err: unknown) => {
+        void vscode.window.showErrorMessage(`Could not copy the ONOSOO project ID: ${err instanceof Error ? err.message : String(err)}`);
+      })),
   );
+  // The dashboard's "ONOSOO project" segment follows the relay host (shown while paired).
+  if (relayHost) {
+    const onosooSegment = createOnosooProjectSegment(relayHost.project);
+    onosooSegment.refresh();
+    DashboardPanel.setOnosooProject(onosooSegment);
+    context.subscriptions.push({ dispose: () => { DashboardPanel.setOnosooProject(null); onosooSegment.dispose(); } });
+  }
 
   // Initialize tree providers
   planTree = new PlanTreeProvider();
@@ -3806,9 +3818,9 @@ async function cmdNewPlanFromTemplate(): Promise<void> {
   const totalTasks = currentPlan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
   vscode.window.showInformationMessage(
     `Plan "${currentPlan.name}" created from template — ${totalTasks} task${totalTasks > 1 ? 's' : ''}.`,
-    'Play Now',
+    'Run Now',
   ).then(action => {
-    if (action === 'Play Now') {
+    if (action === 'Run Now') {
       vscode.commands.executeCommand('agentTaskPlayer.play');
     }
   });
@@ -6009,11 +6021,11 @@ async function cmdFixAllFailed(): Promise<void> {
   }
 
   const choice = await vscode.window.showWarningMessage(
-    `Re-execute ${failedTasks.length} failed task${failedTasks.length === 1 ? '' : 's'} with their auto-fix context?`,
+    `Run ${failedTasks.length} failed task${failedTasks.length === 1 ? '' : 's'} again with their auto-fix context?`,
     { modal: false },
-    'Re-execute All',
+    'Run All Again',
   );
-  if (choice !== 'Re-execute All') { return; }
+  if (choice !== 'Run All Again') { return; }
 
   // Reset all failed tasks to pending and run the plan from the first failed playlist
   const firstFailedPlaylist = failedTasks[0].playlistIndex;
@@ -7219,7 +7231,7 @@ async function cmdSetTaskStatus(item?: PlanTreeItem): Promise<void> {
 
   const task = currentPlan.playlists[item.playlistIndex].tasks[item.taskIndex];
   const picks = [
-    { label: '$(circle-outline) Pending', value: TaskStatus.Pending, description: 'Reset — will run on next play' },
+    { label: '$(circle-outline) Pending', value: TaskStatus.Pending, description: 'Reset — will run on the next run' },
     { label: '$(pass) Completed', value: TaskStatus.Completed, description: 'Mark as done — will be skipped' },
     { label: '$(error) Failed', value: TaskStatus.Failed, description: 'Mark as failed' },
     { label: '$(debug-disconnect) Blocked', value: TaskStatus.Blocked, description: 'Mark as blocked for review' },
@@ -7244,7 +7256,7 @@ async function cmdSetPlaylistStatus(item?: PlanTreeItem): Promise<void> {
 
   const playlist = currentPlan.playlists[item.playlistIndex];
   const picks = [
-    { label: '$(circle-outline) All Pending', value: TaskStatus.Pending, description: 'Reset all tasks — will run on next play' },
+    { label: '$(circle-outline) All Pending', value: TaskStatus.Pending, description: 'Reset all tasks — will run on the next run' },
     { label: '$(pass) All Completed', value: TaskStatus.Completed, description: 'Mark all as done — will be skipped' },
     { label: '$(debug-step-over) All Skipped', value: TaskStatus.Skipped, description: 'Skip all tasks in this playlist' },
   ];

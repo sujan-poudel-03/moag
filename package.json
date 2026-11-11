@@ -1,7 +1,7 @@
 {
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
-  "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
+  "description": "Orchestrate AI coding agents from VS Code. Build a plan, hit Run, and let Claude, Codex, Gemini, or Ollama do the work — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
   "version": "0.10.0",
   "publisher": "moag",
   "license": "MIT",
@@ -77,7 +77,7 @@
       },
       {
         "command": "agentTaskPlayer.play",
-        "title": "Play",
+        "title": "Run Plan",
         "category": "MOAG",
         "icon": "$(play)"
       },
@@ -197,7 +197,7 @@
       },
       {
         "command": "agentTaskPlayer.playPlaylist",
-        "title": "Play Playlist",
+        "title": "Run Playlist",
         "category": "MOAG",
         "icon": "$(play)"
       },
@@ -440,6 +440,11 @@
       {
         "command": "agentTaskPlayer.disconnectOnosoo",
         "title": "Disconnect from ONOSOO",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.copyOnosooProjectId",
+        "title": "Copy ONOSOO Project ID",
         "category": "MOAG"
       },
       {
@@ -1757,10 +1762,10 @@
           },
           {
             "id": "hitPlay",
-            "title": "Hit Play!",
-            "description": "Click the **Play** $(play) button in the Plan panel toolbar. Here's what happens:\n\n1. Extension checks if your CLI is installed (warns if not)\n2. Sends the first task's prompt to the agent CLI\n3. The agent works on your project files\n4. Output streams live in the Dashboard\n5. Moves to the next task automatically\n\n[Play](command:agentTaskPlayer.play) · [Open Dashboard](command:agentTaskPlayer.showDashboard)\n\nUse **Pause** $(debug-pause) to hold between tasks, or **Stop** $(debug-stop) to abort.",
+            "title": "Run your plan",
+            "description": "Click the **Run Plan** $(play) button in the Plan panel toolbar. Here's what happens:\n\n1. Extension checks if your CLI is installed (warns if not)\n2. Sends the first task's prompt to the agent CLI\n3. The agent works on your project files\n4. Output streams live in the Dashboard\n5. Moves to the next task automatically\n\n[Run Plan](command:agentTaskPlayer.play) · [Open Dashboard](command:agentTaskPlayer.showDashboard)\n\nUse **Pause** $(debug-pause) to hold between tasks, or **Stop** $(debug-stop) to abort.",
             "media": {
-              "altText": "Playing tasks and viewing output",
+              "altText": "Running tasks and viewing output",
               "markdown": "media/walkthrough-play.md"
             },
             "completionEvents": [

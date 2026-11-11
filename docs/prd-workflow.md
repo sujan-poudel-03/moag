@@ -213,7 +213,7 @@ When a `testPhase: true` playlist starts, the PLAN tab sidebar shows a **TEST CR
 **Each iteration:**
 1. AI generates a `Fix — Iteration N` playlist based on the gap list
 2. Playlist appended to current plan (user can review before running)
-3. User clicks Play on the fix playlist
+3. User clicks Run Playlist on the fix playlist
 4. Execution → TTT → Testing → Verification loop repeats
 
 **Implementation:** `cmdGenerateFixTasks()` in `src/extension.ts`. Uses `TaskQueue.injectNext()` for dynamic task injection.

@@ -21,8 +21,10 @@
  *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
  *   moag host   [run | init | draft <project> | status | stop <env> | remove <env>]
  *   moag pair   [<key>] [--url <base>]
+ *   moag project-id [--cwd <dir>] [--json]
  *   moag --version | moag help
  *
+ * `project-id` prints the ONOSOO project ID runs from the folder report (exit 1 with the reason when none).
  * `pair`  saves the ONOSOO device key to the user-level onosoo.json (the key from stdin when
  *          omitted, so it stays out of shell history) and checks it with ONOSOO.
  * `host`  runs approved project branches as live environments for ONOSOO previews, behind a
@@ -122,6 +124,7 @@ import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
 import { keyPassesScrub, OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
 import { checkPairing, PairError, writePairing } from './onosoo-pair';
+import { cmdProjectId } from './project-id';
 import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from '../utils/budget-notice';
 import {
   buildRunMeta, forgetRelayEnv, relayConfigured, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
@@ -2347,7 +2350,7 @@ export async function cmdPair(args: Args, deps: PairDeps = {}): Promise<number> 
 // ─── entry ───────────────────────────────────────────────────────────────────
 
 const MAIN_USAGE =
-  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|bench> ...\n' +
+  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|project-id|bench> ...\n' +
   '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
   '       moag --version | moag help\n' +
   '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
@@ -2366,6 +2369,7 @@ const MAIN_USAGE =
   '  moag standards check [--base <ref>] [--no-commands]     exit 0 ok · 1 blocking failure · 5 nothing checked · 6 blocking not checked\n' +
   '  moag standards propose [--stack <id>] [--write [--force]]\n' +
   '  moag pair [<key>] [--url <base>]   save the ONOSOO device key (read from stdin when omitted) and check it\n' +
+  '  moag project-id [--cwd <dir>] [--json]   print the ONOSOO project ID runs from this folder report\n' +
   '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n';
 
 /** The CLI entry point. Exported so a test can drive dispatch. */
@@ -2389,6 +2393,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (args.command === 'pair') {
     // No setup() and no shim: pairing writes one user-level file and makes one HTTP call.
     return cmdPair(args);
+  }
+  if (args.command === 'project-id') {
+    // No setup() and no shim: local git and the user-level ONOSOO config only; nothing is sent.
+    return cmdProjectId(argv.slice(1), { env: relayConfigEnv() });
   }
   // Hidden: the ONOSOO remote child, started by `moag daemon` through sudo (docs/onosoo-remote.md).
   if (args.command === 'remote-child') {

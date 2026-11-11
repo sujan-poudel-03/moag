@@ -1463,7 +1463,7 @@ describe('Regression: the docs do not contradict the code', () => {
   it('documents every command the CLI actually accepts', () => {
     // The usage banner is the CLI's own statement of its surface.
     const cli = fsMod.readFileSync('src/headless/cli.ts', 'utf-8');
-    const banner = /Usage: moag <([a-z|]+)>/.exec(cli);
+    const banner = /Usage: moag <([a-z|-]+)>/.exec(cli);
     assert.ok(banner, 'could not find the usage banner in cli.ts');
     const commands = banner![1].split('|');
     assert.ok(commands.length >= 8, `expected the full command set, got ${commands.join(',')}`);

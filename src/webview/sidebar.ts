@@ -99,17 +99,17 @@ function exitPrdMode() {
   prdStep = 0;
   prdAnswers = [];
   if (prdModeHeaderEl) { prdModeHeaderEl.classList.remove('active'); }
-  if (sendEl) { sendEl.innerHTML = 'Execute <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="flex-shrink:0"><path d="M3 2l10 6-10 6V2z"/></svg>'; }
+  if (sendEl) { sendEl.innerHTML = 'Run <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="flex-shrink:0"><path d="M3 2l10 6-10 6V2z"/></svg>'; }
   promptEl.placeholder = 'Describe a task for the AI agent...';
   renderChat(chatTitleEl ? chatTitleEl.textContent || 'New Chat' : 'New Chat', chatMessages);
 }
 function updateComposerHint() {
   if (!composerHintEl) { return; }
   if (pendingFixRef) {
-    composerHintEl.textContent = 'Execute will retry the task with this fix context';
+    composerHintEl.textContent = 'Run will retry the task with this fix context';
     composerHintEl.classList.add('fix-mode');
   } else {
-    composerHintEl.textContent = 'Ctrl+Enter execute · Shift+Enter queue';
+    composerHintEl.textContent = 'Ctrl+Enter run · Shift+Enter queue';
     composerHintEl.classList.remove('fix-mode');
   }
 }
@@ -417,7 +417,7 @@ function renderLivePanel() {
   planLivePanelEl.innerHTML =
     '<div class="plan-live-header">' +
       '<span class="plan-live-pulse"></span>' +
-      '<span class="plan-live-task">' + escHtml(liveTaskName || 'Executing…') + '</span>' +
+      '<span class="plan-live-task">' + escHtml(liveTaskName || 'Running…') + '</span>' +
       '<span class="plan-live-dash-link" data-action="showDashboard">Open Dashboard ↗</span>' +
     '</div>' +
     (liveOutputLines.length > 0
@@ -680,7 +680,7 @@ function renderPlanGroups(targetEl, groups) {
     const play = document.createElement('button');
     play.type = 'button';
     play.className = 'plan-group-play';
-    play.title = groupStatus === 'running' ? 'Pause entire run (not just this playlist)' : groupStatus === 'completed' ? 'Re-execute' : 'Execute';
+    play.title = groupStatus === 'running' ? 'Pause entire run (not just this playlist)' : groupStatus === 'completed' ? 'Run Again' : 'Run Playlist';
     play.innerHTML = groupStatus === 'running'
       ? '<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><rect x="3.5" y="2.5" width="3.5" height="11" rx="1"/><rect x="9" y="2.5" width="3.5" height="11" rx="1"/></svg>'
       : groupStatus === 'completed'
@@ -802,10 +802,10 @@ function renderPlanGroups(targetEl, groups) {
       const editBtnHtml = status !== 'running' ? '<button type="button" class="task-act-btn task-edit-btn" title="Edit task">' + SVG_EDIT + '</button>' : '';
       const previewBtnHtml = '<button type="button" class="task-act-btn task-preview-btn" title="Preview prompt">' + SVG_EYE + '</button>';
       const actionButtons = isFailedLike
-        ? '<button type="button" class="task-act-btn task-retry" title="Re-execute unchanged">' + SVG_RETRY + '</button>' +
+        ? '<button type="button" class="task-act-btn task-retry" title="Run again unchanged">' + SVG_RETRY + '</button>' +
           '<button type="button" class="smart-fix-btn task-fix" title="Pre-fill composer with error context for guided fix">Fix</button>' +
           editBtnHtml + previewBtnHtml
-        : '<button type="button" class="task-act-btn task-toggle" title="' + (status === 'running' ? 'Pause entire run (not just this task)' : 'Execute') + '">' + (status === 'running' ? SVG_PAUSE : SVG_PLAY) + '</button>' +
+        : '<button type="button" class="task-act-btn task-toggle" title="' + (status === 'running' ? 'Pause entire run (not just this task)' : 'Run Task') + '">' + (status === 'running' ? SVG_PAUSE : SVG_PLAY) + '</button>' +
           editBtnHtml + previewBtnHtml;
       const tokenMeta = (() => {
         const u = task.tokenUsage;
@@ -839,7 +839,7 @@ function renderPlanGroups(targetEl, groups) {
             (failureReason ? '<span class="item-subtitle error" title="' + escHtml(failureReason) + '">' + escHtml(failureReason) + '</span>' : '') +
             errorLinesHtml +
             tokenMeta +
-            (status === 'running' ? '<span class="run-badge">Executing</span>' : '') +
+            (status === 'running' ? '<span class="run-badge">Running</span>' : '') +
           '</button>' +
           '<span class="task-actions' + (status === 'running' || isFailedLike ? ' always-visible' : '') + '">' +
             actionButtons +
@@ -1162,7 +1162,7 @@ function renderPlanTools() {
   const label = activePlanName || 'Ad hoc';
   planActiveNameEl.textContent = label;
   planPlayBtnEl.innerHTML = runnerState === 'playing' ? iconMarkup('pause') : iconMarkup('play');
-  planPlayBtnEl.title = runnerState === 'playing' ? 'Pause Plan' : 'Execute Plan';
+  planPlayBtnEl.title = runnerState === 'playing' ? 'Pause Plan' : runnerState === 'paused' ? 'Resume' : 'Run Plan';
   planPlayBtnEl.setAttribute('aria-label', planPlayBtnEl.title);
   planPlayBtnEl.classList.toggle('active', runnerState === 'playing');
   planRunPendingBtnEl.innerHTML = iconMarkup('pending');

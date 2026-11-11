@@ -555,6 +555,12 @@ window.addEventListener('message', function(event) {
     case 'sandbox-state':
       renderSandboxPanel(msg.sandboxState);
       break;
+    case 'onosoo-project':
+      renderOnosooProject(msg.segment);
+      break;
+    case 'onosoo-project-copied':
+      onOnosooProjectCopied(msg);
+      break;
     case 'sandbox-output': {
       let sbOut = document.getElementById('sandbox-output');
       let sbWrap = document.getElementById('sandbox-output-wrap');
@@ -571,6 +577,145 @@ window.addEventListener('message', function(event) {
     renderSandboxPanel(msg.sandboxState);
   }
 });
+
+// ─── ONOSOO project segment (status bar) ───
+// The host sends the model ({ kind: 'hidden' | 'resolving' | 'key' | 'none', … }); phrases and the
+// revoked tooltip come with it. Built with DOM methods and textContent only: a key or URL never
+// goes through innerHTML.
+
+/** The segment model as the host sends it (ProjectSegmentModel in src/headless/project-id.ts). */
+interface OnosooSegmentView {
+  kind: string;
+  status?: string;
+  revokedTitle?: string;
+  projectKey?: string;
+  repoUrl?: string | null;
+  firstFolderName?: string | null;
+  phrase?: string;
+}
+let onosooSegment: OnosooSegmentView = { kind: 'hidden' };
+let onosooFeedbackTimer = null;
+
+/** A span with a long (>520px) and a short (≤520px) text; CSS shows one of them. */
+function onosooSized(className, longText, shortText) {
+  const wrap = document.createElement('span');
+  wrap.className = className;
+  const long = document.createElement('span');
+  long.className = 'onosoo-long';
+  long.textContent = longText;
+  const short = document.createElement('span');
+  short.className = 'onosoo-short';
+  short.textContent = shortText;
+  wrap.appendChild(long);
+  wrap.appendChild(short);
+  return wrap;
+}
+
+function onosooQualifier(m) {
+  if (m.status !== 'off' && m.status !== 'revoked') { return null; }
+  const q = document.createElement('span');
+  q.className = 'onosoo-qualifier' + (m.status === 'revoked' ? ' is-revoked' : '');
+  if (m.status === 'off') {
+    q.title = 'Relaying is off (agentTaskPlayer.onosoo.relay)';
+    q.appendChild(onosooSized('', '· relaying off', '· off'));
+  } else {
+    q.title = m.revokedTitle || '';
+    q.appendChild(document.createTextNode('· '));
+    const icon = document.createElement('span');
+    icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = '⚠ ';
+    q.appendChild(icon);
+    q.appendChild(onosooSized('', 'key revoked', 'revoked'));
+  }
+  return q;
+}
+
+function renderOnosooProject(m, feedback?) {
+  // A render without feedback ends any Copied / Not copied label still showing.
+  if (!feedback && onosooFeedbackTimer) { clearTimeout(onosooFeedbackTimer); onosooFeedbackTimer = null; }
+  onosooSegment =m && typeof m === 'object' && m.kind ? m : { kind: 'hidden' };
+  const el = document.getElementById('onosoo-project');
+  if (!el) { return; }
+  while (el.firstChild) { el.removeChild(el.firstChild); }
+  const seg = onosooSegment;
+  if (seg.kind !== 'resolving' && seg.kind !== 'key' && seg.kind !== 'none') {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+  el.classList.toggle('is-none', seg.kind === 'none');
+  el.appendChild(onosooSized('onosoo-label', 'ONOSOO project:', 'ONOSOO:'));
+
+  if (seg.kind === 'resolving') {
+    const t = document.createElement('span');
+    t.className = 'onosoo-text';
+    t.textContent = 'resolving…';
+    el.appendChild(t);
+  } else if (seg.kind === 'none') {
+    const line = 'none — ' + String(seg.phrase || '');
+    const t = document.createElement('span');
+    t.className = 'onosoo-text';
+    t.textContent = line;
+    t.title = 'ONOSOO project: ' + line;
+    el.appendChild(t);
+  } else {
+    const key = String(seg.projectKey || '');
+    const k = document.createElement('span');
+    k.className = 'onosoo-key';
+    k.textContent = key;
+    k.title = key + ' — runs started in VS Code report this ONOSOO project.'
+      + (seg.firstFolderName ? ' This is the first workspace folder, ' + seg.firstFolderName + '.' : '');
+    el.appendChild(k);
+  }
+
+  const q = onosooQualifier(seg);
+  if (q) { el.appendChild(q); }
+
+  if (seg.kind !== 'key') { return; }
+  const copy = document.createElement('button');
+  copy.type = 'button';
+  copy.className = 'prompt-action-btn ghost onosoo-copy';
+  copy.title = 'Copy this ONOSOO project ID';
+  copy.setAttribute('aria-label', 'Copy ONOSOO project ID');
+  copy.textContent = feedback || 'Copy';
+  copy.addEventListener('click', function() { vscode.postMessage({ type: 'copy-onosoo-project-id' }); });
+  el.appendChild(copy);
+
+  if (seg.repoUrl) {
+    const url = String(seg.repoUrl);
+    const open = document.createElement('button');
+    open.type = 'button';
+    open.className = 'onosoo-open';
+    open.title = 'Open ' + url + ' in your browser';
+    open.setAttribute('aria-label', 'Open repository ' + url + ' in browser');
+    const text = document.createElement('span');
+    text.className = 'onosoo-long';
+    text.textContent = 'Open repository ';
+    const arrow = document.createElement('span');
+    arrow.setAttribute('aria-hidden', 'true');
+    arrow.textContent = '↗';
+    open.appendChild(text);
+    open.appendChild(arrow);
+    open.addEventListener('click', function() { vscode.postMessage({ type: 'open-onosoo-repository' }); });
+    el.appendChild(open);
+  }
+}
+
+/** The host's answer to a Copy click: brief feedback on the button and one polite announcement. */
+function onOnosooProjectCopied(msg) {
+  if (onosooFeedbackTimer) { clearTimeout(onosooFeedbackTimer); onosooFeedbackTimer = null; }
+  const live = document.getElementById('onosoo-project-live');
+  if (live) {
+    live.textContent = msg.ok
+      ? 'ONOSOO project ID copied to the clipboard.'
+      : 'ONOSOO project ID not copied' + (msg.phrase ? ': ' + msg.phrase : '') + '.';
+  }
+  renderOnosooProject(onosooSegment, msg.ok ? 'Copied' : 'Not copied');
+  onosooFeedbackTimer = setTimeout(function() {
+    onosooFeedbackTimer = null;
+    renderOnosooProject(onosooSegment);
+  }, 1500);
+}
 
 // ─── Context Memory Panel ───
 
@@ -1373,13 +1518,14 @@ function renderPlaylistTiles(plan) {
 function renderStatus(state) {
   runnerState = state;
   const el = document.getElementById('runner-status');
-  const stateLabels = { playing: 'Executing', paused: 'Paused', stopping: 'Stopping', idle: 'Idle' };
+  const stateLabels = { playing: 'Running', paused: 'Paused', stopping: 'Stopping', idle: 'Idle' };
   el.textContent = stateLabels[state] || (state.charAt(0).toUpperCase() + state.slice(1));
   el.className = 'status-badge status-' + state;
   const playBtn = document.getElementById('btn-play');
   const pauseBtn = document.getElementById('btn-pause');
   const stopBtn = document.getElementById('btn-stop');
   playBtn.disabled = state === 'playing';
+  playBtn.title = state === 'paused' ? 'Resume' : 'Run Plan';
   pauseBtn.disabled = state !== 'playing';
   stopBtn.disabled = state === 'idle';
   playBtn.className = playBtn.disabled ? 'icon-btn' : 'icon-btn primary';
