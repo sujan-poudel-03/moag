@@ -166,8 +166,16 @@ wait in a local spool (`<config>/moag/onosoo-spool/`) and are sent by the next r
 
 #### How a project gets into ONOSOO
 
-There is no "Add project" button. **Running MOAG in a folder is what adds it:** the first run from
-that folder, from the VS Code panel or `moag run`, creates its project in ONOSOO.
+A project gets into ONOSOO in one of two ways:
+
+- **Automatically:** running MOAG in a folder adds it. The first run from that folder, from the VS
+  Code panel or `moag run`, creates its project in ONOSOO. Nothing to set up.
+- **By hand, in ONOSOO:** an owner or admin creates the project first and adds its repositories
+  (see [Create a project and add its repositories](#create-a-project-and-add-its-repositories)
+  below). Use this to group repositories that live in separate folders or on separate machines,
+  such as a backend, a frontend and a mobile app, as one project.
+
+The automatic way:
 
 1. Open the project folder in VS Code (or `cd` into it for `moag run`).
 2. Generate or open a plan and press **Play**.
@@ -190,14 +198,45 @@ not used. An SSH nickname for GitHub, GitLab or Bitbucket (`git@github.com-perso
 counts as the real host, so it gives the same project as a normal clone. The full list of examples is
 [project-key-vectors.json](project-key-vectors.json).
 
-In ONOSOO, an owner or admin can **rename** a project (the ONOSOO name then wins over the plan's
-name) and **merge** two projects that are really one (for example, runs from before and after the
-repository got a remote).
+#### Create a project and add its repositories
 
-> **Availability.** MOAG sends the project ID from the release after 0.10.0. The **Projects** page in
-> ONOSOO Builds (the list, rename and merge) comes with ONOSOO's Builds protocol v1.2 update. Until
-> both are live, runs still appear under **Builds → Runs** with their project name, just not grouped
-> under a project.
+In ONOSOO, open **Builds → Projects**. Owners and admins see these actions:
+
+1. **Create project:** a name (up to 120 characters) and an optional description. The project is
+   empty until a repository is added or a run arrives.
+2. On the project's page, under **Repositories**, choose **Add repository**. The one box,
+   **Repository URL or ONOSOO Project ID**, takes either:
+   - the repository's address as you would clone it: `https://github.com/owner/repo`,
+     `git@github.com:owner/repo.git` or `ssh://…`. ONOSOO turns it into the same `git:` ID MOAG
+     sends, so later runs from any clone land in this project. A password or token in the address
+     is never stored.
+   - a **Project ID** (`git:…`, `root:…` or `multi:…`). This is the only way to add a repository
+     with no remote. To get it, run this in the repository and put `root:` in front of the result
+     (if it prints several lines, use the one that sorts first):
+
+     ```sh
+     git rev-list --max-parents=0 HEAD
+     ```
+3. Repeat for each repository of the project (backend, frontend, mobile, …).
+
+Rules ONOSOO applies:
+
+- A repository belongs to **one** project. Adding one that another project already holds asks
+  whether to **move** it.
+- An added repository **wins** over the automatic project: the runs it already had move into your
+  project, and every later run from it lands there.
+- **Remove** unlinks a repository. Its runs stay where they are; its next run creates or finds a
+  project automatically again.
+
+An owner or admin can also **rename** a project (ONOSOO's name then wins over the plan's name) and
+**merge** two projects that are really one (for example, runs from before and after the repository
+got a remote). MOAG is never told about any of this: it keeps sending the same ID, and ONOSOO finds
+the project.
+
+> **Availability.** MOAG sends the project ID from the release after 0.10.0 (or a build of `dev`
+> installed with `npm run deploy`). ONOSOO's **Projects** page, with create, add repository, rename
+> and merge, comes with its Builds protocol v1.2 update. Until both are live, runs still appear under
+> **Builds → Runs** with their project name, just not grouped under a project.
 
 To **start runs from ONOSOO** on a project (Level 2), the project must also be approved on the
 machine: see [Approve projects and switch remote start on](#5-approve-projects-and-switch-remote-start-on).
