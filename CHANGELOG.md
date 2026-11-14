@@ -10,6 +10,7 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ### Added
 
+- **Local mode for ONOSOO remote runs.** With `"mode": "local"` in `projects.json`, a plain Windows, macOS or Linux PC can take **Start run** from ONOSOO and run it as the same user: no runner account, no sudo, no WSL. It is opt-in only (never inferred), keeps the approved-project list, budget, 4-hour cap, `moag/...` worktree, delivery and audit, reports `mode` in its capabilities, prints a warning that runs use your own privileges, and force-stops the whole process tree. The isolated mode is unchanged. See "Local mode" in `docs/onosoo-remote.md`.
 - **ONOSOO project identity (Builds protocol v1.2).** Every run tells ONOSOO which project it belongs to, with an id that is the same on every machine and survives renaming the folder: the repository's `origin` remote (`git:github.com/owner/repo`, plus a link), else its first commit (`root:…`), else, for a folder of several repositories, a `multi:…` id with the list of them. Credentials, ports and local paths are never sent. See "How a project gets into ONOSOO" in `docs/onosoo-builds.md`.
 - `docs/project-key-vectors.json`: example remotes and the id each one gives, checked by MOAG's tests and shared with ONOSOO.
 - Remote runs: an engine login check, the reason an installed engine is not offered, branch delivery, and each task's stage and kind in run-meta.
