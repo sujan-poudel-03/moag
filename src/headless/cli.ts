@@ -1366,7 +1366,7 @@ export async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
 const REMOTE_HELPER_TIMEOUT_MS = 15_000;
 
 /** Run a sudo helper (probe, kill sweep) with a bounded wait; resolves its stdout (capped at 1 MB). */
-function runHelper(command: { command: string; args: string[] }, input: string | null): Promise<string> {
+function runHelper(command: { command: string; args: string[] }, input: string | null, env?: NodeJS.ProcessEnv): Promise<string> {
   const { spawn } = require('child_process');
   const { childSpawnEnv } = require('./remote-isolation');
   return new Promise((resolve) => {
@@ -1381,7 +1381,7 @@ function runHelper(command: { command: string; args: string[] }, input: string |
     };
     let proc: any;
     try {
-      proc = spawn(command.command, command.args, { stdio: ['pipe', 'pipe', 'pipe'], env: childSpawnEnv(process.env), windowsHide: true });
+      proc = spawn(command.command, command.args, { stdio: ['pipe', 'pipe', 'pipe'], env: env ?? childSpawnEnv(process.env), windowsHide: true });
     } catch {
       resolve('');
       return;
@@ -1441,6 +1441,9 @@ function createDaemonRemoteHost(
   // The runner account's home, learned from the probe, so worktree paths are scrubbed from relayed events.
   let runnerHome: string | null = null;
   const runnerUser = (): string | null => loadApprovedProjects(cfg.stateDir).runnerUser;
+  const isLocal = (): boolean => loadApprovedProjects(cfg.stateDir).mode === 'local';
+  // Local mode: mirrors, worktrees and run scratch live here (under MOAG's state dir), never in a runner's home.
+  const localRoot = path.join(cfg.stateDir, iso.LOCAL_RUNNER_DIR);
 
   return createCommandHost({
     control,
@@ -1451,6 +1454,12 @@ function createDaemonRemoteHost(
       // MOAG's own checks first: its state must be private, whatever the runner says.
       const insecure = iso.checkStateSecurity(cfg.stateDir, ownUid);
       if (insecure) { return { ok: false, reason: insecure }; }
+      if (projects.mode === 'local') {
+        // Local mode: ask a child running as THIS user which engines are installed and signed in.
+        const lc = iso.localChildCommand(process.execPath, cliPath);
+        const lspec = JSON.stringify({ op: 'probe', protectedPaths: [], projects: projects.projects.map((p: any) => p.id), engineEnv, localRoot });
+        return iso.parseProbe(await runHelper(lc, lspec, iso.localChildEnv(process.env)), ownUid, [], { local: true });
+      }
       const command = iso.childCommand(projects.runnerUser, process.execPath, cliPath);
       const spec = JSON.stringify({ op: 'probe', protectedPaths, projects: projects.projects.map((p: any) => p.id), engineEnv });
       const out = iso.parseProbe(await runHelper(command, spec), ownUid, protectedPaths);
@@ -1465,13 +1474,20 @@ function createDaemonRemoteHost(
       if (out.home) { runnerHome = out.home; }
       return out;
     },
-    supervisorFactory: (req: any) => new RemoteSupervisor({
+    supervisorFactory: (req: any) => { const local = isLocal(); let localChildPid: number | undefined; return new RemoteSupervisor({
       record: req.record,
       projectName: req.project.name,
       projectIdentity: req.identity ?? null,
       specLine: req.specLine,
       bundle: req.bundle,
       spawnChild: () => {
+        if (local) {
+          // Local mode: the same user, no sudo. POSIX: its own process group, so force-stop can kill the tree.
+          const c = iso.localChildCommand(process.execPath, cliPath);
+          const child = spawn(c.command, c.args, { detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'], env: iso.localChildEnv(process.env), windowsHide: true });
+          localChildPid = child.pid;
+          return child;
+        }
         const c = iso.childCommand(runnerUser(), process.execPath, cliPath);
         return spawn(c.command, c.args, { detached: true, stdio: ['pipe', 'pipe', 'pipe'], env: iso.childSpawnEnv(process.env), windowsHide: true });
       },
@@ -1482,8 +1498,9 @@ function createDaemonRemoteHost(
         redactor: redactorFor(req.project.path),
         stderr,
         runId,
-        cwd: runnerHome ? path.posix.join(runnerHome, '.moag-remote', 'worktrees', runId) : req.project.path,
-        otherHomes: runnerHome ? [runnerHome] : [],
+        cwd: local ? path.join(localRoot, '.moag-remote', 'worktrees', runId)
+          : (runnerHome ? path.posix.join(runnerHome, '.moag-remote', 'worktrees', runId) : req.project.path),
+        otherHomes: local ? [localRoot] : (runnerHome ? [runnerHome] : []),
       }),
       ledger,
       runs,
@@ -1509,18 +1526,26 @@ function createDaemonRemoteHost(
         }, delivery.realDeliveryDeps);
       },
       forceKill: async () => {
+        if (local) {
+          // The child's whole process tree: taskkill /T /F on Windows, SIGKILL to the process group elsewhere.
+          const k = iso.localKillAction(localChildPid, process.platform);
+          if (k?.type === 'command') { await runHelper(k, null, iso.localChildEnv(process.env)); }
+          else if (k?.type === 'group') { try { process.kill(-k.pgid, k.signal); } catch { /* already gone */ } }
+          return;
+        }
         const user = runnerUser();
         if (user && user !== 'root') { await runHelper(iso.forceKillCommand(user), null); }
       },
-      // After every run: nothing the runner account started outlives it.
+      // After every run: nothing the runner account started outlives it. (Local mode: the child kills its own tree on exit.)
       sweep: async () => {
+        if (local) { return; }
         const user = runnerUser();
         if (user && user !== 'root') { await runHelper(iso.forceKillCommand(user), null); }
       },
       stderr,
       onStarted: req.onStarted,
       onExit: req.onExit,
-    }),
+    }); },
     exportBundle: (projectPath: string, opts: any) => branch.exportInboundBundle(projectPath, opts, branch.spawnBranchGit),
     branchExists: (projectPath: string, name: string) => branch.projectHasBranch(projectPath, name, branch.spawnBranchGit),
     projectBranchTip: (projectPath: string, name: string) => branch.projectBranchTip(projectPath, name, branch.spawnBranchGit),
@@ -1544,6 +1569,7 @@ function createDaemonRemoteHost(
       }
     },
     killSweep: async (user: string) => { await runHelper(iso.forceKillCommand(user), null); },
+    localRoot,
     tighten: () => {
       for (const problem of iso.tightenStatePermissions(cfg.stateDir)) { stderr(`ONOSOO: could not tighten permissions: ${problem}\n`); }
     },

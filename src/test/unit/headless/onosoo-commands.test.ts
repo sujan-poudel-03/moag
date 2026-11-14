@@ -177,7 +177,7 @@ describe('ONOSOO command host', () => {
     await h.host.tick();
     await h.host.tick();
     assert.equal(h.control.caps.length, 1);
-    assert.deepEqual(h.control.caps[0], { remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'] }], engines: ['claude', 'ollama'] });
+    assert.deepEqual(h.control.caps[0], { mode: 'isolated', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'] }], engines: ['claude', 'ollama'] });
     assert.ok(!JSON.stringify(h.control.caps).includes(PROJECT_PATH));
     h.setProjects(projects({ projects: [{ id: 'web', name: 'Web (renamed)', kinds: [], path: PROJECT_PATH }] }));
     await h.host.tick();
@@ -879,5 +879,71 @@ describe('ONOSOO command host — project identity', () => {
     assert.deepEqual(h.control.caps[0].projects, [{ id: 'web', name: 'Web app', kinds: ['node'] }]);
     assert.equal(h.sups.length, 1);
     assert.equal(h.sups[0].req.identity, null);
+  });
+});
+
+describe('ONOSOO command host — local mode', () => {
+  const local = (over: Partial<ApprovedProjects> = {}): ApprovedProjects => projects({ mode: 'local', runnerUser: null, ...over });
+
+  it('on Windows with no runner_user, local mode reports remote_start, mode "local" and the engines the probe found; no path leaks', async () => {
+    const h = harness({ platform: 'win32' });
+    h.setProjects(local());
+    await h.host.tick();
+    assert.deepEqual(h.control.caps[0], { mode: 'local', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'] }], engines: ['claude', 'ollama'] });
+    assert.ok(!JSON.stringify(h.control.caps).includes(PROJECT_PATH));
+  });
+
+  it('starts a run on Windows in local mode', async () => {
+    const h = harness({ platform: 'win32' });
+    h.setProjects(local());
+    h.control.polls.push([startRun('c1')]);
+    await h.host.tick();
+    assert.equal(h.sups.length, 1);
+    assert.deepEqual(finals(h.control, 'c1')[0].status, 'running');
+  });
+
+  it('local mode still needs remote_start and a daily budget', async () => {
+    const h = harness({ platform: 'win32' });
+    h.setProjects(local({ dailyBudgetUsd: null }));
+    h.control.polls.push([startRun('c1')]);
+    await h.host.tick();
+    assert.equal(h.control.caps[0].remote_start, false);
+    assert.equal(h.sups.length, 0);
+    const off = harness({ platform: 'win32' });
+    off.setProjects(local({ remoteStart: false }));
+    off.control.polls.push([startRun('c2')]);
+    await off.host.tick();
+    assert.equal(off.sups.length, 0);
+    assert.equal(off.control.caps[0].remote_start, false);
+  });
+
+  it('local mode only starts approved projects', async () => {
+    const h = harness({ platform: 'win32' });
+    h.setProjects(local());
+    h.control.polls.push([startRun('c1', { project_id: 'not-listed' })]);
+    await h.host.tick();
+    assert.equal(h.sups.length, 0);
+    assert.equal(finals(h.control, 'c1')[0].status, 'rejected');
+  });
+
+  it('prints the one-line privilege warning once, and only in local mode', async () => {
+    const lines: string[] = [];
+    const h = harness({ platform: 'win32', stderr: (s) => { lines.push(s); } });
+    h.setProjects(local());
+    await h.host.tick();
+    await h.host.tick();
+    assert.equal(lines.filter((l) => /LOCAL MODE/.test(l) && /own privileges/.test(l)).length, 1);
+    const iso: string[] = [];
+    const h2 = harness({ platform: 'linux', stderr: (s) => { iso.push(s); } });
+    await h2.host.tick();
+    assert.equal(iso.filter((l) => /LOCAL MODE/.test(l)).length, 0);
+  });
+
+  it('isolated mode on Windows is still refused (mode "isolated" is reported)', async () => {
+    const h = harness({ platform: 'win32' });
+    h.setProjects(projects({ mode: 'isolated' }));
+    await h.host.tick();
+    assert.equal(h.control.caps[0].mode, 'isolated');
+    assert.equal(h.control.caps[0].remote_start, false);
   });
 });

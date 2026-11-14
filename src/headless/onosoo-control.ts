@@ -42,6 +42,8 @@ export interface CommandResult {
 export type ResultOutcome = 'delivered' | 'final' | 'drop' | 'retry' | 'revoked';
 
 export interface Capabilities {
+  /** `local`: runs execute as this PC's own user; `isolated`: as a separate runner account. */
+  mode: 'local' | 'isolated';
   remote_start: boolean;
   /** `key` (protocol v1.2) is the folder's project_key when known; never a path or a URL. */
   projects: Array<{ id: string; name: string; kinds: string[]; key?: string }>;

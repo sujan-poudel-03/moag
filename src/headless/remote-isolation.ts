@@ -34,7 +34,9 @@ export const NO_PROBE_ANSWER = 'The runner account did not answer the isolation 
 export const REMOTE_EXCLUDED_ENGINES: ReadonlySet<string> = new Set(['copilot', 'custom']);
 
 /** Why this machine cannot take remote work at all, or null when it may (pending the probe). */
-export function isolationRefusal(platform: NodeJS.Platform, runnerUser: string | null): string | null {
+export function isolationRefusal(platform: NodeJS.Platform, runnerUser: string | null, mode: 'local' | 'isolated' = 'isolated'): string | null {
+  // Local mode is the owner's explicit choice to run as their own user: no platform or runner checks apply.
+  if (mode === 'local') { return null; }
   if (platform !== 'linux') {
     return `Remote runs need a Linux (or WSL) build machine with a separate runner account; this PC runs ${platform === 'win32' ? 'Windows' : platform === 'darwin' ? 'macOS' : platform}.`;
   }
@@ -64,6 +66,64 @@ export function childSpawnEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   for (const [k, v] of Object.entries(env)) {
     if (v === undefined) { continue; }
     if (k === 'PATH' || k === 'LANG' || k === 'TZ' || k.startsWith('LC_')) { out[k] = v; }
+  }
+  return out;
+}
+
+// ─── Local mode (this PC's own user; no runner account) ───
+
+/** The one stderr line printed whenever the daemon is in local mode. */
+export const LOCAL_MODE_WARNING = 'ONOSOO: LOCAL MODE - runs started from ONOSOO execute on this PC with THIS user\'s own privileges '
+  + '(no runner account, no isolation): the agent can read and change anything you can. Only approved projects run, within the budget and 4-hour cap.';
+
+/** Directory under MOAG's state dir that holds local-mode mirrors, worktrees and run scratch (`<it>/.moag-remote/...`). */
+export const LOCAL_RUNNER_DIR = 'local-runner';
+
+/** `<node> <cli.js> remote-child`, run directly as the current user: no sudo. */
+export function localChildCommand(nodePath: string, cliPath: string): SpawnCommand {
+  return { command: nodePath, args: [cliPath, 'remote-child'] };
+}
+
+/** How to force-stop a local child and everything it started. */
+export type LocalKill =
+  | { type: 'command'; command: string; args: string[] }
+  | { type: 'group'; pgid: number; signal: 'SIGKILL' };
+
+/**
+ * win32: `taskkill /PID <pid> /T /F` (the whole tree). POSIX: SIGKILL to the child's process
+ * group (the child is spawned detached, so its pid is its group id). Null for an unusable pid.
+ */
+export function localKillAction(pid: number | undefined, platform: NodeJS.Platform = process.platform): LocalKill | null {
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1) { return null; }
+  if (platform === 'win32') { return { type: 'command', command: 'taskkill', args: ['/PID', String(pid), '/T', '/F'] }; }
+  return { type: 'group', pgid: pid, signal: 'SIGKILL' };
+}
+
+/**
+ * Names (upper-case) a user-level child may inherit besides PATH, LANG, TZ and LC_*: the home and
+ * profile locations, temp dirs and shell/system variables engine CLIs need to find their login.
+ * Secrets are not here: engine API keys travel in the job spec, the device key never travels.
+ */
+export const LOCAL_ENV_ALLOWLIST: readonly string[] = [
+  // POSIX and cross-platform
+  'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'TERM', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
+  // Windows
+  'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432',
+  'COMMONPROGRAMFILES', 'COMMONPROGRAMFILES(X86)', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'TEMP', 'TMP', 'COMSPEC', 'PATHEXT',
+  'USERNAME', 'USERDOMAIN', 'COMPUTERNAME', 'OS', 'PROCESSOR_ARCHITECTURE', 'NUMBER_OF_PROCESSORS',
+];
+
+/**
+ * The local child's environment: the isolated allowlist plus LOCAL_ENV_ALLOWLIST. Never any MOAG_*
+ * or ONOSOO* variable (the device key lives there if anywhere) and never CI.
+ */
+export function localChildEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (v === undefined) { continue; }
+    const name = k.toUpperCase();
+    if (name === 'CI' || name.startsWith('MOAG_') || name.startsWith('ONOSOO')) { continue; }
+    if (name === 'PATH' || name === 'LANG' || name === 'TZ' || name.startsWith('LC_') || LOCAL_ENV_ALLOWLIST.includes(name)) { out[k] = v; }
   }
   return out;
 }
@@ -105,7 +165,8 @@ const SHA_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
  * Check a probe child's stdout. Isolation holds only when the child runs as a
  * different, non-root uid and could read none of `protectedPaths`.
  */
-export function parseProbe(stdout: string, ownUid: number, protectedPaths: readonly string[]): ProbeOutcome {
+export function parseProbe(stdout: string, ownUid: number, protectedPaths: readonly string[], opts: { local?: boolean } = {}): ProbeOutcome {
+  const local = opts.local === true;
   // The FIRST probe line counts; anything the child prints after it is ignored.
   let report: Partial<ProbeReport> | null = null;
   for (const l of stdout.split('\n')) {
@@ -117,10 +178,11 @@ export function parseProbe(stdout: string, ownUid: number, protectedPaths: reado
   }
   if (!report) { return { ok: false, reason: NO_PROBE_ANSWER }; }
   if (typeof report.uid !== 'number' || !Number.isInteger(report.uid)) { return { ok: false, reason: 'The isolation check did not report the runner account.' }; }
-  if (report.uid === 0) { return { ok: false, reason: 'The runner account is root; remote runs need a separate unprivileged account.' }; }
-  if (report.uid === ownUid) { return { ok: false, reason: 'The runner account is the same account as MOAG; remote runs need a separate account.' }; }
+  // Local mode runs as the same user on purpose: no uid or readability checks (the uid is -1 on Windows).
+  if (!local && report.uid === 0) { return { ok: false, reason: 'The runner account is root; remote runs need a separate unprivileged account.' }; }
+  if (!local && report.uid === ownUid) { return { ok: false, reason: 'The runner account is the same account as MOAG; remote runs need a separate account.' }; }
   const unreadable = report.unreadable && typeof report.unreadable === 'object' ? report.unreadable : {};
-  for (const p of protectedPaths) {
+  for (const p of local ? [] : protectedPaths) {
     if (unreadable[p] !== true) {
       return { ok: false, reason: `The runner account can read ${path.basename(p)}; tighten its permissions (MOAG does this at start-up) before remote runs are allowed.` };
     }
@@ -248,6 +310,8 @@ export function tightenStatePermissions(stateDir: string, platform: NodeJS.Platf
     for (const e of entries) {
       const p = path.join(dir, e.name);
       if (e.isSymbolicLink()) { continue; }
+      // Local-mode mirrors and worktrees hold the user's own code: never flatten their file modes to 0600.
+      if (dir === stateDir && e.name === LOCAL_RUNNER_DIR) { continue; }
       if (e.isDirectory()) { walk(p); continue; }
       try { fs.chmodSync(p, 0o600); } catch (err) { problems.push(`${p}: ${(err as Error).message}`); }
     }
