@@ -6,11 +6,19 @@
  * Free of any `vscode` import (asserted by src/test/unit/server/no-vscode.test.ts); the
  * VS Code glue — setting, status bar, notices — lives in src/ui/onosoo-relay-host.ts.
  * Nothing here awaits on the event path: a relay's close is fire-and-forget.
+ *
+ * Project identity (protocol v1.2): run-meta (seq 1) carries the folder's project key. A key
+ * the identity cache already holds is used at once; otherwise the relay is built but not
+ * started, the run's lines are buffered, and the relay starts when the key resolves or after
+ * `identityWaitMs` (no key) — run-meta first, then the buffered lines in order. A run that
+ * ends (or a dispose) while waiting starts the relay at once with whatever the cache holds.
  */
 
 import {
-  RunLine, startRunRelay, subscribeRunCostLines, tallyPlan, wireRunEventLines,
+  prepareRunRelay, RunLine, subscribeRunCostLines, tallyPlan, wireRunEventLines,
 } from './run-reporter';
+import { IDENTITY_WAIT_MS } from './project-identity';
+import type { ProjectIdentity, ProjectIdentityCache } from './project-identity';
 import { reportingSecretValues, ReportingRunner, wireTaskReporting } from './task-reporting';
 import { resolveOnosooConfig } from './onosoo-config';
 import { OnosooRelay, RelayHttpClient, REVOKED_MESSAGE } from './onosoo-relay';
@@ -37,6 +45,9 @@ export const HOST_COST_LABELS: ReadonlySet<string> = new Set(['task']);
 
 /** How long after a run ends its PR may still be reported on the same run. */
 export const PR_FOLLOW_UP_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+/** Most lines buffered while a run waits for its project identity; later ones are dropped. */
+export const PENDING_LINES_MAX = 1000;
 
 /**
  * The run-finished code of a host run: 4 when a budget breach stopped it, 1 when a task
@@ -72,6 +83,10 @@ export interface HostRunRelayDeps {
   isPidAlive?: (pid: number) => boolean;
   closeDeadlineMs?: number;
   collect?: typeof collectTaskChanges;
+  /** The project identity cache (protocol v1.2). Absent: run-meta carries no key. */
+  identity?: Pick<ProjectIdentityCache, 'peek' | 'warm' | 'within'>;
+  /** How long a run waits for an uncached identity (default IDENTITY_WAIT_MS). */
+  identityWaitMs?: number;
 }
 
 /** A live controller. */
@@ -130,6 +145,8 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
   let runsStarted = 0;
   let last: LastRun | null = null;
   let prChain: Promise<void> = Promise.resolve();
+  /** A run whose relay waits for its project identity: its lines are buffered until then. */
+  let pending: { token: number; begin: (identity?: ProjectIdentity | null) => boolean; lines: RunLine[] } | null = null;
   /** The Anthropic key from the host's secret store, an exact-value secret for the redactor. */
   let storedAnthropicKey: string | undefined;
   const refreshStoredSecret = (): void => {
@@ -145,7 +162,50 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
   /** Record one line on the live relay, stamped as the CLI's emit stamps it. */
   const rec = (obj: RunLine): void => {
     if (!relay) { return; }
+    if (pending) {
+      if (pending.lines.length < PENDING_LINES_MAX) { pending.lines.push({ ts: new Date().toISOString(), ...obj }); }
+      return;
+    }
     try { relay.record({ ts: new Date().toISOString(), ...obj }); } catch { /* the relay never disturbs the run */ }
+  };
+
+  /** The cached identity of `cwd`: undefined when never resolved (or no cache). Never throws. */
+  const peekIdentity = (cwd: string | null): ProjectIdentity | null | undefined => {
+    if (!cwd || !d.identity) { return undefined; }
+    try { return d.identity.peek(cwd); } catch { return undefined; }
+  };
+
+  /** Stop relaying the current run without a run-finished (its relay never started). */
+  const detachRun = (): void => {
+    try { offCost?.(); } catch { /* ignore */ }
+    try { unwireReporting?.(); } catch { /* ignore */ }
+    offCost = null;
+    unwireReporting = null;
+    relay = null;
+    scoped = null;
+  };
+
+  /**
+   * Start a waiting run's relay with `identity` (run-meta, seq 1), then record its buffered
+   * lines in order. Ignored unless `token` is the waiting run's: a late lookup never touches a
+   * later run.
+   */
+  const settle = (token: number, identity: ProjectIdentity | null): void => {
+    const p = pending;
+    if (!p || p.token !== token) { return; }
+    pending = null;
+    let begun = false;
+    try { begun = p.begin(identity); } catch { /* begin never throws; belt and braces */ }
+    if (!begun) {
+      detachRun();
+      setStatus('none');
+      return;
+    }
+    const r = relay;
+    if (!r) { return; }
+    for (const line of p.lines) {
+      try { r.record(line); } catch { /* the relay never disturbs the run */ }
+    }
   };
 
   const beginRun = (): void => {
@@ -156,6 +216,7 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     relay = null;
     scoped = null;
     runsStarted++;
+    pending = null;
     refreshStoredSecret();
     const cwd = d.cwd();
     runCwd = cwd;
@@ -170,7 +231,7 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     const buildRedactor = (extra: string[]): Redactor =>
       createRedactor(reportingSecretValues(cwd, env, storedAnthropicKey ? [...extra, storedAnthropicKey] : extra));
     const redactorExtra: string[] = [];
-    const started = startRunRelay({
+    const started = prepareRunRelay({
       cwd,
       plan: runPlan,
       env,
@@ -184,6 +245,22 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
       closeDeadlineMs: d.closeDeadlineMs,
     });
     if (!started) { setStatus('none'); return; }
+
+    // The identity decides when run-meta goes out; decided before any line of this run is recorded.
+    const token = runsStarted;
+    let waitFor = false;
+    if (!d.identity) {
+      if (!started.begin(null)) { setStatus('none'); return; }
+    } else {
+      const known = peekIdentity(cwd);
+      if (known !== undefined) {
+        if (!started.begin(known)) { setStatus('none'); return; }
+        try { void d.identity.warm(cwd).catch(() => undefined); } catch { /* a refresh never disturbs a run */ }
+      } else {
+        waitFor = true;
+        pending = { token, begin: started.begin, lines: [] };
+      }
+    }
 
     relay = started.relay;
     scoped = runPlan;
@@ -203,9 +280,19 @@ export function createHostRunRelay(d: HostRunRelayDeps): HostRunRelay {
     });
     setStatus('on');
     try { d.onRunRelayed?.(runPlan); } catch { /* a notice never disturbs a run */ }
+    if (waitFor && d.identity) {
+      try {
+        d.identity.within(cwd, d.identityWaitMs ?? IDENTITY_WAIT_MS)
+          .then((id) => settle(token, id ?? null), () => settle(token, null));
+      } catch {
+        settle(token, null);
+      }
+    }
   };
 
   const finishRun = (): void => {
+    // Still waiting for the identity: start the relay now with whatever the cache holds.
+    if (pending) { settle(pending.token, peekIdentity(runCwd) ?? null); }
     if (relay && scoped) {
       try { offCost?.(); } catch { /* ignore */ }
       const t = tallyPlan(scoped);

@@ -396,6 +396,31 @@ describe('remote child — probe', () => {
   });
 });
 
+describe('remote child — probe engine issues', () => {
+  it('reports why an installed engine is not usable when the report form is available', async () => {
+    const h = harness();
+    const deps = {
+      ...h.deps,
+      home: h.home,
+      detectEngineReport: async () => ({ engines: ['gemini'], issues: { claude: 'Claude Code is not signed in.' } }),
+    };
+    const code = await runRemoteChild({ op: 'probe', protectedPaths: [], projects: [], engineEnv: {} }, deps);
+    assert.equal(code, 0);
+    assert.deepEqual(h.lines[0].engines, ['gemini']);
+    assert.deepEqual(h.lines[0].engineIssues, { claude: 'Claude Code is not signed in.' });
+  });
+
+  it('falls back to the plain engine list, with no issues, when the report form is absent or fails', async () => {
+    const h = harness();
+    await runRemoteChild({ op: 'probe', protectedPaths: [], projects: [], engineEnv: {} }, { ...h.deps, home: h.home });
+    assert.deepEqual(h.lines[0].engineIssues, {});
+    const h2 = harness();
+    await runRemoteChild({ op: 'probe', protectedPaths: [], projects: [], engineEnv: {} }, { ...h2.deps, home: h2.home, detectEngineReport: async () => { throw new Error('boom'); } });
+    assert.deepEqual(h2.lines[0].engines, []);
+    assert.deepEqual(h2.lines[0].engineIssues, {});
+  });
+});
+
 describe('remote child — spec and transforms', () => {
   it('parseSpec accepts a run and a probe, rejects anything malformed', () => {
     assert.ok(parseSpec(JSON.stringify(spec())));

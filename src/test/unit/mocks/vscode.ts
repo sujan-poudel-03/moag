@@ -131,6 +131,14 @@ export class Uri {
     return new Uri(path);
   }
 
+  /** Mirrors vscode.Uri.parse: toString() gives back the parsed value. */
+  static parse(value: string) {
+    const u = new Uri(value);
+    (u as { scheme: string }).scheme = value.split(':')[0] ?? '';
+    u.toString = () => value;
+    return u;
+  }
+
   /** Mirrors vscode.Uri.joinPath — used to build webview resource URIs. */
   static joinPath(base: Uri, ...parts: string[]) {
     return new Uri([base.fsPath.replace(/[\/]+$/, ''), ...parts].join('/'));
@@ -226,7 +234,7 @@ Object.assign(window, {
   showSaveDialog: async () => undefined,
   showTextDocument: async () => ({ document: {}, selection: null }),
   withProgress: async (_o: unknown, task: (p: unknown, t: unknown) => unknown) =>
-    task({ report: () => {} }, { isCancellationRequested: false }),
+    task({ report: () => {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose: () => {} }) }),
   onDidChangeActiveTextEditor: () => ({ dispose: () => {} }),
   onDidChangeVisibleTextEditors: () => ({ dispose: () => {} }),
   onDidChangeWindowState: () => ({ dispose: () => {} }),

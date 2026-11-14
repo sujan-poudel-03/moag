@@ -11,7 +11,7 @@
       "DOM.Iterable"
     ],
     "module": "none",
-    "outDir": "out/webview",
+    "outDir": "../../out/webview",
     "strict": false,
     "noImplicitAny": false,
     "strictNullChecks": false,

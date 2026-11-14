@@ -1,7 +1,7 @@
 {
   "name": "agent-task-player",
   "displayName": "MOAG — AI Agent Orchestrator",
-  "description": "Orchestrate AI coding agents from VS Code. Build plans, hit Play, and let Claude, Codex, Gemini, or Ollama execute — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
+  "description": "Orchestrate AI coding agents from VS Code. Build a plan, hit Run, and let Claude, Codex, Gemini, or Ollama do the work — with multi-agent review, auto-fix, smart planning, and GitHub integration.",
   "version": "0.10.0",
   "publisher": "moag",
   "license": "MIT",
@@ -77,7 +77,7 @@
       },
       {
         "command": "agentTaskPlayer.play",
-        "title": "Play",
+        "title": "Run Plan",
         "category": "MOAG",
         "icon": "$(play)"
       },
@@ -197,7 +197,7 @@
       },
       {
         "command": "agentTaskPlayer.playPlaylist",
-        "title": "Play Playlist",
+        "title": "Run Playlist",
         "category": "MOAG",
         "icon": "$(play)"
       },
@@ -440,6 +440,11 @@
       {
         "command": "agentTaskPlayer.disconnectOnosoo",
         "title": "Disconnect from ONOSOO",
+        "category": "MOAG"
+      },
+      {
+        "command": "agentTaskPlayer.copyOnosooProjectId",
+        "title": "Copy ONOSOO Project ID",
         "category": "MOAG"
       },
       {
@@ -1757,10 +1762,10 @@
           },
           {
             "id": "hitPlay",
-            "title": "Hit Play!",
-            "description": "Click the **Play** $(play) button in the Plan panel toolbar. Here's what happens:\n\n1. Extension checks if your CLI is installed (warns if not)\n2. Sends the first task's prompt to the agent CLI\n3. The agent works on your project files\n4. Output streams live in the Dashboard\n5. Moves to the next task automatically\n\n[Play](command:agentTaskPlayer.play) · [Open Dashboard](command:agentTaskPlayer.showDashboard)\n\nUse **Pause** $(debug-pause) to hold between tasks, or **Stop** $(debug-stop) to abort.",
+            "title": "Run your plan",
+            "description": "Click the **Run Plan** $(play) button in the Plan panel toolbar. Here's what happens:\n\n1. Extension checks if your CLI is installed (warns if not)\n2. Sends the first task's prompt to the agent CLI\n3. The agent works on your project files\n4. Output streams live in the Dashboard\n5. Moves to the next task automatically\n\n[Run Plan](command:agentTaskPlayer.play) · [Open Dashboard](command:agentTaskPlayer.showDashboard)\n\nUse **Pause** $(debug-pause) to hold between tasks, or **Stop** $(debug-stop) to abort.",
             "media": {
-              "altText": "Playing tasks and viewing output",
+              "altText": "Running tasks and viewing output",
               "markdown": "media/walkthrough-play.md"
             },
             "completionEvents": [
@@ -1801,7 +1806,7 @@
     "test:live": "node --import tsx ./node_modules/mocha/bin/mocha.js \"src/test/unit/**/*live.test.ts\"",
     "test:integration": "vscode-test",
     "pretest:integration": "npm run compile",
-    "package": "vsce package",
+    "package": "node -e \"require('fs').mkdirSync('build',{recursive:true})\" && vsce package -o build/",
     "moag": "node ./out/headless/cli.js",
     "server": "node ./out/server/main.js",
     "smoke:vsix": "node scripts/smoke-vsix.mjs",
@@ -1809,8 +1814,8 @@
     "deploy": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1",
     "deploy:watch": "powershell -ExecutionPolicy Bypass -File scripts/deploy-local.ps1 -Watch",
     "compile:ext": "tsc -p ./",
-    "compile:webview": "tsc -p tsconfig.webview.json && tsc -p tsconfig.webview.back-nav.json && tsc -p tsconfig.webview.dashboard.json && tsc -p tsconfig.webview.prd-panel.json && tsc -p tsconfig.webview.report-panel.json && tsc -p tsconfig.webview.rule-editor.json && tsc -p tsconfig.webview.run-detail.json && tsc -p tsconfig.webview.session-list.json && tsc -p tsconfig.webview.setup-guide.json && tsc -p tsconfig.webview.task-editor.json && tsc -p tsconfig.webview.thread-view.json",
-    "watch:webview": "tsc -watch -p tsconfig.webview.json"
+    "compile:webview": "tsc -p src/webview/tsconfig.sidebar.json && tsc -p src/webview/tsconfig.back-nav.json && tsc -p src/webview/tsconfig.dashboard.json && tsc -p src/webview/tsconfig.prd-panel.json && tsc -p src/webview/tsconfig.report-panel.json && tsc -p src/webview/tsconfig.rule-editor.json && tsc -p src/webview/tsconfig.run-detail.json && tsc -p src/webview/tsconfig.session-list.json && tsc -p src/webview/tsconfig.setup-guide.json && tsc -p src/webview/tsconfig.task-editor.json && tsc -p src/webview/tsconfig.thread-view.json",
+    "watch:webview": "tsc -watch -p src/webview/tsconfig.sidebar.json"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "~0.137.0"

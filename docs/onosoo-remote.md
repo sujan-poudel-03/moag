@@ -9,7 +9,7 @@ cannot read the device key, `projects.json`, the spend ledger or the audit log, 
 your checkout: every run works in its own git worktree of a private mirror, and only its branch comes
 back into your project.
 
-Remote work is **Linux only** (a Linux server or WSL). On Windows and macOS the daemon still polls
+Isolated remote work is **Linux only** (a Linux server or WSL); for a plain PC see [Local mode](#local-mode-this-pc-no-runner-account). On Windows and macOS the daemon still polls
 and still reports `stop`/`approve`/… results for runs it knows, but it reports `remote_start: false`,
 lists no engines, and rejects every command that would start work with a readable message.
 
@@ -122,6 +122,8 @@ Next to the device key, in `~/.config/moag/` (or `$XDG_CONFIG_HOME/moag/`):
 | `projects[].name` | What ONOSOO shows. |
 | `projects[].path` | Absolute path to the repository's top level. **Never sent to ONOSOO.** |
 | `projects[].kinds` | Optional tags ONOSOO shows (e.g. `web`, `api`). |
+| `projects[].delivery` | What to do with a finished run's branch: `"off"` (default), `"branch"` (push it) or `"draft-pr"` (push it and open a draft pull request). See [Delivering the branch](#delivering-the-branch). Anything else leaves it off. |
+| `projects[].pr_base` | The branch a delivered pull request targets, such as `dev`. The repository's default branch when absent. |
 
 A project is rejected (with a message on the daemon's stderr) if its path is missing, is not a git
 top level, overlaps another project's path, or overlaps MOAG's own state directory. ONOSOO only ever
@@ -141,8 +143,101 @@ sees `id`, `name` and `kinds`.
    come back and appear in your project as **`refs/heads/<branch>`** — a fast-forward only; a branch
    someone moved in the meantime is not overwritten, and the run reports why.
 
+### Delivering the branch
+
+By default a run stops once its commits are in your project as `refs/heads/moag/…`: you push it and open the
+pull request yourself. If you want MOAG to do the last step, say so **per project**, in this machine's own
+`projects.json` (nobody can switch it on from ONOSOO):
+
+```json
+{ "id": "onosoo", "name": "ONOSOO", "path": "/home/me/code/onosoo", "delivery": "draft-pr", "pr_base": "dev" }
+```
+
+- `"branch"` pushes that one branch to `origin`.
+- `"draft-pr"` pushes it and opens a **draft** pull request for it (`gh pr create --draft --head <branch> --base <pr_base>`).
+  The text says that nothing was merged or deployed and that the diff must be read first.
+
+What it will never do: merge, deploy, force-push, or push anything that is not a branch under the `moag/` prefix.
+The push names the branch explicitly, git runs with hooks and prompts off, and a branch someone moved on the
+remote is refused, not overwritten. It needs the daemon's own account to be able to push (`git` with a credential
+helper, or `gh auth login` and `gh auth setup-git`) and, for a pull request, `gh`.
+
+ONOSOO is told the result with the events `moag run --pr` already sends: `pr-created` (the run then shows the pull
+request link) or `pr-skipped` with a reason (`unsafe-branch`, `no-branch`, `no-remote`, `push-failed`,
+`gh-missing`, `no-commits`, `failed`). A skipped delivery never fails the run. What it did is on the run's record
+(`remote/runs/<run>.json`, field `delivery`).
+
 A remote run is stopped after **4 hours** at most; ONOSOO shows *"Stopped: the run exceeded the
 4-hour limit for remote runs."* on the run.
+
+## Local mode (this PC, no runner account)
+
+The sections above describe the **isolated** mode: a Linux build machine and a separate runner
+account. **Local mode** is a second, explicitly opt-in way to run for a plain Windows, macOS or Linux
+PC: ONOSOO's **Start run** works, and the run executes **as the same user as `moag daemon`**. There
+is no runner account, no `sudo`, no WSL and no isolation probe.
+
+> **Risk: in local mode the agent runs with your own privileges.** It can read and change anything
+> you can: your files, your SSH keys and tokens, your other repositories, your device key. The
+> protections below limit *what MOAG lets ONOSOO start*, not what the agent can do once it runs.
+> Turn it on only on a machine, and for projects, where you accept that. The daemon prints one
+> stderr line saying so whenever it is in local mode.
+
+Local mode is never inferred from the platform. It is on only when `projects.json` says
+`"mode": "local"`; anything else, or no `mode` at all, is the isolated mode, unchanged (so
+Windows and macOS are still refused there). An invalid value is reported on the daemon's stderr and
+the isolated mode is used.
+
+```json
+{
+  "version": 1,
+  "mode": "local",
+  "remote_start": true,
+  "daily_budget_usd": 10,
+  "projects": [
+    {
+      "id": "shop",
+      "name": "Shop web app",
+      "path": "C:\\Users\\me\\src\\shop",
+      "kinds": ["web"],
+      "delivery": "draft-pr",
+      "pr_base": "dev"
+    }
+  ]
+}
+```
+
+`runner_user` is not needed (and ignored). Everything else in [projects.json](#4-projectsjson) applies.
+
+**What still protects you in local mode**
+
+- Only projects listed in `projects.json` can be started; `remote_start` must be `true`.
+- `daily_budget_usd` must be set (`null` blocks starts), each run has its own budget, and no run lives
+  longer than 4 hours.
+- A run works in its own git worktree on a `moag/...` branch, in a private mirror under MOAG's state
+  directory (`<state dir>/local-runner/.moag-remote/`); your own checkout is never touched. MOAG
+  never merges, deploys or force-pushes. `delivery` (`off`, `branch`, `draft-pr`) works as usual and
+  pushes as you, through your own `git` and `gh` logins.
+- The audit log and spend ledger are written as always. `copilot` and `custom` engines stay refused.
+- The run's process gets a **small environment**: `PATH`, `LANG`, `TZ`, `LC_*`, plus what engine CLIs
+  need to find their login — `HOME`, `USER`, `LOGNAME`, `SHELL`, `TMPDIR`, `XDG_*` and, on Windows,
+  `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`, `SystemRoot`, `TEMP`, `TMP`, `ComSpec`, `PATHEXT` and
+  similar. The ONOSOO device key, every `MOAG_*` and `ONOSOO*` variable and `CI` are never passed. (The
+  agent runs as you, so it could still read the key *file* if it went looking; that is the risk above.)
+- On POSIX the state directory is still checked and kept private (mode 0700 / 0600).
+
+**How to start**
+
+1. `moag pair` with the key from ONOSOO, then create `projects.json` as above (in MOAG's
+   state folder: `%APPDATA%\moag` on Windows, `~/.config/moag` elsewhere).
+2. `moag daemon`, and leave it running.
+3. In ONOSOO, **Start run** appears once this machine reports remote start and at least one approved
+   project; the machine reports `mode: "local"` and the engines that are installed *and signed in* for
+   your user.
+
+The child is `node cli.js remote-child`, started directly. **Stop** is graceful first; after 30 s the
+whole process tree is killed: `taskkill /PID <pid> /T /F` on Windows, SIGKILL to the child's process
+group on macOS and Linux.
 
 ## 6. Running the daemon as a service
 

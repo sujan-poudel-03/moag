@@ -13,6 +13,7 @@ import {
   createHostRunRelay, HOST_MANUAL_GATE_NOTE, HostRelayRunner, HostRunRelayDeps, hostRunFinishedCode, probeRelayStatus, RelayStatus,
 } from '../../../headless/host-run-relay';
 import { REVOKED_MESSAGE } from '../../../headless/onosoo-relay';
+import { ProjectIdentity, ProjectIdentityCache } from '../../../headless/project-identity';
 import { costLedger } from '../../../utils/cost-ledger';
 import { createPlaylist, createTask, loadPlan } from '../../../models/plan';
 import { Plan, TaskStatus } from '../../../models/types';
@@ -612,7 +613,7 @@ describe('host-run-relay', function () {
     setState(h.runner, 'idle');
     await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
     const sent = h.rec.sent();
-    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: 't-2', name: 'Second' }]);
+    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: 't-2', name: 'Second', stage: 'Build', kind: 'agent' }]);
     assert.equal(sent.find((e) => e.type === 'run-finished')!.data.total, 1);
     assert.equal(h.plan.playlists[0].tasks.length, 2, 'the runner\'s plan is not modified');
   });
@@ -632,7 +633,7 @@ describe('host-run-relay', function () {
     setState(h.runner, 'idle');
     await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
     const sent = h.rec.sent();
-    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: t3.id, name: 'Third' }]);
+    assert.deepEqual(sent.find((e) => e.type === 'run-meta')!.data.tasks, [{ id: t3.id, name: 'Third', stage: 'Later', kind: 'agent' }]);
     const fin = sent.find((e) => e.type === 'run-finished')!.data;
     assert.deepEqual([fin.total, fin.completed, fin.failed, fin.code], [1, 1, 0, 0]);
   });
@@ -718,5 +719,195 @@ describe('host-run-relay', function () {
     assert.ok(got);
     assert.deepEqual((got as Plan).playlists[0].tasks.map((t) => t.id), ['t-1']);
     setState(h.runner, 'idle');
+  });
+
+  // ─── protocol v1.2: project identity in run-meta ───
+
+  describe('project identity', () => {
+    const ID_A: ProjectIdentity = { project_key: 'git:github.com/o/a', repo_url: 'https://github.com/O/A' };
+    const ID_B: ProjectIdentity = { project_key: 'root:' + 'b'.repeat(40) };
+
+    /** A fake identity cache: `known` answers peek; every within() gets its own manual promise. */
+    function fakeIdentity(known: Map<string, ProjectIdentity | null> = new Map()) {
+      const waits: Array<{ cwd: string; ms: number; resolve: (v: ProjectIdentity | null) => void }> = [];
+      const warms: string[] = [];
+      const identity = {
+        peek: (cwd: string) => known.get(cwd),
+        warm: (cwd: string) => { warms.push(cwd); return Promise.resolve(known.get(cwd) ?? null); },
+        within: (cwd: string, ms: number) => new Promise<ProjectIdentity | null>((resolve) => { waits.push({ cwd, ms, resolve }); }),
+      };
+      return { identity, waits, warms, known };
+    }
+
+    const typesOf = (sent: Ev[]): string[] => [...sent].sort((a, b) => a.seq - b.seq).map((e) => e.type);
+
+    it('a warm cache: run-meta carries the key at once, then run-started; the entry is refreshed in the background', async () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity });
+      f.known.set(h.ws.dir, ID_A);
+      h.start();
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      const sent = h.rec.sent();
+      assert.equal(sent[0].type, 'run-meta');
+      assert.equal(sent[0].seq, 1);
+      assert.equal(sent[0].data.project_key, 'git:github.com/o/a');
+      assert.equal(sent[0].data.repo_url, 'https://github.com/O/A');
+      assert.equal(sent[1].type, 'run-started');
+      assert.deepEqual(f.waits, []);
+      assert.deepEqual(f.warms, [h.ws.dir]);
+    });
+
+    it('a cached null (no key for this folder) starts at once with no key', async () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity });
+      f.known.set(h.ws.dir, null);
+      h.start();
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      assert.ok(!('project_key' in h.rec.sent()[0].data));
+      assert.deepEqual(f.waits, []);
+    });
+
+    it('a lookup in flight: nothing is sent until it lands; then run-meta (seq 1) and the buffered lines in order', async () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity, identityWaitMs: 1234 });
+      h.start();
+      assert.equal(f.waits.length, 1);
+      assert.equal(f.waits[0].cwd, h.ws.dir);
+      assert.equal(f.waits[0].ms, 1234);
+      const t = h.plan.playlists[0].tasks[0];
+      h.runner.emit('task-started', t);
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(h.rec.calls.length, 0, 'nothing sent while waiting');
+      const beforeResolve = new Date().toISOString();
+      f.waits[0].resolve(ID_A);
+      await new Promise((r) => setImmediate(r)); // the lookup settles before the run ends
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      const sent = [...h.rec.sent()].sort((a, b) => a.seq - b.seq);
+      assert.deepEqual(sent.map((e) => e.seq), sent.map((_e, i) => i + 1));
+      assert.deepEqual(typesOf(sent), ['run-meta', 'run-started', 'state', 'task-started', 'state', 'run-finished']);
+      assert.equal(sent[0].data.project_key, 'git:github.com/o/a');
+      // Buffered lines keep the time they happened, not the time they were flushed.
+      assert.ok(sent[1].at <= beforeResolve);
+    });
+
+    it('a real cache whose lookup never lands: after identityWaitMs the run is relayed with no key', async () => {
+      const cache = new ProjectIdentityCache({ resolve: () => new Promise<ProjectIdentity | null>(() => undefined) });
+      const h = make({ identity: cache, identityWaitMs: 50 });
+      h.start();
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-started'));
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      const sent = h.rec.sent();
+      assert.equal(sent[0].type, 'run-meta');
+      assert.ok(!('project_key' in sent[0].data));
+      assert.deepEqual(typesOf(sent), ['run-meta', 'run-started', 'state', 'state', 'run-finished']);
+    });
+
+    it('a run that ends while waiting starts at once (with what the cache holds by then); a late lookup changes nothing', async () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity });
+      h.start();
+      f.known.set(h.ws.dir, ID_B); // landed in the cache, the within() promise not yet settled
+      const t0 = Date.now();
+      setState(h.runner, 'idle');
+      assert.ok(Date.now() - t0 < 200);
+      assert.equal(h.ctl.live, false);
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      f.waits[0].resolve(ID_A);
+      await new Promise((r) => setTimeout(r, 50));
+      const sent = h.rec.sent();
+      assert.deepEqual(typesOf(sent), ['run-meta', 'run-started', 'state', 'state', 'run-finished']);
+      assert.equal(sent.filter((e) => e.type === 'run-meta').length, 1);
+      assert.equal(sent[0].data.project_key, ID_B.project_key);
+    });
+
+    it('a run that ends while waiting with nothing cached is relayed with no key', async () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity });
+      h.start();
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      assert.ok(!('project_key' in h.rec.sent()[0].data));
+    });
+
+    it('dispose while waiting: run-meta first, then run-finished with code 1, no listener left', async () => {
+      const f = fakeIdentity();
+      const h = harness({ identity: f.identity });
+      h.start();
+      h.ctl.dispose();
+      for (const e of MAPPED_EVENTS) { assert.equal(h.runner.listenerCount(e), 0, e); }
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      const sent = h.rec.sent();
+      assert.equal(typesOf(sent)[0], 'run-meta');
+      assert.equal(sent.find((e) => e.type === 'run-finished')!.data.code, 1);
+      f.waits[0].resolve(ID_A);
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(h.rec.sent().filter((e) => e.type === 'run-meta').length, 1);
+    });
+
+    it('back-to-back runs: a late lookup of the first run never reaches the second', async () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity });
+      h.start();
+      setState(h.runner, 'idle');
+      h.start();
+      assert.equal(f.waits.length, 2);
+      f.waits[0].resolve(ID_A); // the first run's, late
+      await new Promise((r) => setTimeout(r, 30));
+      f.waits[1].resolve(ID_B);
+      await new Promise((r) => setImmediate(r)); // the lookup settles before the run ends
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().filter((e) => e.type === 'run-finished').length === 2);
+      const metas = h.rec.sent().filter((e) => e.type === 'run-meta');
+      assert.equal(metas.length, 2);
+      const runs = [...new Set(h.rec.sent().map((e) => e.run_id))];
+      const metaOf = (run: string) => metas.find((m) => m.run_id === run)!;
+      assert.equal(metaOf(runs[0]).seq, 1);
+      assert.ok(!('project_key' in metaOf(runs[0]).data), 'the first run ended before its lookup landed');
+      assert.equal(metaOf(runs[1]).data.project_key, ID_B.project_key);
+    });
+
+    it('playTask scope: run-meta is still seq 1, scoped, with the key; run-started follows', async () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity });
+      h.start(['t-2']);
+      f.waits[0].resolve(ID_A);
+      await new Promise((r) => setImmediate(r)); // the lookup settles before the run ends
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      const sent = [...h.rec.sent()].sort((a, b) => a.seq - b.seq);
+      assert.equal(sent[0].type, 'run-meta');
+      assert.deepEqual(sent[0].data.tasks, [{ id: 't-2', name: 'Second', stage: 'Build', kind: 'agent' }]);
+      assert.equal(sent[0].data.project_key, ID_A.project_key);
+      assert.equal(sent[1].type, 'run-started');
+    });
+
+    it('beginRun is synchronous: the playing emit returns at once with the run live, even while the lookup hangs', () => {
+      const f = fakeIdentity();
+      const h = make({ identity: f.identity });
+      const t0 = Date.now();
+      h.start();
+      assert.ok(Date.now() - t0 < 200);
+      assert.equal(h.ctl.live, true);
+      assert.deepEqual(h.statuses, ['on']);
+      assert.equal(f.waits.length, 1);
+      setState(h.runner, 'idle');
+    });
+
+    it('an identity cache that throws never disturbs the run', async () => {
+      const throwing = {
+        peek: () => { throw new Error('peek'); },
+        warm: () => { throw new Error('warm'); },
+        within: () => { throw new Error('within'); },
+      };
+      const h = make({ identity: throwing as unknown as HostRunRelayDeps['identity'] });
+      h.start();
+      setState(h.runner, 'idle');
+      await waitFor(() => h.rec.sent().some((e) => e.type === 'run-finished'));
+      assert.deepEqual(typesOf(h.rec.sent()), ['run-meta', 'run-started', 'state', 'state', 'run-finished']);
+    });
   });
 });

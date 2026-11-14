@@ -9,6 +9,8 @@ import { TaskRunner } from '../runner/runner';
 import { designSystemCssTokens } from './design-system';
 import { SandboxState } from '../sandbox/sandbox-manager';
 import { ContributionLedgerPayload } from '../utils/contribution-ledger';
+import type { OnosooProjectSegment } from './onosoo-project-id';
+import { PROJECT_ID_REASON_PHRASES } from '../headless/project-id';
 
 // Diagnostic trace for debugging dashboard issues. Its own channel, so the
 // per-message trace never buries the user-facing MOAG channel; created on
@@ -33,7 +35,7 @@ function log(line: string): void {
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '12';
+const HTML_VERSION = '14';
 
 /** A fresh nonce per render; the CSP admits only the script carrying it. */
 function dashboardNonce(): string {
@@ -45,6 +47,9 @@ function dashboardNonce(): string {
 
 export class DashboardPanel {
   public static currentPanel: DashboardPanel | undefined;
+  /** The ONOSOO project segment every dashboard shows (set at activation while a relay host exists). */
+  private static _onosoo: OnosooProjectSegment | null = null;
+  private _onosooSub: { dispose(): void } | null = null;
   private readonly _panel: vscode.WebviewPanel;
   private _disposables: vscode.Disposable[] = [];
   private _outputBuffer: { text: string; stream: 'stdout' | 'stderr'; taskId?: string }[] = [];
@@ -76,6 +81,7 @@ export class DashboardPanel {
       null,
       this._disposables,
     );
+    this.subscribeOnosoo();
     const plan = this.getPlan();
     log(`[constructor] getPlan() returned: ${plan ? plan.name + ' (' + plan.playlists.length + ' playlists)' : 'null'}`);
     this.renderWebview();
@@ -86,6 +92,8 @@ export class DashboardPanel {
         if (this._panel.visible) {
           this.update();
           this.pushContributionLedger();
+          DashboardPanel._onosoo?.refresh();
+          this.postOnosooProject();
         }
       },
       null,
@@ -148,6 +156,30 @@ export class DashboardPanel {
       getContributionLedger,
     );
     return DashboardPanel.currentPanel;
+  }
+
+  /**
+   * Set (or clear, with null) the ONOSOO project segment. An open dashboard follows the new one
+   * at once; a dashboard opened later subscribes in its constructor.
+   */
+  public static setOnosooProject(segment: OnosooProjectSegment | null): void {
+    DashboardPanel._onosoo = segment;
+    const panel = DashboardPanel.currentPanel;
+    if (panel) {
+      panel.subscribeOnosoo();
+      panel.postOnosooProject();
+    }
+  }
+
+  /** Follow the current segment's changes (replacing any earlier subscription). */
+  private subscribeOnosoo(): void {
+    try { this._onosooSub?.dispose(); } catch { /* already gone */ }
+    this._onosooSub = DashboardPanel._onosoo ? DashboardPanel._onosoo.onDidChange(() => this.postOnosooProject()) : null;
+  }
+
+  /** Send the segment model; hidden when there is no segment. No-op once the panel is disposed. */
+  private postOnosooProject(): void {
+    this.safePostMessage({ type: 'onosoo-project', segment: DashboardPanel._onosoo?.current() ?? { kind: 'hidden' } });
   }
 
   private renderWebview(): void {
@@ -452,6 +484,29 @@ export class DashboardPanel {
         this.update();
         this.replayHistoryCards();
         this.pushContributionLedger();
+        DashboardPanel._onosoo?.refresh();
+        this.postOnosooProject();
+        break;
+      case 'copy-onosoo-project-id': {
+        // No payload is read: the host copies the key it holds, after checking it again.
+        const seg = DashboardPanel._onosoo;
+        if (!seg) {
+          this.safePostMessage({ type: 'onosoo-project-copied', ok: false });
+          break;
+        }
+        void seg.copy().then(
+          (r) => this.safePostMessage({
+            type: 'onosoo-project-copied',
+            ok: r.ok,
+            ...(r.reason ? { reason: r.reason, phrase: PROJECT_ID_REASON_PHRASES[r.reason] } : {}),
+          }),
+          () => this.safePostMessage({ type: 'onosoo-project-copied', ok: false }),
+        );
+        break;
+      }
+      case 'open-onosoo-repository':
+        // Any url in the message is ignored: only the host-held URL, checked again, is opened.
+        void DashboardPanel._onosoo?.openRepository().catch(() => undefined);
         break;
       case 'play':
         vscode.commands.executeCommand('agentTaskPlayer.play');
@@ -646,6 +701,8 @@ export class DashboardPanel {
   private dispose(): void {
     this._disposed = true;
     DashboardPanel.currentPanel = undefined;
+    try { this._onosooSub?.dispose(); } catch { /* already gone */ }
+    this._onosooSub = null;
     this.clearWebviewReadyFallback();
     if (this._outputFlushTimer) {
       clearInterval(this._outputFlushTimer);
@@ -1134,8 +1191,39 @@ export class DashboardPanel {
       color: var(--dimmed);
       background: var(--sidebar-bg);
       flex-shrink: 0;
+      overflow: hidden;
     }
     .status-bar .spacer { flex: 1; min-width: 0; }
+    #status-summary { flex: 0 1 auto; min-width: 0; max-width: 50%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    #status-right { flex-shrink: 0; white-space: nowrap; }
+
+    /* ─── ONOSOO project segment (status bar) ─── */
+    .onosoo-project {
+      display: flex; align-items: center; gap: var(--ds-space-1);
+      min-width: 0; flex: 0 1 auto;
+      border-left: 1px solid var(--border); padding-left: var(--ds-space-2);
+      white-space: nowrap;
+    }
+    .onosoo-label { color: var(--ds-muted); font-size: 11px; flex-shrink: 0; }
+    .onosoo-key {
+      color: var(--ds-fg); font-family: var(--ds-editor-font); font-size: 11px;
+      min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
+    }
+    .onosoo-text { color: var(--ds-muted); min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+    .onosoo-qualifier { color: var(--ds-muted); flex-shrink: 0; }
+    .onosoo-qualifier.is-revoked { color: var(--warning); }
+    .onosoo-project .onosoo-copy { min-height: 20px; font-family: inherit; flex-shrink: 0; }
+    .onosoo-open {
+      font-size: 11px; color: var(--dimmed); background: transparent; border: none; padding: 0;
+      min-height: 20px; font-family: inherit; cursor: pointer; flex-shrink: 0; white-space: nowrap;
+    }
+    .onosoo-open:hover { color: var(--fg); text-decoration: underline; }
+    .onosoo-copy:focus-visible, .onosoo-open:focus-visible { outline: 1px solid var(--focus-border); outline-offset: 1px; }
+    .onosoo-short { display: none; }
+    .visually-hidden {
+      position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+      overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0;
+    }
 
     /* ─── Contribution Ledger ─── */
     .cl-section { border-top: 1px solid var(--border); flex-shrink: 0; }
@@ -1196,6 +1284,9 @@ export class DashboardPanel {
 
     @media (max-width: 520px) {
       .cl-col-secondary { display: none; }
+      #status-summary { max-width: 40%; }
+      .onosoo-long { display: none; }
+      .onosoo-short { display: inline; }
     }
 
   </style>
@@ -1206,7 +1297,7 @@ export class DashboardPanel {
     <button class="plan-name" id="plan-name" onclick="vscode.postMessage({type:'switch-plan'})">MOAG</button>
     <span id="runner-status" class="status-badge status-idle">Idle</span>
     <div class="transport">
-      <button id="btn-play" class="icon-btn primary" title="Execute">▶</button>
+      <button id="btn-play" class="icon-btn primary" title="Run Plan">▶</button>
       <button id="btn-pause" class="icon-btn" title="Pause">⏸</button>
       <button id="btn-stop" class="icon-btn" title="Stop">■</button>
     </div>
@@ -1246,7 +1337,7 @@ export class DashboardPanel {
       <div class="plan-summary-desc" id="plan-summary-desc" hidden></div>
       <div class="plan-summary-playlists" id="plan-summary-playlists"></div>
       <div class="plan-summary-total" id="plan-summary-total"></div>
-      <button class="plan-summary-play" id="plan-summary-play">▶ Play</button>
+      <button class="plan-summary-play" id="plan-summary-play">▶ Run</button>
     </div>
     <!-- Quick composer — visible in idle/no-plan state -->
     <div class="prompt-composer" id="prompt-composer" hidden>
@@ -1259,7 +1350,7 @@ export class DashboardPanel {
         <div class="prompt-composer-actions">
           <button id="prompt-generate-plan" class="prompt-action-btn ghost" title="Generate a plan from this description">Plan</button>
           <button id="prompt-add-task" class="prompt-action-btn ghost" title="Add as a task to the current plan">Add Task</button>
-          <button id="prompt-submit" class="prompt-action-btn primary" title="Execute now (Ctrl+Enter)">Execute ▶</button>
+          <button id="prompt-submit" class="prompt-action-btn primary" title="Run now (Ctrl+Enter)">Run Prompt</button>
         </div>
       </div>
       <div id="prompt-context-pill" class="prompt-context-pill" hidden>
@@ -1397,6 +1488,8 @@ export class DashboardPanel {
     <span id="status-summary">Ready</span>
     <span class="spacer"></span>
     <span id="status-right"></span>
+    <span id="onosoo-project" class="onosoo-project" role="group" aria-label="ONOSOO project" hidden></span>
+    <span id="onosoo-project-live" class="visually-hidden" aria-live="polite"></span>
   </div>
   <script id="moag-bootstrap" type="application/json">${bootstrapJson}</script>
   <script nonce="${nonce}" src="${scriptUri}"></script>

@@ -1,6 +1,6 @@
 // ─── setup-guide webview script ───────────────────────────────────
 //
-// Runs in the webview. Compiled by tsconfig.webview.setup-guide.json and loaded
+// Runs in the webview. Compiled by src/webview/tsconfig.setup-guide.json and loaded
 // with <script src>. Lifted from src/ui/setup-guide.ts, where it lived inside a
 // template literal the compiler never parsed.
 

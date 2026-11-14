@@ -16,6 +16,7 @@ import {
   persistRequirementTrace,
   cmdTrace,
   wireEvents,
+  keyPromptInput,
 } from '../../../headless/cli';
 import * as sinon from 'sinon';
 import type { ChildProcess } from 'child_process';
@@ -823,7 +824,7 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const { dir, planFile, configDir } = workspace();
     const { calls, http } = recorder();
     const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir, '--verify']),
-      ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000 }));
+      ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000, identity: async () => null }));
     assert.equal(code, 0);
     assert.ok(calls.length >= 1);
     for (const c of calls) { assert.equal(c.url, ENDPOINT); }
@@ -845,7 +846,7 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const meta = sent[0].data as { plan_name: string; project: string; tasks: Array<{ id: string; name: string }> };
     assert.equal(meta.plan_name, 'Relay plan');
     assert.equal(meta.project, path.basename(dir));
-    assert.deepEqual(meta.tasks, [{ id: 't-1', name: 'First' }, { id: 't-2', name: 'Second' }]);
+    assert.deepEqual(meta.tasks, [{ id: 't-1', name: 'First', stage: 'Build', kind: 'agent' }, { id: 't-2', name: 'Second', stage: 'Build', kind: 'agent' }]);
     for (const c of calls) { assert.ok(!c.raw.includes(PROMPT), 'no prompt text in any request'); }
     // No request carries the absolute workspace path, in any spelling JSON gives it.
     for (const c of calls) {
@@ -855,6 +856,64 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const started = sent.find((e) => e.type === 'run-started')!;
     assert.equal(started.data.planPath, 'plan.json', 'the relay copy is cwd-relative');
     assert.equal(out.find((e) => e.event === 'run-started')!.planPath, planFile, 'stdout keeps the absolute path');
+  });
+
+  it('protocol v1.2: run-meta (seq 1) carries the project identity, run-started follows, stdout never sees it', async () => {
+    const { dir, planFile, configDir } = workspace();
+    const { calls, http } = recorder();
+    const asked: string[] = [];
+    const identity = async (cwd: string) => {
+      asked.push(cwd);
+      return { project_key: 'git:github.com/owner/repo', repo_url: 'https://github.com/Owner/Repo' };
+    };
+    const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]),
+      ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000, identity }));
+    assert.equal(code, 0);
+    assert.deepEqual(asked, [dir]);
+    const sent = calls.flatMap((c) => c.body.events);
+    assert.equal(sent[0].seq, 1);
+    assert.equal(sent[0].type, 'run-meta');
+    assert.equal(sent[0].data.project_key, 'git:github.com/owner/repo');
+    assert.equal(sent[0].data.repo_url, 'https://github.com/Owner/Repo');
+    assert.equal(sent[1].type, 'run-started');
+    assert.equal(sent[1].seq, 2);
+    assert.ok(!lines.join('').includes('project_key'));
+    assert.ok(!lines.join('').includes('github.com/owner/repo'));
+  });
+
+  it('protocol v1.2: a null or rejecting identity leaves run-meta without the fields', async () => {
+    for (const identity of [async () => null, async () => { throw new Error('git broke'); }]) {
+      const { dir, planFile, configDir } = workspace();
+      const { calls, http } = recorder();
+      const code = await loadCli().cmdRun(parseArgs(['run', planFile, '--cwd', dir]),
+        ctxFor('ok', { env: envWithKey(configDir), http, closeDeadlineMs: 2000, identity }));
+      assert.equal(code, 0);
+      const meta = calls.flatMap((c) => c.body.events)[0];
+      assert.equal(meta.type, 'run-meta');
+      assert.deepEqual(Object.keys(meta.data).sort(), ['plan_name', 'project', 'tasks']);
+    }
+  });
+
+  it('protocol v1.2: the default resolver runs only with a device key (no git without one)', async () => {
+    const within: string[] = [];
+    class FakeCache {
+      within(cwd: string): Promise<null> { within.push(cwd); return Promise.resolve(null); }
+    }
+    const cli = proxyquire('../../../headless/cli', {
+      './project-identity': { ProjectIdentityCache: FakeCache, IDENTITY_WAIT_MS: 2000 },
+      '../runner/evidence': { detectPrdFile: () => null, captureBaseRef: async () => null, captureHeadRef: async () => null },
+      '../sandbox/project-detector': { detectProject: () => null },
+    });
+    const noKey = workspace();
+    assert.equal(await cli.cmdRun(parseArgs(['run', noKey.planFile, '--cwd', noKey.dir]),
+      ctxFor('ok', { env: { APPDATA: noKey.configDir, XDG_CONFIG_HOME: noKey.configDir }, closeDeadlineMs: 50 })), 0);
+    assert.deepEqual(within, []);
+
+    const withKey = workspace();
+    const { http } = recorder();
+    assert.equal(await cli.cmdRun(parseArgs(['run', withKey.planFile, '--cwd', withKey.dir]),
+      ctxFor('ok', { env: envWithKey(withKey.configDir), http, closeDeadlineMs: 2000 })), 0);
+    assert.deepEqual(within, [withKey.dir]);
   });
 
   const failing: Array<[string, () => (req: unknown) => Promise<{ status: number; body: string }>]> = [
@@ -977,7 +1036,7 @@ describe('headless CLI: cmdRun ONOSOO relay', function () {
     const { buildRunMeta } = loadCli();
     const dir = fs.realpathSync(tmpDir());
     const plan = { name: 'P', playlists: [{ tasks: [{ id: 'a', name: 'A', prompt: 'x' }] }, { tasks: [{ id: 'b' }] }] };
-    assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A' }, { id: 'b', name: '' }] });
+    assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A', kind: 'agent' }, { id: 'b', name: '', kind: 'agent' }] });
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@acme/app' }));
     assert.equal(buildRunMeta(plan, dir).project, '@acme/app');
     fs.writeFileSync(path.join(dir, 'package.json'), '{broken');
@@ -2207,7 +2266,7 @@ describe('headless CLI: moag standards', () => {
 
   it('the verb is listed in the top-level usage and the header comment', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'utf-8');
-    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|pair\|bench>/);
+    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|pair\|project-id\|bench>/);
     for (const line of ['moag standards show', 'moag standards check [--base <ref>] [--no-commands]', 'moag standards propose [--stack <id>] [--write [--force]]']) {
       assert.ok(source.split(line).length - 1 >= 2, `"${line}" appears in the header and in the usage text`);
     }
@@ -2896,6 +2955,25 @@ describe('headless CLI: --version, help, pair', () => {
     }
   });
 
+  it('help lists project-id in the command list and its own usage line', async () => {
+    const r = await captureStdout(() => cli.main(['help']));
+    assert.equal(r.code, 0);
+    assert.match(r.out, /^Usage: moag <[^>]*\|project-id\|[^>]*>/);
+    assert.match(r.out, /moag project-id \[--cwd <dir>\] \[--json\] {3}print the ONOSOO project ID runs from this folder report/);
+  });
+
+  it('project-id with an unknown flag prints its usage to stderr and returns 2', async () => {
+    const err = process.stderr.write.bind(process.stderr);
+    let text = '';
+    (process.stderr as unknown as { write: (s: string) => boolean }).write = (c: string) => { text += String(c); return true; };
+    try {
+      assert.equal(await cli.main(['project-id', '--nope']), 2);
+    } finally {
+      (process.stderr as unknown as { write: typeof err }).write = err;
+    }
+    assert.equal(text, 'Usage: moag project-id [--cwd <dir>] [--json]\n');
+  });
+
   it('an unknown command still prints the usage to stderr and returns 2', async () => {
     const err = process.stderr.write.bind(process.stderr);
     let text = '';
@@ -2993,5 +3071,29 @@ describe('headless CLI: --version, help, pair', () => {
       assert.equal(b.code, 2);
       assert.ok(!(b.out + b.err).includes(KEY));
     });
+  });
+});
+
+describe('headless CLI: moag pair hidden key prompt', () => {
+  const KEY = 'onosoo_live_abcDEF123_xyz';
+
+  it('takes a key pasted with bracketed-paste markers (PowerShell leaves them on)', () => {
+    assert.deepEqual(keyPromptInput('', `\u001b[200~${KEY}\u001b[201~\r`), { key: KEY, end: 'enter' });
+  });
+
+  it('takes a bracketed paste split across chunks, then Enter on its own', () => {
+    let s = keyPromptInput('', `\u001b[200~${KEY.slice(0, 10)}`);
+    s = keyPromptInput(s.key, `${KEY.slice(10)}\u001b[201~`);
+    assert.deepEqual(s, { key: KEY });
+    assert.deepEqual(keyPromptInput(s.key, '\r'), { key: KEY, end: 'enter' });
+  });
+
+  it('drops arrow keys and other control characters, honours backspace', () => {
+    assert.deepEqual(keyPromptInput('', `ab\u001b[Dc\u001bOA\td\u007fe\n`), { key: 'abce', end: 'enter' });
+  });
+
+  it('Ctrl+C and Ctrl+D cancel with nothing entered', () => {
+    assert.deepEqual(keyPromptInput('partial', '\u0003'), { key: '', end: 'cancel' });
+    assert.deepEqual(keyPromptInput('partial', 'x\u0004'), { key: '', end: 'cancel' });
   });
 });

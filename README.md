@@ -5,9 +5,9 @@
 [![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Run AI agents like a playlist.** Build a plan, pick your engines, hit Play — Claude Code, Codex, Gemini, Ollama, GitHub Copilot or the Anthropic API execute your tasks while you watch.
+> **Run AI agents like a playlist.** Build a plan, pick your engines, hit Run — Claude Code, Codex, Gemini, Ollama, GitHub Copilot or the Anthropic API execute your tasks while you watch.
 
-<!-- screenshot: media/screenshots/hero.gif | alt: "MOAG running a plan: the sidebar plan, Play, and the Dashboard streaming live output" -->
+<!-- screenshot: media/screenshots/hero.gif | alt: "MOAG running a plan: the sidebar plan, Run Plan, and the Dashboard streaming live output" -->
 
 ---
 
@@ -49,9 +49,9 @@ or no CLI at all: run **MOAG: Set Anthropic API Key** (the key is kept in VS Cod
 
 <!-- screenshot: media/screenshots/smart-plan.png | alt: "Smart New Plan turning a PRD into playlists and tasks" -->
 
-### 3. Hit Play
+### 3. Hit Run
 
-Click **Play** in the title bar. MOAG opens the Dashboard, validates engines, and starts executing. Tasks stream live output, run verification commands, and auto-fix failures.
+Click **Run Plan** ▶ in the title bar. MOAG opens the Dashboard, validates engines, and starts executing. Tasks stream live output, run verification commands, and auto-fix failures.
 
 <!-- screenshot: media/screenshots/dashboard.png | alt: "The MOAG Dashboard with live task output and task cards" -->
 
@@ -349,7 +349,7 @@ npm run compile      # build
 npm run watch        # dev mode
 npm test             # unit tests (Mocha + Sinon)
 npm run lint         # ESLint
-npm run package      # build .vsix
+npm run package      # build build/agent-task-player-<version>.vsix
 ```
 
 ---

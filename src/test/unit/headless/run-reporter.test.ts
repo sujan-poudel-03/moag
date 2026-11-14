@@ -6,7 +6,8 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  buildRunMeta, HEADLESS_MANUAL_GATE_NOTE, RunLine, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
+  buildRunMeta, HEADLESS_MANUAL_GATE_NOTE, prepareRunRelay, relayConfigured, RunLine, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan,
+  wireRunEventLines,
 } from '../../../headless/run-reporter';
 import type { RelayHttpClient } from '../../../headless/onosoo-relay';
 import type { RelayEvent } from '../../../headless/onosoo-spool';
@@ -183,7 +184,7 @@ describe('run-reporter', () => {
       const first = rec.bodies[0].events[0];
       assert.equal(first.type, 'run-meta');
       assert.equal(first.seq, 1);
-      assert.deepEqual(first.data.tasks, [{ id: 'a', name: 'A' }]);
+      assert.deepEqual(first.data.tasks, [{ id: 'a', name: 'A', kind: 'agent' }]);
     });
 
     it('a throwing buildRedactor still starts, and run-meta carries redaction_failed', async () => {
@@ -197,6 +198,63 @@ describe('run-reporter', () => {
       const first = rec.bodies[0].events[0];
       assert.equal(first.type, 'run-meta');
       assert.equal(first.data.redaction_failed, true);
+    });
+
+    it('carries the identity given to startRunRelay', async () => {
+      const rec = recording();
+      const started = startRunRelay({
+        cwd, plan, env: env(), buildRedactor: () => ({ redact: (s: string) => ({ text: s, count: 0 }) }), stderr: () => undefined,
+        http: rec.http, closeDeadlineMs: 500, identity: { project_key: 'git:github.com/o/r', repo_url: 'https://github.com/O/R' },
+      });
+      assert.ok(started);
+      await started.relay.close();
+      const first = rec.bodies[0].events[0];
+      assert.equal(first.data.project_key, 'git:github.com/o/r');
+      assert.equal(first.data.repo_url, 'https://github.com/O/R');
+    });
+
+    it('prepareRunRelay sends nothing before begin, then run-meta at seq 1; begin twice sends one run-meta', async () => {
+      const rec = recording();
+      const prepared = prepareRunRelay({
+        cwd, plan, env: env(), buildRedactor: () => ({ redact: (s: string) => ({ text: s, count: 0 }) }), stderr: () => undefined,
+        http: rec.http, closeDeadlineMs: 500,
+      });
+      assert.ok(prepared);
+      assert.equal(prepared.key, KEY);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(rec.bodies.length, 0);
+      assert.equal(prepared.begin({ project_key: 'root:' + 'a'.repeat(40) }), true);
+      assert.equal(prepared.begin({ project_key: 'git:github.com/x/y' }), false);
+      prepared.relay.record({ ts: '2026-11-10T00:00:00.000Z', event: 'run-started' });
+      await prepared.relay.close();
+      const events = rec.bodies.flatMap((b) => b.events);
+      assert.deepEqual(events.map((e) => [e.seq, e.type]), [[1, 'run-meta'], [2, 'run-started']]);
+      assert.equal(events[0].data.project_key, 'root:' + 'a'.repeat(40));
+    });
+
+    it('prepareRunRelay without a key is null', () => {
+      assert.equal(prepareRunRelay({
+        cwd, plan, env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir }, buildRedactor: () => ({ redact: (s: string) => ({ text: s, count: 0 }) }),
+        stderr: () => undefined,
+      }), null);
+    });
+  });
+
+  describe('relayConfigured', () => {
+    it('is false without a device key and true with one, and prints nothing', () => {
+      const configDir = tmp('moag-rr-config-');
+      const cwd = tmp('moag-rr-cwd-');
+      const before = process.stderr.write;
+      let printed = '';
+      process.stderr.write = ((s: string) => { printed += s; return true; }) as typeof process.stderr.write;
+      try {
+        assert.equal(relayConfigured({ APPDATA: configDir, XDG_CONFIG_HOME: configDir }, cwd), false);
+        assert.equal(relayConfigured({ MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: 'http://127.0.0.1:9', APPDATA: configDir, XDG_CONFIG_HOME: configDir }, cwd), true);
+        assert.equal(relayConfigured({ MOAG_ONOSOO_KEY: 'not-a-key', APPDATA: configDir, XDG_CONFIG_HOME: configDir }, cwd), false);
+      } finally {
+        process.stderr.write = before;
+      }
+      assert.equal(printed, '');
     });
   });
 
@@ -218,11 +276,38 @@ describe('run-reporter', () => {
     it('package.json name, else the folder name; tasks flattened in plan order', () => {
       const dir = tmp('moag-rr-meta-');
       const plan = { name: 'P', playlists: [{ tasks: [{ id: 'a', name: 'A', prompt: 'x' }] }, { tasks: [{ id: 'b' }] }] };
-      assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A' }, { id: 'b', name: '' }] });
+      assert.deepEqual(buildRunMeta(plan, dir), { plan_name: 'P', project: path.basename(dir), tasks: [{ id: 'a', name: 'A', kind: 'agent' }, { id: 'b', name: '', kind: 'agent' }] });
+      // a named playlist is the task's stage, and a task's type is its kind
+      const staged = { name: 'P', playlists: [{ name: 'Development', tasks: [{ id: 'a', name: 'A', type: 'agent' }] }, { name: 'Testing', tasks: [{ id: 'b', name: 'B', type: 'command' }, { id: 'c', name: 'C', type: 'manual' }] }] };
+      assert.deepEqual(buildRunMeta(staged, dir).tasks, [
+        { id: 'a', name: 'A', stage: 'Development', kind: 'agent' },
+        { id: 'b', name: 'B', stage: 'Testing', kind: 'command' },
+        { id: 'c', name: 'C', stage: 'Testing', kind: 'manual' },
+      ]);
       fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: '@acme/app' }));
       assert.equal(buildRunMeta(plan, dir).project, '@acme/app');
       fs.writeFileSync(path.join(dir, 'package.json'), '{broken');
       assert.equal(buildRunMeta(plan, dir).project, path.basename(dir));
+    });
+
+    it('appends the identity fields when given; null equals the two-argument form', () => {
+      const dir = tmp('moag-rr-meta-');
+      const plan = { name: 'P', playlists: [{ tasks: [{ id: 'a', name: 'A' }] }] };
+      const base = buildRunMeta(plan, dir);
+      assert.deepEqual(buildRunMeta(plan, dir, null), base);
+      assert.deepEqual(buildRunMeta(plan, dir, undefined), base);
+      const multi = {
+        project_key: 'multi:' + 'f'.repeat(64),
+        repos: [{ dir: 'api', key: 'git:github.com/o/api', repo_url: 'https://github.com/o/api', extra: 'x' }, { dir: 'web', key: 'root:' + 'a'.repeat(40) }],
+        extra: 'not picked',
+      };
+      assert.deepEqual(buildRunMeta(plan, dir, multi), {
+        ...base,
+        project_key: 'multi:' + 'f'.repeat(64),
+        repos: [{ dir: 'api', key: 'git:github.com/o/api', repo_url: 'https://github.com/o/api' }, { dir: 'web', key: 'root:' + 'a'.repeat(40) }],
+      });
+      assert.deepEqual(buildRunMeta(plan, dir, { project_key: 'git:github.com/o/r', repo_url: 'https://github.com/O/R' }),
+        { ...base, project_key: 'git:github.com/o/r', repo_url: 'https://github.com/O/R' });
     });
   });
 });

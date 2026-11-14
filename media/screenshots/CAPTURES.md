@@ -11,7 +11,7 @@ possible (a GIF can be larger; keep it short). Capture at 1x scale with a theme 
 
 | # | File | Size | What it shows | Alt text |
 |---|---|---|---|---|
-| 1 | `hero.gif` | 1280×720, about 10 s | The sidebar plan, a click on **Play**, then the Dashboard streaming live output | MOAG running a plan: the sidebar plan, Play, and the Dashboard streaming live output |
+| 1 | `hero.gif` | 1280×720, about 10 s | The sidebar plan, a click on **Run Plan**, then the Dashboard streaming live output | MOAG running a plan: the sidebar plan, Run Plan, and the Dashboard streaming live output |
 | 2 | `dashboard.png` | 1280×800 | The Dashboard mid-run: live output and task cards | The MOAG Dashboard with live task output and task cards |
 | 3 | `plan-tree.png` | 600×800 | The sidebar plan with playlists and tasks in mixed statuses (completed, running, failed, pending) | A plan in the sidebar with playlists and tasks in mixed statuses |
 | 4 | `smart-plan.png` | 1280×800 | Smart New Plan: PRD text on one side, the generated plan on the other | Smart New Plan turning a PRD into playlists and tasks |

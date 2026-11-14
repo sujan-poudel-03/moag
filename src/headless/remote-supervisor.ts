@@ -23,6 +23,8 @@ import type { RemoteLedger } from './remote-ledger';
 import type { RemoteRunRecord, RemoteRuns } from './remote-runs';
 import { BundleAssembler, writeBundleFile } from './remote-branch';
 import type { RunMeta } from './onosoo-relay';
+import type { ProjectIdentity } from './project-identity';
+import { pickIdentity } from './run-reporter';
 
 export const STOP_GRACE_MS = 30_000;
 export const REMOTE_RUN_MAX_MS = 4 * 60 * 60 * 1000;
@@ -69,6 +71,11 @@ export interface SupervisorOptions {
   record: RemoteRunRecord;
   /** The project's display name (never its path), for run-meta. */
   projectName: string;
+  /**
+   * The project identity for run-meta (protocol v1.2): from the approved project's own folder,
+   * never the worktree. Absent or null: run-meta carries no key.
+   */
+  projectIdentity?: ProjectIdentity | null;
   /** The job spec line (JSON, without newline). Must not contain the device key. */
   specLine: string;
   bundle: Buffer;
@@ -80,6 +87,12 @@ export interface SupervisorOptions {
   /** Where outbound bundles are staged: <stateDir>/remote/tmp. */
   tmpDir: string;
   importBranch(bundleFile: string): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /**
+   * Optional last step once the run's commits are in the project: push the branch and open a draft PR,
+   * if the project asks for it. Returns the run event to tell ONOSOO (or null) and a line for the audit.
+   * Never throws into the run.
+   */
+  deliver?(exitCode: number | null): Promise<{ event: Record<string, unknown> | null; note: string }>;
   forceKill(): Promise<void>;
   /** After every run, once the child has exited: kill whatever the runner account still has running. */
   sweep?(): Promise<void>;
@@ -106,6 +119,8 @@ export class RemoteSupervisor {
   private relayStarted = false;
   private started = false;
   private exited = false;
+  /** True once the run's commits were imported into the project. */
+  private imported = false;
   private failure: string | null = null;
   private lastError: string | null = null;
   private stopRequested = false;
@@ -255,8 +270,9 @@ export class RemoteSupervisor {
           this.ensureRelay({
             plan_name: plan.name,
             project: this.o.projectName,
-            tasks: plan.playlists.flatMap((pl) => pl.tasks).map((t) => ({ id: t.id, name: t.name })),
+            tasks: plan.playlists.flatMap((pl) => pl.tasks.map((t) => ({ id: t.id, name: t.name, stage: pl.name, kind: String(t.type ?? 'agent') }))),
             branch: r.branch,
+            ...pickIdentity(this.o.projectIdentity),
           });
         } catch (err) {
           this.lastError = `The run's plan could not be read: ${err instanceof Error ? err.message : String(err)}`;
@@ -326,11 +342,27 @@ export class RemoteSupervisor {
       fs.mkdirSync(this.o.tmpDir, { recursive: true, mode: 0o700 });
       writeBundleFile(file, got.data);
       const out = await this.o.importBranch(file);
-      if (!out.ok) { r.importError = out.reason; }
+      if (!out.ok) { r.importError = out.reason; } else { this.imported = true; }
     } catch (err) {
       r.importError = `The run's commits could not be imported: ${err instanceof Error ? err.message : String(err)}`;
     } finally {
       try { fs.rmSync(file, { force: true }); } catch { /* best effort */ }
+    }
+  }
+
+  /** Push and open a draft PR when the project asks for it; tell ONOSOO through the run's own relay. */
+  private async deliver(exitCode: number | null): Promise<void> {
+    if (!this.imported || !this.o.deliver) { return; }
+    const r = this.o.record;
+    try {
+      const out = await this.o.deliver(exitCode);
+      r.delivery = out.note.slice(0, 300);
+      if (out.event) {
+        const relay = this.ensureRelay();
+        try { relay?.record({ ...out.event, ts: this.now().toISOString() }); } catch { /* never disturbs the run */ }
+      }
+    } catch (err) {
+      r.delivery = `delivery failed: ${err instanceof Error ? err.message : String(err)}`.slice(0, 300);
     }
   }
 
@@ -349,6 +381,7 @@ export class RemoteSupervisor {
       if (costKnown) { this.o.ledger.settle(this.runId); } else { this.o.ledger.chargeInFull(this.runId); }
     } catch { /* the ledger fails closed on its own */ }
     await this.importBundle();
+    await this.deliver(code);
     r.outcome = 'finished';
     r.exitCode = code;
     r.endedAt = this.now().toISOString();

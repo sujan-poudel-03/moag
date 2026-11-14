@@ -12,12 +12,14 @@ import * as sinon from 'sinon';
 import {
   BACKOFF_MAX_MS, BACKOFF_START_MS, classify, CLOSE_DEADLINE_MS, defaultHttpClient, HEARTBEAT_MS, MAX_BODY_BYTES, MAX_EVENTS,
   MAX_EVENT_DATA_BYTES, MAX_MEMORY_BYTES, OnosooRelay, protocolStatus, REPLAY_MEMORY_BYTES, RelayHttpClient, RelayHttpRequest, REQUEST_TIMEOUT_MS, REVOKED_MESSAGE, RunMeta, scrubPaths,
+  RUN_META_KEY_MAX, RUN_META_REPOS_MAX, RUN_META_URL_MAX, keyPassesScrub,
   SPOOL_TOUCH_MS,
 } from '../../../headless/onosoo-relay';
 import {
   isLiveRelayRun, OnosooSpool, RelayEvent, releaseLiveRelayRun, SPOOL_OWNER_MAX_IDLE_MS,
 } from '../../../headless/onosoo-spool';
 import type { OnosooConfig } from '../../../headless/onosoo-config';
+import { projectIdAsSent } from '../../../headless/project-id';
 import { createRedactor, Redactor } from '../../../utils/redact';
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -689,6 +691,31 @@ describe('ONOSOO relay — run-meta', () => {
     assert.equal(calls[0].body.events[1].seq, 2);
   });
 
+  it('sends each task\'s stage and kind, scrubbed, and drops a kind that is not a plain word', async () => {
+    const { calls, client } = recorder();
+    const { relay } = mkRelay(client);
+    relay.start({
+      plan_name: 'p',
+      project: 'proj',
+      tasks: [
+        { id: 'a', name: 'A', stage: 'Development', kind: 'agent' },
+        { id: 'b', name: 'B', stage: 'Testing', kind: 'command' },
+        { id: 'c', name: 'C', stage: '   ', kind: 'Manual Gate!' },
+        { id: 'd', name: 'D', stage: 'x'.repeat(300), kind: '../etc' },
+        { id: 'e', name: 'E' },
+      ],
+    });
+    await settle();
+    await relay.close();
+    const tasks = calls[0].body.events[0].data.tasks as Array<Record<string, unknown>>;
+    assert.deepEqual(tasks[0], { id: 'a', name: 'A', stage: 'Development', kind: 'agent' });
+    assert.deepEqual(tasks[1], { id: 'b', name: 'B', stage: 'Testing', kind: 'command' });
+    assert.deepEqual(tasks[2], { id: 'c', name: 'C' }, 'a blank stage and an odd kind are left out');
+    assert.equal((tasks[3].stage as string).length, 80, 'a long stage is cut');
+    assert.equal('kind' in tasks[3], false);
+    assert.deepEqual(tasks[4], { id: 'e', name: 'E' }, 'a task with neither sends neither');
+  });
+
   it('drops tasks from the end when the event would not fit one body', async () => {
     const { calls, client } = recorder();
     const { relay } = mkRelay(client);
@@ -711,6 +738,211 @@ describe('ONOSOO relay — run-meta', () => {
     await settle();
     await relay.close();
     assert.deepEqual(calls[0].body.events.map((e) => [e.seq, e.type]), [[1, 'run-started']]);
+  });
+});
+
+describe('ONOSOO relay — run-meta project identity (protocol v1.2)', () => {
+  const BASE: RunMeta = { plan_name: 'p', project: 'proj', tasks: [{ id: 't1', name: 'One' }] };
+
+  /** The run-meta data and the raw first request body for `meta`. */
+  async function sendMeta(meta: RunMeta, opts: { redactor?: Redactor; homedir?: string; fx?: ReturnType<typeof fixture> } = {}) {
+    const { calls, client } = recorder();
+    const fx = opts.fx ?? fixture();
+    const { relay } = mkRelay(client, { redactor: opts.redactor, homedir: opts.homedir, fx, cwd: fx.cwd });
+    relay.start(meta);
+    await settle();
+    await relay.close();
+    const ev = calls[0].body.events[0];
+    assert.equal(ev.type, 'run-meta');
+    assert.equal(ev.seq, 1);
+    return { data: ev.data, body: calls[0].req.body };
+  }
+
+  it('exports the caps', () => {
+    assert.equal(RUN_META_KEY_MAX, 255);
+    assert.equal(RUN_META_URL_MAX, 500);
+    assert.equal(RUN_META_REPOS_MAX, 20);
+  });
+
+  it('a meta without identity fields is byte-identical to before', async () => {
+    const { data, body } = await sendMeta({ ...BASE, branch: 'b' });
+    assert.ok(body.includes('"data":{"plan_name":"p","project":"proj","tasks":[{"id":"t1","name":"One"}],"branch":"b"}'), body);
+    assert.deepEqual(Object.keys(data), ['plan_name', 'project', 'tasks', 'branch']);
+  });
+
+  it('carries a git: key and its https repo_url after the branch', async () => {
+    const { data, body } = await sendMeta({ ...BASE, branch: 'b', project_key: 'git:github.com/owner/repo', repo_url: 'https://github.com/Owner/Repo' });
+    assert.equal(data.project_key, 'git:github.com/owner/repo');
+    assert.equal(data.repo_url, 'https://github.com/Owner/Repo');
+    assert.ok(body.includes('"branch":"b","project_key":"git:github.com/owner/repo","repo_url":"https://github.com/Owner/Repo"'));
+  });
+
+  it('drops (never cuts) a key over 255 with its URL, and a URL over 500', async () => {
+    const longKey = await sendMeta({ ...BASE, project_key: 'git:github.com/' + 'k'.repeat(300), repo_url: 'https://github.com/o/r' });
+    for (const k of ['project_key', 'repo_url', 'repos']) { assert.ok(!(k in longKey.data), k); }
+    const atCap = 'git:github.com/' + 'k'.repeat(RUN_META_KEY_MAX - 'git:github.com/'.length);
+    const longUrl = await sendMeta({ ...BASE, project_key: atCap, repo_url: 'https://github.com/' + 'u'.repeat(600) });
+    assert.equal(longUrl.data.project_key, atCap, 'a key of exactly 255 is kept');
+    assert.ok(!('repo_url' in longUrl.data));
+    const urlAtCap = 'https://github.com/' + 'u'.repeat(RUN_META_URL_MAX - 'https://github.com/'.length);
+    assert.equal((await sendMeta({ ...BASE, project_key: 'git:github.com/o/r', repo_url: urlAtCap })).data.repo_url, urlAtCap);
+  });
+
+  describe('keyPassesScrub (the same rule for senders outside a relay)', () => {
+    it('a clean key passes; a key with the cwd, the home, another home or a secret does not', () => {
+      const redactor = createRedactor([KEY, SECRET]);
+      const fx = fixture();
+      const home = tmp('moag-relay-home-');
+      const other = tmp('moag-relay-other-');
+      const ctx = { redactor, cwd: fx.cwd, homedir: home, otherHomes: [other] };
+      assert.equal(keyPassesScrub('git:github.com/o/r', ctx), true);
+      assert.equal(keyPassesScrub('root:' + 'a'.repeat(40), ctx), true);
+      assert.equal(keyPassesScrub('git:' + path.join(fx.cwd, 'x'), ctx), false);
+      assert.equal(keyPassesScrub('git:' + path.join(home, 'x'), ctx), false);
+      assert.equal(keyPassesScrub('git:' + path.join(other, 'x'), ctx), false);
+      assert.equal(keyPassesScrub('git:github.com/' + SECRET, ctx), false);
+    });
+
+    it('a throwing redactor means false, never a throw', () => {
+      const throwing: Redactor = { redact: () => { throw new Error('nope'); } };
+      assert.equal(keyPassesScrub('git:github.com/o/r', { redactor: throwing }), false);
+    });
+  });
+
+  it('drops an http URL, a path-like URL, and any URL on a root: key, keeping the key', async () => {
+    const plain = await sendMeta({ ...BASE, project_key: 'git:github.com/o/r', repo_url: 'http://github.com/o/r' });
+    assert.equal(plain.data.project_key, 'git:github.com/o/r');
+    assert.ok(!('repo_url' in plain.data));
+    const local = await sendMeta({ ...BASE, project_key: 'git:github.com/o/r', repo_url: '/srv/repos/r.git' });
+    assert.ok(!('repo_url' in local.data));
+    assert.ok(!local.body.includes('/srv/repos'));
+    const root = await sendMeta({ ...BASE, project_key: 'root:' + 'a'.repeat(40), repo_url: 'https://github.com/o/r' });
+    assert.equal(root.data.project_key, 'root:' + 'a'.repeat(40));
+    assert.ok(!('repo_url' in root.data));
+  });
+
+  it('drops a key with an unknown prefix or an empty key', async () => {
+    assert.ok(!('project_key' in (await sendMeta({ ...BASE, project_key: 'name:proj' })).data));
+    assert.ok(!('project_key' in (await sendMeta({ ...BASE, project_key: '' })).data));
+  });
+
+  it('a secret in project_key drops the key, repo_url and repos; the secret is nowhere in the body', async () => {
+    const redactor = createRedactor([KEY, SECRET]);
+    const git = await sendMeta({ ...BASE, project_key: 'git:github.com/' + SECRET, repo_url: 'https://github.com/o/r' }, { redactor });
+    for (const k of ['project_key', 'repo_url', 'repos']) { assert.ok(!(k in git.data), k); }
+    assert.ok(!git.body.includes(SECRET));
+    const multi = await sendMeta({ ...BASE, project_key: 'multi:' + SECRET, repos: [{ dir: 'a', key: 'root:' + 'a'.repeat(40) }] }, { redactor });
+    for (const k of ['project_key', 'repo_url', 'repos']) { assert.ok(!(k in multi.data), k); }
+    assert.ok(!multi.body.includes(SECRET));
+  });
+
+  it('a secret in repo_url is redacted', async () => {
+    const { data, body } = await sendMeta({ ...BASE, project_key: 'git:github.com/o/r', repo_url: 'https://github.com/o/r?t=' + SECRET }, { redactor: createRedactor([KEY, SECRET]) });
+    assert.ok((data.repo_url as string).includes('[REDACTED]'));
+    assert.ok(!body.includes(SECRET));
+  });
+
+  it('a key that contains the relay cwd or the home directory is dropped', async () => {
+    const fx = fixture();
+    const inCwd = await sendMeta({ ...BASE, project_key: 'root:' + path.join(fx.cwd, 'x') }, { fx });
+    assert.ok(!('project_key' in inCwd.data));
+    assert.ok(!inCwd.body.includes(fx.cwd));
+    const home = tmp('moag-relay-home-');
+    const inHome = await sendMeta({ ...BASE, project_key: 'git:' + path.join(home, 'repo') }, { homedir: home });
+    assert.ok(!('project_key' in inHome.data));
+    assert.ok(!inHome.body.includes(home));
+  });
+
+  describe('projectIdAsSent agrees with run-meta (parity table)', () => {
+    const fx = fixture();
+    const home = tmp('moag-relay-home-');
+    const redactor = createRedactor([KEY, SECRET]);
+    const at255 = 'git:github.com/' + 'k'.repeat(RUN_META_KEY_MAX - 'git:github.com/'.length);
+    const cases: Array<{ name: string; key: string; url?: string; ok: boolean }> = [
+      { name: 'git: with an https URL', key: 'git:github.com/o/r', url: 'https://github.com/O/R', ok: true },
+      { name: 'git: with an http URL', key: 'git:github.com/o/r', url: 'http://github.com/o/r', ok: true },
+      { name: 'git: with a secret in the URL', key: 'git:github.com/o/r', url: 'https://github.com/o/r?t=' + SECRET, ok: true },
+      { name: 'root: + 40 hex', key: 'root:' + 'a'.repeat(40), url: 'https://github.com/o/r', ok: true },
+      { name: 'multi: + 64 hex', key: 'multi:' + 'f'.repeat(64), ok: true },
+      { name: 'key containing the workspace path', key: 'git:' + path.join(fx.cwd, 'x'), ok: false },
+      { name: 'key containing the home path', key: 'git:' + path.join(home, 'x'), ok: false },
+      { name: 'key containing a redacted secret', key: 'git:github.com/' + SECRET, url: 'https://github.com/o/r', ok: false },
+      { name: '256-char key', key: at255 + 'k', ok: false },
+      { name: '255-char key', key: at255, url: 'https://github.com/o/r', ok: true },
+      { name: 'unknown prefix', key: 'svn:x/y', ok: false },
+    ];
+    for (const c of cases) {
+      it(`${c.name}: ${c.ok ? 'sent' : 'not sent'} on both sides`, async () => {
+        const meta: RunMeta = { ...BASE, project_key: c.key, ...(c.url ? { repo_url: c.url } : {}) };
+        const { data } = await sendMeta(meta, { redactor, homedir: home, fx });
+        const check = projectIdAsSent({ project_key: c.key, ...(c.url ? { repo_url: c.url } : {}) }, { redactor, cwd: fx.cwd, homedir: home });
+        assert.equal(check.ok, 'project_key' in data);
+        assert.equal(check.ok, c.ok);
+        if (check.ok) {
+          assert.equal(check.project_key, data.project_key);
+          assert.equal(check.repo_url, (data.repo_url as string | undefined) ?? null);
+        }
+      });
+    }
+  });
+
+  describe('repos of a multi: key', () => {
+    const MULTI = 'multi:' + 'f'.repeat(64);
+    const ROOT = 'root:' + 'a'.repeat(40);
+
+    it('keeps at most 20 entries', async () => {
+      const repos = Array.from({ length: 25 }, (_, i) => ({ dir: `r${String(i).padStart(2, '0')}`, key: ROOT }));
+      const { data } = await sendMeta({ ...BASE, project_key: MULTI, repos });
+      assert.equal((data.repos as unknown[]).length, RUN_META_REPOS_MAX);
+      assert.equal((data.repos as Array<{ dir: string }>)[19].dir, 'r19');
+    });
+
+    it('drops each bad entry and omits an http entry URL', async () => {
+      const home = tmp('moag-relay-home-');
+      const repos = [
+        { dir: 'ok', key: 'git:github.com/o/ok', repo_url: 'https://github.com/o/ok' },
+        { dir: 'plain', key: 'git:github.com/o/plain', repo_url: 'http://github.com/o/plain' },
+        { dir: 'rooturl', key: ROOT, repo_url: 'https://github.com/o/x' },
+        { dir: '', key: ROOT },
+        { dir: 'a/b', key: ROOT },
+        { dir: 'a\\b', key: ROOT },
+        { dir: 'd'.repeat(256), key: ROOT },
+        { dir: 'multi', key: MULTI },
+        { dir: 'name', key: 'name:x' },
+        { dir: 'long', key: 'git:' + 'k'.repeat(260) },
+        { dir: 'secret', key: 'git:github.com/' + SECRET },
+        { dir: SECRET, key: ROOT },
+        { dir: 'home', key: 'git:' + path.join(home, 'r') },
+        { dir: 42, key: ROOT },
+        null,
+      ] as unknown as RunMeta['repos'];
+      const { data, body } = await sendMeta({ ...BASE, project_key: MULTI, repos }, { redactor: createRedactor([KEY, SECRET]), homedir: home });
+      assert.equal(data.project_key, MULTI);
+      assert.deepEqual(data.repos, [
+        { dir: 'ok', key: 'git:github.com/o/ok', repo_url: 'https://github.com/o/ok' },
+        { dir: 'plain', key: 'git:github.com/o/plain' },
+        { dir: 'rooturl', key: ROOT },
+      ]);
+      assert.ok(!body.includes(SECRET));
+      assert.ok(!body.includes(home));
+    });
+
+    it('all entries invalid → no repos, the key kept', async () => {
+      const { data } = await sendMeta({ ...BASE, project_key: MULTI, repos: [{ dir: 'a/b', key: ROOT }] });
+      assert.equal(data.project_key, MULTI);
+      assert.ok(!('repos' in data));
+    });
+
+    it('repos on a git: key are ignored', async () => {
+      const { data } = await sendMeta({ ...BASE, project_key: 'git:github.com/o/r', repos: [{ dir: 'a', key: ROOT }] });
+      assert.ok(!('repos' in data));
+    });
+  });
+
+  it('a throwing redactor gives { redaction_failed: true }', async () => {
+    const throwing: Redactor = { redact: () => { throw new Error('nope'); } };
+    const { data } = await sendMeta({ ...BASE, project_key: 'git:github.com/o/r', repo_url: 'https://github.com/o/r' }, { redactor: throwing });
+    assert.deepEqual(data, { redaction_failed: true });
   });
 });
 

@@ -21,8 +21,10 @@
  *   moag bench  <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]
  *   moag host   [run | init | draft <project> | status | stop <env> | remove <env>]
  *   moag pair   [<key>] [--url <base>]
+ *   moag project-id [--cwd <dir>] [--json]
  *   moag --version | moag help
  *
+ * `project-id` prints the ONOSOO project ID runs from the folder report (exit 1 with the reason when none).
  * `pair`  saves the ONOSOO device key to the user-level onosoo.json (the key from stdin when
  *          omitted, so it stays out of shell history) and checks it with ONOSOO.
  * `host`  runs approved project branches as live environments for ONOSOO previews, behind a
@@ -120,12 +122,14 @@ import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { OnosooSpool } from './onosoo-spool';
-import { OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
+import { keyPassesScrub, OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
 import { checkPairing, PairError, writePairing } from './onosoo-pair';
+import { cmdProjectId } from './project-id';
 import { BUDGET_UNENFORCEABLE_TEXT, watchUnenforceableBudget } from '../utils/budget-notice';
 import {
-  buildRunMeta, forgetRelayEnv, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
+  buildRunMeta, forgetRelayEnv, relayConfigured, startRunRelay, subscribeRunCostLines, takeRelayEnv, tallyPlan, wireRunEventLines,
 } from './run-reporter';
+import type { ProjectIdentity, ProjectIdentityCache } from './project-identity';
 
 export { buildRunMeta, forgetRelayEnv };
 
@@ -336,6 +340,10 @@ export interface RelayDeps {
   onDaemonStop?: (stop: () => void) => void;
   /** `moag daemon` only: how a second stop signal exits (process.exit in production). */
   exit?: (code: number) => void;
+  /** `moag run` only: resolves the project identity of a folder (default: a fresh cache, bounded wait). */
+  identity?: (cwd: string) => Promise<ProjectIdentity | null>;
+  /** `moag daemon` only: the identity cache of the approved projects (default: a fresh one). */
+  identities?: Pick<ProjectIdentityCache, 'peek' | 'warm' | 'within'>;
 }
 
 /**
@@ -920,6 +928,11 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   // After wireEvents, so task-changes / task-error-tail follow the task's own line.
   // Injected in tests; otherwise process.env plus the relay variables main() took out of it.
   const env = ctx.relayDeps?.env ?? relayConfigEnv();
+  // Protocol v1.2: the project identity for run-meta, resolved only when the run will relay.
+  // Bounded (IDENTITY_WAIT_MS) and never rejects; null means no key.
+  const identityP: Promise<ProjectIdentity | null> = ctx.relayDeps?.identity
+    ? ctx.relayDeps.identity(args.cwd).catch(() => null)
+    : runIdentity(env, args.cwd);
   const redactorExtra: string[] = [];
   const buildRedactor = ctx.relayDeps?.makeRedactor
     ?? ((extra: string[]): Redactor => createRedactor(reportingSecretValues(args.cwd, env, extra)));
@@ -936,7 +949,8 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
   const shim = ctx.vscode as { __setConfigOverride?: (k: string, v: unknown) => void; __configFileSets?: (k: string) => boolean };
   let overrodeClaudeFormat = false;
   try {
-    const started = startRelay(args, ctx, plan, env, buildRedactor);
+    const identity = await identityP;
+    const started = startRelay(args, ctx, plan, env, buildRedactor, identity);
     // main() already did this; a caller that bypassed main() still must not leak the key to children.
     if (!ctx.relayDeps?.env) { forgetRelayEnv(process.env); }
     if (started) {
@@ -958,6 +972,20 @@ export async function cmdRun(args: Args, ctx: Ctx): Promise<number> {
     if (overrodeClaudeFormat) { shim.__setConfigOverride?.(claudeFormatKey, undefined); }
     if (relay) { await relay.close(); }
     unwireReporting();
+  }
+}
+
+/**
+ * The project identity of `moag run`'s folder: resolved only when a device key is configured
+ * (no git spawn otherwise), within IDENTITY_WAIT_MS. Never rejects.
+ */
+function runIdentity(env: NodeJS.ProcessEnv, cwd: string): Promise<ProjectIdentity | null> {
+  if (!relayConfigured(env, cwd)) { return Promise.resolve(null); }
+  try {
+    const { ProjectIdentityCache: Cache, IDENTITY_WAIT_MS } = require('./project-identity');
+    return (new Cache() as ProjectIdentityCache).within(cwd, IDENTITY_WAIT_MS);
+  } catch {
+    return Promise.resolve(null);
   }
 }
 
@@ -989,6 +1017,7 @@ function startRelay(
   plan: any,
   env: NodeJS.ProcessEnv,
   buildRedactor: (extra: string[]) => Redactor,
+  identity: ProjectIdentity | null,
 ): { relay: OnosooRelay; key: string } | null {
   const deps = ctx.relayDeps;
   return startRunRelay({
@@ -1000,6 +1029,7 @@ function startRelay(
     http: deps?.http,
     isPidAlive: deps?.isPidAlive,
     closeDeadlineMs: deps?.closeDeadlineMs,
+    identity,
   });
 }
 
@@ -1336,7 +1366,7 @@ export async function cmdDaemon(args: Args, ctx: Ctx): Promise<number> {
 const REMOTE_HELPER_TIMEOUT_MS = 15_000;
 
 /** Run a sudo helper (probe, kill sweep) with a bounded wait; resolves its stdout (capped at 1 MB). */
-function runHelper(command: { command: string; args: string[] }, input: string | null): Promise<string> {
+function runHelper(command: { command: string; args: string[] }, input: string | null, env?: NodeJS.ProcessEnv): Promise<string> {
   const { spawn } = require('child_process');
   const { childSpawnEnv } = require('./remote-isolation');
   return new Promise((resolve) => {
@@ -1351,7 +1381,7 @@ function runHelper(command: { command: string; args: string[] }, input: string |
     };
     let proc: any;
     try {
-      proc = spawn(command.command, command.args, { stdio: ['pipe', 'pipe', 'pipe'], env: childSpawnEnv(process.env), windowsHide: true });
+      proc = spawn(command.command, command.args, { stdio: ['pipe', 'pipe', 'pipe'], env: env ?? childSpawnEnv(process.env), windowsHide: true });
     } catch {
       resolve('');
       return;
@@ -1379,15 +1409,20 @@ function createDaemonRemoteHost(
   const { spawn } = require('child_process');
   const { OnosooControl } = require('./onosoo-control');
   const { createCommandHost } = require('./onosoo-commands');
-  const { loadApprovedProjects } = require('./onosoo-projects');
+  const { loadApprovedProjects, MAX_PROJECTS } = require('./onosoo-projects');
   const { RemoteAudit } = require('./remote-audit');
   const { RemoteLedger } = require('./remote-ledger');
   const { RemoteRuns } = require('./remote-runs');
   const iso = require('./remote-isolation');
   const branch = require('./remote-branch');
   const { RemoteSupervisor } = require('./remote-supervisor');
+  const { ProjectIdentityCache: IdentityCache } = require('./project-identity');
 
   const http = ctx.relayDeps?.http;
+  // Project identities of the approved folders (protocol v1.2), shared by capabilities and runs.
+  // Sized past the approved-project cap, so a full projects.json never evicts and re-resolves every tick.
+  const identities: Pick<ProjectIdentityCache, 'peek' | 'warm' | 'within'> = ctx.relayDeps?.identities
+    ?? new IdentityCache({ maxEntries: MAX_PROJECTS + 64 });
   const control = new OnosooControl({ config: cfg, http, stderr });
   const ledger = new RemoteLedger(cfg.stateDir);
   const runs = new RemoteRuns(cfg.stateDir);
@@ -1406,6 +1441,9 @@ function createDaemonRemoteHost(
   // The runner account's home, learned from the probe, so worktree paths are scrubbed from relayed events.
   let runnerHome: string | null = null;
   const runnerUser = (): string | null => loadApprovedProjects(cfg.stateDir).runnerUser;
+  const isLocal = (): boolean => loadApprovedProjects(cfg.stateDir).mode === 'local';
+  // Local mode: mirrors, worktrees and run scratch live here (under MOAG's state dir), never in a runner's home.
+  const localRoot = path.join(cfg.stateDir, iso.LOCAL_RUNNER_DIR);
 
   return createCommandHost({
     control,
@@ -1416,6 +1454,12 @@ function createDaemonRemoteHost(
       // MOAG's own checks first: its state must be private, whatever the runner says.
       const insecure = iso.checkStateSecurity(cfg.stateDir, ownUid);
       if (insecure) { return { ok: false, reason: insecure }; }
+      if (projects.mode === 'local') {
+        // Local mode: ask a child running as THIS user which engines are installed and signed in.
+        const lc = iso.localChildCommand(process.execPath, cliPath);
+        const lspec = JSON.stringify({ op: 'probe', protectedPaths: [], projects: projects.projects.map((p: any) => p.id), engineEnv, localRoot });
+        return iso.parseProbe(await runHelper(lc, lspec, iso.localChildEnv(process.env)), ownUid, [], { local: true });
+      }
       const command = iso.childCommand(projects.runnerUser, process.execPath, cliPath);
       const spec = JSON.stringify({ op: 'probe', protectedPaths, projects: projects.projects.map((p: any) => p.id), engineEnv });
       const out = iso.parseProbe(await runHelper(command, spec), ownUid, protectedPaths);
@@ -1430,12 +1474,20 @@ function createDaemonRemoteHost(
       if (out.home) { runnerHome = out.home; }
       return out;
     },
-    supervisorFactory: (req: any) => new RemoteSupervisor({
+    supervisorFactory: (req: any) => { const local = isLocal(); let localChildPid: number | undefined; return new RemoteSupervisor({
       record: req.record,
       projectName: req.project.name,
+      projectIdentity: req.identity ?? null,
       specLine: req.specLine,
       bundle: req.bundle,
       spawnChild: () => {
+        if (local) {
+          // Local mode: the same user, no sudo. POSIX: its own process group, so force-stop can kill the tree.
+          const c = iso.localChildCommand(process.execPath, cliPath);
+          const child = spawn(c.command, c.args, { detached: process.platform !== 'win32', stdio: ['pipe', 'pipe', 'pipe'], env: iso.localChildEnv(process.env), windowsHide: true });
+          localChildPid = child.pid;
+          return child;
+        }
         const c = iso.childCommand(runnerUser(), process.execPath, cliPath);
         return spawn(c.command, c.args, { detached: true, stdio: ['pipe', 'pipe', 'pipe'], env: iso.childSpawnEnv(process.env), windowsHide: true });
       },
@@ -1446,26 +1498,54 @@ function createDaemonRemoteHost(
         redactor: redactorFor(req.project.path),
         stderr,
         runId,
-        cwd: runnerHome ? path.posix.join(runnerHome, '.moag-remote', 'worktrees', runId) : req.project.path,
-        otherHomes: runnerHome ? [runnerHome] : [],
+        cwd: local ? path.join(localRoot, '.moag-remote', 'worktrees', runId)
+          : (runnerHome ? path.posix.join(runnerHome, '.moag-remote', 'worktrees', runId) : req.project.path),
+        otherHomes: local ? [localRoot] : (runnerHome ? [runnerHome] : []),
       }),
       ledger,
       runs,
       tmpDir: path.join(cfg.stateDir, 'remote', 'tmp'),
       importBranch: (file: string) => branch.importRunBranch(req.project.path, file, req.record.branch, branchPrefix, branch.spawnBranchGit),
+      // The optional last step: push the branch and open a DRAFT pull request, when this project's
+      // delivery setting (machine-local projects.json) asks for it. Off by default.
+      deliver: (exitCode: number | null) => {
+        const delivery = require('./remote-delivery');
+        const taskNames: string[] = [];
+        for (const pl of (req.record.snapshot?.playlists ?? []) as any[]) { for (const t of (pl.tasks ?? []) as any[]) { if (typeof t.name === 'string') { taskNames.push(t.name); } } }
+        return delivery.deliverBranch({
+          mode: req.project.delivery ?? 'off',
+          projectPath: req.project.path,
+          branch: req.record.branch,
+          branchPrefix,
+          base: req.project.prBase ?? null,
+          projectName: req.project.name,
+          planName: typeof req.record.snapshot?.name === 'string' ? req.record.snapshot.name : '',
+          taskNames,
+          exitCode,
+          runId: req.record.runId,
+        }, delivery.realDeliveryDeps);
+      },
       forceKill: async () => {
+        if (local) {
+          // The child's whole process tree: taskkill /T /F on Windows, SIGKILL to the process group elsewhere.
+          const k = iso.localKillAction(localChildPid, process.platform);
+          if (k?.type === 'command') { await runHelper(k, null, iso.localChildEnv(process.env)); }
+          else if (k?.type === 'group') { try { process.kill(-k.pgid, k.signal); } catch { /* already gone */ } }
+          return;
+        }
         const user = runnerUser();
         if (user && user !== 'root') { await runHelper(iso.forceKillCommand(user), null); }
       },
-      // After every run: nothing the runner account started outlives it.
+      // After every run: nothing the runner account started outlives it. (Local mode: the child kills its own tree on exit.)
       sweep: async () => {
+        if (local) { return; }
         const user = runnerUser();
         if (user && user !== 'root') { await runHelper(iso.forceKillCommand(user), null); }
       },
       stderr,
       onStarted: req.onStarted,
       onExit: req.onExit,
-    }),
+    }); },
     exportBundle: (projectPath: string, opts: any) => branch.exportInboundBundle(projectPath, opts, branch.spawnBranchGit),
     branchExists: (projectPath: string, name: string) => branch.projectHasBranch(projectPath, name, branch.spawnBranchGit),
     projectBranchTip: (projectPath: string, name: string) => branch.projectBranchTip(projectPath, name, branch.spawnBranchGit),
@@ -1489,10 +1569,18 @@ function createDaemonRemoteHost(
       }
     },
     killSweep: async (user: string) => { await runHelper(iso.forceKillCommand(user), null); },
+    localRoot,
     tighten: () => {
       for (const problem of iso.tightenStatePermissions(cfg.stateDir)) { stderr(`ONOSOO: could not tighten permissions: ${problem}\n`); }
     },
     stderr: (line: string) => stderr(line.endsWith('\n') ? line : `${line}\n`),
+    identities,
+    // The capabilities' key gets run-meta's rule, against the same redactor and paths a run's relay uses.
+    keyPasses: (key: string, projectPath: string) => keyPassesScrub(key, {
+      redactor: redactorFor(projectPath),
+      cwd: projectPath,
+      otherHomes: runnerHome ? [runnerHome] : [],
+    }),
   });
 }
 
@@ -2201,15 +2289,35 @@ function readKeyFromStdin(): Promise<string> {
       resolve(value.trim());
     };
     const onData = (chunk: string): void => {
-      for (const ch of chunk) {
-        if (ch === '\r' || ch === '\n') { done(key); return; }
-        if (ch === '\u0003' || ch === '\u0004') { done(''); return; } // Ctrl+C / Ctrl+D: nothing entered
-        if (ch === '\u007f' || ch === '\b') { key = key.slice(0, -1); continue; }
-        key += ch;
-      }
+      const step = keyPromptInput(key, chunk);
+      key = step.key;
+      if (step.end === 'enter') { done(key); } else if (step.end === 'cancel') { done(''); }
     };
     stdin.on('data', onData);
   });
+}
+
+/** A terminal escape sequence: CSI (`ESC [ … final`), SS3 (`ESC O x`) or a lone two-byte `ESC x`. */
+// eslint-disable-next-line no-control-regex -- matching ESC is the point
+const TERMINAL_ESCAPE = /\u001b(?:\[[0-9;?<=>]*[ -/]*[@-~]|O.|[^[O])?/g;
+
+/**
+ * One chunk of raw-mode input to the hidden key prompt, applied to what was typed
+ * so far. Terminal escape sequences are dropped: PowerShell (PSReadLine) leaves
+ * bracketed paste on, so a paste arrives as `ESC[200~<key>ESC[201~`, and those
+ * markers once made every pasted key "not a device key". Other control
+ * characters are ignored; Enter ends the prompt, Ctrl+C / Ctrl+D cancel it.
+ */
+export function keyPromptInput(sofar: string, chunk: string): { key: string; end?: 'enter' | 'cancel' } {
+  let key = sofar;
+  for (const ch of chunk.replace(TERMINAL_ESCAPE, '')) {
+    if (ch === '\r' || ch === '\n') { return { key, end: 'enter' }; }
+    if (ch === '\u0003' || ch === '\u0004') { return { key: '', end: 'cancel' }; }
+    if (ch === '\u007f' || ch === '\b') { key = key.slice(0, -1); continue; }
+    if (ch < ' ') { continue; }
+    key += ch;
+  }
+  return { key };
 }
 
 /**
@@ -2268,7 +2376,7 @@ export async function cmdPair(args: Args, deps: PairDeps = {}): Promise<number> 
 // ─── entry ───────────────────────────────────────────────────────────────────
 
 const MAIN_USAGE =
-  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|bench> ...\n' +
+  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|project-id|bench> ...\n' +
   '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
   '       moag --version | moag help\n' +
   '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
@@ -2287,6 +2395,7 @@ const MAIN_USAGE =
   '  moag standards check [--base <ref>] [--no-commands]     exit 0 ok · 1 blocking failure · 5 nothing checked · 6 blocking not checked\n' +
   '  moag standards propose [--stack <id>] [--write [--force]]\n' +
   '  moag pair [<key>] [--url <base>]   save the ONOSOO device key (read from stdin when omitted) and check it\n' +
+  '  moag project-id [--cwd <dir>] [--json]   print the ONOSOO project ID runs from this folder report\n' +
   '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n';
 
 /** The CLI entry point. Exported so a test can drive dispatch. */
@@ -2310,6 +2419,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (args.command === 'pair') {
     // No setup() and no shim: pairing writes one user-level file and makes one HTTP call.
     return cmdPair(args);
+  }
+  if (args.command === 'project-id') {
+    // No setup() and no shim: local git and the user-level ONOSOO config only; nothing is sent.
+    return cmdProjectId(argv.slice(1), { env: relayConfigEnv() });
   }
   // Hidden: the ONOSOO remote child, started by `moag daemon` through sudo (docs/onosoo-remote.md).
   if (args.command === 'remote-child') {

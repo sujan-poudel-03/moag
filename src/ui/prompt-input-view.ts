@@ -3003,7 +3003,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         </div>
         <div class="plan-tools-right">
           <div class="plan-tool-group">
-            <button id="planPlayBtn" class="plan-tool-btn" type="button" title="Execute Plan" aria-label="Execute Plan">Execute</button>
+            <button id="planPlayBtn" class="plan-tool-btn" type="button" title="Run Plan" aria-label="Run Plan">Run Plan</button>
             <button id="planRunPendingBtn" class="plan-tool-btn" type="button" title="Run Pending" aria-label="Run Pending">Run</button>
 
             <button id="planSearchBtn" class="plan-tool-btn icon-only" type="button" title="Search Tasks" aria-label="Search Tasks"><svg viewBox="0 0 16 16" width="13" height="13" fill="currentColor"><path d="M6.5 1a5.5 5.5 0 1 1 0 11 5.5 5.5 0 0 1 0-11zm4.986 5.5a4.5 4.5 0 1 0-4.986 4.486A4.5 4.5 0 0 0 11.486 6.5zM14 13l-2.5-2.5.707-.707L14.707 12.29z"/></svg></button>
@@ -3262,8 +3262,8 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         </div>
         <div class="composer-toolbar-right">
           <button id="addToPlanBtn" class="add-to-plan-btn" type="button" title="Add to queue (Shift+Enter)" aria-keyshortcuts="Shift+Enter">+ Queue</button>
-          <button id="send" class="run-btn" type="button" title="Execute (Ctrl+Enter)" aria-keyshortcuts="Control+Enter">
-            Execute
+          <button id="send" class="run-btn" type="button" title="Run (Ctrl+Enter)" aria-keyshortcuts="Control+Enter">
+            Run
             <svg viewBox="0 0 16 16" width="11" height="11" fill="currentColor" style="flex-shrink:0"><path d="M3 2l10 6-10 6V2z"/></svg>
           </button>
         </div>
@@ -3275,7 +3275,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
       <span id="ctxRunner" class="ctx-chip">IDLE</span>
       <span id="ctxCost" class="ctx-chip" style="display:none;">$0.00</span>
     </div>
-    <div id="composerHint" class="composer-hint">Ctrl+Enter execute · Shift+Enter queue</div>
+    <div id="composerHint" class="composer-hint">Ctrl+Enter run · Shift+Enter queue</div>
   </div>
 
   <script nonce="${nonce}" src="${scriptUri}"></script>

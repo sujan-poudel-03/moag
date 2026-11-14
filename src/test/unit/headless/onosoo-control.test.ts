@@ -75,7 +75,7 @@ describe('ONOSOO control — poll', () => {
       assert.equal(await control.poll(), 'stop');
       assert.equal(await control.poll(), 'stop');
       assert.equal(await control.postResult('abcd', { status: 'failed', message: 'x' }), 'revoked');
-      assert.equal(await control.sendCapabilities({ remote_start: false, projects: [], engines: [] }), false);
+      assert.equal(await control.sendCapabilities({ mode: 'isolated' as const, remote_start: false, projects: [], engines: [] }), false);
       assert.equal(calls.length, 1, 'nothing is sent after a revocation');
       assert.deepEqual(stderr, [`${REVOKED_MESSAGE}\n`]);
       assert.equal(control.revoked, true);
@@ -146,7 +146,7 @@ describe('ONOSOO control — results and capabilities', () => {
 
   it('sends capabilities on the events route with no events and never a heartbeat', async () => {
     const { control, calls } = client([ok({ acked: {} })]);
-    const caps = { remote_start: true, projects: [{ id: 'web', name: 'Web', kinds: ['node'] }], engines: ['claude'] };
+    const caps = { mode: 'isolated' as const, remote_start: true, projects: [{ id: 'web', name: 'Web', kinds: ['node'] }], engines: ['claude'] };
     assert.equal(await control.sendCapabilities(caps), true);
     assert.equal(calls[0].url, CONFIG.endpoint);
     assert.deepEqual(Object.keys(calls[0].body).sort(), ['capabilities', 'device_id', 'events', 'moag_version', 'protocol']);
@@ -158,7 +158,7 @@ describe('ONOSOO control — results and capabilities', () => {
     const { control, calls } = client(() => ok({ commands: [], acked: {} }) as { status: number; body: string });
     await control.poll();
     await control.postResult('abcd', { status: 'running', message: 'x' });
-    await control.sendCapabilities({ remote_start: false, projects: [], engines: [] });
+    await control.sendCapabilities({ mode: 'isolated' as const, remote_start: false, projects: [], engines: [] });
     assert.equal(calls.length, 3);
     assert.ok(calls.every((c) => !('heartbeat' in c.body)));
   });

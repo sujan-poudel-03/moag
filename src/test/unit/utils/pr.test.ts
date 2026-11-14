@@ -49,6 +49,27 @@ describe('utils/pr — buildPrBody', () => {
   });
 });
 
+describe('utils/pr — a pushed branch and the caller\'s own text', () => {
+  const req = { cwd: '/r', title: 'T', planName: 'P', tasks: [], changedFiles: [] };
+
+  it('names the head branch, so the PR does not depend on what is checked out', () => {
+    const { gh, calls } = okGh();
+    createPullRequest({ ...req, head: 'moag/run-1', base: 'dev', draft: true }, gh);
+    const create = calls.find((c) => c[0] === 'pr')!;
+    assert.deepEqual(create.slice(create.indexOf('--head'), create.indexOf('--head') + 2), ['--head', 'moag/run-1']);
+    assert.ok(create.includes('--draft'));
+    assert.equal(create[create.indexOf('--base') + 1], 'dev');
+  });
+
+  it('uses the body it is given instead of building one, and omits --head when none is given', () => {
+    const { gh, calls } = okGh();
+    createPullRequest({ ...req, body: 'My own body' }, gh);
+    const create = calls.find((c) => c[0] === 'pr')!;
+    assert.equal(create[create.indexOf('--body') + 1], 'My own body');
+    assert.equal(create.includes('--head'), false);
+  });
+});
+
 describe('utils/pr — createPullRequest', () => {
   const req = { cwd: '/repo', title: 'T', planName: 'P', tasks: [], changedFiles: [] };
 

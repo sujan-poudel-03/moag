@@ -42,9 +42,14 @@ export interface CommandResult {
 export type ResultOutcome = 'delivered' | 'final' | 'drop' | 'retry' | 'revoked';
 
 export interface Capabilities {
+  /** `local`: runs execute as this PC's own user; `isolated`: as a separate runner account. */
+  mode: 'local' | 'isolated';
   remote_start: boolean;
-  projects: Array<{ id: string; name: string; kinds: string[] }>;
+  /** `key` (protocol v1.2) is the folder's project_key when known; never a path or a URL. */
+  projects: Array<{ id: string; name: string; kinds: string[]; key?: string }>;
   engines: string[];
+  /** engine id → why an installed engine cannot be used (not signed in). Only present when there is one. */
+  engine_issues?: Record<string, string>;
 }
 
 export interface OnosooControlOptions {

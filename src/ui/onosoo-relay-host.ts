@@ -9,6 +9,8 @@ import * as vscode from 'vscode';
 import { createHostRunRelay, HostRelayRunner, probeRelayStatus, RelayStatus } from '../headless/host-run-relay';
 import type { RelayEnvSnapshot } from '../headless/run-reporter';
 import { REVOKED_MESSAGE } from '../headless/onosoo-relay';
+import { createReasonedIdentityCache, IdentityAbsenceReason } from '../headless/project-id';
+import type { ProjectIdentity, ProjectIdentityResolution } from '../headless/project-identity';
 import type { Plan } from '../models/types';
 
 /** globalState key: the user dismissed the text-mode cost notice for good. */
@@ -39,6 +41,29 @@ export interface OnosooRelayHostDeps {
    */
   loadedPlan?(): Plan | null;
   log(line: string): void;
+  /** Resolves one folder's project identity with its reason (tests; default: git). */
+  resolveIdentity?: (dir: string) => Promise<ProjectIdentityResolution>;
+}
+
+/**
+ * A read-only view of the relay host for the ONOSOO project ID command and the dashboard
+ * segment: the relay status, the relay's folder, the env a run sees, and the identity cache.
+ */
+export interface OnosooProjectView {
+  status(): RelayStatus;
+  /** The relay's folder: the first workspace folder, or null. */
+  folder(): string | null;
+  firstFolderName(): string | null;
+  isMultiRoot(): boolean;
+  /** process.env plus the relay variables activate() took out of it. */
+  env(): NodeJS.ProcessEnv;
+  identities: {
+    peek(dir: string): ProjectIdentity | null | undefined;
+    reasonOf(dir: string): IdentityAbsenceReason | undefined;
+    warm(dir: string, opts?: { priority?: boolean }): Promise<ProjectIdentity | null>;
+  };
+  /** Fires when the status is drawn (a reprobe, or the controller mid-run) and when a warmed identity lands. */
+  onDidChange(listener: () => void): { dispose(): void };
 }
 
 /** What activate() keeps: the pairing commands and the PR follow-up use it. */
@@ -49,6 +74,8 @@ export interface OnosooRelayHost {
   isLive(): boolean;
   /** Report a PR opened right after a relayed run on that run in ONOSOO. Never rejects. */
   notePrCreated?(url: string): Promise<void>;
+  /** The project view the copy command and the dashboard segment read. */
+  readonly project: OnosooProjectView;
 }
 
 /** Call once during activate(), after the runner exists. */
@@ -63,10 +90,21 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost 
   const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 97);
   item.command = { command: 'workbench.action.openSettings', title: 'ONOSOO', arguments: [RELAY_SETTING] };
 
+  let lastStatus: RelayStatus = 'none';
+  const listeners = new Set<() => void>();
+  /** Tell every project-view listener; one that throws never disturbs the others or a run. */
+  const fire = (): void => {
+    for (const l of [...listeners]) {
+      try { l(); } catch { /* a listener never disturbs the host */ }
+    }
+  };
+
   const render = (status: RelayStatus): void => {
+    lastStatus = status;
     switch (status) {
       case 'none':
         item.hide();
+        fire();
         return;
       case 'on':
         item.text = '$(cloud) ONOSOO';
@@ -82,9 +120,22 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost 
         break;
     }
     item.show();
+    fire();
   };
 
-  const reprobe = (): void => { render(probeRelayStatus(env(), cwd(), enabled(), deps.log)); };
+  // Project identity (protocol v1.2): warmed whenever this machine is paired, so a run rarely
+  // waits for it and the dashboard can show it (local git only; nothing is sent while off).
+  const reasoned = createReasonedIdentityCache({ resolve: deps.resolveIdentity });
+  const identities = reasoned.cache;
+
+  const reprobe = (): void => {
+    const s = probeRelayStatus(env(), cwd(), enabled(), deps.log);
+    render(s);
+    const c = cwd();
+    if (s !== 'none' && c) {
+      try { void identities.warm(c).then(fire, () => undefined); } catch { /* warming never disturbs the host */ }
+    }
+  };
   reprobe();
 
   const configListener = vscode.workspace.onDidChangeConfiguration((e) => {
@@ -137,12 +188,37 @@ export function initOnosooRelayHost(deps: OnosooRelayHostDeps): OnosooRelayHost 
     log: deps.log,
     onStatus: render,
     onRunRelayed: maybeNotice,
+    identity: identities,
   });
 
-  deps.context.subscriptions.push(item, configListener, foldersListener, { dispose: () => controller.dispose() });
+  deps.context.subscriptions.push(item, configListener, foldersListener, {
+    dispose: () => {
+      listeners.clear();
+      controller.dispose();
+    },
+  });
+
+  const project: OnosooProjectView = {
+    status: () => lastStatus,
+    folder: cwd,
+    firstFolderName: () => vscode.workspace.workspaceFolders?.[0]?.name ?? null,
+    isMultiRoot: () => (vscode.workspace.workspaceFolders?.length ?? 0) > 1,
+    env,
+    identities: {
+      peek: (d) => identities.peek(d),
+      reasonOf: (d) => reasoned.reasonOf(d),
+      warm: (d, o) => identities.warm(d, o),
+    },
+    onDidChange: (listener) => {
+      listeners.add(listener);
+      return { dispose: () => { listeners.delete(listener); } };
+    },
+  };
+
   return {
     reprobe,
     isLive: () => controller.live,
     notePrCreated: (url) => controller.notePrCreated(url),
+    project,
   };
 }

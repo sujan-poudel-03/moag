@@ -2,13 +2,13 @@
 #
 # MOAG — prepare a Linux (or WSL2 Ubuntu) machine as an ONOSOO build server.
 #
-#   bash scripts/setup-build-server.sh [--source <path-or-git-url>] [--branch <name>]
+#   bash scripts/setup-build-server.sh [--source <path-or-git-url>] [--branch <name>] [--node <major>]
 #
 # Run it as your own login (not root); it asks for your sudo password where needed.
 # Safe to run again: every step checks before it changes anything.
 #
 # What it does (see docs/onosoo-remote.md and docs/host-agent.md):
-#   1. base packages, Node 20 at /usr/bin/node, git >= 2.45.1
+#   1. base packages, Node (default 24) at /usr/bin/node, git >= 2.45.1
 #   2. Docker Engine + Compose plugin, and your login in the docker group
 #   3. MOAG built at /opt/moag (read-only for the runner) and a `moag` wrapper
 #   4. the dedicated runner account `moag-runner` and the sudoers rule for remote runs
@@ -20,11 +20,16 @@
 set -euo pipefail
 
 SOURCE="${MOAG_SOURCE:-$(cd "$(dirname "$0")/.." && pwd)}"
+# The Node every run uses: the projects MOAG builds run on the machine's Node, and ONOSOO needs 24 (its
+# lock file only installs with npm 11). MOAG itself runs on it too. Use --node 20 only for a project that
+# needs 20, or to run MOAG's own test suite (see docs/benchmark.md, "Brownfield and the Node version").
+NODE_MAJOR=24
 BRANCH="feat/sdlc-automation"
 while [ $# -gt 0 ]; do
   case "$1" in
     --source) SOURCE="$2"; shift 2 ;;
     --branch) BRANCH="$2"; shift 2 ;;
+    --node) NODE_MAJOR="$2"; shift 2 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
 done
@@ -48,11 +53,12 @@ if grep -qi microsoft /proc/version 2>/dev/null; then
   fi
 fi
 
-say "1/6 Base packages and Node 20"
+say "1/6 Base packages and Node $NODE_MAJOR"
 sudo apt-get update -y
 sudo apt-get install -y ca-certificates curl gnupg git build-essential rsync
-if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" != "20" ]; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+case "$NODE_MAJOR" in *[!0-9]*|'') echo "--node needs a major version number, such as 24 (got '$NODE_MAJOR')." >&2; exit 2 ;; esac
+if ! command -v node >/dev/null || [ "$(node -p 'process.versions.node.split(".")[0]')" != "$NODE_MAJOR" ]; then
+  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | sudo -E bash -
   sudo apt-get install -y nodejs
 fi
 NODE_BIN="$(command -v node)"
@@ -157,6 +163,7 @@ say "Done"
 note "Next:"
 note "  1. Log out and in again (WSL: run 'wsl --shutdown' in Windows, reopen Ubuntu) so the docker group applies."
 note "  2. Run the tests on Linux:   cd ~/src/moag && npm test"
+note "     (on Node 22.6 or later some of MOAG's own tests need Node 20 or: node --no-experimental-strip-types node_modules/mocha/bin/mocha.js; see docs/benchmark.md)"
 note "  3. Give the runner an engine: either set ANTHROPIC_API_KEY for the daemon, or"
 note "     sudo npm install -g @anthropic-ai/claude-code && sudo -u $RUNNER -H claude   (log in once)"
 note "  4. Pair this machine in ONOSOO, then: export MOAG_ONOSOO_URL=... MOAG_ONOSOO_KEY=...  and run: moag daemon"

@@ -1076,7 +1076,7 @@ describe('Regression: the sidebar webview script', () => {
   // prompt-input-view.ts, where tsc never parsed it. Two SyntaxErrors reached
   // users that way and a ReferenceError came within one command of doing so.
   //
-  // It is now src/webview/sidebar.ts, compiled by tsconfig.webview.json — so the
+  // It is now src/webview/sidebar.ts, compiled by src/webview/tsconfig.sidebar.json — so the
   // compiler is the primary guard and these are the backstop. They check the
   // shipped artifact and the wiring that loads it, neither of which tsc covers.
   const COMPILED = 'out/webview/sidebar.js';
@@ -1463,7 +1463,7 @@ describe('Regression: the docs do not contradict the code', () => {
   it('documents every command the CLI actually accepts', () => {
     // The usage banner is the CLI's own statement of its surface.
     const cli = fsMod.readFileSync('src/headless/cli.ts', 'utf-8');
-    const banner = /Usage: moag <([a-z|]+)>/.exec(cli);
+    const banner = /Usage: moag <([a-z|-]+)>/.exec(cli);
     assert.ok(banner, 'could not find the usage banner in cli.ts');
     const commands = banner![1].split('|');
     assert.ok(commands.length >= 8, `expected the full command set, got ${commands.join(',')}`);
@@ -1548,7 +1548,7 @@ describe('Regression: the published package is complete', () => {
     const kept = rules.filter((r: string) => r.startsWith('!')).map((r: string) => new RegExp(
       '^' + r.slice(1).replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '<<GLOBSTAR>>').replace(/\*/g, '[^/]*').replace(/<<GLOBSTAR>>/g, '.*') + '$'));
     // Each of these shipped once and is pure noise in an install.
-    for (const unwanted of ['src/extension.ts', 'CLAUDE.md', 'scripts/bundle.js', 'tsconfig.webview.json', 'out/extension.js', 'out/server/main.js', 'node_modules/@anthropic-ai/sdk/index.js']) {
+    for (const unwanted of ['src/extension.ts', 'CLAUDE.md', 'scripts/bundle.js', 'src/webview/tsconfig.sidebar.json', 'out/extension.js', 'out/server/main.js', 'node_modules/@anthropic-ai/sdk/index.js']) {
       assert.ok(!kept.some((re: RegExp) => re.test(unwanted)), `.vscodeignore now ships ${unwanted}`);
     }
   });

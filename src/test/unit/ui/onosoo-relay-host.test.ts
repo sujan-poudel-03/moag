@@ -5,6 +5,7 @@ import * as sinon from 'sinon';
 import { REVOKED_MESSAGE } from '../../../headless/onosoo-relay';
 import type { HostRunRelayDeps, RelayStatus } from '../../../headless/host-run-relay';
 import type { Plan } from '../../../models/types';
+import type { ProjectIdentityResolution } from '../../../headless/project-identity';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const proxyquire = require('proxyquire').noCallThru();
 // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -74,7 +75,7 @@ describe('onosoo-relay-host', () => {
   });
 
   /** A fresh copy of the module (so its once-per-session flag starts unset), initialised. */
-  function init(relayEnv: Record<string, string> = {}, extra: { runner?: unknown; planPath?: () => string | null; loadedPlan?: () => Plan | null } = {}): HostModule {
+  function init(relayEnv: Record<string, string> = {}, extra: { runner?: unknown; planPath?: () => string | null; loadedPlan?: () => Plan | null; resolveIdentity?: (dir: string) => Promise<ProjectIdentityResolution> } = {}): HostModule {
     const mod = proxyquire('../../../ui/onosoo-relay-host', {
       vscode: vscodeMock,
       '../headless/host-run-relay': {
@@ -95,6 +96,8 @@ describe('onosoo-relay-host', () => {
       planPath: extra.planPath ?? (() => null),
       ...(extra.loadedPlan ? { loadedPlan: extra.loadedPlan } : {}),
       log: () => undefined,
+      // Never real git in these tests: warming runs for on, off and revoked.
+      resolveIdentity: extra.resolveIdentity ?? (async () => ({ identity: null, reason: 'not_a_repo' })),
     });
     return mod;
   }
@@ -277,6 +280,122 @@ describe('onosoo-relay-host', () => {
     sinon.stub(vscodeMock.window, 'showInformationMessage').throws(new Error('no window'));
     init();
     assert.doesNotThrow(() => captured!.onRunRelayed!(plan([undefined], 'claude')));
+  });
+
+  // ─── project view (copy command and dashboard segment) ───
+
+  describe('project view', () => {
+    const ROOT = 'root:' + 'a'.repeat(40);
+    let folders: unknown;
+    beforeEach(() => { folders = vscodeMock.workspace.workspaceFolders; });
+    afterEach(() => { vscodeMock.workspace.workspaceFolders = folders; });
+
+    /** Let the cache's lookup and its .then(fire) run. */
+    const flush = async (): Promise<void> => { for (let i = 0; i < 10; i++) { await Promise.resolve(); } };
+
+    it('probe off: the folder is warmed once; none: not at all', async () => {
+      const resolveIdentity = sinon.stub().resolves({ identity: { project_key: ROOT }, reason: null });
+      probe.returns('off');
+      init({}, { resolveIdentity });
+      await flush();
+      assert.equal(resolveIdentity.callCount, 1);
+      assert.equal(resolveIdentity.firstCall.args[0], '/mock/workspace');
+      const none = sinon.stub().resolves({ identity: { project_key: ROOT }, reason: null });
+      probe.returns('none');
+      init({}, { resolveIdentity: none });
+      await flush();
+      assert.equal(none.called, false);
+    });
+
+    it('status() follows render, and a mid-run revoked from the controller fires the listener', () => {
+      probe.returns('on');
+      init();
+      const view = handle!.project;
+      assert.equal(view.status(), 'on');
+      const listener = sinon.spy();
+      view.onDidChange(listener);
+      captured!.onStatus!('revoked');
+      assert.equal(view.status(), 'revoked');
+      assert.equal(listener.callCount, 1);
+      captured!.onStatus!('none');
+      assert.equal(view.status(), 'none');
+      assert.equal(listener.callCount, 2, 'none fires too');
+    });
+
+    it('the listener fires when a warmed identity lands, and peek() then holds it', async () => {
+      let release: (r: ProjectIdentityResolution) => void = () => undefined;
+      const resolveIdentity = (): Promise<ProjectIdentityResolution> => new Promise((r) => { release = r; });
+      probe.returns('on');
+      init({}, { resolveIdentity });
+      const view = handle!.project;
+      const listener = sinon.spy();
+      view.onDidChange(listener);
+      assert.equal(view.identities.peek('/mock/workspace'), undefined);
+      release({ identity: { project_key: ROOT }, reason: null });
+      await flush();
+      assert.equal(listener.callCount, 1);
+      assert.deepEqual(view.identities.peek('/mock/workspace'), { project_key: ROOT });
+      assert.equal(view.identities.reasonOf('/mock/workspace'), undefined);
+    });
+
+    it('a folder without an identity keeps its reason', async () => {
+      probe.returns('revoked');
+      init({}, { resolveIdentity: async () => ({ identity: null, reason: 'shallow_no_origin' }) });
+      await flush();
+      const view = handle!.project;
+      assert.equal(view.identities.peek('/mock/workspace'), null);
+      assert.equal(view.identities.reasonOf('/mock/workspace'), 'shallow_no_origin');
+    });
+
+    it('a change of folders fires the listener and warms the new first folder', async () => {
+      const resolveIdentity = sinon.stub().resolves({ identity: { project_key: ROOT }, reason: null });
+      probe.returns('on');
+      init({}, { resolveIdentity });
+      await flush();
+      const view = handle!.project;
+      const listener = sinon.spy();
+      view.onDidChange(listener);
+      vscodeMock.workspace.workspaceFolders = [{ uri: { fsPath: '/mock/other' }, name: 'other' }, { uri: { fsPath: '/mock/workspace' }, name: 'workspace' }];
+      foldersListener!();
+      assert.equal(listener.callCount, 1, 'fired by the redraw');
+      assert.equal(view.folder(), '/mock/other');
+      assert.equal(view.firstFolderName(), 'other');
+      assert.equal(view.isMultiRoot(), true);
+      await flush();
+      assert.equal(resolveIdentity.lastCall.args[0], '/mock/other');
+      assert.equal(listener.callCount, 2, 'fired again when the new identity lands');
+    });
+
+    it('a throwing listener breaks neither render nor the other listeners', () => {
+      probe.returns('on');
+      init();
+      const view = handle!.project;
+      view.onDidChange(() => { throw new Error('boom'); });
+      const ok = sinon.spy();
+      view.onDidChange(ok);
+      assert.doesNotThrow(() => captured!.onStatus!('off'));
+      assert.equal(ok.callCount, 1);
+      assert.equal(item.text, '$(circle-slash) ONOSOO: off');
+    });
+
+    it('a disposed listener, and every listener after the host is disposed, is not called', () => {
+      probe.returns('on');
+      init();
+      const view = handle!.project;
+      const a = sinon.spy();
+      const b = sinon.spy();
+      view.onDidChange(a).dispose();
+      view.onDidChange(b);
+      for (const sub of subscriptions) { sub.dispose(); }
+      captured!.onStatus!('off');
+      assert.equal(a.called, false);
+      assert.equal(b.called, false);
+    });
+
+    it('env() is process.env plus the relay snapshot', () => {
+      init({ MOAG_ONOSOO_KEY: 'snap-key-1234' });
+      assert.equal(handle!.project.env().MOAG_ONOSOO_KEY, 'snap-key-1234');
+    });
   });
 
   // ─── lifecycle ───

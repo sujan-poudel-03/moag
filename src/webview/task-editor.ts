@@ -1,7 +1,7 @@
 // ─── task-editor webview script ───────────────────────────────────────
 //
 // Runs in the webview, not the extension host. Compiled by
-// tsconfig.webview.task-editor.json and loaded with <script src>. It used to live
+// src/webview/tsconfig.task-editor.json and loaded with <script src>. It used to live
 // inside a template literal, where the compiler never parsed it.
 
 /** Provided by the VS Code webview runtime. */

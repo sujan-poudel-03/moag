@@ -44,6 +44,8 @@ export interface RemoteRunRecord {
   /** Set once an approve/skip/retry has acted on this run: it can be decided once. */
   decided?: { kind: string; commandId: string; at: string };
   importError?: string;
+  /** What the delivery step did (pushed, opened a draft PR, or why it did not), one line. Absent when delivery is off. */
+  delivery?: string;
   stopReason?: string;
   /** How the plan was made: a PRD plan carries ship gates, a goal-only plan does not. */
   planKind?: 'goal' | 'prd';

@@ -25,14 +25,25 @@ export interface ApprovedProject {
   name: string;
   kinds: string[];
   path: string;
+  /** What to do with a finished run's branch: nothing (default), push it, or push it and open a draft PR. */
+  delivery?: 'off' | 'branch' | 'draft-pr';
+  /** The branch a delivered pull request targets; the repository default when absent. */
+  prBase?: string;
 }
+
+export type ProjectsMode = 'local' | 'isolated';
 
 export interface ApprovedProjects {
   /** True only when the file says `"remote_start": true`. */
   remoteStart: boolean;
   dailyBudgetUsd: number | null;
-  /** OS account runs should use; never `root`. */
+  /** OS account runs should use; never `root`. Ignored in local mode. */
   runnerUser: string | null;
+  /**
+   * `local`: runs execute as this PC's own user (explicit opt-in, `"mode": "local"`). Anything else,
+   * or absent, is the isolated mode (a separate runner account). Absent here means isolated.
+   */
+  mode?: ProjectsMode;
   projects: ApprovedProject[];
   /** One readable line per problem found; empty when the file is clean (or absent). */
   errors: string[];
@@ -51,7 +62,7 @@ const RUNNER_USER_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
 const MAX_NAME = 200;
 
 function empty(errors: string[] = []): ApprovedProjects {
-  return { remoteStart: false, dailyBudgetUsd: null, runnerUser: null, projects: [], errors };
+  return { remoteStart: false, dailyBudgetUsd: null, runnerUser: null, mode: 'isolated', projects: [], errors };
 }
 
 /** A path in comparable form: forward slashes and case-folded on win32, no trailing separator. */
@@ -131,6 +142,13 @@ export function loadApprovedProjects(stateDir: string, opts: LoadApprovedProject
         : `runner_user must be a plain account name (got ${JSON.stringify(user)}); no runner user is set.`);
     }
 
+    // Local mode is never inferred: only the exact string "local" turns it on.
+    if (doc.mode === 'local') {
+      out.mode = 'local';
+    } else if (doc.mode !== undefined && doc.mode !== 'isolated') {
+      errors.push(`mode must be "local" or "isolated" (got ${JSON.stringify(doc.mode)}); the isolated mode is used.`);
+    }
+
     // ─── Projects ───
 
     if (doc.projects === undefined) { return out; }
@@ -188,6 +206,18 @@ export function loadApprovedProjects(stateDir: string, opts: LoadApprovedProject
       if (!stat.isDirectory()) { reject(`path is not a directory: ${p}`); return; }
       if (!fs.existsSync(path.join(p, '.git'))) { reject(`path is not the top level of a git repository (no .git): ${p}`); return; }
 
+      // Delivery is opt-in and fails closed: anything unrecognised leaves it off, with a note.
+      let delivery: 'off' | 'branch' | 'draft-pr' = 'off';
+      if (entry.delivery !== undefined) {
+        if (entry.delivery === 'off' || entry.delivery === 'branch' || entry.delivery === 'draft-pr') { delivery = entry.delivery; }
+        else { errors.push(`${label}: delivery must be "off", "branch" or "draft-pr" (got ${JSON.stringify(entry.delivery)}); delivery stays off.`); }
+      }
+      let prBase: string | undefined;
+      if (entry.pr_base !== undefined) {
+        if (typeof entry.pr_base === 'string' && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(entry.pr_base) && !entry.pr_base.includes('..')) { prBase = entry.pr_base; }
+        else { errors.push(`${label}: pr_base must be a plain branch name (got ${JSON.stringify(entry.pr_base)}); the repository default is used.`); }
+      }
+
       let real: string;
       try { real = realpath(p); } catch { reject(`path could not be resolved: ${p}`); return; }
       const cmp = comparable(real, platform);
@@ -196,7 +226,7 @@ export function loadApprovedProjects(stateDir: string, opts: LoadApprovedProject
         return;
       }
 
-      accepted.push({ project: { id, name: name.slice(0, MAX_NAME), kinds, path: real }, cmp, label });
+      accepted.push({ project: { id, name: name.slice(0, MAX_NAME), kinds, path: real, ...(delivery !== 'off' ? { delivery } : {}), ...(prBase ? { prBase } : {}) }, cmp, label });
     });
 
     // Overlapping repositories reject both: a run in one would touch the other.

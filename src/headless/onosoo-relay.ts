@@ -57,6 +57,16 @@ export const REVOKED_MESSAGE = 'ONOSOO device key was revoked or is wrong — re
 
 const MAX_RESPONSE_BYTES = 1024 * 1024;
 const RUN_META_TASKS = 1000;
+/** Longest `project_key` (and child `key`/`dir`) in run-meta. Mirrors PROJECT_KEY_MAX in project-identity.ts. */
+export const RUN_META_KEY_MAX = 255;
+/** Longest `repo_url` in run-meta. Mirrors REPO_URL_MAX in project-identity.ts. */
+export const RUN_META_URL_MAX = 500;
+/** Most child repositories of a `multi:` key in run-meta. */
+export const RUN_META_REPOS_MAX = 20;
+/** The prefixes a run-meta `project_key` may have; a key with any other is dropped. */
+export const RUN_META_KEY_PREFIX = /^(git|root|multi):/;
+/** A task type as MOAG names it: lower-case words, nothing that could carry text. */
+const TASK_KIND_RE = /^[a-z][a-z0-9-]{0,23}$/;
 /**
  * How often a live run's spool file is touched; far inside SPOOL_OWNER_MAX_IDLE_MS (10 min).
  * 30 s, not 60: off Linux, ownership rests on the file's mtime alone, and after a sleep/resume
@@ -207,9 +217,19 @@ function applyProtocolStatus(type: string, data: Record<string, unknown>): void 
 export interface RunMeta {
   plan_name: string;
   project: string;
-  tasks: Array<{ id: string; name: string }>;
+  /**
+   * Each task in plan order. `stage` is the playlist it sits in (Design, Development, Testing, Ship),
+   * `kind` its type (agent, command, check, manual, ...): together they let ONOSOO draw the run as stages.
+   */
+  tasks: Array<{ id: string; name: string; stage?: string; kind?: string }>;
   /** The branch a remote run delivers to; absent or null for a run started by hand. */
   branch?: string | null;
+  /** Protocol v1.2: the stable, path-free project id (`git:`, `root:` or `multi:`). */
+  project_key?: string;
+  /** Protocol v1.2: a browsable https link to the repository; only with a `git:` key. */
+  repo_url?: string;
+  /** Protocol v1.2: the child repositories of a `multi:` key. */
+  repos?: Array<{ dir: string; key: string; repo_url?: string }>;
 }
 
 /** True when `s` looks like a file-system path rather than a project name. */
@@ -285,6 +305,59 @@ export function scrubPaths(s: string, cwd: string | null, home: string | null, o
     if (h && !isRoot(h)) { out = replacePrefix(out, h, '~'); }
   }
   return out;
+}
+
+// ─── Scrubbing outside a relay ───
+
+/** What a string is scrubbed against before it leaves the machine: a relay's own inputs. */
+export interface RelayScrubContext {
+  redactor: Redactor;
+  /** The workspace: absolute paths inside it become relative. */
+  cwd?: string | null;
+  /** The user's home, shown as `~`; defaults to os.homedir(). */
+  homedir?: string | null;
+  /** More home directories to show as `~`. */
+  otherHomes?: readonly string[];
+}
+
+/** The path-scrub targets of a relay (or a context), normalised the same way everywhere. */
+function scrubTargets(o: { cwd?: string | null; homedir?: string | null; otherHomes?: readonly string[] }): { cwd: string | null; home: string | null; otherHomes: string[] } {
+  const cwd = o.cwd ? path.resolve(o.cwd) : null;
+  let home: string | null = o.homedir ?? null;
+  if (home === null) { try { home = os.homedir(); } catch { home = null; } }
+  const otherHomes = (o.otherHomes ?? []).filter((h) => typeof h === 'string' && h.length > 1);
+  return { cwd, home: home || null, otherHomes };
+}
+
+/**
+ * True when `key` would leave the machine unchanged: the relay's redaction and path scrub
+ * leave it as it is. The rule run-meta applies to `project_key`, for senders outside a relay
+ * (the daemon's capabilities). Never throws: a failing redactor means false.
+ */
+export function keyPassesScrub(key: string, ctx: RelayScrubContext): boolean {
+  try {
+    const t = scrubTargets(ctx);
+    return scrubPaths(ctx.redactor.redact(key).text, t.cwd, t.home, t.otherHomes) === key;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The `repo_url` run-meta would carry with a `git:` key, for senders outside a relay: the URL
+ * redacted and path-scrubbed, kept only when it then starts with https:// and fits
+ * RUN_META_URL_MAX (the relay's own run-meta rule). Returns the scrubbed URL, or null.
+ * Never throws: a failing redactor means null.
+ */
+export function repoUrlAsSent(url: unknown, ctx: RelayScrubContext): string | null {
+  if (typeof url !== 'string' || url.length === 0) { return null; }
+  try {
+    const t = scrubTargets(ctx);
+    const scrubbed = scrubPaths(ctx.redactor.redact(url).text, t.cwd, t.home, t.otherHomes);
+    return scrubbed.startsWith('https://') && scrubbed.length <= RUN_META_URL_MAX ? scrubbed : null;
+  } catch {
+    return null;
+  }
 }
 
 // ─── Relay ───
@@ -381,11 +454,10 @@ export class OnosooRelay {
     this.stderr = opts.stderr ?? ((s: string): void => { process.stderr.write(s); });
     this.now = opts.now ?? Date.now;
     this.closeDeadlineMs = opts.closeDeadlineMs ?? CLOSE_DEADLINE_MS;
-    this.cwd = opts.cwd ? path.resolve(opts.cwd) : null;
-    let home: string | null = opts.homedir ?? null;
-    if (home === null) { try { home = os.homedir(); } catch { home = null; } }
-    this.home = home || null;
-    this.otherHomes = (opts.otherHomes ?? []).filter((h) => typeof h === 'string' && h.length > 1);
+    const targets = scrubTargets(opts);
+    this.cwd = targets.cwd;
+    this.home = targets.home;
+    this.otherHomes = targets.otherHomes;
     if (typeof opts.seqStart === 'number' && Number.isSafeInteger(opts.seqStart) && opts.seqStart >= 0) {
       this.seq = opts.seqStart;
     }
@@ -526,15 +598,20 @@ export class OnosooRelay {
       const rawProject = this.redactor.redact(String(meta.project ?? '')).text;
       const project = r(looksLikePath(rawProject) ? baseName(rawProject) : rawProject, 200);
       const all = Array.isArray(meta.tasks) ? meta.tasks : [];
-      const tasks = all.slice(0, RUN_META_TASKS).map((t) => ({ id: r(t?.id, 100), name: r(t?.name, 200) }));
+      const tasks = all.slice(0, RUN_META_TASKS).map((t) => {
+        const stage = typeof t?.stage === 'string' ? r(t.stage, 80).trim() : '';
+        const kind = typeof t?.kind === 'string' && TASK_KIND_RE.test(t.kind) ? t.kind : '';
+        return { id: r(t?.id, 100), name: r(t?.name, 200), ...(stage ? { stage } : {}), ...(kind ? { kind } : {}) };
+      });
       const data: Record<string, unknown> = { plan_name: r(meta.plan_name, 200), project, tasks };
       if (typeof meta.branch === 'string' && meta.branch.length > 0) { data.branch = r(meta.branch, 255); }
+      this.addIdentity(meta, data);
       if (all.length > RUN_META_TASKS) { data.tasks_truncated = true; }
 
       // Keep the data within the per-event cap: drop tasks from the end until it fits.
       if (Buffer.byteLength(JSON.stringify(data), 'utf-8') > MAX_EVENT_DATA_BYTES) {
         let size = Buffer.byteLength(JSON.stringify({ ...data, tasks: [], tasks_truncated: true }), 'utf-8');
-        const kept: Array<{ id: string; name: string }> = [];
+        const kept: Array<{ id: string; name: string; stage?: string; kind?: string }> = [];
         for (const t of tasks) {
           const add = Buffer.byteLength(JSON.stringify(t), 'utf-8') + (kept.length > 0 ? 1 : 0);
           if (size + add > MAX_EVENT_DATA_BYTES) { break; }
@@ -547,6 +624,42 @@ export class OnosooRelay {
       return data;
     } catch {
       return { redaction_failed: true };
+    }
+  }
+
+  /**
+   * Protocol v1.2 identity fields. A key the redactor or path scrubber would change, or one over
+   * RUN_META_KEY_MAX, is dropped with its URL and repos (never sent mangled or cut: a cut key is
+   * a wrong identity). A URL is sent only scrubbed, https, and whole (a cut URL is a broken link).
+   * Throws when redaction does (the caller turns that into `redaction_failed`).
+   */
+  private addIdentity(meta: RunMeta, data: Record<string, unknown>): void {
+    const k = meta.project_key;
+    if (typeof k !== 'string' || k.length === 0 || k.length > RUN_META_KEY_MAX) { return; }
+    if (this.scrubString(k) !== k || !RUN_META_KEY_PREFIX.test(k)) { return; }
+    data.project_key = k;
+    const httpsUrl = (u: unknown): string | null => {
+      if (typeof u !== 'string' || u.length === 0) { return null; }
+      const scrubbed = this.scrubString(u);
+      return scrubbed.startsWith('https://') && scrubbed.length <= RUN_META_URL_MAX ? scrubbed : null;
+    };
+    if (k.startsWith('git:')) {
+      const u = httpsUrl(meta.repo_url);
+      if (u) { data.repo_url = u; }
+    }
+    if (k.startsWith('multi:') && Array.isArray(meta.repos)) {
+      const repos: Array<{ dir: string; key: string; repo_url?: string }> = [];
+      for (const e of meta.repos.slice(0, RUN_META_REPOS_MAX)) {
+        const dir: unknown = e?.dir;
+        const key: unknown = e?.key;
+        if (typeof dir !== 'string' || dir.length === 0 || dir.length > RUN_META_KEY_MAX || /[\\/]/.test(dir)
+          || this.scrubString(dir) !== dir) { continue; }
+        if (typeof key !== 'string' || !/^(git|root):/.test(key) || key.length > RUN_META_KEY_MAX
+          || this.scrubString(key) !== key) { continue; }
+        const u = key.startsWith('git:') ? httpsUrl(e.repo_url) : null;
+        repos.push(u ? { dir, key, repo_url: u } : { dir, key });
+      }
+      if (repos.length > 0) { data.repos = repos; }
     }
   }
 

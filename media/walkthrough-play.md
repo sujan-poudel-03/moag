@@ -1,7 +1,7 @@
 ## Execution Flow
 
 ```
-  You hit Play
+  You hit Run
        │
        ▼
   ┌─────────────┐
@@ -40,4 +40,4 @@ Open the Dashboard to see live output streaming:
 |--------|-------------|
 | **Pause** | Finishes current task, then holds |
 | **Stop** | Kills the running process immediately |
-| **Play** (when paused) | Resumes from where it stopped |
+| **Resume** (when paused) | Resumes from where it stopped |

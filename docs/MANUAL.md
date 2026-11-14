@@ -145,7 +145,7 @@ into a plan, assigning roles per playlist.
 
 ## Step 3 — Run it
 
-**In the IDE:** click the MOAG icon in the Activity Bar, then Play. The
+**In the IDE:** click the MOAG icon in the Activity Bar, then Run Plan. The
 dashboard opens automatically.
 
 **Unattended:**
@@ -638,6 +638,7 @@ moag standards propose [--stack <id>] [--write [--force]]
 moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]
 moag host [run | init | draft <project> | status | stop <env> | remove <env>]
 moag pair [<key>] [--url <base>]
+moag project-id [--cwd <dir>] [--json]
 moag --version | moag help
 ```
 
@@ -682,6 +683,8 @@ run needs `--max-usd`. See docs/benchmark.md.
 CLI bundled in the newest installed extension (from a checkout, `npm link` from the
 repository root works too). `moag pair` saves the ONOSOO device key; pass it on stdin
 (`moag pair < key.txt`, or paste it at the prompt) to keep it out of shell history.
+`moag project-id` prints the ONOSOO project ID runs from the folder report (with
+`--json`, one object); it exits 1, with the reason on stderr, when the folder has none.
 
 ### IDE commands worth knowing
 
@@ -698,6 +701,7 @@ repository root works too). `moag pair` saves the ONOSOO device key; pass it on 
 | Setup Guide | First-run walkthrough |
 | Set Anthropic API Key / Clear Anthropic API Key | Store or remove the Anthropic API key in VS Code's secret storage |
 | Connect to ONOSOO Builds / Disconnect from ONOSOO | Pair this machine with ONOSOO Builds, or remove the pairing |
+| Copy ONOSOO Project ID | Put the ID runs from this folder report on the clipboard, to add the repository to an ONOSOO project |
 | Install Command-Line Tool | Put `moag` on your PATH |
 | Export Diagnostics | Save a redacted support report |
 | Report Issue to GitHub | A public issue on the MOAG repository, shown in full before it is posted |
