@@ -82,7 +82,7 @@ describe('ONOSOO approved projects — file level', () => {
 
   it('a missing file is "nothing approved", with no error', () => {
     assert.deepEqual(loadApprovedProjects(tmp('moag-proj-state-')), {
-      remoteStart: false, dailyBudgetUsd: null, runnerUser: null, projects: [], errors: [],
+      remoteStart: false, dailyBudgetUsd: null, runnerUser: null, mode: 'isolated', projects: [], errors: [],
     });
   });
 

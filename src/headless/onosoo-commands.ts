@@ -34,7 +34,7 @@ import {
   StartRunPayload, usd, validatePayload,
 } from './remote-commands';
 import type { ProbeOutcome } from './remote-isolation';
-import { isolationRefusal, ISOLATION_RECHECK_MS } from './remote-isolation';
+import { isolationRefusal, ISOLATION_RECHECK_MS, LOCAL_MODE_WARNING } from './remote-isolation';
 import type { RemoteLedger } from './remote-ledger';
 import type { LockOutcome } from './remote-lock';
 import { IDENTITY_WAIT_MS, PROJECT_KEY_MAX } from './project-identity';
@@ -117,6 +117,8 @@ export interface CommandHostOptions {
   killSweep?(runnerUser: string): Promise<void>;
   /** Boot: owner-only permissions on the state directory (non-Windows). */
   tighten?(): void;
+  /** Local mode: the directory (under MOAG's state dir) that holds mirrors and worktrees; sent to the child in its job. */
+  localRoot?: string;
   timers?: HostTimers;
   now?: () => Date;
   stderr?: (s: string) => void;
@@ -173,6 +175,8 @@ export class CommandHost {
   private lastCaps: string | null = null;
   private isolation: Isolation | null = null;
   private isolationAt = 0;
+  private isolationMode: 'local' | 'isolated' | null = null;
+  private warnedLocal = false;
   private active: SupervisorLike | null = null;
   /** Claimed synchronously by a start, before any await; released on failure or exit. */
   private slotClaimed = false;
@@ -249,7 +253,8 @@ export class CommandHost {
     try { this.o.runs.prune(); } catch { /* best effort */ }
     try { await this.o.drainLeftoverSpool?.(); } catch { /* best effort */ }
     const projects = this.o.loadProjects();
-    if (!isolationRefusal(this.o.platform, projects.runnerUser) && projects.runnerUser) {
+    // Local mode has no runner account to sweep.
+    if (projects.mode !== 'local' && !isolationRefusal(this.o.platform, projects.runnerUser) && projects.runnerUser) {
       try { await this.o.killSweep?.(projects.runnerUser); } catch { /* best effort */ }
     }
     this.schedule(0);
@@ -332,9 +337,16 @@ export class CommandHost {
   // ─── Capabilities and isolation ───
 
   private async checkIsolation(projects: ApprovedProjects, force: boolean): Promise<Isolation> {
-    const refusal = isolationRefusal(this.o.platform, projects.runnerUser);
+    const mode = projects.mode === 'local' ? 'local' : 'isolated';
+    if (mode === 'local' && !this.warnedLocal) {
+      this.warnedLocal = true;
+      this.note(LOCAL_MODE_WARNING);
+    }
+    const refusal = isolationRefusal(this.o.platform, projects.runnerUser, mode);
     if (refusal) { this.isolation = { ok: false, reason: refusal }; return this.isolation; }
     const t = this.now().getTime();
+    // A switch between modes is never answered from the other mode's cached check.
+    if (mode !== this.isolationMode) { force = true; this.isolationMode = mode; }
     if (!force && this.isolation && t - this.isolationAt < ISOLATION_RECHECK_MS) { return this.isolation; }
     let out: ProbeOutcome;
     try { out = await this.o.probe(projects); } catch (err) { out = { ok: false, reason: `The isolation check failed: ${err instanceof Error ? err.message : String(err)}` }; }
@@ -379,7 +391,8 @@ export class CommandHost {
   private capabilities(projects: ApprovedProjects, iso: Isolation | null): Capabilities {
     const ok = iso?.ok === true;
     return {
-      // Only what this machine would actually accept: switched on, isolated, and budgeted.
+      mode: projects.mode === 'local' ? 'local' : 'isolated',
+      // Only what this machine would actually accept: switched on, isolated (or local, by choice), and budgeted.
       remote_start: projects.remoteStart && ok && projects.dailyBudgetUsd !== null,
       // Never a path or a URL: ONOSOO only ever sees id, name, kinds and the cached project key.
       projects: projects.projects.map((p) => {
@@ -649,6 +662,7 @@ export class CommandHost {
       engine: r.engine, engines, allotment: r.allotment, bundleBytes: inbound.bundle.length, engineEnv: this.o.engineEnv, planKind: r.planKind,
       ...(r.resumeFromMirrorBranch ? { resumeFromMirrorBranch: r.resumeFromMirrorBranch } : {}),
       ...(r.expectedTip ? { expectedTip: r.expectedTip } : {}),
+      ...(r.projects.mode === 'local' && this.o.localRoot ? { localRoot: this.o.localRoot } : {}),
       ...(r.goal ? { goal: r.goal } : {}), ...(r.prd ? { prd: r.prd } : {}), ...(r.snapshot ? { snapshot: r.snapshot } : {}),
     });
     let startedReported = false;

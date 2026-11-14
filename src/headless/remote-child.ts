@@ -67,10 +67,14 @@ export interface RemoteProbeSpec {
   /** Project ids whose mirror shas to report. */
   projects: string[];
   engineEnv: Record<string, string>;
+  /** Local mode only: the directory that replaces the account's home for mirrors and worktrees. */
+  localRoot?: string;
 }
 
 export interface RemoteRunSpec {
   op: 'run';
+  /** Local mode only: the directory that replaces the account's home for mirrors and worktrees (under MOAG's state dir). */
+  localRoot?: string;
   runId: string;
   projectId: string;
   branch: string;
@@ -131,10 +135,15 @@ export function parseSpec(line: string): RemoteChildSpec | null {
   }
   const engineEnv = engineEnvOf(o.engineEnv);
   if (!engineEnv) { return null; }
+  // Local mode: an absolute directory (either platform's form) that stands in for the runner's home.
+  const localRoot = typeof o.localRoot === 'string' && o.localRoot.length > 0 && o.localRoot.length < 1024
+    && (path.posix.isAbsolute(o.localRoot) || path.win32.isAbsolute(o.localRoot)) && !o.localRoot.includes('\0')
+    ? { localRoot: o.localRoot } : {};
+  if (o.localRoot !== undefined && !('localRoot' in localRoot)) { return null; }
   if (o.op === 'probe') {
     const paths = Array.isArray(o.protectedPaths) && o.protectedPaths.every((p) => typeof p === 'string') ? o.protectedPaths as string[] : null;
     const projects = Array.isArray(o.projects) ? (o.projects as unknown[]).filter((p): p is string => typeof p === 'string' && PROJECT_ID.test(p)) : [];
-    return paths ? { op: 'probe', protectedPaths: paths, projects, engineEnv } : null;
+    return paths ? { op: 'probe', protectedPaths: paths, projects, engineEnv, ...localRoot } : null;
   }
   if (o.op !== 'run') { return null; }
   const str = (k: string, re?: RegExp): string | null => (typeof o[k] === 'string' && (!re || re.test(o[k] as string)) ? o[k] as string : null);
@@ -160,6 +169,7 @@ export function parseSpec(line: string): RemoteChildSpec | null {
     ...(typeof o.resumeFromMirrorBranch === 'string' && BRANCH.test(o.resumeFromMirrorBranch) && !o.resumeFromMirrorBranch.includes('..')
       ? { resumeFromMirrorBranch: o.resumeFromMirrorBranch } : {}),
     ...(typeof o.expectedTip === 'string' && SHA.test(o.expectedTip) ? { expectedTip: o.expectedTip } : {}),
+    ...localRoot,
     op: 'run', runId, projectId, branch, branchPrefix, baseSha, startSha, engine, allotment: o.allotment, bundleBytes: o.bundleBytes, engineEnv,
     ...(typeof o.goal === 'string' ? { goal: o.goal } : {}),
     ...(typeof o.prd === 'string' ? { prd: o.prd } : {}),
@@ -664,7 +674,9 @@ async function runRun(spec: RemoteRunSpec, deps: RemoteChildDeps): Promise<numbe
 }
 
 /** Run one remote job. Never throws: a failure is an `error` line and exit 2. */
-export async function runRemoteChild(spec: RemoteChildSpec, deps: RemoteChildDeps): Promise<number> {
+export async function runRemoteChild(spec: RemoteChildSpec, depsIn: RemoteChildDeps): Promise<number> {
+  // Local mode: mirrors, worktrees and run scratch live under MOAG's own state dir, not the OS home.
+  const deps: RemoteChildDeps = spec.localRoot ? { ...depsIn, home: spec.localRoot } : depsIn;
   try {
     return spec.op === 'probe' ? await runProbe(spec, deps) : await runRun(spec, deps);
   } catch (err) {
@@ -711,7 +723,7 @@ export async function remoteChildMain(): Promise<number> {
   if (!spec) { write({ event: 'error', message: 'Malformed remote job.' }); return 2; }
   if (process.env.CI) { delete process.env.CI; }
 
-  const home = os.homedir();
+  const home = spec.localRoot ?? os.homedir();
   const { installVscodeShim } = require('./install-shim');
   installVscodeShim(path.join(home, REMOTE_HOME_DIR));
   const cli = require('./cli');
