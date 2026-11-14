@@ -18,7 +18,8 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ### Changed
 
-- Play and Execute are now **Run**: **Run Plan**, **Run Playlist**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
+- Play and Execute are now **Run**: **Run Plan**, **Run Stage**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
+- Playlist is now **Stage** wherever MOAG shows it: **Add Stage**, **Run Stage**, **Set Stage Status...**, the sidebar, Dashboard, notifications, Get Started walkthrough, command-line output, the hosted web UI and the docs. Command ids, settings (including `agentTaskPlayer.parallelPlaylists`) and plan files (the `playlists` key) are unchanged, so existing plans keep working.
 
 ### Fixed
 

@@ -1294,7 +1294,7 @@ export function createApp(deps: AppDeps): App {
             const pl = doc.playlist;
             if (!pl || typeof pl !== 'object' || !Array.isArray(pl.tasks)) {
               p.status = 'parse-failed';
-              p.error = 'The generated playlist was malformed.';
+              p.error = 'The generated stage was malformed.';
               break;
             }
             // A generated task must never arrive pre-completed: a playlist whose
@@ -2411,7 +2411,7 @@ export function createApp(deps: AppDeps): App {
         file.playlists.push(review.playlist);
         next = hydratePlan(file, 'plan');
       } catch (err) {
-        throw new HttpError(422, 'invalid-playlist', `The generated playlist is not valid: ${(err as Error).message}`);
+        throw new HttpError(422, 'invalid-playlist', `The generated stage is not valid: ${(err as Error).message}`);
       }
       state.saveCanonicalPlan(p.id, next, p.defaultEngine);
       review.status = 'approved';

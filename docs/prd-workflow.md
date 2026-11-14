@@ -21,22 +21,22 @@ The PRD Workflow transforms MOAG from a task runner into a full development life
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
 │                  AI PLAN GENERATION                         │
-│  Claude reads PRD → generates 3-playlist MOAG plan JSON     │
-│  • Playlist 1: Design      (skipped if no UI in PRD)        │
-│  • Playlist 2: Development (feature implementation tasks)   │
-│  • Playlist 3: Testing     (testPhase: true)                │
+│  Claude reads PRD → generates 3-stage MOAG plan JSON        │
+│  • Stage 1: Design      (skipped if no UI in PRD)           │
+│  • Stage 2: Development (feature implementation tasks)      │
+│  • Stage 3: Testing     (testPhase: true)                   │
 │  Saved to: .moag/prd-{timestamp}.agent-plan.json            │
 └─────────────────────┬───────────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│               PLAYLIST 1 — DESIGN (optional)                │
+│                STAGE 1 — DESIGN (optional)                  │
 │  Tasks: wireframes, component specs, API contracts          │
 │  Engine: Claude Code or Anthropic adapter                   │
 │  Auto-fix: yes (up to configured retries)                   │
 └─────────────────────┬───────────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│             PLAYLIST 2 — DEVELOPMENT                        │
+│              STAGE 2 — DEVELOPMENT                          │
 │  Tasks: implement features, write code, run lint/build      │
 │  Engine: Claude Code or Anthropic adapter                   │
 │  Auto-fix: yes                                              │
@@ -46,7 +46,7 @@ The PRD Workflow transforms MOAG from a task runner into a full development life
 ┌─────────────────────────────────────────────────────────────┐
 │               TTT — TIME TO TEST CHECKPOINT                 │
 │                                                             │
-│  MOAG detects testPhase: true playlist starting             │
+│  MOAG detects testPhase: true stage starting                │
 │  Reads agentTaskPlayer.testTool setting                     │
 │                                                             │
 │  ┌────────────┬──────────────┬──────────────┬────────────┐  │
@@ -66,7 +66,7 @@ The PRD Workflow transforms MOAG from a task runner into a full development life
 └─────────────────────┬───────────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────────────┐
-│             PLAYLIST 3 — TESTING                            │
+│              STAGE 3 — TESTING                              │
 │  Tasks: run test suite, capture results, screenshot verify  │
 │  testPhase: true                                            │
 │  prdContext: acceptance criteria extracted from PRD         │
@@ -89,14 +89,14 @@ The PRD Workflow transforms MOAG from a task runner into a full development life
 ┌──────────────────────┐  ┌─────────────────────────────────┐
 │  GIT COMMIT & PUSH   │  │     FIX LOOP (max 3 iterations) │
 │                      │  │                                 │
-│  AI generates commit │  │  AI generates fix playlist      │
+│  AI generates commit │  │  AI generates fix stage         │
 │  message from PRD    │  │  Appended to current plan       │
 │  context + diff stat │  │  User reviews before running    │
 │                      │  │  fixIterations counter tracked  │
 │  User edits if needed│  │  On iteration 3: hard stop,     │
 │  git commit          │  │  manual intervention required   │
 │  Optional: git push  │  │         ↓                       │
-└──────────────────────┘  │  Re-run Development playlist    │
+└──────────────────────┘  │  Re-run Development stage       │
                           │  → TTT → Testing → Verify again │
                           └─────────────────────────────────┘
 ```
@@ -151,7 +151,7 @@ Configured via `agentTaskPlayer.testTool` setting. Set once, used for all PRD pl
 
 ### 3. TTT Sidebar Checklist
 
-When a `testPhase: true` playlist starts, the PLAN tab sidebar shows a **TEST CRITERIA** section above the task list.
+When a `testPhase: true` stage starts, the PLAN tab sidebar shows a **TEST CRITERIA** section above the task list.
 
 - Parsed from `prdSource` via `parsePrdCriteria()` in `src/ui/prompt-input-view.ts`
 - Patterns matched: `AC:`, `Acceptance Criteria`, `- [ ]`, numbered items under `Criteria` heading
@@ -159,7 +159,7 @@ When a `testPhase: true` playlist starts, the PLAN tab sidebar shows a **TEST CR
 - Each criterion renders as a checkbox row
 - Checking all criteria reveals **"Verify Against PRD ✓"** button
 - Clicking sends `{ type: 'tttAllCriteriaVerified' }` to extension — triggers `verifyAgainstPrd`
-- State is in-memory only (resets when playlist changes)
+- State is in-memory only (resets when the stage changes)
 
 **Implementation:** `renderTttCriteria()` and `parsePrdCriteria()` in `src/ui/prompt-input-view.ts`.
 
@@ -211,9 +211,9 @@ When a `testPhase: true` playlist starts, the PLAN tab sidebar shows a **TEST CR
 **Guard:** `plan.fixIterations` counter. Hard stop at 3. Shows error: `"Max fix iterations (3) reached. Manual intervention required."`
 
 **Each iteration:**
-1. AI generates a `Fix — Iteration N` playlist based on the gap list
-2. Playlist appended to current plan (user can review before running)
-3. User clicks Run Playlist on the fix playlist
+1. AI generates a `Fix — Iteration N` stage based on the gap list
+2. Stage appended to current plan (user can review before running)
+3. User clicks Run Stage on the fix stage
 4. Execution → TTT → Testing → Verification loop repeats
 
 **Implementation:** `cmdGenerateFixTasks()` in `src/extension.ts`. Uses `TaskQueue.injectNext()` for dynamic task injection.
@@ -239,12 +239,12 @@ All git operations: workspace `cwd`, 30s timeout (`GIT_TIMEOUT_MS`).
 
 ### 7. Anthropic Adapter (new — `src/adapters/anthropic-adapter.ts`)
 
-Direct Anthropic API integration for multi-turn agentic sessions. Replaces CLI subprocess for tasks that benefit from persistent conversation context across a playlist.
+Direct Anthropic API integration for multi-turn agentic sessions. Replaces CLI subprocess for tasks that benefit from persistent conversation context across a stage.
 
 - Agentic tools available: `read_file`, `write_file`, `list_directory`, `run_bash`
-- Per-playlist session memory via `_sessions` map
+- Per-stage session memory via `_sessions` map
 - Supports extended thinking
-- Used when engine is set to `anthropic` in a task or playlist
+- Used when engine is set to `anthropic` in a task or stage
 
 ---
 
@@ -262,10 +262,10 @@ Compresses task stdout into ~250-char summaries for context budget management.
 
 Dynamic task queue with runtime injection support.
 
-- `TaskQueue` class wraps the active playlist's task list
+- `TaskQueue` class wraps the active stage's task list
 - `injectNext(task)` — inserts a synthetic task immediately after the current one
 - Tracks `repairCycleCount` on injected tasks (for fix loop guard)
-- Used by `cmdGenerateFixTasks()` to append fix playlists without blocking the runner
+- Used by `cmdGenerateFixTasks()` to append fix stages without blocking the runner
 
 ---
 
@@ -329,8 +329,8 @@ The profile format, the review flow, migration of existing projects and the `moa
 ## New Types (`src/models/types.ts`)
 
 ```typescript
-// Playlist additions
-testPhase?: boolean          // marks this as the TTT playlist
+// Stage additions
+testPhase?: boolean          // marks this as the TTT stage
 prdContext?: string          // acceptance criteria slice (defined; populated at plan level)
 
 // Plan additions
@@ -350,13 +350,13 @@ interface PrdVerificationResult {
 
 ## Acceptance Criteria
 
-- AC1: Pasting a PRD text generates a valid `.moag/prd-*.agent-plan.json` with Design/Development/Testing playlists
-- AC2: Opening the plan in MOAG shows all playlists with correct task counts
-- AC3: When the Testing playlist starts, the TTT checkpoint fires and the configured test tool launches
+- AC1: Pasting a PRD text generates a valid `.moag/prd-*.agent-plan.json` with Design/Development/Testing stages
+- AC2: Opening the plan in MOAG shows all stages with correct task counts
+- AC3: When the Testing stage starts, the TTT checkpoint fires and the configured test tool launches
 - AC4: The TEST CRITERIA checklist appears in the sidebar during the test phase, parsed from the PRD
 - AC5: After testing, `cmdVerifyAgainstPrd` produces an HTML report that opens in the browser
 - AC6: The browser report shows PRD criteria vs results in two columns with correct pass/fail icons
-- AC7: Failing verification appends a Fix playlist and increments `fixIterations`
+- AC7: Failing verification appends a Fix stage and increments `fixIterations`
 - AC8: After 3 failed iterations, the fix loop stops with a clear error message
 - AC9: Passing verification opens the commit dialog with an AI-generated message pre-filled
 - AC10: The entire flow from PRD paste to committed code works end-to-end with no manual steps except test verification (for `claude-chrome` and `manual` tool modes)
@@ -386,13 +386,13 @@ wrong file entirely after the PRD code moved out of `extension.ts`.
 | Anthropic adapter | ✓ Complete | `src/adapters/anthropic-adapter.ts` |
 | Memory extractor | ✓ Complete | `src/context/memory-extractor.ts` |
 | Task queue with `injectNext` | ✓ Complete | `src/runner/task-queue.ts` |
-| `prdContext` per-playlist wiring | Partial | Defined in types; stored at plan level instead |
+| `prdContext` per-stage wiring | Partial | Defined in types; stored at plan level instead |
 
 ---
 
 ## Known Gaps / Future Work
 
-1. **`prdContext` per-playlist** — The type is defined but the plan generator does not slice acceptance criteria per playlist. Criteria live on `plan.prdSource`. Low priority since the TTT checklist reads from the plan level anyway.
+1. **`prdContext` per-stage** — The type is defined but the plan generator does not slice acceptance criteria per stage. Criteria live on `plan.prdSource`. Low priority since the TTT checklist reads from the plan level anyway.
 
 2. **Semantic retrieval** — `contextBudgetUsage.usedSemanticRetrieval` is typed but semantic vector search is not implemented. The memory extractor provides basic summary compression as a fallback.
 

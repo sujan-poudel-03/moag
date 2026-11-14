@@ -35,7 +35,7 @@ function log(line: string): void {
 // reports a different version on webview-ready, we force a full re-render
 // instead of just posting a data update — this fixes stale cached webviews
 // that VS Code restores from a previous session with old HTML.
-const HTML_VERSION = '14';
+const HTML_VERSION = '15';
 
 /** A fresh nonce per render; the CSP admits only the script carrying it. */
 function dashboardNonce(): string {

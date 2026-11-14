@@ -827,7 +827,7 @@ ${tail(failed?.tail ?? '', 2_000)}`;
           haltReason: 'engine-error',
           failedGate,
           gaps,
-          suggestion: `Running the fix playlist failed: ${err instanceof Error ? err.message : String(err)}`,
+          suggestion: `Running the fix stage failed: ${err instanceof Error ? err.message : String(err)}`,
           score,
         });
       }
@@ -842,7 +842,7 @@ ${tail(failed?.tail ?? '', 2_000)}`;
           haltReason: 'engine-error',
           failedGate,
           gaps,
-          suggestion: 'The fix playlist never started — the runner was already busy (play lock held).',
+          suggestion: 'The fix stage never started — the runner was already busy (play lock held).',
           score,
         });
       }

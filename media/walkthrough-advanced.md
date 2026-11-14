@@ -56,7 +56,7 @@ Runs after the task succeeds. If it exits non-zero, the task is marked failed.
 ### Templates
 
 - **Right-click a task** → "Save as Template" to reuse it later
-- **Right-click a playlist** → "Add Task from Template" to pick from the library
+- **Right-click a stage** → "Add Task from Template" to pick from the library
 - 10 built-in templates covering setup, features, testing, bugfixes, and more
 
 ### Import / Export
