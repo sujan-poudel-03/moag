@@ -5,10 +5,12 @@
 // from a crash (marking it interrupted, sweeping its processes). So the command host
 // holds an exclusive lock: <stateDir>/remote/daemon.lock (0600)
 //
-//   { "pid": 1234, "token": "<random>", "started_at": "...", "proc_start": "<linux start time>" }
+//   { "pid": 1234, "token": "<random>", "started_at": "...", "proc_start": "<linux start time>",
+//     "proc_image": "<windows program name>" }
 //
 // A lock whose process is gone — or whose pid now belongs to a different process
-// (the recorded /proc start time no longer matches) — is stale and is taken over.
+// (Linux: the recorded /proc start time no longer matches; Windows: the program name the pid
+// belongs to is no longer the one that wrote the lock) — is stale and is taken over.
 // The lock is released on close, only by the holder whose token it carries.
 //
 // Atomic, with no window where two takers both win:
@@ -21,6 +23,7 @@
 //   - after linking, the lock is read back and must carry our token.
 // Imports nothing that loads `vscode`.
 
+import { execFileSync } from 'child_process';
 import { randomBytes } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -38,6 +41,8 @@ interface LockBody {
   token: string;
   started_at: string;
   proc_start: string | null;
+  /** Windows: the program's file name (`node.exe`), so a pid reused by another program is seen as stale. */
+  proc_image?: string | null;
 }
 
 export interface LockOptions {
@@ -46,6 +51,10 @@ export interface LockOptions {
   isPidAlive?: (pid: number) => boolean;
   /** The process start time of `pid` (Linux: /proc/<pid>/stat field 22), or null when unknown. */
   procStart?: (pid: number) => string | null;
+  /** The program file name running as `pid` (Windows: from `tasklist`), or null when unknown. */
+  procImage?: (pid: number) => string | null;
+  /** This process's own program file name, written to the lock; null where `procImage` cannot check it. */
+  ownImage?: string | null;
 }
 
 export type LockOutcome = { ok: true } | { ok: false; holderPid: number };
@@ -66,12 +75,46 @@ export function linuxProcStart(pid: number): string | null {
   }
 }
 
+/**
+ * The program file name running as `pid` on Windows, or null off Windows or when it cannot be read.
+ * `tasklist` needs no privileges and names every process, including protected system ones (a plain
+ * `Get-Process` start time is refused for those), which is the case that matters: a pid left in the lock
+ * is later reused by `svchost.exe`.
+ */
+export function windowsProcImage(pid: number): string | null {
+  if (process.platform !== 'win32' || !Number.isInteger(pid) || pid <= 0) { return null; }
+  try {
+    // The system's own tasklist, by full path: nothing a PATH entry could shadow.
+    const tasklist = path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tasklist.exe');
+    const out = execFileSync(tasklist, ['/FI', `PID eq ${pid}`, '/FO', 'CSV', '/NH'], {
+      encoding: 'utf-8', windowsHide: true, timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return parseTasklistImage(out);
+  } catch {
+    return null;
+  }
+}
+
+/** The image name from one `tasklist /FO CSV /NH` line (`"node.exe","1234",...`), or null when there is none. */
+export function parseTasklistImage(output: string): string | null {
+  const line = output.split(/\r?\n/).find((l) => l.startsWith('"'));
+  const match = line ? /^"([^"]+)"/.exec(line) : null;
+  return match ? match[1] : null;
+}
+
+/** This process's program file name where `windowsProcImage` can check it later (Windows only). */
+function defaultOwnImage(): string | null {
+  return process.platform === 'win32' ? path.basename(process.execPath) : null;
+}
+
 export class DaemonLock {
   readonly file: string;
   private readonly pid: number;
   private readonly now: () => Date;
   private readonly isPidAlive: (pid: number) => boolean;
   private readonly procStart: (pid: number) => string | null;
+  private readonly procImage: (pid: number) => string | null;
+  private readonly ownImage: string | null;
   private token: string | null = null;
 
   constructor(stateDir: string, opts: LockOptions = {}) {
@@ -80,6 +123,8 @@ export class DaemonLock {
     this.now = opts.now ?? ((): Date => new Date());
     this.isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
     this.procStart = opts.procStart ?? linuxProcStart;
+    this.procImage = opts.procImage ?? windowsProcImage;
+    this.ownImage = opts.ownImage === undefined ? defaultOwnImage() : opts.ownImage;
   }
 
   private readRaw(file: string = this.file): string | null {
@@ -107,6 +152,11 @@ export class DaemonLock {
       const now = this.procStart(body.pid);
       if (now !== null && now !== body.proc_start) { return false; } // the pid was reused
     }
+    if (body.proc_image) {
+      const image = this.procImage(body.pid);
+      // A different program now has the pid (Windows has no /proc start time): the holder is gone.
+      if (image !== null && image.toLowerCase() !== body.proc_image.toLowerCase()) { return false; }
+    }
     return true;
   }
 
@@ -114,7 +164,7 @@ export class DaemonLock {
   acquire(): LockOutcome {
     fs.mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     const token = randomBytes(16).toString('hex');
-    const body: LockBody = { pid: this.pid, token, started_at: this.now().toISOString(), proc_start: this.procStart(this.pid) };
+    const body: LockBody = { pid: this.pid, token, started_at: this.now().toISOString(), proc_start: this.procStart(this.pid), proc_image: this.ownImage };
     const temp = `${this.file}.${this.pid}.${token}.tmp`;
     fs.writeFileSync(temp, JSON.stringify(body), { mode: 0o600, flag: 'wx' });
     try {

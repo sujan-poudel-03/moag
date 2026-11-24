@@ -139,7 +139,11 @@ export function resolveOnosooConfig(opts: ResolveOnosooOptions): OnosooConfig | 
     }
 
     if (isInside(opts.cwd, stateDir, platform)) {
-      stderr('ONOSOO relay is off: the user config directory is inside the workspace, and relay state must never be written there.\n');
+      stderr(
+        `ONOSOO relay is off: you ran MOAG from ${path.resolve(opts.cwd)}, which contains MOAG's own config folder `
+        + `(${stateDir}). Relay state, including the device key, must never sit inside a folder an agent works in. `
+        + 'Run it from another folder instead, such as your MOAG checkout or a project folder.\n'
+      );
       return null;
     }
 

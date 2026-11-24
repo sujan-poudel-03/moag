@@ -115,6 +115,9 @@ describe('ONOSOO config', () => {
     });
     assert.equal(cfg, null);
     assert.equal(errors.length, 1);
+    // The note names the folder it was run from and says to run it elsewhere, not just that something is "inside".
+    assert.ok(errors[0].includes(cwd));
+    assert.match(errors[0], /Run it from another folder/);
     assert.deepEqual(walk(cwd), []);
   });
 

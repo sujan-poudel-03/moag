@@ -255,6 +255,37 @@ TimeoutStopSec=180
 A second SIGINT/SIGTERM during that wait gives up at once: MOAG releases its lock and exits 130 (the
 run is then marked interrupted at the next start, and charged its full allotment).
 
+### Windows: start the daemon when you sign in
+
+```
+moag service install      # register it and start it now
+moag service status       # installed? last run, last result, where the log is
+moag service uninstall    # remove it (a daemon already running keeps running)
+```
+
+`install` registers a per-user Task Scheduler task named **MOAG Daemon**: it starts at every logon with no
+window, runs as you (never elevated), has no run-time limit, and is restarted a minute after it fails (a clean
+stop is not restarted). What it runs is `%LOCALAPPDATA%\moag\daemon-run.ps1`; its output goes to
+`%LOCALAPPDATA%\moag\daemon.log` (rotated to `daemon.log.old` past 5 MB). It works in
+`%LOCALAPPDATA%\moag\daemon-home`, so MOAG's config folder (with the device key) is never inside its working
+folder. Close any `moag daemon` terminal first: only one daemon holds the lock. Windows ends a task at sign-out,
+so a signed-out PC takes no runs, and a locked or sleeping one does not either.
+
+### The lock and a reused process number
+
+The lock records the daemon's process number. A lock left behind by a crash is taken over when that process is
+gone, or when the number now belongs to a different program. Linux compares the process start time; Windows
+compares the program name (`tasklist`), so a number reused by `svchost.exe` no longer blocks a start. When the
+name cannot be read the lock is kept, never taken over on a guess. If `moag daemon` still says another daemon
+holds it and you are sure none runs, delete `<config folder>\moag\remote\daemon.lock`.
+
+### "Config folder is inside the workspace"
+
+MOAG refuses to relay when the folder it was started in contains its own config folder, because relay state (the
+device key) must never sit inside a folder an agent works in. Starting `moag daemon` from your home folder is the
+usual cause. The message names the folder and the fix: start it from another folder, such as your MOAG checkout.
+`moag service install` does this for you.
+
 ## 7. Safeguards MOAG checks itself
 
 Before it accepts remote work — at start-up, every 10 minutes and before every run — MOAG checks, on

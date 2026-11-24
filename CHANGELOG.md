@@ -16,12 +16,16 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 - Remote runs: an engine login check, the reason an installed engine is not offered, branch delivery, and each task's stage and kind in run-meta.
 - **Copy ONOSOO Project ID.** The command **MOAG: Copy ONOSOO Project ID** puts the ID runs from a folder report on the clipboard (with a folder picker in a multi-root workspace), and `moag project-id [--cwd <dir>] [--json]` prints it, exiting 1 with the reason when the folder has none. Both apply the same privacy filter as a run, so an ID a run would not send is never shown. While this machine is paired, the Dashboard status bar shows the ONOSOO project runs go to, with **Copy** and, for a repository with a link, **Open repository**.
 
+- **`moag service install | uninstall | status` (Windows).** Registers a per-user Task Scheduler task so the daemon starts when you sign in, hidden, as you, restarted a minute after a failure, with a log in `%LOCALAPPDATA%\moag\daemon.log`. No terminal window to keep open. See "Windows: start the daemon when you sign in" in `docs/onosoo-remote.md`.
+
 ### Changed
 
+- The "config folder is inside the workspace" refusal now names the folder you ran MOAG from and says what to do (run it from another folder), instead of a bare statement. The rule itself is unchanged.
 - Play and Execute are now **Run**: **Run Plan**, **Run Playlist**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
 
 ### Fixed
 
+- **A stale daemon lock on Windows.** A lock left by a crashed daemon whose process number was later reused by another program (for example `svchost.exe`) was treated as held, and `moag daemon` refused to start. The lock now records the program name and is taken over when the number belongs to a different program. A name that cannot be read keeps the lock.
 - `moag pair` accepts a key pasted into PowerShell (bracketed-paste markers are ignored).
 - An SSH host alias of GitHub, GitLab or Bitbucket (`git@github.com-personal:…`, `ssh.github.com`) gives the same project id as a normal clone.
 
