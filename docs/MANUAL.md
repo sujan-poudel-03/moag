@@ -638,6 +638,8 @@ moag standards propose [--stack <id>] [--write [--force]]
 moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>]
 moag host [run | init | draft <project> | status | stop <env> | remove <env>]
 moag pair [<key>] [--url <base>]
+moag init [<folder>] [--url <base>] [--name <name>] [--id <id>] [--budget <usd>] [--delivery off|branch|draft-pr] [--pr-base <branch>]
+moag service <install | uninstall | status>
 moag project-id [--cwd <dir>] [--json]
 moag --version | moag help
 ```
@@ -683,6 +685,9 @@ run needs `--max-usd`. See docs/benchmark.md.
 CLI bundled in the newest installed extension (from a checkout, `npm link` from the
 repository root works too). `moag pair` saves the ONOSOO device key; pass it on stdin
 (`moag pair < key.txt`, or paste it at the prompt) to keep it out of shell history.
+`moag init`, run inside a git repository, pairs the machine if it is not paired and lists the
+repository in `projects.json` so ONOSOO can start runs in it (local mode; see "Local mode" in
+`docs/onosoo-remote.md`). On Windows, `moag service install` starts the daemon whenever you sign in.
 `moag project-id` prints the ONOSOO project ID runs from the folder report (with
 `--json`, one object); it exits 1, with the reason on stderr, when the folder has none.
 

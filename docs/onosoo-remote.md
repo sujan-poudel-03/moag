@@ -172,6 +172,14 @@ A remote run is stopped after **4 hours** at most; ONOSOO shows *"Stopped: the r
 
 ## Local mode (this PC, no runner account)
 
+**The short way:** in a git repository, run `moag init`. It pairs this machine if it is not paired (it asks for
+the device key), adds the repository to `projects.json` (creating the file in local mode, remote start on and a
+$10 daily budget if there is none), and says what to run next (on Windows, `moag service install`). It never
+changes an existing file's mode, budget or other projects, and a repository that is already listed is left as
+it is. Delivery is `draft-pr` when `gh` is signed in, `branch` when there is an origin but no `gh` login, and
+`off` when there is no origin; `--delivery`, `--pr-base`, `--name`, `--id` and `--budget` override. The longer
+manual setup follows.
+
 The sections above describe the **isolated** mode: a Linux build machine and a separate runner
 account. **Local mode** is a second, explicitly opt-in way to run for a plain Windows, macOS or Linux
 PC: ONOSOO's **Start run** works, and the run executes **as the same user as `moag daemon`**. There
