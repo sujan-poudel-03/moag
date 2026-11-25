@@ -176,7 +176,7 @@ export async function cmdSavePrdToPlan(prdText: string): Promise<void> {
   plan.prdSource = prdText;
   if (deps.currentPlanPath) { savePlan(plan, deps.currentPlanPath); }
   if (deps.promptViewProvider) { deps.syncPromptProviderSidebar(deps.promptViewProvider); }
-  vscode.window.showInformationMessage('PRD saved to plan — use "Verify Against PRD" after your test playlist runs.');
+  vscode.window.showInformationMessage('PRD saved to plan — use "Verify Against PRD" after your test stage runs.');
 }
 
 export async function cmdOpenPrdFromPlan(args?: { prdOverride?: string }): Promise<void> {
@@ -928,10 +928,10 @@ export async function generatePlanFromPrdText(prdText: string): Promise<void> {
   fs.writeFileSync(planPath, JSON.stringify(parsed, null, 2), 'utf-8');
 
   const roleNote = invalidRoleCount > 0
-    ? ` — ${invalidRoleCount} playlist${invalidRoleCount !== 1 ? 's' : ''} had an unrecognised role and will use the plan default`
+    ? ` — ${invalidRoleCount} stage${invalidRoleCount !== 1 ? 's' : ''} had an unrecognised role and will use the plan default`
     : '';
   const action = await vscode.window.showInformationMessage(
-    `Plan generated — ${taskCount} task${taskCount !== 1 ? 's' : ''} across ${playlistCount} playlist${playlistCount !== 1 ? 's' : ''}${roleNote}`,
+    `Plan generated — ${taskCount} task${taskCount !== 1 ? 's' : ''} across ${playlistCount} stage${playlistCount !== 1 ? 's' : ''}${roleNote}`,
     'Open Plan',
   );
   if (action === 'Open Plan') {

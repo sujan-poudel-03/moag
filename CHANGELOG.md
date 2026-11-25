@@ -21,13 +21,15 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ### Changed
 
-- The "config folder is inside the workspace" refusal now names the folder you ran MOAG from and says what to do (run it from another folder), instead of a bare statement. The rule itself is unchanged.
-- Play and Execute are now **Run**: **Run Plan**, **Run Playlist**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
+- The "config folder is inside the workspace" refusal now names the folder you ran MOAG from and says what to do (run it from another folder), instead of a bare statement.
+- Play and Execute are now **Run**: **Run Plan**, **Run Stage**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
+- Playlist is now **Stage** wherever MOAG shows it: **Add Stage**, **Run Stage**, **Set Stage Status...**, the sidebar, Dashboard, notifications, Get Started walkthrough, command-line output, the hosted web UI and the docs. Command ids, settings (including `agentTaskPlayer.parallelPlaylists`) and plan files (the `playlists` key) are unchanged, so existing plans keep working.
 
 ### Fixed
 
-- **A stale daemon lock on Windows.** A lock left by a crashed daemon whose process number was later reused by another program (for example `svchost.exe`) was treated as held, and `moag daemon` refused to start. The lock now records the program name and is taken over when the number belongs to a different program. A name that cannot be read keeps the lock.
+- **A stale daemon lock on Windows.** A lock left by a crashed daemon whose process id was later reused by another program (for example `svchost.exe`) was treated as held, and `moag daemon` refused to start. The lock now records the program name and the process start time: it is taken over when the id belongs to a different program, when the start time differs, or (for a lock from an older MOAG) when the process holding the id started after the lock was written. Facts that cannot be read keep the lock.
 - `moag pair` accepts a key pasted into PowerShell (bracketed-paste markers are ignored).
+- `moag daemon` started from your home folder no longer turns ONOSOO off and exits ("the user config directory is inside the workspace"). The home folder (or a folder above it) is allowed unless a git repository lies between it and the config folder; a project folder that contains the config folder is still refused.
 - An SSH host alias of GitHub, GitLab or Bitbucket (`git@github.com-personal:…`, `ssh.github.com`) gives the same project id as a normal clone.
 
 ## [0.10.0] - 2026-11-09

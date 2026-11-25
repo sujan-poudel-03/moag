@@ -48,7 +48,7 @@ unaccounted call is not reachable — not merely discouraged.
 ### Choosing one
 
 - Per task: `task.engine`
-- Per playlist: `playlist.engine`
+- Per stage: `playlist.engine`
 - Otherwise: `plan.defaultEngine`
 - Headless default: `moag config set-engine <id>`
 
@@ -124,7 +124,7 @@ A plan is `.moag/plan.json`:
 
 ```
 Plan
-└── Playlist          a coherent phase — "Build the API"
+└── Stage             a coherent phase — "Build the API"
     └── Task          one unit of work
 ```
 
@@ -141,7 +141,7 @@ A task has a `type`, and the type decides what runs:
 | `visual-test` | Browser UAT |
 
 You can also start from a PRD: **`MOAG: Plan from PRD`** turns a written brief
-into a plan, assigning roles per playlist.
+into a plan, assigning roles per stage.
 
 ## Step 3 — Run it
 
@@ -511,7 +511,7 @@ workspace tier only; there is no global rules tier outside VS Code.
 With `agentTaskPlayer.git.autoCommit` on:
 
 1. The run takes a branch: `moag/<plan-slug>-<run-id>`
-2. Every task that passes gets a commit carrying playlist, engine, cost, files
+2. Every task that passes gets a commit carrying the stage (a `Playlist:` trailer), engine, cost, files
 3. `--pr` opens a pull request from those commits
 
 **It refuses rather than best-efforts.** Not a git repo, detached HEAD, or a
@@ -521,7 +521,7 @@ dirty check, since otherwise it would block on files it wrote itself.
 
 ## Parallelism and isolation
 
-`parallelPlaylists > 1` gives each concurrent playlist **its own git worktree
+`parallelPlaylists > 1` gives each concurrent stage **its own git worktree
 and branch**, so two agents cannot edit the same file. Isolation requires
 `git.autoCommit` — without it the work would be stranded in a throwaway
 checkout. Teardown never passes `--force`: git refuses to remove a worktree

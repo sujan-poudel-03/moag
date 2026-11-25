@@ -5,7 +5,7 @@
 [![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Run AI agents like a playlist.** Build a plan, pick your engines, hit Run — Claude Code, Codex, Gemini, Ollama, GitHub Copilot or the Anthropic API execute your tasks while you watch.
+> **Run AI agents stage by stage.** Build a plan, pick your engines, hit Run — Claude Code, Codex, Gemini, Ollama, GitHub Copilot or the Anthropic API execute your tasks while you watch.
 
 <!-- screenshot: media/screenshots/hero.gif | alt: "MOAG running a plan: the sidebar plan, Run Plan, and the Dashboard streaming live output" -->
 
@@ -13,7 +13,7 @@
 
 ## Why MOAG
 
-- **Smart Planning** — Describe what you want and MOAG generates a structured plan with playlists, tasks, and verification steps. Or pick from 12 built-in templates. Every prompt is enriched with project context, relevant files, and best practices automatically.
+- **Smart Planning** — Describe what you want and MOAG generates a structured plan with stages, tasks, and verification steps. Or pick from 12 built-in templates. Every prompt is enriched with project context, relevant files, and best practices automatically.
 
 - **Multi-Agent Review** — After a task completes, a different engine reviews the changes. Or run the same task on multiple engines and keep the first success (consensus mode). Catch bugs one model misses.
 
@@ -45,9 +45,9 @@ or no CLI at all: run **MOAG: Set Anthropic API Key** (the key is kept in VS Cod
 - **Smart Plan** (recommended): `Ctrl+Shift+P` → `MOAG: Smart New Plan` → describe your goal → get a full plan
 - **From Template**: `MOAG: New Plan from Template` → 12 ready-made plans
 - **From GitHub Issue**: `MOAG: Plan from GitHub Issue` → paste an issue URL
-- **Manual**: Click the rocket icon in the Activity Bar → New Plan → add playlists and tasks
+- **Manual**: Click the rocket icon in the Activity Bar → New Plan → add stages and tasks
 
-<!-- screenshot: media/screenshots/smart-plan.png | alt: "Smart New Plan turning a PRD into playlists and tasks" -->
+<!-- screenshot: media/screenshots/smart-plan.png | alt: "Smart New Plan turning a PRD into stages and tasks" -->
 
 ### 3. Hit Run
 
@@ -55,7 +55,7 @@ Click **Run Plan** ▶ in the title bar. MOAG opens the Dashboard, validates eng
 
 <!-- screenshot: media/screenshots/dashboard.png | alt: "The MOAG Dashboard with live task output and task cards" -->
 
-<!-- screenshot: media/screenshots/plan-tree.png | alt: "A plan in the sidebar with playlists and tasks in mixed statuses" -->
+<!-- screenshot: media/screenshots/plan-tree.png | alt: "A plan in the sidebar with stages and tasks in mixed statuses" -->
 
 ---
 
@@ -80,7 +80,7 @@ Click **Run Plan** ▶ in the title bar. MOAG opens the Dashboard, validates eng
 | **Plan Variables** | `{{varName}}` substitution in prompts | Plan JSON |
 | **Conditional Tasks** | `skipIf` controls whether a task runs | Task field |
 | **Output Chaining** | Previous output feeds into next prompt | On by default |
-| **Parallel Playlists** | Run playlists concurrently (1-8) | `agentTaskPlayer.parallelPlaylists` |
+| **Parallel Stages** | Run stages concurrently (1-8) | `agentTaskPlayer.parallelPlaylists` |
 | **Dry Run** | Preview what will execute | `MOAG: Dry Run` |
 | **Export Results** | Markdown, JSON, or clipboard | `MOAG: Export Results` |
 | **Share as Gist** | Upload plan to GitHub Gist | `MOAG: Share Plan` |
@@ -224,7 +224,7 @@ Open `Ctrl+,` → search `agentTaskPlayer`:
 | `defaultEngine` | `claude` | Default agent engine |
 | `autoplayDelay` | `500` | Delay between tasks (ms) |
 | `taskTimeoutMs` | `1800000` | Per-task timeout (30 min) |
-| `parallelPlaylists` | `1` | Concurrent playlists (1-8) |
+| `parallelPlaylists` | `1` | Concurrent stages (1-8) |
 | `costBudgetUsd` | `10` | Hard spend ceiling (USD); calls that report no cost are not counted |
 | `maxHistoryEntries` | `200` | History entries to retain |
 | `engines.*.command` | varies | CLI path per engine |
@@ -256,7 +256,7 @@ Open `Ctrl+,` → search `agentTaskPlayer`:
 | **Anthropic API** | none | An API key, set with `MOAG: Set Anthropic API Key` (or `ANTHROPIC_API_KEY` for the CLI) |
 | **Custom** | Configurable | Any CLI that accepts a prompt |
 
-Engine priority: **task** > **playlist** > **plan `defaultEngine`** > **VS Code setting** > **execution profile**.
+Engine priority: **task** > **stage** > **plan `defaultEngine`** > **VS Code setting** > **execution profile**.
 
 ---
 
@@ -306,13 +306,13 @@ A new plan is saved as `.moag/plan.json`; `.moag/.agent-plan.json` is loaded too
 | `skipIf` | No | Condition to skip this task |
 | `cwd` | No | Working directory (relative to workspace) |
 
-### Playlist Fields
+### Stage Fields (entries of `playlists`)
 
 | Field | Required | Description |
 |-------|----------|-------------|
 | `id` | Yes | Unique identifier |
 | `name` | Yes | Display name |
-| `engine` | No | Default engine for tasks in this playlist |
+| `engine` | No | Default engine for tasks in this stage |
 | `parallel` | No | Run all tasks concurrently (default: false) |
 | `autoplay` | No | Auto-advance to next task (default: true) |
 | `autoplayDelay` | No | Delay between tasks (ms) |

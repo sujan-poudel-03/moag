@@ -11,6 +11,7 @@ interface WalkthroughStep {
   title: string;
   description: string;
   media?: { altText?: string; markdown?: string; image?: string };
+  completionEvents?: string[];
 }
 
 const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf-8')) as {
@@ -82,5 +83,22 @@ describe('walkthrough — agentTaskPlayer.getStarted', () => {
     assert.ok(step.description.includes('~/.config/moag/onosoo.json'));
     assert.ok(step.description.includes('setx'));
     assert.match(step.description, /[Nn]ever inside a project/);
+  });
+
+  it('titles the stage step "Add a Stage and Tasks" and still completes on addPlaylist', () => {
+    const step = getStarted!.steps.find(s => s.id === 'addPlaylistAndTask');
+    assert.ok(step, 'the step id is a contract — renaming it resets walkthrough progress');
+    assert.equal(step!.title, 'Add a Stage and Tasks');
+    // A renamed command id here would silently stop the step from ever completing.
+    assert.deepEqual(step!.completionEvents, ['onCommand:agentTaskPlayer.addPlaylist']);
+  });
+
+  it('never says "playlist" in step prose once command links are stripped', () => {
+    const strip = (s: string | undefined) => (s ?? '').replace(/command:agentTaskPlayer\.\w+/g, '');
+    for (const step of getStarted!.steps) {
+      for (const [field, value] of [['title', step.title], ['description', step.description], ['altText', step.media?.altText]] as const) {
+        assert.doesNotMatch(strip(value), /playlist/i, `${step.id}.${field} still says playlist`);
+      }
+    }
   });
 });

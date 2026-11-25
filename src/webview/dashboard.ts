@@ -211,7 +211,7 @@ function findRunningOrNextTask(plan) {
       if (String(rt && rt.status || '').toLowerCase() === 'running') {
         return {
           phase: 'running',
-          playlistName: runningPlaylist.name || ('Playlist ' + (i + 1)),
+          playlistName: runningPlaylist.name || ('Stage ' + (i + 1)),
           task: rt,
           playlist: runningPlaylist,
         };
@@ -228,7 +228,7 @@ function findRunningOrNextTask(plan) {
       if (!s || s === 'pending' || s === 'queued' || s === 'todo') {
         return {
           phase: 'queued',
-          playlistName: pendingPlaylist.name || ('Playlist ' + (j + 1)),
+          playlistName: pendingPlaylist.name || ('Stage ' + (j + 1)),
           task: pt,
           playlist: pendingPlaylist,
         };
@@ -384,7 +384,7 @@ function renderPromptComposerState() {
   } else if (!isIdle) {
     promptContextNoteEl.textContent = 'Runner is active. Stop the current run to submit another prompt.';
   } else if (hasPlanLoaded()) {
-    promptContextNoteEl.textContent = 'Run the prompt, generate a plan from this chat, or add tasks and playlists to the current plan.';
+    promptContextNoteEl.textContent = 'Run the prompt, generate a plan from this chat, or add tasks and stages to the current plan.';
   } else {
     promptContextNoteEl.textContent = 'No plan loaded. You can still run a one-off prompt or generate a plan from this chat.';
   }
@@ -448,10 +448,10 @@ function renderIdleOverview(plan) {
       let status = String(t && t.status || '').toLowerCase();
       return status === 'completed' || status === 'failed' || status === 'blocked' || status === 'skipped';
     }).length;
-    let playlistName = escHtml(pl.name || ('Playlist ' + (idx + 1)));
+    let playlistName = escHtml(pl.name || ('Stage ' + (idx + 1)));
     return '<div class="plan-summary-pl"><span>' + playlistName + '</span><span>' + done + '/' + tasks.length + ' done</span></div>';
   }).join('');
-  totalEl.textContent = totalTasksInPlan + ' tasks across ' + plan.playlists.length + ' playlists';
+  totalEl.textContent = totalTasksInPlan + ' tasks across ' + plan.playlists.length + ' stages';
   playBtn.disabled = runnerState === 'playing';
 }
 
@@ -1086,7 +1086,7 @@ function startTask(msg) {
   engineEl.className = 'engine-badge engine-' + (msg.engine || 'custom');
   document.getElementById('active-timer').textContent = '0s';
   let detailsParts = [];
-  if (msg.playlistName) { detailsParts.push('Playlist: ' + msg.playlistName); }
+  if (msg.playlistName) { detailsParts.push('Stage: ' + msg.playlistName); }
   detailsParts.push('Type: ' + (msg.taskType || 'agent'));
   if (msg.command) { detailsParts.push('Command: ' + msg.command); }
   if (Array.isArray(msg.acceptanceCriteria) && msg.acceptanceCriteria.length > 0) {
@@ -1118,7 +1118,7 @@ function syncActiveTaskFromPlan(plan) {
   }
 
   const taskName = candidate.task.name || 'Untitled task';
-  const playlistName = candidate.playlistName || 'Playlist';
+  const playlistName = candidate.playlistName || 'Stage';
 
   document.getElementById('active-task-name').textContent = taskName;
 
@@ -1138,7 +1138,7 @@ function syncActiveTaskFromPlan(plan) {
   let queuedDetails = document.getElementById('active-task-details-content');
   if (queuedDetails) {
     queuedDetails.textContent = [
-      'Playlist: ' + playlistName,
+      'Stage: ' + playlistName,
       'Type: ' + (candidate.task.taskType || 'agent'),
       candidate.task.command ? ('Command: ' + candidate.task.command) : ''
     ].filter(Boolean).join('\n');
@@ -1503,8 +1503,8 @@ function renderPlaylistTiles(plan) {
     if (isActive) { classes.push('is-active'); }
     if ((stats.failed + stats.blocked) > 0) { classes.push('has-failure'); }
     if (statusKey === 'done') { classes.push('is-done'); }
-    return '<button class="' + classes.join(' ') + '" onclick="vscode.postMessage({type:\\x27switch-plan\\x27})" title="' + escHtml(pl.name || 'Playlist') + '">' +
-      '<span class="tile-name">' + escHtml(pl.name || 'Playlist') + '</span>' +
+    return '<button class="' + classes.join(' ') + '" onclick="vscode.postMessage({type:\\x27switch-plan\\x27})" title="' + escHtml(pl.name || 'Stage') + '">' +
+      '<span class="tile-name">' + escHtml(pl.name || 'Stage') + '</span>' +
       '<span class="tile-meta">' +
         '<span class="tile-status ' + statusKey + '">' + statusKey + '</span>' +
         '<span class="tile-fraction">' + fraction + '</span>' +

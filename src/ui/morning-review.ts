@@ -48,7 +48,7 @@ export function renderReviewMarkdown(d: Digest, now: string): string {
       out.push(`### ${item.taskName}`);
       out.push('');
       out.push(`- **What happened:** ${describeParkReason(item.reason)}`);
-      if (item.playlistName) { out.push(`- **Playlist:** ${item.playlistName}`); }
+      if (item.playlistName) { out.push(`- **Stage:** ${item.playlistName}`); }
       out.push(`- **Parked:** ${item.parkedAt}`);
       out.push(`- **Your call:** ${item.decision}`);
       if (item.evidence?.gate) { out.push(`- **Gate:** \`${item.evidence.gate}\``); }

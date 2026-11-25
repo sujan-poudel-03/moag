@@ -146,6 +146,14 @@ describe('worktree — reporting', () => {
       );
     }
   });
+
+  it('every failure calls the concurrent groups stages, never playlists', () => {
+    for (const r of ['not-a-repo', 'unsupported', 'create-failed', 'delivery-off'] as const) {
+      const text = describeIsolationFailure(r);
+      assert.ok(/stages?/.test(text), `${r} must name the stages`);
+      assert.ok(!/playlist/i.test(text), `${r} still says playlist`);
+    }
+  });
 });
 
 describe('worktree — addBranchWorktree', () => {

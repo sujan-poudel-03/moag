@@ -61,8 +61,8 @@ export interface WritePairingResult {
   aclApplied: boolean | 'n/a';
   /**
    * What checkPairing needs, from what was just saved. Not re-resolved through
-   * resolveOnosooConfig, which refuses when the working folder contains the
-   * config folder (`moag pair` run from the home directory).
+   * resolveOnosooConfig, which can refuse when the working folder contains the
+   * config folder (`moag pair` run from a home folder that is a git repository).
    */
   saved: Pick<OnosooConfig, 'key' | 'endpoint' | 'deviceId'>;
 }

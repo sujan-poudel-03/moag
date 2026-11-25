@@ -104,7 +104,7 @@ export function render(app, params, view) {
   const cp = pdto.currentPlan || { playlists: [] };
   const taskCount = cp.playlists.reduce((n, pl) => n + pl.tasks.length, 0);
   parts.push(h('details', { class: 'card' },
-    h('summary', null, `Current plan (${cp.playlists.length} playlist${cp.playlists.length === 1 ? '' : 's'} · ${taskCount} task${taskCount === 1 ? '' : 's'})`),
+    h('summary', null, `Current plan (${cp.playlists.length} stage${cp.playlists.length === 1 ? '' : 's'} · ${taskCount} task${taskCount === 1 ? '' : 's'})`),
     cp.playlists.map((pl) => h('div', null, h('h3', null, pl.name), taskRows(pl.tasks)))));
 
   mount(view, ...parts);

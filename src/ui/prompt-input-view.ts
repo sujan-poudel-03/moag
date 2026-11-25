@@ -3035,7 +3035,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         <button id="planFixAllBarBtn" class="plan-fix-bar-btn" type="button" style="display:none">Fix All</button>
       </div>
       <div id="planSearchBar" class="plan-search-bar">
-        <input id="planSearchInput" class="plan-search-input" type="text" placeholder="Search tasks or playlists">
+        <input id="planSearchInput" class="plan-search-input" type="text" placeholder="Search tasks or stages">
         <button id="planSearchClearBtn" class="plan-tool-btn" type="button" title="Clear Search" aria-label="Clear Search">Clear</button>
       </div>
     </div>
@@ -3044,7 +3044,7 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
         <div id="planOverviewTitle" class="plan-overview-title">Plan Progress</div>
         <div id="ghSyncHeaderIndicator" class="gh-sync-header-indicator" style="display:none"></div>
       </div>
-      <div id="planOverviewMeta" class="plan-overview-meta">0/0 playlists, 0/0 tasks completed</div>
+      <div id="planOverviewMeta" class="plan-overview-meta">0/0 stages, 0/0 tasks completed</div>
       <div class="plan-overview-bar"><div id="planOverviewFill" class="plan-overview-fill"></div></div>
       <div id="planOverviewFailedMeta" class="plan-overview-meta-failed" style="display:none"></div>
       <div id="planOverviewRunning" class="plan-overview-running"><span class="dot"></span><span id="planOverviewRunningText" class="text"></span></div>
@@ -3061,13 +3061,13 @@ export class PromptInputViewProvider implements vscode.WebviewViewProvider {
     </div>
     <div id="planLivePanel" class="plan-live-panel" style="display:none"></div>
     <div id="planRulesSection"></div>
-    <div id="planListHeading" class="plan-list-heading"><input id="planListSelectModeCb" type="checkbox" aria-label="Enable selection mode" title="Enable selection mode — check tasks/playlists for bulk actions (Run Selected, etc.)"><span>All Tasks</span><button id="planHeadingCollapseBtn" class="plan-tool-btn" type="button" title="Collapse All" aria-label="Collapse All">Collapse All</button></div>
+    <div id="planListHeading" class="plan-list-heading"><input id="planListSelectModeCb" type="checkbox" aria-label="Enable selection mode" title="Enable selection mode — check tasks/stages for bulk actions (Run Selected, etc.)"><span>All Tasks</span><button id="planHeadingCollapseBtn" class="plan-tool-btn" type="button" title="Collapse All" aria-label="Collapse All">Collapse All</button></div>
     <div id="planList" class="list"></div>
     <div id="historyTools" class="history-tools">
       <select id="historyGroupBy" class="tool-select" title="Group by">
         <option value="none">Flat</option>
         <option value="plan">By plan</option>
-        <option value="playlist">By playlist</option>
+        <option value="playlist">By stage</option>
       </select>
       <div class="history-status-chips" id="historyStatusChips">
         <button type="button" class="chip active" data-status="all">All</button>

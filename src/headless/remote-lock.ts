@@ -5,12 +5,17 @@
 // from a crash (marking it interrupted, sweeping its processes). So the command host
 // holds an exclusive lock: <stateDir>/remote/daemon.lock (0600)
 //
-//   { "pid": 1234, "token": "<random>", "started_at": "...", "proc_start": "<linux start time>",
+//   { "pid": 1234, "token": "<random>", "started_at": "...", "proc_start": "<process start time>",
 //     "proc_image": "<windows program name>" }
 //
-// A lock whose process is gone — or whose pid now belongs to a different process
-// (Linux: the recorded /proc start time no longer matches; Windows: the program name the pid
-// belongs to is no longer the one that wrote the lock) — is stale and is taken over.
+// proc_start is /proc/<pid>/stat field 22 on Linux, "win:<creation time, Unix ms>" on Windows,
+// null elsewhere; proc_image is the program file name on Windows (from tasklist). A lock whose
+// process is gone — or whose pid now belongs to a different process (a different program name,
+// a different recorded start time, or, for a lock written without one, a process that started
+// after the lock was written) — is stale and is taken over. Windows reuses pids quickly, and
+// Get-Process refuses the start time of protected system processes (svchost.exe), so the program
+// name is checked too: without both, a crashed daemon's pid taken by another program blocked
+// every restart.
 // The lock is released on close, only by the holder whose token it carries.
 //
 // Atomic, with no window where two takers both win:
@@ -31,6 +36,10 @@ import * as path from 'path';
 export const LOCK_FILE = 'daemon.lock';
 /** A takeover guard older than this belongs to a taker that died mid-takeover. */
 const GUARD_STALE_MS = 10_000;
+/** Prefix of a Windows proc_start; the rest is the process creation time in Unix ms. */
+export const WIN_START_PREFIX = 'win:';
+/** A holder starts before it writes its lock; this much later still counts as before (clock rounding). */
+const START_SLACK_MS = 2_000;
 
 function pause(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -49,7 +58,7 @@ export interface LockOptions {
   pid?: number;
   now?: () => Date;
   isPidAlive?: (pid: number) => boolean;
-  /** The process start time of `pid` (Linux: /proc/<pid>/stat field 22), or null when unknown. */
+  /** The process start time of `pid` (see the header for its form per platform), or null when unknown. */
   procStart?: (pid: number) => string | null;
   /** The program file name running as `pid` (Windows: from `tasklist`), or null when unknown. */
   procImage?: (pid: number) => string | null;
@@ -107,6 +116,37 @@ function defaultOwnImage(): string | null {
   return process.platform === 'win32' ? path.basename(process.execPath) : null;
 }
 
+/** Own start time, read once: it never changes, and each read on Windows starts PowerShell. */
+let ownWindowsStart: string | null | undefined;
+
+/**
+ * Windows process creation time as "win:<Unix ms>", or null when the process is gone, belongs to
+ * a user this one cannot inspect, or PowerShell is unavailable. `exec` is injectable for tests.
+ */
+export function windowsProcStart(pid: number, exec: typeof execFileSync = execFileSync): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) { return null; }
+  const own = pid === process.pid && exec === execFileSync;
+  if (own && ownWindowsStart !== undefined) { return ownWindowsStart; }
+  let result: string | null = null;
+  try {
+    const out = exec('powershell.exe', [
+      '-NoProfile', '-NonInteractive', '-Command',
+      `([DateTimeOffset](Get-Process -Id ${pid} -ErrorAction Stop).StartTime).ToUnixTimeMilliseconds()`,
+    ], { encoding: 'utf-8', timeout: 15_000, windowsHide: true, stdio: ['ignore', 'pipe', 'ignore'] });
+    const ms = Number(String(out).trim());
+    result = Number.isSafeInteger(ms) && ms > 0 ? `${WIN_START_PREFIX}${ms}` : null;
+  } catch {
+    result = null;
+  }
+  if (own) { ownWindowsStart = result; }
+  return result;
+}
+
+/** The start time reader for this platform: /proc on Linux, PowerShell on Windows, none elsewhere. */
+export function platformProcStart(pid: number): string | null {
+  return process.platform === 'win32' ? windowsProcStart(pid) : linuxProcStart(pid);
+}
+
 export class DaemonLock {
   readonly file: string;
   private readonly pid: number;
@@ -122,7 +162,7 @@ export class DaemonLock {
     this.pid = opts.pid ?? process.pid;
     this.now = opts.now ?? ((): Date => new Date());
     this.isPidAlive = opts.isPidAlive ?? defaultIsPidAlive;
-    this.procStart = opts.procStart ?? linuxProcStart;
+    this.procStart = opts.procStart ?? platformProcStart;
     this.procImage = opts.procImage ?? windowsProcImage;
     this.ownImage = opts.ownImage === undefined ? defaultOwnImage() : opts.ownImage;
   }
@@ -148,14 +188,21 @@ export class DaemonLock {
   /** True when `body`'s process is still the one that wrote it. */
   private holderAlive(body: LockBody): boolean {
     if (!this.isPidAlive(body.pid)) { return false; }
-    if (body.proc_start) {
-      const now = this.procStart(body.pid);
-      if (now !== null && now !== body.proc_start) { return false; } // the pid was reused
-    }
     if (body.proc_image) {
       const image = this.procImage(body.pid);
-      // A different program now has the pid (Windows has no /proc start time): the holder is gone.
+      // A different program now has the pid: the holder is gone. Checked first, because Windows refuses the
+      // start time of protected system processes (svchost.exe), which would otherwise trust the pid.
       if (image !== null && image.toLowerCase() !== body.proc_image.toLowerCase()) { return false; }
+    }
+    const now = this.procStart(body.pid);
+    if (now === null) { return true; } // unknown: trust the pid
+    if (body.proc_start) { return now === body.proc_start; } // a different start time: the pid was reused
+    // A lock written without a start time (older MOAG on Windows): a process that started after
+    // the lock was written cannot be the one that wrote it.
+    if (now.startsWith(WIN_START_PREFIX)) {
+      const started = Number(now.slice(WIN_START_PREFIX.length));
+      const wrote = Date.parse(body.started_at);
+      if (Number.isFinite(wrote) && started > wrote + START_SLACK_MS) { return false; }
     }
     return true;
   }
