@@ -4,7 +4,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { DaemonLock, LOCK_FILE, platformProcStart, WIN_START_PREFIX, windowsProcStart } from '../../../headless/remote-lock';
+import { DaemonLock, LOCK_FILE, parseTasklistImage, platformProcStart, WIN_START_PREFIX, windowsProcStart } from '../../../headless/remote-lock';
 
 function tmp(): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'moag-lock-')));
@@ -39,6 +39,37 @@ describe('remote daemon lock', () => {
     assert.deepEqual(b.acquire(), { ok: true });
   });
 
+  it('Windows: a pid now running another program (svchost.exe for node.exe) is stale, whatever its start time', () => {
+    const dir = tmp();
+    new DaemonLock(dir, { pid: 3128, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe' }).acquire();
+    const b = new DaemonLock(dir, {
+      pid: 202, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe',
+      procImage: (pid) => (pid === 3128 ? 'svchost.exe' : 'node.exe'),
+    });
+    assert.deepEqual(b.acquire(), { ok: true });
+    assert.equal(JSON.parse(fs.readFileSync(b.file, 'utf-8')).proc_image, 'node.exe');
+  });
+
+  it('Windows: the same program under that pid still holds the lock (names compare without case)', () => {
+    const dir = tmp();
+    new DaemonLock(dir, { pid: 101, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe' }).acquire();
+    const b = new DaemonLock(dir, { pid: 202, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe', procImage: () => 'NODE.EXE' });
+    assert.deepEqual(b.acquire(), { ok: false, holderPid: 101 });
+  });
+
+  it('Windows: when the program name cannot be read the holder is kept, never taken over on a guess', () => {
+    const dir = tmp();
+    new DaemonLock(dir, { pid: 101, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe' }).acquire();
+    const b = new DaemonLock(dir, { pid: 202, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe', procImage: () => null });
+    assert.deepEqual(b.acquire(), { ok: false, holderPid: 101 });
+  });
+
+  it('reads the program name from a tasklist line, and nothing from "no tasks"', () => {
+    assert.equal(parseTasklistImage('"node.exe","1234","Console","1","50,000 K"\r\n'), 'node.exe');
+    assert.equal(parseTasklistImage('INFO: No tasks are running which match the specified criteria.\r\n'), null);
+    assert.equal(parseTasklistImage(''), null);
+  });
+
   describe('Windows pid reuse', () => {
     const WROTE = new Date('2026-11-24T10:00:00.000Z');
     const at = (iso: string): string => `${WIN_START_PREFIX}${Date.parse(iso)}`;
@@ -47,7 +78,8 @@ describe('remote daemon lock', () => {
     /** A lock written by pid 101 at WROTE, with the given proc_start (null: older MOAG on Windows). */
     function writtenLock(procStart: string | null): string {
       const dir = tmp();
-      new DaemonLock(dir, { pid: 101, now: () => WROTE, procStart: () => procStart }).acquire();
+      // ownImage null: these tests are about the start time, so no real tasklist lookup of pid 101.
+      new DaemonLock(dir, { pid: 101, now: () => WROTE, procStart: () => procStart, ownImage: null }).acquire();
       return dir;
     }
 

@@ -121,6 +121,8 @@ import type { Plan } from '../models/types';
 import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
+import { cmdInit } from './onosoo-init';
+import { cmdService } from './service-windows';
 import { OnosooSpool } from './onosoo-spool';
 import { keyPassesScrub, OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
 import { checkPairing, PairError, writePairing } from './onosoo-pair';
@@ -2376,7 +2378,7 @@ export async function cmdPair(args: Args, deps: PairDeps = {}): Promise<number> 
 // ─── entry ───────────────────────────────────────────────────────────────────
 
 const MAIN_USAGE =
-  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|project-id|bench> ...\n' +
+  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|init|service|project-id|bench> ...\n' +
   '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
   '       moag --version | moag help\n' +
   '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
@@ -2396,6 +2398,8 @@ const MAIN_USAGE =
   '  moag standards propose [--stack <id>] [--write [--force]]\n' +
   '  moag pair [<key>] [--url <base>]   save the ONOSOO device key (read from stdin when omitted) and check it\n' +
   '  moag project-id [--cwd <dir>] [--json]   print the ONOSOO project ID runs from this folder report\n' +
+  '  moag init [<folder>] [--url <base>] [--budget <usd>]   pair this machine if needed and list this git repository for ONOSOO runs\n' +
+  '  moag service <install | uninstall | status>   Windows: start the daemon when you sign in (hidden, restarted on failure)\n' +
   '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n';
 
 /** The CLI entry point. Exported so a test can drive dispatch. */
@@ -2419,6 +2423,17 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
   if (args.command === 'pair') {
     // No setup() and no shim: pairing writes one user-level file and makes one HTTP call.
     return cmdPair(args);
+  }
+  if (args.command === 'init') {
+    // No setup() and no shim: pairs (the same prompt as `moag pair`) and writes one user-level file.
+    return cmdInit(argv.slice(1), {
+      env: relayConfigEnv(),
+      pair: (url) => cmdPair(parseArgs(['pair', ...(url ? ['--url', url] : [])])),
+    });
+  }
+  if (args.command === 'service') {
+    // No setup() and no shim: it only registers or removes a Windows scheduled task (and says so elsewhere).
+    return cmdService(args.positionals[0]);
   }
   if (args.command === 'project-id') {
     // No setup() and no shim: local git and the user-level ONOSOO config only; nothing is sent.
