@@ -180,12 +180,34 @@ describe('ONOSOO command host', () => {
     await h.host.tick();
     await h.host.tick();
     assert.equal(h.control.caps.length, 1);
-    assert.deepEqual(h.control.caps[0], { mode: 'isolated', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'] }], engines: ['claude', 'ollama'] });
+    assert.deepEqual(h.control.caps[0], { mode: 'isolated', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'], delivery: 'off' }], engines: ['claude', 'ollama'], daily_budget_usd: 20 });
     assert.ok(!JSON.stringify(h.control.caps).includes(PROJECT_PATH));
     h.setProjects(projects({ projects: [{ id: 'web', name: 'Web (renamed)', kinds: [], path: PROJECT_PATH }] }));
     await h.host.tick();
     assert.equal(h.control.caps.length, 2);
     assert.equal(h.control.caps[1].projects[0].name, 'Web (renamed)');
+  });
+
+  it('capabilities carry each project\'s delivery mode and the daily cap, and leave the cap out when there is none', async () => {
+    const withDelivery = harness();
+    withDelivery.setProjects(projects({
+      dailyBudgetUsd: 7.5,
+      projects: [
+        { id: 'web', name: 'Web app', kinds: ['node'], path: PROJECT_PATH, delivery: 'draft-pr' },
+        { id: 'api', name: 'API', kinds: ['node'], path: PROJECT_PATH, delivery: 'branch' },
+        { id: 'docs', name: 'Docs', kinds: [], path: PROJECT_PATH },
+      ],
+    }));
+    await withDelivery.host.tick();
+    const caps = withDelivery.control.caps[0];
+    assert.deepEqual(caps.projects.map((p) => [p.id, p.delivery]), [['web', 'draft-pr'], ['api', 'branch'], ['docs', 'off']]);
+    assert.equal(caps.daily_budget_usd, 7.5);
+    assert.ok(!JSON.stringify(caps).includes(PROJECT_PATH), 'still no path');
+
+    const noCap = harness();
+    noCap.setProjects(projects({ dailyBudgetUsd: null }));
+    await noCap.host.tick();
+    assert.equal('daily_budget_usd' in noCap.control.caps[0], false);
   });
 
   it('capabilities carry why an installed engine is not offered, and omit the key when there is nothing to say', async () => {
@@ -750,7 +772,7 @@ describe('ONOSOO command host — project identity', () => {
     f.known.set(PROJECT_PATH, ID_WEB);
     await h.host.tick();
     assert.equal(h.control.caps.length, 2);
-    assert.deepEqual(h.control.caps[1].projects, [{ id: 'web', name: 'Web app', kinds: ['node'], key: KEY_WEB }]);
+    assert.deepEqual(h.control.caps[1].projects, [{ id: 'web', name: 'Web app', kinds: ['node'], key: KEY_WEB, delivery: 'off' }]);
     await h.host.tick();
     await h.host.tick();
     assert.equal(h.control.caps.length, 2);
@@ -919,7 +941,7 @@ describe('ONOSOO command host — project identity', () => {
     h.control.polls.push([startRun('c1')]);
     await h.host.tick();
     await tick();
-    assert.deepEqual(h.control.caps[0].projects, [{ id: 'web', name: 'Web app', kinds: ['node'] }]);
+    assert.deepEqual(h.control.caps[0].projects, [{ id: 'web', name: 'Web app', kinds: ['node'], delivery: 'off' }]);
     assert.equal(h.sups.length, 1);
     assert.equal(h.sups[0].req.identity, null);
   });
@@ -932,7 +954,7 @@ describe('ONOSOO command host — local mode', () => {
     const h = harness({ platform: 'win32' });
     h.setProjects(local());
     await h.host.tick();
-    assert.deepEqual(h.control.caps[0], { mode: 'local', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'] }], engines: ['claude', 'ollama'] });
+    assert.deepEqual(h.control.caps[0], { mode: 'local', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'], delivery: 'off' }], engines: ['claude', 'ollama'], daily_budget_usd: 20 });
     assert.ok(!JSON.stringify(h.control.caps).includes(PROJECT_PATH));
   });
 

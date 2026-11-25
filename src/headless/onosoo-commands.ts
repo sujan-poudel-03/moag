@@ -404,8 +404,10 @@ export class CommandHost {
       // Never a path or a URL: ONOSOO only ever sees id, name, kinds and the cached project key.
       projects: projects.projects.map((p) => {
         const key = this.knownKey(p.path);
-        return { id: p.id, name: p.name, kinds: [...p.kinds], ...(key ? { key } : {}) };
+        return { id: p.id, name: p.name, kinds: [...p.kinds], ...(key ? { key } : {}), delivery: p.delivery ?? 'off' };
       }),
+      // The daily cap the machine enforces, so ONOSOO can show it beside what a project spent today.
+      ...(projects.dailyBudgetUsd !== null ? { daily_budget_usd: projects.dailyBudgetUsd } : {}),
       engines: ok ? [...(iso as { engines: string[] }).engines] : [],
       // Why an installed engine is not offered, so ONOSOO can say "not signed in" instead of showing nothing.
       ...(ok && Object.keys((iso as { engineIssues: Record<string, string> }).engineIssues).length > 0

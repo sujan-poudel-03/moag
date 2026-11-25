@@ -180,6 +180,10 @@ it is. Delivery is `draft-pr` when `gh` is signed in, `branch` when there is an 
 `off` when there is no origin; `--delivery`, `--pr-base`, `--name`, `--id` and `--budget` override. The longer
 manual setup follows.
 
+**What the machine tells ONOSOO:** its mode, whether remote start is on, the approved projects (id, name, kinds, the
+project key and each project's `delivery` mode, never a path or a URL), the usable engines, and the daily budget cap
+(`daily_budget_usd`), so the Builds screen can show a ready check and what a project spent against the cap.
+
 **Check that delivery will work:** `moag delivery-check [<project id>]` asks, read-only, whether a finished run can
 leave this machine: the project has an `origin`, `git ls-remote --heads origin` succeeds (prompts off, 25 s limit),
 and, for `draft-pr` projects, `gh auth status` passes. Exit 0 when every project can deliver, 1 when one cannot,

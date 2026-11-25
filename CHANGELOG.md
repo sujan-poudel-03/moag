@@ -24,6 +24,7 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 ### Changed
 
 - A failed branch push now says the real reason and what to do (a blocked port 22 with the port 443 way round it, a missing SSH key or login, an untrusted host key, a missing repository, a branch rule, a branch that moved on), followed by git's own words, instead of a single "check the GitHub login" line.
+- The machine's capabilities now also carry each project's `delivery` mode (`off`, `branch` or `draft-pr`) and the machine's `daily_budget_usd`, so ONOSOO can show them in its ready check. Never a path or a URL. ONOSOO versions that do not know the fields ignore them.
 - A run the daemon was cut off in is now ended in ONOSOO at the next start (an `error` and a failed `run-finished`), instead of showing as running until someone noticed.
 - The "config folder is inside the workspace" refusal now names the folder you ran MOAG from and says what to do (run it from another folder), instead of a bare statement.
 - Play and Execute are now **Run**: **Run Plan**, **Run Stage**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
