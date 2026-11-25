@@ -133,15 +133,15 @@ export async function removeWorktrees(
 export function describeIsolationFailure(reason: IsolationFailure): string {
   switch (reason) {
     case 'not-a-repo':
-      return 'Concurrent playlists need git worktree isolation, but this folder is not a git repository. Running playlists one at a time instead.';
+      return 'Concurrent stages need git worktree isolation, but this folder is not a git repository. Running stages one at a time instead.';
     case 'unsupported':
-      return 'Concurrent playlists need git worktree isolation, which this git does not support. Running playlists one at a time instead.';
+      return 'Concurrent stages need git worktree isolation, which this git does not support. Running stages one at a time instead.';
     case 'create-failed':
-      return 'Concurrent playlists need git worktree isolation, which could not be set up. Running playlists one at a time instead.';
+      return 'Concurrent stages need git worktree isolation, which could not be set up. Running stages one at a time instead.';
     case 'delivery-off':
       // Isolation without delivery would strand each playlist's work in a
       // throwaway checkout with no commit to carry it out.
-      return 'Concurrent playlists need agentTaskPlayer.git.autoCommit so each playlist can commit inside its own checkout. Running playlists one at a time instead.';
+      return 'Concurrent stages need agentTaskPlayer.git.autoCommit so each stage can commit inside its own checkout. Running stages one at a time instead.';
   }
 }
 

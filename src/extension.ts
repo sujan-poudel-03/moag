@@ -443,7 +443,7 @@ function getPromptSidebarPlanGroups(): PromptSidebarPlanGroup[] {
 
     return {
       id: playlist.id ?? `playlist-${index}`,
-      name: playlist.name || `Playlist ${index + 1}`,
+      name: playlist.name || `Stage ${index + 1}`,
       playlistStatus: status,
       progress: { done, total },
       aiRules: playlist.aiRules,
@@ -562,7 +562,7 @@ function getPromptSidebarActiveContext(): { planName: string; playlistName: stri
   if (runningPlaylist) {
     return {
       planName: plan.name || 'Untitled Plan',
-      playlistName: runningPlaylist.name || 'Playlist',
+      playlistName: runningPlaylist.name || 'Stage',
     };
   }
 
@@ -571,13 +571,13 @@ function getPromptSidebarActiveContext(): { planName: string; playlistName: stri
   if (nextPlaylist) {
     return {
       planName: plan.name || 'Untitled Plan',
-      playlistName: nextPlaylist.name || 'Playlist',
+      playlistName: nextPlaylist.name || 'Stage',
     };
   }
 
   return {
     planName: plan.name || 'Untitled Plan',
-    playlistName: plan.playlists[0]?.name || 'Playlist',
+    playlistName: plan.playlists[0]?.name || 'Stage',
   };
 }
 
@@ -2766,7 +2766,7 @@ function handleTttPhaseStart(playlist: Playlist): void {
   const tool = vscode.workspace.getConfiguration('agentTaskPlayer').get<string>('testTool', 'manual');
 
   DashboardPanel.currentPanel?.appendOutput(
-    `\n[TTT] Test phase started — playlist: "${playlist.name}" | tool: ${tool}\n`,
+    `\n[TTT] Test phase started — stage: "${playlist.name}" | tool: ${tool}\n`,
     'stdout',
   );
 
@@ -3683,7 +3683,7 @@ async function createPlanFromIdea(
   currentPlanPath = getNewPlanSavePath() || path.join(workspaceFolder.uri.fsPath, `${planName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+$/, '')}.agent-plan.json`);
   saveAndRefresh();
   vscode.window.showInformationMessage(
-    `Plan "${planName}" created — ${currentPlan.playlists.length} playlist${currentPlan.playlists.length > 1 ? 's' : ''}, ${totalTasks} task${totalTasks > 1 ? 's' : ''}.`,
+    `Plan "${planName}" created — ${currentPlan.playlists.length} stage${currentPlan.playlists.length > 1 ? 's' : ''}, ${totalTasks} task${totalTasks > 1 ? 's' : ''}.`,
   );
   return true;
 }
@@ -4002,7 +4002,7 @@ async function cmdAddPlaylist(): Promise<void> {
   }
 
   const name = await vscode.window.showInputBox({
-    prompt: 'Playlist name',
+    prompt: 'Stage name',
     placeHolder: 'e.g., Setup, Feature, Testing',
   });
   if (!name) { return; }
@@ -4032,11 +4032,11 @@ async function cmdAddTask(playlistIndexOrItem?: unknown): Promise<void> {
   } else if (currentPlan.playlists.length === 1) {
     playlistIndex = 0;
   } else if (currentPlan.playlists.length === 0) {
-    vscode.window.showWarningMessage('Add a playlist first.');
+    vscode.window.showWarningMessage('Add a stage first.');
     return;
   } else {
     const items = currentPlan.playlists.map((pl, i) => ({ label: pl.name, index: i }));
-    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select playlist' });
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select a stage' });
     if (!picked) { return; }
     playlistIndex = picked.index;
   }
@@ -4203,7 +4203,7 @@ async function cmdPreviewTaskPrompt(arg?: unknown): Promise<void> {
         `| Engine | \`${engine}\` |`,
         `| Type | \`${taskType}\` |`,
         `| Role | ${previewRoleId ? `\`${previewRoleId}\`${rolesEnabled ? '' : ' (roles disabled)'}` : 'none'} |`,
-        `| Playlist | ${playlist.name} |`,
+        `| Stage | ${playlist.name} |`,
         `| Status | ${task.status ?? 'pending'} |`,
         ``,
         `---`,
@@ -4320,7 +4320,7 @@ async function cmdQuickAddTask(): Promise<void> {
     return;
   }
   if (currentPlan.playlists.length === 0) {
-    vscode.window.showWarningMessage('Add a playlist first.');
+    vscode.window.showWarningMessage('Add a stage first.');
     return;
   }
 
@@ -4330,7 +4330,7 @@ async function cmdQuickAddTask(): Promise<void> {
     playlistIndex = 0;
   } else {
     const items = currentPlan.playlists.map((pl, i) => ({ label: pl.name, index: i }));
-    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select playlist' });
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select a stage' });
     if (!picked) { return; }
     playlistIndex = picked.index;
   }
@@ -4371,7 +4371,7 @@ async function cmdAddTaskFromSelection(): Promise<void> {
     return;
   }
   if (currentPlan.playlists.length === 0) {
-    vscode.window.showWarningMessage('Add a playlist first.');
+    vscode.window.showWarningMessage('Add a stage first.');
     return;
   }
 
@@ -4381,7 +4381,7 @@ async function cmdAddTaskFromSelection(): Promise<void> {
     playlistIndex = 0;
   } else {
     const items = currentPlan.playlists.map((pl, i) => ({ label: pl.name, index: i }));
-    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select playlist' });
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select a stage' });
     if (!picked) { return; }
     playlistIndex = picked.index;
   }
@@ -5675,7 +5675,7 @@ async function cmdBulkDelete(): Promise<void> {
     const pl = currentPlan.playlists[pi];
     items.push({
       label: `$(list-unordered) ${pl.name}`,
-      description: `Playlist — ${pl.tasks.length} tasks`,
+      description: `Stage — ${pl.tasks.length} tasks`,
       itemType: 'playlist',
       playlistIndex: pi,
     });
@@ -5693,7 +5693,7 @@ async function cmdBulkDelete(): Promise<void> {
 
   const picks = await vscode.window.showQuickPick(items, {
     canPickMany: true,
-    placeHolder: 'Select items to delete (playlists and/or tasks)',
+    placeHolder: 'Select items to delete (stages and/or tasks)',
     title: 'Bulk Delete',
   });
 
@@ -5754,17 +5754,17 @@ async function cmdClearAllTasks(): Promise<void> {
 
   const choice = await vscode.window.showQuickPick(
     [
-      { label: '$(clear-all) Clear all tasks', description: 'Remove all tasks but keep playlists', value: 'tasks' },
-      { label: '$(trash) Clear entire plan', description: 'Remove all playlists and tasks', value: 'all' },
+      { label: '$(clear-all) Clear all tasks', description: 'Remove all tasks but keep stages', value: 'tasks' },
+      { label: '$(trash) Clear entire plan', description: 'Remove all stages and tasks', value: 'all' },
     ],
-    { placeHolder: `Plan has ${currentPlan.playlists.length} playlist(s) with ${totalTasks} total task(s)` },
+    { placeHolder: `Plan has ${currentPlan.playlists.length} stage(s) with ${totalTasks} total task(s)` },
   );
   if (!choice) { return; }
 
   const confirm = await vscode.window.showWarningMessage(
     choice.value === 'all'
-      ? `Remove all ${currentPlan.playlists.length} playlists and ${totalTasks} tasks?`
-      : `Remove all ${totalTasks} tasks from ${currentPlan.playlists.length} playlists?`,
+      ? `Remove all ${currentPlan.playlists.length} stages and ${totalTasks} tasks?`
+      : `Remove all ${totalTasks} tasks from ${currentPlan.playlists.length} stages?`,
     { modal: true },
     'Delete',
   );
@@ -6272,15 +6272,15 @@ async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIn
     return;
   }
   if (!item || !isPlaylistLikeItem(item)) {
-    vscode.window.showWarningMessage('Could not run playlist: invalid selection payload.');
+    vscode.window.showWarningMessage('Could not run stage: invalid selection payload.');
     return;
   }
   if (item.kind && item.kind !== 'playlist') {
-    vscode.window.showWarningMessage('Could not run playlist: selected item is not a playlist.');
+    vscode.window.showWarningMessage('Could not run stage: the selected item is not a stage.');
     return;
   }
   if (item.playlistIndex < 0 || item.playlistIndex >= activePlan.playlists.length) {
-    vscode.window.showWarningMessage('Could not run playlist: playlist index is out of range.');
+    vscode.window.showWarningMessage('Could not run stage: stage index is out of range.');
     return;
   }
 
@@ -6294,10 +6294,10 @@ async function cmdPlayPlaylist(item?: PlanTreeItem | { kind?: string; playlistIn
   if (hasProgress) {
     const action = await vscode.window.showQuickPick(
       [
-        { label: '$(debug-continue) Resume', description: 'Skip completed tasks in this playlist', value: 'resume' },
-        { label: '$(debug-restart) Restart', description: 'Reset all tasks in this playlist', value: 'restart' },
+        { label: '$(debug-continue) Resume', description: 'Skip completed tasks in this stage', value: 'resume' },
+        { label: '$(debug-restart) Restart', description: 'Reset all tasks in this stage', value: 'restart' },
       ],
-      { placeHolder: `Playlist "${playlist.name}" has progress from a previous run` },
+      { placeHolder: `Stage "${playlist.name}" has progress from a previous run` },
     );
     if (!action) { return; }
     if (action.value === 'restart') {
@@ -6333,7 +6333,7 @@ async function cmdPlayTask(item?: PlanTreeItem | { kind?: string; playlistIndex:
     return;
   }
   if (item.playlistIndex < 0 || item.playlistIndex >= activePlan.playlists.length) {
-    vscode.window.showWarningMessage('Could not run task: playlist index is out of range.');
+    vscode.window.showWarningMessage('Could not run task: stage index is out of range.');
     return;
   }
   if (item.taskIndex < 0 || item.taskIndex >= activePlan.playlists[item.playlistIndex].tasks.length) {
@@ -6459,11 +6459,11 @@ async function cmdAddTaskFromTemplate(playlistIndexOrItem?: unknown): Promise<vo
   } else if (currentPlan.playlists.length === 1) {
     playlistIndex = 0;
   } else if (currentPlan.playlists.length === 0) {
-    vscode.window.showWarningMessage('Add a playlist first.');
+    vscode.window.showWarningMessage('Add a stage first.');
     return;
   } else {
     const items = currentPlan.playlists.map((pl, i) => ({ label: pl.name, index: i }));
-    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select playlist' });
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select a stage' });
     if (!picked) { return; }
     playlistIndex = picked.index;
   }
@@ -6813,7 +6813,7 @@ async function cmdImportPlanFromUrl(): Promise<void> {
 
   const totalTasks = plan.playlists.reduce((sum, pl) => sum + pl.tasks.length, 0);
   vscode.window.showInformationMessage(
-    `Imported "${plan.name}" — ${totalTasks} task${totalTasks !== 1 ? 's' : ''} across ${plan.playlists.length} playlist${plan.playlists.length !== 1 ? 's' : ''}.`,
+    `Imported "${plan.name}" — ${totalTasks} task${totalTasks !== 1 ? 's' : ''} across ${plan.playlists.length} stage${plan.playlists.length !== 1 ? 's' : ''}.`,
   );
 }
 
@@ -7024,7 +7024,7 @@ async function cmdDryRun(): Promise<void> {
   const availability = await checkEngineAvailability(engineIds);
 
   let doc = `# Dry Run Preview: ${currentPlan.name}\n\n`;
-  doc += `**Playlists:** ${currentPlan.playlists.length}\n`;
+  doc += `**Stages:** ${currentPlan.playlists.length}\n`;
   const totalTasks = currentPlan.playlists.reduce((s, pl) => s + pl.tasks.length, 0);
   doc += `**Total Tasks:** ${totalTasks}\n`;
   doc += `**Default Engine:** ${currentPlan.defaultEngine}\n\n`;
@@ -7085,7 +7085,7 @@ async function cmdDryRun(): Promise<void> {
   const concurrency = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('parallelPlaylists', 1);
   const timeout = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('taskTimeoutMs', 1800000);
   doc += '## Settings\n\n';
-  doc += `- **Parallel Playlists:** ${concurrency}\n`;
+  doc += `- **Parallel stages:** ${concurrency}\n`;
   doc += `- **Task Timeout:** ${formatDuration(timeout)}\n`;
   doc += `- **Autoplay Delay:** ${vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('autoplayDelay', 500)}ms\n`;
 
@@ -7258,7 +7258,7 @@ async function cmdSetPlaylistStatus(item?: PlanTreeItem): Promise<void> {
   const picks = [
     { label: '$(circle-outline) All Pending', value: TaskStatus.Pending, description: 'Reset all tasks — will run on the next run' },
     { label: '$(pass) All Completed', value: TaskStatus.Completed, description: 'Mark all as done — will be skipped' },
-    { label: '$(debug-step-over) All Skipped', value: TaskStatus.Skipped, description: 'Skip all tasks in this playlist' },
+    { label: '$(debug-step-over) All Skipped', value: TaskStatus.Skipped, description: 'Skip all tasks in this stage' },
   ];
 
   const pick = await vscode.window.showQuickPick(picks, {
@@ -7279,8 +7279,8 @@ async function cmdSetTestPhase(item?: PlanTreeItem): Promise<void> {
   const playlist = currentPlan.playlists[item.playlistIndex];
   const current = playlist.testPhase ?? false;
   const picks = [
-    { label: '$(beaker) Mark as Test Phase', value: true, description: 'Sandbox auto-launches and TTT check runs when this playlist starts' },
-    { label: '$(circle-slash) Remove Test Phase', value: false, description: 'Normal playlist — no sandbox auto-launch' },
+    { label: '$(beaker) Mark as Test Phase', value: true, description: 'Sandbox auto-launches and TTT check runs when this stage starts' },
+    { label: '$(circle-slash) Remove Test Phase', value: false, description: 'Regular stage — no sandbox auto-launch' },
   ];
   const pick = await vscode.window.showQuickPick(picks, {
     placeHolder: `"${playlist.name}" test phase: currently ${current ? 'ON' : 'OFF'}`,
@@ -7289,7 +7289,7 @@ async function cmdSetTestPhase(item?: PlanTreeItem): Promise<void> {
 
   playlist.testPhase = pick.value;
   saveAndRefresh();
-  vscode.window.showInformationMessage(`"${playlist.name}" test phase: ${pick.value ? 'ON — sandbox will auto-launch when this playlist runs' : 'OFF'}`);
+  vscode.window.showInformationMessage(`"${playlist.name}" test phase: ${pick.value ? 'ON — sandbox will auto-launch when this stage runs' : 'OFF'}`);
 }
 
 async function cmdUndoTask(treeItem?: PlanTreeItem): Promise<void> {

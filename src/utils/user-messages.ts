@@ -30,8 +30,8 @@ export function noPlanLoaded(): UserMessage {
 
 export function noPlaylist(): UserMessage {
   return {
-    text: 'Your plan needs at least one playlist before you can add tasks.',
-    actions: [{ label: 'Add Playlist', command: 'agentTaskPlayer.addPlaylist' }],
+    text: 'Your plan needs at least one stage before you can add tasks.',
+    actions: [{ label: 'Add Stage', command: 'agentTaskPlayer.addPlaylist' }],
   };
 }
 

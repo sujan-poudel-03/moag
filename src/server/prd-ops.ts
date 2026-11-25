@@ -241,7 +241,7 @@ function reviewPendingPlaylist(pl: PlanFilePlaylist, allowedEngines: readonly En
       engineErrors.push(error);
     }
   };
-  checkEngine(pl.engine, `Playlist "${pl.name}"`);
+  checkEngine(pl.engine, `Stage "${pl.name}"`);
   // Truthiness, exactly as the runner decides it (`playlist.parallel && !failSafe`).
   if (pl.parallel) { errors.push(PARALLEL_PLAYLIST_ERROR); }
   for (const t of (pl.tasks ?? []) as PlanFileTask[]) {

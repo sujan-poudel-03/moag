@@ -10,19 +10,26 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ### Added
 
+- **`moag init`.** In a git repository, one command pairs the machine (asking for the device key unless it is already paired), adds the repository to `projects.json` (creating the file in local mode with remote start on and a $10 daily budget if there is none), and says what to run next. It never changes an existing file's mode, budget or other projects, leaves an already-listed repository alone, and picks delivery from what the machine can do (`draft-pr` with `gh` signed in, `branch` with an origin only, else off). See "Local mode" in `docs/onosoo-remote.md`.
 - **Local mode for ONOSOO remote runs.** With `"mode": "local"` in `projects.json`, a plain Windows, macOS or Linux PC can take **Start run** from ONOSOO and run it as the same user: no runner account, no sudo, no WSL. It is opt-in only (never inferred), keeps the approved-project list, budget, 4-hour cap, `moag/...` worktree, delivery and audit, reports `mode` in its capabilities, prints a warning that runs use your own privileges, and force-stops the whole process tree. The isolated mode is unchanged. See "Local mode" in `docs/onosoo-remote.md`.
 - **ONOSOO project identity (Builds protocol v1.2).** Every run tells ONOSOO which project it belongs to, with an id that is the same on every machine and survives renaming the folder: the repository's `origin` remote (`git:github.com/owner/repo`, plus a link), else its first commit (`root:…`), else, for a folder of several repositories, a `multi:…` id with the list of them. Credentials, ports and local paths are never sent. See "How a project gets into ONOSOO" in `docs/onosoo-builds.md`.
 - `docs/project-key-vectors.json`: example remotes and the id each one gives, checked by MOAG's tests and shared with ONOSOO.
 - Remote runs: an engine login check, the reason an installed engine is not offered, branch delivery, and each task's stage and kind in run-meta.
 - **Copy ONOSOO Project ID.** The command **MOAG: Copy ONOSOO Project ID** puts the ID runs from a folder report on the clipboard (with a folder picker in a multi-root workspace), and `moag project-id [--cwd <dir>] [--json]` prints it, exiting 1 with the reason when the folder has none. Both apply the same privacy filter as a run, so an ID a run would not send is never shown. While this machine is paired, the Dashboard status bar shows the ONOSOO project runs go to, with **Copy** and, for a repository with a link, **Open repository**.
 
+- **`moag service install | uninstall | status` (Windows).** Registers a per-user Task Scheduler task so the daemon starts when you sign in, hidden, as you, restarted a minute after a failure, with a log in `%LOCALAPPDATA%\moag\daemon.log`. No terminal window to keep open. See "Windows: start the daemon when you sign in" in `docs/onosoo-remote.md`.
+
 ### Changed
 
-- Play and Execute are now **Run**: **Run Plan**, **Run Playlist**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
+- The "config folder is inside the workspace" refusal now names the folder you ran MOAG from and says what to do (run it from another folder), instead of a bare statement.
+- Play and Execute are now **Run**: **Run Plan**, **Run Stage**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
+- Playlist is now **Stage** wherever MOAG shows it: **Add Stage**, **Run Stage**, **Set Stage Status...**, the sidebar, Dashboard, notifications, Get Started walkthrough, command-line output, the hosted web UI and the docs. Command ids, settings (including `agentTaskPlayer.parallelPlaylists`) and plan files (the `playlists` key) are unchanged, so existing plans keep working.
 
 ### Fixed
 
+- **A stale daemon lock on Windows.** A lock left by a crashed daemon whose process id was later reused by another program (for example `svchost.exe`) was treated as held, and `moag daemon` refused to start. The lock now records the program name and the process start time: it is taken over when the id belongs to a different program, when the start time differs, or (for a lock from an older MOAG) when the process holding the id started after the lock was written. Facts that cannot be read keep the lock.
 - `moag pair` accepts a key pasted into PowerShell (bracketed-paste markers are ignored).
+- `moag daemon` started from your home folder no longer turns ONOSOO off and exits ("the user config directory is inside the workspace"). The home folder (or a folder above it) is allowed unless a git repository lies between it and the config folder; a project folder that contains the config folder is still refused.
 - An SSH host alias of GitHub, GitLab or Bitbucket (`git@github.com-personal:…`, `ssh.github.com`) gives the same project id as a normal clone.
 
 ## [0.10.0] - 2026-11-09

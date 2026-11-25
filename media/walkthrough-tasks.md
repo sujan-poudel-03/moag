@@ -1,6 +1,6 @@
-## Playlists and Tasks
+## Stages and Tasks
 
-### Playlist = a phase of work
+### Stage = a phase of work
 
 Think of it as a folder that groups related tasks:
 - "Project Setup"

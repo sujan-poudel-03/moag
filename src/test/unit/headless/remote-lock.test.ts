@@ -4,7 +4,7 @@ import { strict as assert } from 'assert';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { DaemonLock, LOCK_FILE } from '../../../headless/remote-lock';
+import { DaemonLock, LOCK_FILE, parseTasklistImage, platformProcStart, WIN_START_PREFIX, windowsProcStart } from '../../../headless/remote-lock';
 
 function tmp(): string {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'moag-lock-')));
@@ -39,6 +39,105 @@ describe('remote daemon lock', () => {
     assert.deepEqual(b.acquire(), { ok: true });
   });
 
+  it('Windows: a pid now running another program (svchost.exe for node.exe) is stale, whatever its start time', () => {
+    const dir = tmp();
+    new DaemonLock(dir, { pid: 3128, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe' }).acquire();
+    const b = new DaemonLock(dir, {
+      pid: 202, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe',
+      procImage: (pid) => (pid === 3128 ? 'svchost.exe' : 'node.exe'),
+    });
+    assert.deepEqual(b.acquire(), { ok: true });
+    assert.equal(JSON.parse(fs.readFileSync(b.file, 'utf-8')).proc_image, 'node.exe');
+  });
+
+  it('Windows: the same program under that pid still holds the lock (names compare without case)', () => {
+    const dir = tmp();
+    new DaemonLock(dir, { pid: 101, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe' }).acquire();
+    const b = new DaemonLock(dir, { pid: 202, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe', procImage: () => 'NODE.EXE' });
+    assert.deepEqual(b.acquire(), { ok: false, holderPid: 101 });
+  });
+
+  it('Windows: when the program name cannot be read the holder is kept, never taken over on a guess', () => {
+    const dir = tmp();
+    new DaemonLock(dir, { pid: 101, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe' }).acquire();
+    const b = new DaemonLock(dir, { pid: 202, isPidAlive: () => true, procStart: () => null, ownImage: 'node.exe', procImage: () => null });
+    assert.deepEqual(b.acquire(), { ok: false, holderPid: 101 });
+  });
+
+  it('reads the program name from a tasklist line, and nothing from "no tasks"', () => {
+    assert.equal(parseTasklistImage('"node.exe","1234","Console","1","50,000 K"\r\n'), 'node.exe');
+    assert.equal(parseTasklistImage('INFO: No tasks are running which match the specified criteria.\r\n'), null);
+    assert.equal(parseTasklistImage(''), null);
+  });
+
+  describe('Windows pid reuse', () => {
+    const WROTE = new Date('2026-11-24T10:00:00.000Z');
+    const at = (iso: string): string => `${WIN_START_PREFIX}${Date.parse(iso)}`;
+    type Exec = typeof import('child_process').execFileSync;
+
+    /** A lock written by pid 101 at WROTE, with the given proc_start (null: older MOAG on Windows). */
+    function writtenLock(procStart: string | null): string {
+      const dir = tmp();
+      // ownImage null: these tests are about the start time, so no real tasklist lookup of pid 101.
+      new DaemonLock(dir, { pid: 101, now: () => WROTE, procStart: () => procStart, ownImage: null }).acquire();
+      return dir;
+    }
+
+    /** A second contender (pid 202) that sees pid 101 alive with start time `start101`. */
+    function contender(dir: string, start101: string | null): DaemonLock {
+      return new DaemonLock(dir, { pid: 202, isPidAlive: () => true, procStart: (pid) => (pid === 101 ? start101 : 'B') });
+    }
+
+    it('a recorded Windows start time that no longer matches is stale', () => {
+      const dir = writtenLock(at('2026-11-24T09:59:59.000Z'));
+      assert.deepEqual(contender(dir, at('2026-11-24T11:30:00.000Z')).acquire(), { ok: true });
+    });
+
+    it('a recorded Windows start time that matches is still held', () => {
+      const start = at('2026-11-24T09:59:59.000Z');
+      assert.deepEqual(contender(writtenLock(start), start).acquire(), { ok: false, holderPid: 101 });
+    });
+
+    it('a lock without a start time, whose pid now belongs to a process started later, is stale', () => {
+      assert.deepEqual(contender(writtenLock(null), at('2026-11-24T10:05:00.000Z')).acquire(), { ok: true });
+    });
+
+    it('a lock without a start time, whose process started before it was written, is still held', () => {
+      assert.deepEqual(contender(writtenLock(null), at('2026-11-24T09:58:00.000Z')).acquire(), { ok: false, holderPid: 101 });
+    });
+
+    it('a start time within the clock slack of the lock still counts as the writer', () => {
+      assert.deepEqual(contender(writtenLock(null), at('2026-11-24T10:00:01.500Z')).acquire(), { ok: false, holderPid: 101 });
+    });
+
+    it('an unreadable start time trusts the pid, as before', () => {
+      assert.deepEqual(contender(writtenLock(null), null).acquire(), { ok: false, holderPid: 101 });
+    });
+
+    it('windowsProcStart reads PowerShell\'s Unix ms and fails closed to null', () => {
+      const calls: string[][] = [];
+      const ok = ((_cmd: string, args: string[]) => { calls.push(args); return '1764000000123\r\n'; }) as unknown as Exec;
+      assert.equal(windowsProcStart(4242, ok), `${WIN_START_PREFIX}1764000000123`);
+      assert.match(calls[0][calls[0].length - 1], /Get-Process -Id 4242 /);
+      const throws = (() => { throw new Error('Cannot find a process'); }) as unknown as Exec;
+      assert.equal(windowsProcStart(4242, throws), null);
+      assert.equal(windowsProcStart(4242, (() => 'not a number') as unknown as Exec), null);
+      assert.equal(windowsProcStart(0, ok), null);
+      assert.equal(windowsProcStart(1.5, ok), null);
+      assert.equal(calls.length, 1, 'a bad pid never reaches PowerShell');
+    });
+
+    it('on Windows, this process\'s real start time is readable and in the past', function () {
+      if (process.platform !== 'win32') { this.skip(); }
+      this.timeout(30_000);
+      const v = windowsProcStart(process.pid);
+      if (v === null) { this.skip(); return; } // PowerShell unavailable on this machine
+      const ms = Number(v.slice(WIN_START_PREFIX.length));
+      assert.ok(ms <= Date.now() && ms > Date.now() - process.uptime() * 1000 - 60_000, v);
+      assert.equal(platformProcStart(process.pid), v);
+    });
+  });
+
   it('an unreadable lock file is taken over', () => {
     const dir = tmp();
     fs.mkdirSync(path.join(dir, 'remote'), { recursive: true });
@@ -50,6 +149,8 @@ describe('remote daemon lock', () => {
     this.timeout(300_000);
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const { fork } = require('child_process');
+    // Start times are left out (procStart null): this is about the file operations being atomic,
+    // and on Windows each read would start PowerShell. Start-time logic has its own tests above.
     const scriptDir = tmp();
     const script = path.join(scriptDir, 'contender.js');
     const modulePath = path.join(__dirname, '..', '..', '..', 'headless', 'remote-lock.ts');
@@ -59,7 +160,7 @@ describe('remote daemon lock', () => {
       'process.on("message", (m) => {',
       '  if (m && m.go) {',
       '    let r;',
-      '    try { r = new DaemonLock(m.dir).acquire(); } catch (e) { r = { ok: false, error: String(e) }; }',
+      '    try { r = new DaemonLock(m.dir, { procStart: () => null }).acquire(); } catch (e) { r = { ok: false, error: String(e) }; }',
       '    process.send({ ok: r.ok, error: r.error || null });',
       '  }',
       '});',

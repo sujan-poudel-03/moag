@@ -153,8 +153,8 @@ export class DesktopValidator implements ValidationAdapter {
       durationMs: Date.now() - startedAt,
       output: stages.map(s => s.output).join('\n'),
       summary: passed
-        ? `${stages.length} stage${stages.length === 1 ? '' : 's'} passed`
-        : `${failedStages.length} stage${failedStages.length === 1 ? '' : 's'} failed`,
+        ? `${stages.length} validation stage${stages.length === 1 ? '' : 's'} passed`
+        : `${failedStages.length} validation stage${failedStages.length === 1 ? '' : 's'} failed`,
     };
   }
 

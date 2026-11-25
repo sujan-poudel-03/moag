@@ -4,13 +4,13 @@ A **plan** is a `.agent-plan.json` file that defines your workflow:
 
 ```
 Plan
-├── Playlist: "Setup"          ← Phase/group of related tasks
+├── Stage: "Setup"             ← Phase/group of related tasks
 │   ├── Task: "Init project"   ← A single prompt for the AI agent
 │   └── Task: "Add database"
-├── Playlist: "Features"
+├── Stage: "Features"
 │   ├── Task: "User CRUD"
 │   └── Task: "Authentication"
-└── Playlist: "Testing"
+└── Stage: "Testing"
     └── Task: "Write tests"
 ```
 

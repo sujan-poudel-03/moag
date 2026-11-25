@@ -124,7 +124,7 @@ Remote runs started from ONOSOO always use JSON mode.
 #### From the VS Code panel
 
 When the machine is paired (step 2, or `MOAG_ONOSOO_KEY` in the environment VS Code was started
-from), every run you start from the MOAG panel is relayed too: play, play playlist, a single task,
+from), every run you start from the MOAG panel is relayed too: a whole plan, a single stage, a single task,
 retries and fix runs. Each run gets its own entry in Builds, and a paused run that you resume stays
 the same run. Relay messages (a rejected URL, a revoked key) go to the **MOAG** output channel.
 

@@ -290,7 +290,7 @@ function buildHistoryGroups(items) {
     if (historyGroupBy === 'plan') {
       key = item.planName || 'Unplanned';
     } else if (historyGroupBy === 'playlist') {
-      key = item.playlistName || 'Unassigned playlist';
+      key = item.playlistName || 'No stage';
     }
     if (!groups.has(key)) {
       groups.set(key, []);
@@ -349,7 +349,7 @@ function renderHistoryList() {
       const groupKind = historyGroupBy === 'plan' ? 'plan' : historyGroupBy === 'playlist' ? 'playlist' : '';
       head.className = 'group-head' + (groupKind ? (' ' + groupKind) : '');
       head.type = 'button';
-      const badge = historyGroupBy === 'plan' ? 'Plan' : 'Playlist';
+      const badge = historyGroupBy === 'plan' ? 'Plan' : 'Stage';
       head.innerHTML =
         '<span class="group-head-label">' + escHtml(badge) + '</span>' +
         escHtml((collapsed ? (ICON_COLLAPSED + ' ') : (ICON_EXPANDED + ' ')) + label + ' (' + items.length + ')');
@@ -643,7 +643,7 @@ function renderPlanGroups(targetEl, groups) {
               : groupStatus === 'paused'
                 ? ICON_PAUSE
                 : ICON_PENDING;
-    const groupLabel = (collapsed ? (ICON_COLLAPSED + ' ') : (ICON_EXPANDED + ' ')) + (group.name || 'Playlist');
+    const groupLabel = (collapsed ? (ICON_COLLAPSED + ' ') : (ICON_EXPANDED + ' ')) + (group.name || 'Stage');
     const totalCount = allTasks.length;
     const doneCount = allTasks.filter((t) => {
       const s = String(t.status || '').toLowerCase();
@@ -680,7 +680,8 @@ function renderPlanGroups(targetEl, groups) {
     const play = document.createElement('button');
     play.type = 'button';
     play.className = 'plan-group-play';
-    play.title = groupStatus === 'running' ? 'Pause entire run (not just this playlist)' : groupStatus === 'completed' ? 'Run Again' : 'Run Playlist';
+    play.title = groupStatus === 'running' ? 'Pause entire run (not just this stage)' : groupStatus === 'completed' ? 'Run Again' : 'Run Stage';
+    play.setAttribute('aria-label', play.title);
     play.innerHTML = groupStatus === 'running'
       ? '<svg viewBox="0 0 16 16" width="12" height="12" fill="currentColor"><rect x="3.5" y="2.5" width="3.5" height="11" rx="1"/><rect x="9" y="2.5" width="3.5" height="11" rx="1"/></svg>'
       : groupStatus === 'completed'
@@ -701,8 +702,8 @@ function renderPlanGroups(targetEl, groups) {
     const rulesBtn = document.createElement('button');
     rulesBtn.type = 'button';
     rulesBtn.className = 'plan-group-rules-btn' + (playlistRules ? ' has-rules' : '');
-    rulesBtn.title = playlistRules ? 'Playlist rules active — click to edit' : 'Add playlist rules';
-    rulesBtn.title = playlistRules ? 'Playlist rules active — click to edit' : 'Add playlist rules';
+    rulesBtn.title = playlistRules ? 'Stage rules active — click to edit' : 'Add stage rules';
+    rulesBtn.setAttribute('aria-label', rulesBtn.title);
     rulesBtn.innerHTML = playlistRules
       ? '<svg viewBox="0 0 16 16" width="10" height="10" fill="currentColor"><path d="M4 2h8a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1zm0 3h8V4H4v1zm0 3h8V7H4v1zm0 3h5v-1H4v1z"/></svg>'
       : '<svg viewBox="0 0 16 16" width="10" height="10" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M8 3v10M3 8h10"/></svg>';
@@ -711,7 +712,7 @@ function renderPlanGroups(targetEl, groups) {
     rulesPanel.className = 'rules-edit-panel';
     rulesPanel.style.display = 'none';
     rulesPanel.innerHTML =
-      '<label>Playlist rules — injected before every task in this playlist</label>' +
+      '<label>Stage rules — injected before every task in this stage</label>' +
       '<textarea rows="5" placeholder="e.g. Always use TypeScript strict mode. Check for existing utilities before creating new ones.">' + escHtml(playlistRules) + '</textarea>' +
       '<div class="rules-edit-btns">' +
         '<button type="button" class="rules-cancel-btn">Cancel</button>' +
@@ -739,7 +740,7 @@ function renderPlanGroups(targetEl, groups) {
       const prdBtn = document.createElement('button');
       prdBtn.type = 'button';
       prdBtn.className = 'prd-pill-btn';
-      prdBtn.title = 'View PRD slice for this playlist';
+      prdBtn.title = 'View PRD slice for this stage';
       prdBtn.innerHTML = '&#128196; PRD';
       prdBtn.addEventListener('click', (e) => {
         e.stopPropagation();
@@ -1005,7 +1006,7 @@ function renderPlanOverview(groups) {
     }
     // ─── Completion ceremony: replace progress bar with done banner ───
     planOverviewTitleEl.textContent = planLabel;
-    planOverviewMetaEl.textContent = taskTotal + ' tasks · ' + playlistTotal + ' playlists — all done';
+    planOverviewMetaEl.textContent = taskTotal + ' tasks · ' + playlistTotal + ' stages — all done';
     planOverviewFillEl.style.width = '100%';
     planOverviewFillEl.classList.remove('has-failed');
     planOverviewEl.classList.add('done');
@@ -1030,7 +1031,7 @@ function renderPlanOverview(groups) {
     doneBannerEl.style.display = 'flex';
   } else {
     planOverviewTitleEl.textContent = planLabel + ' Progress';
-    planOverviewMetaEl.textContent = playlistDone + '/' + playlistTotal + ' playlists, ' + taskCompleted + '/' + taskTotal + ' tasks completed';
+    planOverviewMetaEl.textContent = playlistDone + '/' + playlistTotal + ' stages, ' + taskCompleted + '/' + taskTotal + ' tasks completed';
     planOverviewFillEl.style.width = pct + '%';
     planOverviewFillEl.classList.toggle('has-failed', taskFailed > 0);
     planOverviewEl.classList.remove('done');
@@ -1055,12 +1056,12 @@ function renderPlanOverview(groups) {
     const tasks = Array.isArray(group?.tasks) ? group.tasks : [];
     const runningTask = tasks.find((task) => String(task?.status || '').toLowerCase() === 'running');
     if (runningTask) {
-      runningPlaylistName = group?.name || ('Playlist ' + (i + 1));
+      runningPlaylistName = group?.name || ('Stage ' + (i + 1));
       runningTaskName = runningTask?.name || 'Untitled task';
       break;
     }
     if (!runningPlaylistName && String(group?.playlistStatus || '').toLowerCase() === 'running') {
-      runningPlaylistName = group?.name || ('Playlist ' + (i + 1));
+      runningPlaylistName = group?.name || ('Stage ' + (i + 1));
     }
     if (!queuedTaskName) {
       const queuedTask = tasks.find((task) => {
@@ -1068,7 +1069,7 @@ function renderPlanOverview(groups) {
         return !s || s === 'pending' || s === 'queued' || s === 'todo';
       });
       if (queuedTask) {
-        queuedPlaylistName = group?.name || ('Playlist ' + (i + 1));
+        queuedPlaylistName = group?.name || ('Stage ' + (i + 1));
         queuedTaskName = queuedTask?.name || 'Untitled task';
       }
     }
@@ -1100,7 +1101,7 @@ function renderPlanQueue(groups) {
       const task = tasks[ti];
       const status = String(task?.status || '').toLowerCase();
       if (isPendingLikeStatus(status)) {
-        pending.push({ groupName: group?.name || ('Playlist ' + (i + 1)), taskName: task?.name || 'Untitled task' });
+        pending.push({ groupName: group?.name || ('Stage ' + (i + 1)), taskName: task?.name || 'Untitled task' });
       }
     }
   }
@@ -1590,8 +1591,8 @@ function renderChat(chatTitle, messages) {
         } else {
           addMoreItem('Review Diff', () => vscode.postMessage({ type: 'reviewChanges' }));
         }
-        addMoreItem('Use as playlist template', () => {
-          const seed = 'Create a playlist + tasks from this:\\n' + displayText.slice(0, 1200);
+        addMoreItem('Use as stage template', () => {
+          const seed = 'Create a stage + tasks from this:\\n' + displayText.slice(0, 1200);
           promptEl.value = seed;
           autoResize();
                   updateActionState();
@@ -1943,7 +1944,7 @@ function openPrdInputScreen(mode) {
     if (prdInputTitleEl) { prdInputTitleEl.textContent = planPrdSource ? 'Update PRD' : 'Add PRD'; }
     if (prdInputHintEl) { prdInputHintEl.innerHTML = planPrdSource
       ? 'Edit your PRD below — changes will be saved to the current plan and used for TTT criteria and Verify.'
-      : 'Paste your PRD below to link it to the current plan. Use <strong>Verify Against PRD</strong> in the Test &amp; Verify panel after your test playlist runs.'; }
+      : 'Paste your PRD below to link it to the current plan. Use <strong>Verify Against PRD</strong> in the Test &amp; Verify panel after your test stage runs.'; }
     if (prdGenerateBtnEl) { prdGenerateBtnEl.textContent = 'Save to Plan'; }
     if (prdTextareaEl && planPrdSource) {
       prdTextareaEl.value = planPrdSource;
@@ -2472,10 +2473,10 @@ function renderTavPanel() {
   let hint = '';
   let hintClass = '';
   if (!hasTestPlaylist) {
-    hint = '⚠ No test playlist — right-click a playlist → Toggle Test Phase';
+    hint = '⚠ No test stage — right-click a stage → Toggle Test Phase';
     hintClass = 'warn';
   } else if (testTool === 'sandbox' && !sbActive && !testPlaylistRunning) {
-    hint = 'Sandbox will auto-launch when test playlist starts';
+    hint = 'Sandbox will auto-launch when the test stage starts';
     hintClass = 'ok';
   } else if (testTool === 'manual' && hasTestPlaylist) {
     hint = 'Switch to "Sandbox (auto-launch)" to automate this step';
@@ -2569,10 +2570,10 @@ function renderSandboxTttHint() {
   const hasTestPlaylist = Array.isArray(planGroups) && planGroups.some(function(g) { return g.testPhase; });
   if (testTool === 'sandbox') {
     if (hasTestPlaylist) {
-      sbTttHintEl.textContent = '✓ Auto-launches when test playlist runs';
+      sbTttHintEl.textContent = '✓ Auto-launches when the test stage runs';
       sbTttHintEl.className = 'sb-ttt-hint ok';
     } else {
-      sbTttHintEl.textContent = '⚠ No test playlist — right-click a playlist → Toggle Test Phase';
+      sbTttHintEl.textContent = '⚠ No test stage — right-click a stage → Toggle Test Phase';
       sbTttHintEl.className = 'sb-ttt-hint warn';
     }
     sbTttHintRowEl.style.display = '';

@@ -5,7 +5,7 @@
 │ $(rocket)  AGENT TASK PLAYER    │
 ├─────────────────────────────────┤
 │ PLAN                            │
-│ ├── $(list-tree) Setup          │  ← Playlist (phase)
+│ ├── $(list-tree) Setup          │  ← Stage (phase)
 │ │   ├── $(circle) Init project  │  ← Task (pending)
 │ │   └── $(circle) Add database  │  ← Task (pending)
 │ └── $(list-tree) Features       │
@@ -23,7 +23,7 @@
 |------|--------|
 | $(folder-opened) | Open an existing plan file |
 | $(new-file) | Create a new plan |
-| $(add) | Add a playlist |
+| $(add) | Add a stage |
 | $(play) | Start execution |
 | $(debug-pause) | Pause between tasks |
 | $(debug-stop) | Stop and kill process |

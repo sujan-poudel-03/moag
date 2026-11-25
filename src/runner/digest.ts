@@ -164,7 +164,7 @@ export function renderDigest(d: Digest): string {
     out.push('');
     for (const item of d.needsDecision) {
       out.push(`  [${item.id}] ${item.taskName}`);
-      if (item.playlistName) { out.push(`      playlist: ${item.playlistName}`); }
+      if (item.playlistName) { out.push(`      stage: ${item.playlistName}`); }
       out.push(`      ${item.decision}`);
       out.push('');
     }

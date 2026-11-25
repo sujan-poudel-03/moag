@@ -13,11 +13,11 @@
 MOAG is a VS Code extension that turns your AI coding agents into a managed, trackable software delivery pipeline. Instead of running Claude Code or Codex manually in a terminal and copy-pasting results, MOAG lets you:
 
 - **Write your intent** — as a prompt, a PRD, or a GitHub issue
-- **Generate a plan** — structured playlists of tasks, with test phases auto-injected
+- **Generate a plan** — structured stages of tasks, with test phases auto-injected
 - **Hit Run** — MOAG runs each task through your chosen AI engine, streams output live, auto-fixes failures, and verifies the result
 - **Ship with confidence** — PRD verification, visual regression testing, and a full audit trail before you create the PR
 
-Think of it as a **music player for AI tasks**: playlists of tasks, engines as instruments, Run/Pause/Stop controls, a live dashboard showing what's running, and a history of every session.
+Think of it as a **music player for AI tasks**: stages of tasks, engines as instruments, Run/Pause/Stop controls, a live dashboard showing what's running, and a history of every session.
 
 ---
 
@@ -63,10 +63,10 @@ A plan is a JSON file (`.moag/plan.json`) that describes a complete piece of wor
 - Plan-level AI Rules (injected into every task)
 - A linked PRD (`prdSource`) for verification
 - User-defined template variables
-- One or more **Playlists**
+- One or more **Stages**
 
-### Playlist
-A playlist is an ordered group of tasks. Playlists can:
+### Stage
+A stage is an ordered group of tasks. Stages can:
 - Run sequentially (default) or in parallel
 - Have their own AI Rules that merge with plan-level rules
 - Be marked as a **Test Phase** — MOAG treats these differently, auto-launching the sandbox and enabling the Test & Verify (TAV) panel
@@ -111,7 +111,7 @@ Every task produces an `EngineResult`: stdout, stderr, exit code, duration, toke
 ║     or: free-form Chat → Smart Plan                      ║
 ║                                                          ║
 ║  2. PLAN                                                 ║
-║     Edit playlists + tasks                               ║
+║     Edit stages + tasks                                  ║
 ║     Set AI Rules, engine, failure policy                 ║
 ║     Add visual-test and verify steps                     ║
 ║                                                          ║
@@ -122,7 +122,7 @@ Every task produces an `EngineResult`: stdout, stderr, exit code, duration, toke
 ║     Fallback engine on rate limit                        ║
 ║                                                          ║
 ║  4. TEST                                                 ║
-║     Test Phase playlist runs                             ║
+║     Test Phase stage runs                                ║
 ║     Sandbox auto-launches                                ║
 ║     visual-test tasks: screenshot → Claude vision        ║
 ║     Playwright specs run programmatically                ║
@@ -158,27 +158,27 @@ Every task produces an `EngineResult`: stdout, stderr, exit code, duration, toke
 | Switch between plans | Toolbar → Switch Plan (pinned, always visible) |
 | Open plan file in editor | Toolbar → Open Plan |
 
-### Playlist & Task Editing
+### Stage & Task Editing
 | Capability | How to Access |
 |-----------|--------------|
-| Add playlist | Toolbar → Add Playlist |
-| Add task to playlist | Right-click playlist → Add Task |
+| Add stage | Toolbar → Add Stage |
+| Add task to stage | Right-click stage → Add Task |
 | Edit task (full editor) | Right-click task → Edit Task |
 | Duplicate task | Right-click task → Duplicate |
 | Split task into steps | Right-click task → Split Task |
 | Add review step | Right-click task → Add Review Step |
 | Move task up/down | Right-click task → Move Up/Down |
 | Save task as template | Right-click task → Save as Template |
-| Add from template | Right-click playlist → Add from Template |
+| Add from template | Right-click stage → Add from Template |
 | Set task status manually | Right-click task → Set Status |
-| Mark test phase playlist | Right-click playlist → Toggle Test Phase |
+| Mark test phase stage | Right-click stage → Toggle Test Phase |
 | Bulk delete tasks | Select + Delete |
 
 ### Execution
 | Capability | How to Access |
 |-----------|--------------|
 | Run full plan | Toolbar → Run Plan ▶ (always pinned) |
-| Run single playlist | Playlist row → ▶ button |
+| Run single stage | Stage row → ▶ button |
 | Run single task | Task row → ▶ button (hover) |
 | Pause between tasks | Toolbar → Pause ⏸ |
 | Stop run | Toolbar → Stop ⏹ (always pinned) |
@@ -213,7 +213,7 @@ Rules are injected at the highest context priority — always included, never bu
 | Configure monorepo targets | Plan JSON → `sandbox.targets` array |
 | Run visual-test task | Task type = `visual-test` — uses Anthropic API + Playwright |
 | Run Playwright spec | `visual-test` task with `spec_file` field |
-| Auto-launch sandbox on test phase | Enabled automatically when test playlist runs |
+| Auto-launch sandbox on test phase | Enabled automatically when the test stage runs |
 
 ### GitHub Integration
 | Capability | How to Access |
@@ -243,7 +243,7 @@ Rules are injected at the highest context priority — always included, never bu
 |-----------|--------------|
 | View execution history | History tab |
 | Filter by status | History tab → filter chips (All / ✓ / ✗) |
-| Group by plan or playlist | History tab → Group dropdown |
+| Group by plan or stage | History tab → Group dropdown |
 | View per-task output + diff | History tab → click entry |
 | View thread conversations | Toolbar → Show Threads |
 | View cost summary | Toolbar → Cost Summary |
@@ -284,7 +284,7 @@ Every task prompt that goes to the AI is assembled by the Context Builder in pri
 
 ```
 Priority -1 (highest, never trimmed):
-  AI Rules (global + workspace + plan-level + playlist-level)
+  AI Rules (global + workspace + plan-level + stage-level)
 
 Priority 1:
   Plan overview (name, description, current progress)
@@ -328,13 +328,13 @@ The fix prompt is kept concise (~100 chars) — it does NOT re-send the full ori
 
 ## 9. Multi-Turn Sessions
 
-For the Anthropic API engine, MOAG maintains conversation history across all tasks in a playlist session:
+For the Anthropic API engine, MOAG maintains conversation history across all tasks in a stage session:
 
 - Task 1 runs → response added to session history
 - Task 2 starts → session history prepended to prompt
 - The model "remembers" what it did in Task 1 without MOAG re-sending all the output
 
-Session history is capped at 20 turns to prevent unbounded context growth. Sessions are keyed by `sessionId` (one per playlist run).
+Session history is capped at 20 turns to prevent unbounded context growth. Sessions are keyed by `sessionId` (one per stage run).
 
 ---
 
@@ -345,7 +345,7 @@ Session history is capped at 20 turns to prevent unbounded context growth. Sessi
 | Area | Status |
 |------|--------|
 | Chat tab (composer, message feed, live output) | ✅ Shipped |
-| Plan tab (playlists, tasks, execution controls) | ✅ Shipped |
+| Plan tab (stages, tasks, execution controls) | ✅ Shipped |
 | History tab (timeline, filter, group) | ✅ Shipped |
 | Dashboard panel (live streaming, minimap, tiles) | ✅ Shipped |
 | Task Editor (all types except visual-test) | ✅ Shipped |
@@ -376,7 +376,7 @@ Session history is capped at 20 turns to prevent unbounded context growth. Sessi
 
 ```
 .moag/
-  plan.json              ← Active plan (playlists + tasks + prdSource)
+  plan.json              ← Active plan (stages + tasks + prdSource)
   feedback.jsonl         ← Rolling 20-run friction log
   rules.json             ← Workspace-scoped AI Rules
   prd.md                 ← Saved PRD text (optional)
@@ -387,7 +387,7 @@ src/
   adapters/              ← One adapter per engine (claude, anthropic, codex, gemini, ollama, copilot, custom)
   context/               ← Context builder, memory extractor, project analyzer
   history/               ← Execution history store
-  models/                ← types.ts (Plan/Task/Playlist), plan.ts (hydrate/dehydrate)
+  models/                ← types.ts (`Plan`/`Task`/`Playlist` — a stage is a `Playlist`), plan.ts (hydrate/dehydrate)
   runner/                ← State machine, auto-fix loop, task dispatch
   sandbox/               ← Dev server manager, screenshot, browser-driver (Playwright)
   ui/                    ← Dashboard panel, prompt input view, task editor
@@ -414,7 +414,7 @@ docs/
 6. Review the generated plan in the Plan tab
 7. Click **Run Plan ▶** — dashboard opens, tasks run
 8. If tasks fail → **🔨 Smart Fix** auto-repairs them
-9. When development tasks finish → test playlist runs automatically
+9. When development tasks finish → test stage runs automatically
 10. Click **Verify Against PRD** — see per-criterion pass/fail
 11. Click **Create PR** — done
 

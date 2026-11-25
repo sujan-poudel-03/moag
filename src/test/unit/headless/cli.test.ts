@@ -2266,7 +2266,7 @@ describe('headless CLI: moag standards', () => {
 
   it('the verb is listed in the top-level usage and the header comment', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'utf-8');
-    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|pair\|project-id\|bench>/);
+    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|pair\|init\|service\|project-id\|bench>/);
     for (const line of ['moag standards show', 'moag standards check [--base <ref>] [--no-commands]', 'moag standards propose [--stack <id>] [--write [--force]]']) {
       assert.ok(source.split(line).length - 1 >= 2, `"${line}" appears in the header and in the usage text`);
     }
@@ -2960,6 +2960,13 @@ describe('headless CLI: --version, help, pair', () => {
     assert.equal(r.code, 0);
     assert.match(r.out, /^Usage: moag <[^>]*\|project-id\|[^>]*>/);
     assert.match(r.out, /moag project-id \[--cwd <dir>\] \[--json\] {3}print the ONOSOO project ID runs from this folder report/);
+  });
+
+  it('help lists init and service in the command list and their own usage lines', async () => {
+    const r = await captureStdout(() => cli.main(['help']));
+    assert.match(r.out, /^Usage: moag <[^>]*\|init\|service\|[^>]*>/);
+    assert.match(r.out, /moag init \[<folder>\]/);
+    assert.match(r.out, /moag service <install \| uninstall \| status>/);
   });
 
   it('project-id with an unknown flag prints its usage to stderr and returns 2', async () => {

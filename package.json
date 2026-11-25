@@ -119,7 +119,7 @@
       },
       {
         "command": "agentTaskPlayer.addPlaylist",
-        "title": "Add Playlist",
+        "title": "Add Stage",
         "category": "MOAG",
         "icon": "$(add)"
       },
@@ -197,7 +197,7 @@
       },
       {
         "command": "agentTaskPlayer.playPlaylist",
-        "title": "Run Playlist",
+        "title": "Run Stage",
         "category": "MOAG",
         "icon": "$(play)"
       },
@@ -311,7 +311,7 @@
       },
       {
         "command": "agentTaskPlayer.setPlaylistStatus",
-        "title": "Set Playlist Status...",
+        "title": "Set Stage Status...",
         "category": "MOAG",
         "icon": "$(checklist)"
       },
@@ -1234,7 +1234,7 @@
           "default": 1,
           "minimum": 1,
           "maximum": 8,
-          "description": "Number of playlists to run concurrently. Set to 1 for sequential (default). Higher values run independent playlists in parallel."
+          "description": "Number of stages to run concurrently. Set to 1 for sequential (default). Higher values run independent stages in parallel."
         },
         "agentTaskPlayer.taskTimeoutMs": {
           "type": "number",
@@ -1317,7 +1317,7 @@
           "default": 3,
           "minimum": 1,
           "maximum": 10,
-          "description": "Maximum number of fix playlists the PRD verification loop may generate before halting for a human."
+          "description": "Maximum number of fix stages the PRD verification loop may generate before halting for a human."
         },
         "agentTaskPlayer.prdLoop.versionBudgetUsd": {
           "type": "number",
@@ -1553,7 +1553,7 @@
         "agentTaskPlayer.roles.enabled": {
           "type": "boolean",
           "default": true,
-          "description": "Inject the expert-role charter for playlists and tasks that declare a role. Disable to run every task as a generic agent without editing plan files."
+          "description": "Inject the expert-role charter for stages and tasks that declare a role. Disable to run every task as a generic agent without editing plan files."
         },
         "agentTaskPlayer.promptRulesEnabled": {
           "type": "boolean",
@@ -1588,7 +1588,7 @@
         "agentTaskPlayer.context.allPriorOutputs": {
           "type": "boolean",
           "default": false,
-          "description": "Output chaining — include ALL prior playlist task outputs (not just dependencies). Enables each task to see what previous tasks produced."
+          "description": "Output chaining — include ALL prior stage task outputs (not just dependencies). Enables each task to see what previous tasks produced."
         },
         "agentTaskPlayer.context.projectState": {
           "type": "boolean",
@@ -1692,7 +1692,7 @@
         "agentTaskPlayer.engines.anthropic.multiTurn": {
           "type": "boolean",
           "default": true,
-          "description": "Maintain conversation history across tasks in the same playlist. Claude remembers previous tasks' context, improving coherence in multi-step plans."
+          "description": "Maintain conversation history across tasks in the same stage. Claude remembers previous tasks' context, improving coherence in multi-step plans."
         },
         "agentTaskPlayer.git.autoCommit": {
           "type": "boolean",
@@ -1710,7 +1710,7 @@
       {
         "id": "agentTaskPlayer.getStarted",
         "title": "Get Started with MOAG",
-        "description": "Learn how to automate your AI coding workflow — define task playlists and run them with any coding agent CLI.",
+        "description": "Learn how to automate your AI coding workflow — define stages of tasks and run them with any coding agent CLI.",
         "steps": [
           {
             "id": "installCli",
@@ -1727,7 +1727,7 @@
           {
             "id": "openPanel",
             "title": "Open the MOAG Panel",
-            "description": "Click the **rocket icon** $(rocket) in the Activity Bar on the left side of VS Code. This opens the MOAG panel with two sections:\n\n- **Plan** — your playlists and tasks\n- **History** — past execution logs\n\n[Open MOAG Panel](command:workbench.view.extension.agentTaskPlayer)",
+            "description": "Click the **rocket icon** $(rocket) in the Activity Bar on the left side of VS Code. This opens the MOAG panel with two sections:\n\n- **Plan** — your stages and tasks\n- **History** — past execution logs\n\n[Open MOAG Panel](command:workbench.view.extension.agentTaskPlayer)",
             "media": {
               "altText": "MOAG panel in the activity bar",
               "markdown": "media/walkthrough-panel.md"
@@ -1739,7 +1739,7 @@
           {
             "id": "createPlan",
             "title": "Create Your First Plan",
-            "description": "A **plan** is a JSON file that holds your task playlists. Click the button below to create one:\n\n[Create New Plan](command:agentTaskPlayer.newPlan)\n\nOr open the example plan from the ``examples/`` folder with **Open Plan File**.",
+            "description": "A **plan** is a JSON file that holds your stages of tasks. Click the button below to create one:\n\n[Create New Plan](command:agentTaskPlayer.newPlan)\n\nOr open the example plan from the ``examples/`` folder with **Open Plan File**.",
             "media": {
               "altText": "Creating a new plan file",
               "markdown": "media/walkthrough-plan.md"
@@ -1750,10 +1750,10 @@
           },
           {
             "id": "addPlaylistAndTask",
-            "title": "Add a Playlist and Tasks",
-            "description": "A **playlist** is a phase/group (e.g., \"Setup\", \"Features\", \"Testing\"). Each playlist contains **tasks** — the prompts you want the AI agent to execute.\n\n1. Click **+** in the Plan panel toolbar to add a playlist\n2. Click **+** on the playlist to add a task\n3. Enter a **name** and a **prompt** — the instruction for the AI\n\n[Add Playlist](command:agentTaskPlayer.addPlaylist)\n\nOr edit the ``.agent-plan.json`` file directly — changes are picked up automatically.",
+            "title": "Add a Stage and Tasks",
+            "description": "A **stage** is a phase/group (e.g., \"Setup\", \"Features\", \"Testing\"). Each stage contains **tasks** — the prompts you want the AI agent to execute.\n\n1. Click **+** in the Plan panel toolbar to add a stage\n2. Click **+** on the stage to add a task\n3. Enter a **name** and a **prompt** — the instruction for the AI\n\n[Add Stage](command:agentTaskPlayer.addPlaylist)\n\nOr edit the ``.agent-plan.json`` file directly — changes are picked up automatically.",
             "media": {
-              "altText": "Adding playlists and tasks to a plan",
+              "altText": "Adding stages and tasks to a plan",
               "markdown": "media/walkthrough-tasks.md"
             },
             "completionEvents": [
@@ -1775,7 +1775,7 @@
           {
             "id": "advancedFeatures",
             "title": "Level Up: Dependencies, Retries & Templates",
-            "description": "Once you're comfortable, explore these power features:\n\n- **Dependencies** — ``\"dependsOn\": [\"task-id\"]`` ensures order\n- **Retries** — ``\"retryCount\": 1`` retries failed tasks\n- **Parallel** — ``\"parallel\": true`` on a playlist runs tasks concurrently\n- **Verify** — ``\"verifyCommand\": \"npm test\"`` validates results\n- **Templates** — right-click a task → **Save as Template** for reuse\n- **Import/Export** — share plans with your team\n\n[Open Settings](command:workbench.action.openSettings?%22agentTaskPlayer%22)",
+            "description": "Once you're comfortable, explore these power features:\n\n- **Dependencies** — ``\"dependsOn\": [\"task-id\"]`` ensures order\n- **Retries** — ``\"retryCount\": 1`` retries failed tasks\n- **Parallel** — ``\"parallel\": true`` on a stage runs tasks concurrently\n- **Verify** — ``\"verifyCommand\": \"npm test\"`` validates results\n- **Templates** — right-click a task → **Save as Template** for reuse\n- **Import/Export** — share plans with your team\n\n[Open Settings](command:workbench.action.openSettings?%22agentTaskPlayer%22)",
             "media": {
               "altText": "Advanced features overview",
               "markdown": "media/walkthrough-advanced.md"
