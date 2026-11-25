@@ -42,6 +42,9 @@ export interface SpoolOptions {
 }
 
 export const SPOOL_VERSION = 1;
+/** What ONOSOO shows for a run the daemon was cut off in the middle of. */
+export const INTERRUPTED_RUN_MESSAGE =
+  'MOAG stopped while this run was going (the daemon crashed or the machine restarted). Work already finished is kept; retry the run from ONOSOO.';
 export const SPOOL_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 export const SPOOL_MAX_DIR_BYTES = 100 * 1024 * 1024;
 /**
@@ -314,6 +317,36 @@ export class OnosooSpool {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * End a run that was cut short, in ONOSOO's eyes: append an `error` and a `run-finished` (code 2, which ONOSOO shows
+   * as Failed) after the last event this run wrote, so the next replay delivers them. Nothing is added when the run
+   * has no spool file or no events (ONOSOO never heard of it), or when it already ends in `run-finished` (it did
+   * finish; only the daemon's own record was late). True when the two events were written. Never throws.
+   */
+  closeInterrupted(runId: string, message: string): boolean {
+    if (!safeRunId(runId)) { return false; }
+    const file = this.file(runId, '.jsonl');
+    let last = 0;
+    try {
+      let meta = true;
+      for (const line of readLinesFrom(file, 0)) {
+        if (meta) { meta = false; continue; }
+        let ev: unknown = null;
+        if (line.text) { try { ev = JSON.parse(line.text); } catch { ev = null; } }
+        if (!isRelayEvent(ev) || ev.run_id !== runId) { continue; }
+        if (ev.type === 'run-finished') { return false; }
+        last = Math.max(last, ev.seq);
+      }
+    } catch {
+      return false;
+    }
+    if (last === 0) { return false; }
+    const at = new Date(this.now()).toISOString();
+    const error = this.append({ run_id: runId, seq: last + 1, type: 'error', at, data: { message } });
+    const finished = this.append({ run_id: runId, seq: last + 2, type: 'run-finished', at, data: { code: 2 } });
+    return error && finished;
   }
 
   /** The highest acked seq recorded for `runId` (0 when none). */

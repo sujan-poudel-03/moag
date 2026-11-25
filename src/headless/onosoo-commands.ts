@@ -111,6 +111,8 @@ export interface CommandHostOptions {
   projectDefaultEngine?(project: ApprovedProject): string | null;
   /** The single-instance lock (<stateDir>/remote/daemon.lock). */
   lock?: { acquire(): LockOutcome; release(): void };
+  /** Boot: end, in ONOSOO's eyes, the runs the last daemon was cut off in the middle of (written into their spool, sent by the drain). */
+  closeInterruptedRuns?(runIds: readonly string[]): void | Promise<void>;
   /** Boot: send whatever earlier runs left in the spool (a relay with no meta and no heartbeat). */
   drainLeftoverSpool?(): Promise<void>;
   /** Boot: kill every process the runner account owns (only when isolation is possible). */
@@ -247,8 +249,13 @@ export class CommandHost {
     for (const u of unfinished) {
       await this.finalize(u.id, u.kind, { status: 'failed', message: RESTARTED_MESSAGE });
     }
-    for (const runId of this.o.runs.markInterruptedOnBoot()) {
+    const interrupted = this.o.runs.markInterruptedOnBoot();
+    for (const runId of interrupted) {
       try { this.o.ledger.chargeInFull(runId); } catch { /* fails closed */ }
+    }
+    // Tell ONOSOO those runs ended, before the spool is drained, so they stop showing as running.
+    if (interrupted.length > 0) {
+      try { await this.o.closeInterruptedRuns?.(interrupted); } catch { /* best effort */ }
     }
     try { this.o.runs.prune(); } catch { /* best effort */ }
     try { await this.o.drainLeftoverSpool?.(); } catch { /* best effort */ }

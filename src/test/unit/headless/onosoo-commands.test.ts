@@ -90,6 +90,8 @@ function harness(opts: {
   timers?: { setTimeout(fn: () => void, ms: number): unknown; clearTimeout(h: unknown): void }; stderr?: (s: string) => void;
   /** The project's tip of the parent branch (null = no branch); when set, the host uses it instead of branchExists. */
   projectTip?: string | null; drain?: () => Promise<void>;
+  /** Boot: end, in ONOSOO's eyes, the runs the last daemon was cut off in. */
+  closeInterrupted?: (runIds: readonly string[]) => void | Promise<void>;
   /** Project identities (protocol v1.2); absent by default. */
   identities?: CommandHostOptions['identities'];
   /** The capabilities key check; defaults to pass-all when identities are given; null leaves it out. */
@@ -118,6 +120,7 @@ function harness(opts: {
     branchExists: async () => opts.branchExists ?? true,
     ...(opts.projectTip !== undefined ? { projectBranchTip: async () => opts.projectTip as string | null } : {}),
     ...(opts.drain ? { drainLeftoverSpool: opts.drain } : {}),
+    ...(opts.closeInterrupted ? { closeInterruptedRuns: opts.closeInterrupted } : {}),
     ...(opts.lock ? { lock: opts.lock } : {}),
     ledger: new RemoteLedger(stateDir),
     audit: new RemoteAudit(stateDir),
@@ -239,6 +242,46 @@ describe('ONOSOO command host', () => {
     await h.host.start();
     assert.equal(h.runs.get('run-old')!.outcome, 'interrupted');
     assert.equal(new RemoteLedger(stateDir).remaining(20), 14);
+  });
+
+  describe('a run cut short by a crash is closed in ONOSOO at the next start', () => {
+    function crashedState(): string {
+      const stateDir = tmp();
+      new RemoteLedger(stateDir, { pid: process.pid }).reserve('run-old', 6, 20);
+      new RemoteRuns(stateDir).save({
+        runId: 'run-old', projectId: 'web', commandId: 'c0', kind: 'start-run', branch: 'moag/x', startSha: 'a'.repeat(40), engine: 'claude',
+        allotment: 6, startedAt: '2026-10-11T00:00:00Z', exitCode: null, outcome: 'live', gateTaskId: null, snapshot: dehydratePlan(createEmptyPlan('x')),
+      });
+      return stateDir;
+    }
+
+    it('names the interrupted runs, before the spool is drained so the closing events go out with it', async () => {
+      const order: string[] = [];
+      const closed: string[][] = [];
+      const h = harness({
+        stateDir: crashedState(),
+        closeInterrupted: (ids) => { order.push('close'); closed.push([...ids]); },
+        drain: async () => { order.push('drain'); },
+      });
+      await h.host.start();
+      assert.deepEqual(closed, [['run-old']]);
+      assert.deepEqual(order, ['close', 'drain']);
+    });
+
+    it('is not called when nothing was live', async () => {
+      let called = false;
+      const h = harness({ closeInterrupted: () => { called = true; } });
+      await h.host.start();
+      assert.equal(called, false);
+    });
+
+    it('a failure there never stops the daemon from starting, and the run is still charged and marked', async () => {
+      const stateDir = crashedState();
+      const h = harness({ stateDir, closeInterrupted: () => { throw new Error('disk full'); } });
+      await h.host.start();
+      assert.equal(h.runs.get('run-old')!.outcome, 'interrupted');
+      assert.equal(new RemoteLedger(stateDir).remaining(20), 14);
+    });
   });
 
   it('a 409 result is not retried; a retry result stays in the outbox for the next cycle', async () => {

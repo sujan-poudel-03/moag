@@ -10,7 +10,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import {
-  DeliveryDeps, DeliveryRequest, GitResult, deliverBranch, deliveryBody, isDeliverableBranch, realDeliveryDeps,
+  DeliveryDeps, DeliveryRequest, GitResult, classifyGitFailure, deliverBranch, deliveryBody, isDeliverableBranch, realDeliveryDeps,
 } from '../../../headless/remote-delivery';
 import type { PrOutcome, PrRequest } from '../../../utils/pr';
 
@@ -131,7 +131,7 @@ describe('deliverBranch', () => {
     const out = await deliverBranch(base, refused.deps);
     assert.equal((out.event as { reason: string }).reason, 'push-failed');
     assert.match((out.event as { message: string }).message, /non-fast-forward/);
-    assert.match((out.event as { message: string }).message, /GitHub login/);
+    assert.match((out.event as { message: string }).message, /already exists on the remote and has moved on/);
     assert.equal(refused.prCalls.length, 0, 'no PR for a branch that was not pushed');
   });
 

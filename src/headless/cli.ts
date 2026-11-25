@@ -122,8 +122,9 @@ import { reportingSecretValues, wireTaskReporting } from './task-reporting';
 import { createRedactor, Redactor } from '../utils/redact';
 import { OnosooConfig, resolveOnosooConfig } from './onosoo-config';
 import { cmdInit } from './onosoo-init';
+import { cmdDeliveryCheck } from './delivery-check';
 import { cmdService } from './service-windows';
-import { OnosooSpool } from './onosoo-spool';
+import { INTERRUPTED_RUN_MESSAGE, OnosooSpool } from './onosoo-spool';
 import { keyPassesScrub, OnosooRelay, readMoagVersion, RelayHttpClient } from './onosoo-relay';
 import { checkPairing, PairError, writePairing } from './onosoo-pair';
 import { cmdProjectId } from './project-id';
@@ -1559,6 +1560,14 @@ function createDaemonRemoteHost(
     engineEnv,
     newRunId: () => randomUUID(),
     projectDefaultEngine: (p: any) => { try { return readDefaultEngine(p.path) ?? null; } catch { return null; } },
+    closeInterruptedRuns: (runIds: readonly string[]) => {
+      const dirs = [args.cwd, ...loadApprovedProjects(cfg.stateDir).projects.map((p: any) => p.path)];
+      for (const dir of dirs) {
+        const spool = new OnosooSpool(cfg.stateDir, dir, { isPidAlive: ctx.relayDeps?.isPidAlive });
+        // Only a run that has a spool file here and no run-finished is touched; every other directory answers false.
+        for (const runId of runIds) { spool.closeInterrupted(runId, INTERRUPTED_RUN_MESSAGE); }
+      }
+    },
     drainLeftoverSpool: async () => {
       const dirs = [args.cwd, ...loadApprovedProjects(cfg.stateDir).projects.map((p: any) => p.path)];
       for (const dir of dirs) {
@@ -2378,7 +2387,7 @@ export async function cmdPair(args: Args, deps: PairDeps = {}): Promise<number> 
 // ─── entry ───────────────────────────────────────────────────────────────────
 
 const MAIN_USAGE =
-  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|init|service|project-id|bench> ...\n' +
+  'Usage: moag <run|verify|loop|daemon|config|queue|digest|land|trace|standards|pair|init|service|delivery-check|project-id|bench> ...\n' +
   '       moag host [run | init | draft <project> | status | stop <env> | remove <env>]   (docs/host-agent.md)\n' +
   '       moag --version | moag help\n' +
   '  moag run <plan.json> [--full-auto] [--engine <id>] [--verify] [--fix] [--pr] [--no-standards] [--base <ref>]\n' +
@@ -2400,6 +2409,7 @@ const MAIN_USAGE =
   '  moag project-id [--cwd <dir>] [--json]   print the ONOSOO project ID runs from this folder report\n' +
   '  moag init [<folder>] [--url <base>] [--budget <usd>]   pair this machine if needed and list this git repository for ONOSOO runs\n' +
   '  moag service <install | uninstall | status>   Windows: start the daemon when you sign in (hidden, restarted on failure)\n' +
+  '  moag delivery-check [<project id>]   check, read-only, that a finished run can be pushed (and a draft PR opened) from here\n' +
   '  moag bench <scenario.json> [--dry-run] [--out <dir>] [--max-usd <n>] [--allow-failed-probes]\n';
 
 /** The CLI entry point. Exported so a test can drive dispatch. */
@@ -2430,6 +2440,10 @@ export async function main(argv: string[] = process.argv.slice(2)): Promise<numb
       env: relayConfigEnv(),
       pair: (url) => cmdPair(parseArgs(['pair', ...(url ? ['--url', url] : [])])),
     });
+  }
+  if (args.command === 'delivery-check') {
+    // No setup() and no shim: it reads projects.json and runs read-only git and gh checks; nothing is changed or sent.
+    return cmdDeliveryCheck(argv.slice(1), { env: relayConfigEnv() });
   }
   if (args.command === 'service') {
     // No setup() and no shim: it only registers or removes a Windows scheduled task (and says so elsewhere).

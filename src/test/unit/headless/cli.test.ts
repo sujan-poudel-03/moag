@@ -2266,7 +2266,7 @@ describe('headless CLI: moag standards', () => {
 
   it('the verb is listed in the top-level usage and the header comment', () => {
     const source = fs.readFileSync(path.join(__dirname, '..', '..', '..', 'headless', 'cli.ts'), 'utf-8');
-    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|pair\|init\|service\|project-id\|bench>/);
+    assert.match(source, /Usage: moag <run\|verify\|loop\|daemon\|config\|queue\|digest\|land\|trace\|standards\|pair\|init\|service\|delivery-check\|project-id\|bench>/);
     for (const line of ['moag standards show', 'moag standards check [--base <ref>] [--no-commands]', 'moag standards propose [--stack <id>] [--write [--force]]']) {
       assert.ok(source.split(line).length - 1 >= 2, `"${line}" appears in the header and in the usage text`);
     }
