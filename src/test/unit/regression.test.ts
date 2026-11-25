@@ -893,6 +893,29 @@ describe('Regression: browser UAT manifest contributions', () => {
     assert.equal(prop.default, true);
     assert.equal(prop.scope, 'machine');
   });
+
+  // Playlist is labelled "Stage" in the UI, but the command ids are a contract:
+  // keybindings, walkthrough completion events and command links name them.
+  it('labels the stage commands "Stage" while keeping their playlist ids', () => {
+    const expected: Array<[string, string]> = [
+      ['agentTaskPlayer.addPlaylist', 'Add Stage'],
+      ['agentTaskPlayer.playPlaylist', 'Run Stage'],
+      ['agentTaskPlayer.setPlaylistStatus', 'Set Stage Status...'],
+    ];
+    for (const [id, title] of expected) {
+      const cmd = pkg.contributes.commands.find((c) => c.command === id);
+      assert.ok(cmd, `${id} must still be declared — renaming the id breaks every caller`);
+      assert.equal(cmd!.title, title);
+    }
+  });
+
+  it('keeps the stage-row menus keyed on viewItem == playlist', () => {
+    const entries = Object.values(pkg.contributes.menus).flat();
+    assert.ok(
+      entries.some((m) => (m.when ?? '').includes('viewItem == playlist')),
+      'the contextValue is a contract — renaming it with the label hides every stage-row menu',
+    );
+  });
 });
 
 // ─── 5. Engine call-site census ───────────────────────────────────────────────
@@ -1106,6 +1129,13 @@ describe('Regression: the sidebar webview script', () => {
     assert.ok(fsMod.existsSync(COMPILED),
       `${COMPILED} is missing — run npm run compile, which must build the webview too`);
     assert.ok(compiled().length > 50_000, 'the compiled script is implausibly small');
+  });
+
+  it('labels a stage "Stage" but still posts the playPlaylist message', () => {
+    const js = compiled();
+    assert.ok(js.includes('Run Stage'), 'the stage play button no longer says Run Stage');
+    // The message type is a contract with extension.ts — renaming it with the label kills the button.
+    assert.ok(js.includes("type: 'playPlaylist'"), 'the playPlaylist message type is gone');
   });
 
   it('emits a plain browser script, not a CommonJS module', () => {
@@ -1349,6 +1379,12 @@ describe('Regression: the dashboard webview script', () => {
   it('emits a plain browser script, not a CommonJS module', () => {
     const js = fsMod.readFileSync(COMPILED, 'utf-8');
     assert.ok(!js.includes('Object.defineProperty(exports'), 'a CommonJS wrapper would not run in a webview');
+  });
+
+  it('labels the running group "Stage: <name>", never "Playlist: <name>"', () => {
+    const js = fsMod.readFileSync(COMPILED, 'utf-8');
+    assert.ok(js.includes("'Stage: '"), 'the task-card and queue lines no longer read Stage:');
+    assert.ok(!js.includes("'Playlist: '"), 'a Playlist: label is still shown');
   });
 
   it('parses as JavaScript', () => {

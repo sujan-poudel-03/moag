@@ -68,6 +68,12 @@ describe('morning-review — decisions come first', () => {
     assert.ok(md.includes('Raise the ceiling'));
   });
 
+  it('labels the group of a parked task "Stage", not "Playlist"', () => {
+    const md = renderReviewMarkdown(digest({ needsDecision: [parked('manual-gate')] }), NOW);
+    assert.ok(md.includes('- **Stage:** Backend'), 'the parked task must name its stage');
+    assert.ok(!md.includes('**Playlist:**'));
+  });
+
   it('includes gate evidence when there is any', () => {
     const md = renderReviewMarkdown(digest({ needsDecision: [parked('gate-failure', {
       evidence: { gate: 'npm test', lastError: 'AssertionError: expected 1 to equal 2' },

@@ -240,7 +240,7 @@ describe('prd-ops', () => {
       const all = validatePendingPlaylist(mixed, ['claude']).errors;
       const engine = pendingPlaylistEngineErrors(mixed, ['claude']);
       assert.deepEqual(engine, [
-        'Playlist "PRD v1.1.0 delta" uses engine "codex", which is not allowed for server runs.',
+        'Stage "PRD v1.1.0 delta" uses engine "codex", which is not allowed for server runs.',
         'Task "Implement" uses engine "custom", which is not allowed for server runs.',
         'Task "Run tests" uses engine "copilot", which is not allowed for server runs.',
       ]);

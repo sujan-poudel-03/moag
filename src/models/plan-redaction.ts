@@ -120,7 +120,7 @@ const PLAN_FILE_LABELS: Record<string, string> = {
 
 const PLAYLIST_LABELS: Record<string, string> = {
   aiRules: 'plan rules',
-  prdContext: 'playlist PRD context',
+  prdContext: 'stage PRD context',
 };
 
 const TASK_LABELS: Record<string, string> = {

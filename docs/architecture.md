@@ -1,7 +1,7 @@
 # MOAG — Architecture Overview
 
 > Agent Task Player (extension ID: `moag.agent-task-player`)  
-> Orchestrates AI coding agents (Claude Code, Codex, Gemini CLI, Copilot, Ollama) to run task playlists inside VS Code.
+> Orchestrates AI coding agents (Claude Code, Codex, Gemini CLI, Copilot, Ollama) to run stages of tasks inside VS Code.
 
 ---
 
@@ -46,7 +46,7 @@ graph TD
     end
 
     subgraph Models["Models / Types"]
-        TYPES["types.ts\nPlan · Playlist · Task\nTaskStatus · RunnerState\nEngineResult · HistoryEntry"]
+        TYPES["types.ts\nPlan · Stage · Task\nTaskStatus · RunnerState\nEngineResult · HistoryEntry"]
     end
 
     EXT -->|"creates & wires"| SIDEBAR
@@ -105,7 +105,7 @@ sequenceDiagram
     EXT->>Runner: runner.play(plan)
     Runner->>Runner: detectAndMarkCycles(plan)
 
-    loop each Playlist / Task
+    loop each Stage / Task
         Runner->>CTX: buildPrompt(task, plan)
         CTX->>CTX: runRetrievalCascade() — symbol hints → rg/glob → semantic
         CTX->>CTX: applyBudget() — drop lowest-priority sections to fit 12K chars
@@ -183,7 +183,7 @@ erDiagram
         string engine
         string version
     }
-    Playlist {
+    Stage {
         string id
         string name
         string engine
@@ -203,10 +203,12 @@ erDiagram
         number retryCount
         TokenUsage tokenUsage
     }
-    Plan ||--o{ Playlist : contains
-    Playlist ||--o{ Task : contains
+    Plan ||--o{ Stage : contains
+    Stage ||--o{ Task : contains
     Task ||--o{ Task : dependsOn
 ```
+
+A stage is the `Playlist` type in code and an entry of `playlists` in plan JSON.
 
 ---
 
@@ -256,7 +258,7 @@ classDiagram
 graph LR
     subgraph Sidebar["PromptInputViewProvider (WebviewView)"]
         PROMPT["PROMPT tab\n─────────\nChat feed\nLive output blocks\nComposer + active file pill\n✦ Plan button"]
-        PLAN["PLAN tab\n─────────\nOverview bar\nPlaylist groups\nTask rows (inline edit ✏)\nBulk run tools"]
+        PLAN["PLAN tab\n─────────\nOverview bar\nStage groups\nTask rows (inline edit ✏)\nBulk run tools"]
         HISTORY["HISTORY tab\n─────────\nRun sessions\nPer-task entries"]
     end
 ```

@@ -279,6 +279,16 @@ describe('remote child — run', () => {
     assert.equal(reviewRemotePlan(transformGeneratedPlan(JSON.parse(JSON.stringify(GENERATED)) as PlanFile), ['claude']), null);
   });
 
+  it('reviewRemotePlan names the stage whose engine is not allowed', () => {
+    const file = transformGeneratedPlan(JSON.parse(JSON.stringify(GENERATED)) as PlanFile);
+    file.playlists[0].engine = 'codex';
+    const reason = reviewRemotePlan(file, ['claude']);
+    assert.ok(reason, 'a forbidden stage engine must be refused');
+    assert.ok(reason!.startsWith('stage "'), `the refusal names the stage: ${reason}`);
+    assert.ok(reason!.includes('uses the engine "codex"'));
+    assert.doesNotMatch(reason!, /playlist/i);
+  });
+
   it('resumes from the mirror\'s copy of the parent branch at its tip, and reports the tip at the end', async () => {
     const tip = 'd'.repeat(40);
     const h = harness('ok', { mirrorTip: tip });

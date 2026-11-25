@@ -90,11 +90,11 @@ describe('redactPlanFile / serializePlanForSharing', () => {
       'custom role definitions',
       'owner notes',
       'plan rules',
-      'playlist PRD context',
+      'stage PRD context',
       'task environment variables',
       'variables',
     ].sort());
-    // De-duplicated: plan rules and playlist rules share one label
+    // De-duplicated: plan rules and stage rules share one label
     assert.equal(new Set(redacted).size, redacted.length);
   });
 

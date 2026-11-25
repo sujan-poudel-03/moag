@@ -309,7 +309,7 @@ export function reviewRemotePlan(file: PlanFile, allowedEngines: readonly string
   const allowed = new Set(allowedEngines);
   const named: Array<[string, unknown]> = [['the plan\'s default engine', file.defaultEngine], ['the plan\'s fallback engine', file.fallbackEngine]];
   for (const pl of file.playlists ?? []) {
-    named.push([`playlist "${pl.name}"`, pl.engine]);
+    named.push([`stage "${pl.name}"`, pl.engine]);
     for (const t of pl.tasks ?? []) {
       named.push([`task "${t.name}"`, t.engine]);
       if (typeof t.cwd === 'string' && t.cwd.length > 0 && cwdEscapesWorkspace(t.cwd)) {

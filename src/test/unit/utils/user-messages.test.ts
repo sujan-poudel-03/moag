@@ -40,6 +40,22 @@ describe('UserMsg.planLoadError', () => {
   });
 });
 
+describe('UserMsg.noPlaylist', () => {
+  it('says "stage", never "playlist"', () => {
+    const msg = UserMsg.noPlaylist();
+    assert.match(msg.text, /at least one stage/);
+    assert.doesNotMatch(msg.text, /playlist/i);
+  });
+
+  it('offers Add Stage on the unchanged addPlaylist command id', () => {
+    const msg = UserMsg.noPlaylist();
+    assert.equal(msg.actions?.length, 1);
+    assert.equal(msg.actions[0].label, 'Add Stage');
+    // The id is a contract: renaming it with the label makes the button dead.
+    assert.equal(msg.actions[0].command, 'agentTaskPlayer.addPlaylist');
+  });
+});
+
 describe('UserMsg — ONOSOO project ID', () => {
   const KEY = 'git:github.com/o/r';
 
