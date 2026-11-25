@@ -24,6 +24,8 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 ### Fixed
 
 - `moag pair` accepts a key pasted into PowerShell (bracketed-paste markers are ignored).
+- `moag daemon` started from your home folder no longer turns ONOSOO off and exits ("the user config directory is inside the workspace"). The home folder (or a folder above it) is allowed unless a git repository lies between it and the config folder; a project folder that contains the config folder is still refused.
+- Windows: a crashed daemon no longer blocks every restart when Windows hands its process id to another program. The daemon lock now records the process start time on Windows too, and a lock from an older MOAG is taken over when the process holding its id started after the lock was written.
 - An SSH host alias of GitHub, GitLab or Bitbucket (`git@github.com-personal:…`, `ssh.github.com`) gives the same project id as a normal clone.
 
 ## [0.10.0] - 2026-11-09
