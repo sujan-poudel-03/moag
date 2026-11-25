@@ -10,6 +10,8 @@
 // <configDir> is %APPDATA% on Windows, else $XDG_CONFIG_HOME, else ~/.config.
 // The file is user-level on purpose: nothing relay-related is ever read from or
 // written under the workspace, so a delivery commit can never carry the key.
+// The one exception is the home folder as the working folder: it contains the
+// config dir by design, and is allowed when no git repository could commit it.
 //
 // No key → null, silently: the relay is off and `moag run` behaves as before.
 // Imports nothing that loads `vscode`.
@@ -102,10 +104,34 @@ function isInside(parent: string, child: string, platform: NodeJS.Platform): boo
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 }
 
+/** True when a `.git` (directory or file) sits in `from` or any folder above it, up to and including `stop`. */
+function gitBetween(from: string, stop: string, platform: NodeJS.Platform): boolean {
+  let dir = path.resolve(from);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.git'))) { return true; }
+    if (!isInside(stop, dir, platform) || isInside(dir, stop, platform)) { return false; }
+    const up = path.dirname(dir);
+    if (up === dir) { return false; }
+    dir = up;
+  }
+}
+
+/**
+ * True when the config dir under `cwd` must turn the relay off. A project folder that contains
+ * it always does. The home folder (or a folder above it, such as C:\Users) is not a project: it
+ * holds the config dir by design, and `moag daemon` is often started there. It is allowed unless
+ * a git repository lies between the config dir and `cwd`, since only a repository can commit the key.
+ */
+function configDirExposed(cwd: string, stateDir: string, home: string, platform: NodeJS.Platform): boolean {
+  if (!isInside(cwd, stateDir, platform)) { return false; }
+  if (!isInside(cwd, home, platform)) { return true; }
+  return gitBetween(stateDir, cwd, platform);
+}
+
 /**
  * Resolve the relay configuration, or null when the relay is off. Never throws.
- * A key with no usable URL, or a config dir inside the workspace, is reported
- * on `stderr` once and turns the relay off.
+ * A key with no usable URL, or a config dir inside the workspace (other than the
+ * home folder; see configDirExposed), is reported on `stderr` once and turns the relay off.
  */
 export function resolveOnosooConfig(opts: ResolveOnosooOptions): OnosooConfig | null {
   const platform = opts.platform ?? process.platform;
@@ -138,7 +164,7 @@ export function resolveOnosooConfig(opts: ResolveOnosooOptions): OnosooConfig | 
       return null;
     }
 
-    if (isInside(opts.cwd, stateDir, platform)) {
+    if (configDirExposed(opts.cwd, stateDir, homedir(), platform)) {
       stderr('ONOSOO relay is off: the user config directory is inside the workspace, and relay state must never be written there.\n');
       return null;
     }

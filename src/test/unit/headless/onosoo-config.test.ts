@@ -108,14 +108,65 @@ describe('ONOSOO config', () => {
 
   it('a config dir inside the workspace → null with a stderr note, nothing written there', () => {
     const cwd = tmp('moag-onosoo-ws-');
+    const home = tmp('moag-onosoo-home-');
     const errors: string[] = [];
     const cfg = resolveOnosooConfig({
       env: { APPDATA: cwd, XDG_CONFIG_HOME: cwd, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: 'https://x.co' },
-      cwd, homedir: () => cwd, stderr: (s) => errors.push(s),
+      cwd, homedir: () => home, stderr: (s) => errors.push(s),
     });
     assert.equal(cfg, null);
     assert.equal(errors.length, 1);
     assert.deepEqual(walk(cwd), []);
+  });
+
+  describe('started from the home folder', () => {
+    /** A home folder holding the config dir the way the OS lays it out (AppData\Roaming, .config). */
+    function homeFixture() {
+      const home = tmp('moag-onosoo-home-');
+      const configDir = path.join(home, 'AppData', 'Roaming');
+      fs.mkdirSync(configDir, { recursive: true });
+      const errors: string[] = [];
+      const resolve = (cwd: string) => resolveOnosooConfig({
+        env: { APPDATA: configDir, XDG_CONFIG_HOME: configDir, MOAG_ONOSOO_KEY: KEY, MOAG_ONOSOO_URL: 'https://x.co' },
+        cwd, homedir: () => home, stderr: (s) => errors.push(s),
+      });
+      return { home, configDir, errors, resolve };
+    }
+
+    it('the home folder as the working folder keeps the relay on', () => {
+      const f = homeFixture();
+      const cfg = f.resolve(f.home);
+      assert.ok(cfg);
+      assert.equal(cfg.stateDir, path.join(f.configDir, 'moag'));
+      assert.deepEqual(f.errors, []);
+    });
+
+    it('a folder above the home folder (C:\\Users) keeps it on too', () => {
+      const f = homeFixture();
+      assert.ok(f.resolve(path.dirname(f.home)));
+      assert.deepEqual(f.errors, []);
+    });
+
+    it('a home folder that is a git repository turns it off', () => {
+      const f = homeFixture();
+      fs.mkdirSync(path.join(f.home, '.git'));
+      assert.equal(f.resolve(f.home), null);
+      assert.equal(f.errors.length, 1);
+    });
+
+    it('a git repository between the config dir and the home folder turns it off', () => {
+      const f = homeFixture();
+      fs.writeFileSync(path.join(f.home, 'AppData', '.git'), 'gitdir: elsewhere');
+      assert.equal(f.resolve(f.home), null);
+      assert.equal(f.errors.length, 1);
+    });
+
+    it('a project folder inside the home folder that holds the config dir still turns it off', () => {
+      const f = homeFixture();
+      // The working folder is AppData: inside home, not home itself, and it contains the config dir.
+      assert.equal(f.resolve(path.join(f.home, 'AppData')), null);
+      assert.equal(f.errors.length, 1);
+    });
   });
 
   it('no file under the workspace contains the key or the device id', () => {
