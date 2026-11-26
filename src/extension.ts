@@ -14,6 +14,7 @@ import { registerAllEngines, checkEngineAvailability, getEngine, setCeilingGuard
 import { loadWorkspaceRoutingConfig, saveWorkspaceRoutingConfig, RoutingRuleConfig } from './routing/routing-store';
 import { commandExists } from './utils/command-exists';
 import { ghSync, ghAsync } from './utils/gh';
+import { readParallelStages } from './utils/parallel-stages';
 import { createPullRequest, describeFailure, isGhAvailable } from './utils/pr';
 import { cmdResolveParkedItem, cmdShowMorningReview } from './ui/morning-review';
 import { cmdShowSetupGuide } from './ui/setup-guide';
@@ -1494,7 +1495,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push({ dispose: () => runner.dispose() });
 
   // Cost ceiling. The guard is a plain synchronous latch read — never async and
-  // never a modal, because under parallelPlaylists it runs once per concurrent
+  // never a modal, because under parallelStages it runs once per concurrent
   // engine call. The latch is raised by the 'budget-exceeded' handler and
   // cleared from the same notification that announces it (plus any change to
   // costBudgetUsd), so the user is never stuck without reloading the window.
@@ -4994,7 +4995,7 @@ function getPrdLoopConfig(cwd: string, fix: boolean): PrdLoopConfig {
 // ─── Browser UAT sandbox lease ───
 //
 // There is exactly ONE `sandboxManager`, and two verification loops can be live
-// at once (parallelPlaylists 1-8, or Verify fired during a daemon run). Strategy:
+// at once (parallelStages 1-8, or Verify fired during a daemon run). Strategy:
 // reference counting, serialised behind a promise chain.
 //
 //  * acquire/release both run inside `uatChain`, so a second loop can never
@@ -7082,7 +7083,7 @@ async function cmdDryRun(): Promise<void> {
   }
 
   // Concurrency settings
-  const concurrency = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('parallelPlaylists', 1);
+  const concurrency = readParallelStages(vscode.workspace.getConfiguration('agentTaskPlayer'));
   const timeout = vscode.workspace.getConfiguration('agentTaskPlayer').get<number>('taskTimeoutMs', 1800000);
   doc += '## Settings\n\n';
   doc += `- **Parallel stages:** ${concurrency}\n`;

@@ -521,7 +521,7 @@ dirty check, since otherwise it would block on files it wrote itself.
 
 ## Parallelism and isolation
 
-`parallelPlaylists > 1` gives each concurrent stage **its own git worktree
+`parallelStages > 1` gives each concurrent stage **its own git worktree
 and branch**, so two agents cannot edit the same file. Isolation requires
 `git.autoCommit` — without it the work would be stranded in a throwaway
 checkout. Teardown never passes `--force`: git refuses to remove a worktree
@@ -603,7 +603,7 @@ errors to users before it was fixed.
 | `git.autoCommit` | `false` | Branch per run, commit per verified task |
 | `git.branchPrefix` | `moag/` | Branch namespace |
 | `costBudgetUsd` | `0` | Spend ceiling; `0` disables |
-| `parallelPlaylists` | `1` | Concurrency — needs isolation above 1 |
+| `parallelStages` | `1` | Concurrency — needs isolation above 1 |
 | `taskTimeoutMs` | `1800000` | Per-task timeout (30 min) |
 | `fullAuto` | `false` | Write → test → repair without asking |
 | `autoFix` | `true` | One repair attempt per failed task |

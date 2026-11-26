@@ -192,7 +192,7 @@ describe('remote child — run', () => {
     assert.equal(cfg['engines.claude.maxBudgetUsdPerCall'], 7);
     assert.equal(cfg['git.autoCommit'], true);
     assert.equal(cfg['git.branchPrefix'], 'moag/');
-    assert.equal(cfg.parallelPlaylists, 1);
+    assert.equal(cfg.parallelStages, 1);
     assert.equal(cfg.taskTimeoutMs, REMOTE_TASK_TIMEOUT_MS);
     assert.equal(cfg['engines.claude.autoApprove'], true);
     assert.equal(cfg.fullAuto, false);

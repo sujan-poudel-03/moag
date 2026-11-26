@@ -4,7 +4,7 @@
 // in text mode, Codex, Gemini, Copilot, custom) is invisible to it, so a set
 // ceiling cannot stop that spend. This says so once, the first time such a
 // call happens while a ceiling is set. The extension shows a warning; the CLI
-// prints one stderr line. Concurrent calls (parallelPlaylists) hit the latch,
+// prints one stderr line. Concurrent calls (parallelStages) hit the latch,
 // not a second notice.
 
 import { costLedger, UnreportedCostEvent } from './cost-ledger';

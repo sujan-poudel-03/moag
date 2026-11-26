@@ -1,6 +1,6 @@
 {
   "agentTaskPlayer.fullAuto": false,
-  "agentTaskPlayer.parallelPlaylists": 1,
+  "agentTaskPlayer.parallelStages": 1,
   "agentTaskPlayer.failSafeMode": true,
   "agentTaskPlayer.autoFix": false,
   "agentTaskPlayer.taskTimeoutMs": 240000,

@@ -80,7 +80,7 @@ Click **Run Plan** ▶ in the title bar. MOAG opens the Dashboard, validates eng
 | **Plan Variables** | `{{varName}}` substitution in prompts | Plan JSON |
 | **Conditional Tasks** | `skipIf` controls whether a task runs | Task field |
 | **Output Chaining** | Previous output feeds into next prompt | On by default |
-| **Parallel Stages** | Run stages concurrently (1-8) | `agentTaskPlayer.parallelPlaylists` |
+| **Parallel Stages** | Run stages concurrently (1-8) | `agentTaskPlayer.parallelStages` |
 | **Dry Run** | Preview what will execute | `MOAG: Dry Run` |
 | **Export Results** | Markdown, JSON, or clipboard | `MOAG: Export Results` |
 | **Share as Gist** | Upload plan to GitHub Gist | `MOAG: Share Plan` |
@@ -224,7 +224,7 @@ Open `Ctrl+,` → search `agentTaskPlayer`:
 | `defaultEngine` | `claude` | Default agent engine |
 | `autoplayDelay` | `500` | Delay between tasks (ms) |
 | `taskTimeoutMs` | `1800000` | Per-task timeout (30 min) |
-| `parallelPlaylists` | `1` | Concurrent stages (1-8) |
+| `parallelStages` | `1` | Concurrent stages (1-8) |
 | `costBudgetUsd` | `10` | Hard spend ceiling (USD); calls that report no cost are not counted |
 | `maxHistoryEntries` | `200` | History entries to retain |
 | `engines.*.command` | varies | CLI path per engine |
