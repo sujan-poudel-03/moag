@@ -16,7 +16,8 @@
 import { spawnSync } from 'child_process';
 import * as fs from 'fs';
 import * as os from 'os';
-import * as path from 'path';
+// Windows paths on every host: the service is Windows-only, and its tests run on Linux and macOS too.
+import { win32 as path } from 'path';
 
 export const TASK_NAME = 'MOAG Daemon';
 const LOG_LIMIT_MB = 5;

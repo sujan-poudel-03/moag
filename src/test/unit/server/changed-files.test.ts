@@ -59,7 +59,8 @@ describe('server/changed-files', function () {
     fs.mkdirSync(path.join(dir, '.moag'));
     fs.writeFileSync(path.join(dir, '.moag', 'x'), 'internal\n');
     // Windows refuses < and > in a file name; the parser test covers such a path there.
-    const odd = process.platform === 'win32' ? null : '<script>alert(1)</script>.txt';
+    // No '/' in it: that would be a folder on Linux and macOS, and the file could not be written.
+    const odd = process.platform === 'win32' ? null : '<img src=x onerror=alert(1)>.txt';
     if (odd) { fs.writeFileSync(path.join(dir, odd), 'x\n'); }
 
     const doc = await collectChangedFiles(dir, head, exec);
