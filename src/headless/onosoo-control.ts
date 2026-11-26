@@ -46,7 +46,9 @@ export interface Capabilities {
   mode: 'local' | 'isolated';
   remote_start: boolean;
   /** `key` (protocol v1.2) is the folder's project_key when known; never a path or a URL. */
-  projects: Array<{ id: string; name: string; kinds: string[]; key?: string }>;
+  projects: Array<{ id: string; name: string; kinds: string[]; key?: string; delivery?: 'off' | 'branch' | 'draft-pr' }>;
+  /** The machine's own daily spending cap in US dollars; absent when none is set. */
+  daily_budget_usd?: number;
   engines: string[];
   /** engine id → why an installed engine cannot be used (not signed in). Only present when there is one. */
   engine_issues?: Record<string, string>;

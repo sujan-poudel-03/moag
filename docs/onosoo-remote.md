@@ -180,6 +180,23 @@ it is. Delivery is `draft-pr` when `gh` is signed in, `branch` when there is an 
 `off` when there is no origin; `--delivery`, `--pr-base`, `--name`, `--id` and `--budget` override. The longer
 manual setup follows.
 
+**What the machine tells ONOSOO:** its mode, whether remote start is on, the approved projects (id, name, kinds, the
+project key and each project's `delivery` mode, never a path or a URL), the usable engines, and the daily budget cap
+(`daily_budget_usd`), so the Builds screen can show a ready check and what a project spent against the cap.
+
+**Check that delivery will work:** `moag delivery-check [<project id>]` asks, read-only, whether a finished run can
+leave this machine: the project has an `origin`, `git ls-remote --heads origin` succeeds (prompts off, 25 s limit),
+and, for `draft-pr` projects, `gh auth status` passes. Exit 0 when every project can deliver, 1 when one cannot,
+2 for a wrong argument or no approved projects. A failure, and a failed push during a real run (the
+`pr-skipped` message in ONOSOO), names the cause: a blocked port 22 (use `ssh.github.com` on port 443, or an https
+remote), a missing SSH key or `gh auth login`, an untrusted host key, a missing repository, a branch rule, or a
+branch name that already exists on the remote and moved on. Git's own message follows the plain reason.
+
+**A run the daemon was cut off in:** after a crash, a power cut or a restart, the next `moag daemon` start marks the
+run interrupted (charging its full allotment, as before) and now also ends it in ONOSOO, with an `error` and a
+`run-finished` code 2 written after its last event and sent with the spool drain, so it stops showing as running.
+A run that had already sent `run-finished` is left alone.
+
 The sections above describe the **isolated** mode: a Linux build machine and a separate runner
 account. **Local mode** is a second, explicitly opt-in way to run for a plain Windows, macOS or Linux
 PC: ONOSOO's **Start run** works, and the run executes **as the same user as `moag daemon`**. There

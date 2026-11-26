@@ -19,8 +19,13 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 - **`moag service install | uninstall | status` (Windows).** Registers a per-user Task Scheduler task so the daemon starts when you sign in, hidden, as you, restarted a minute after a failure, with a log in `%LOCALAPPDATA%\moag\daemon.log`. No terminal window to keep open. See "Windows: start the daemon when you sign in" in `docs/onosoo-remote.md`.
 
+- **`moag delivery-check [<project id>]`.** Read-only check that a finished run can be pushed (and a draft pull request opened) from this machine: an `origin` exists, git can reach it, and `gh` is signed in where draft pull requests are on. Exit 0 when all is well, 1 on a problem. See "Local mode" in `docs/onosoo-remote.md`.
+
 ### Changed
 
+- A failed branch push now says the real reason and what to do (a blocked port 22 with the port 443 way round it, a missing SSH key or login, an untrusted host key, a missing repository, a branch rule, a branch that moved on), followed by git's own words, instead of a single "check the GitHub login" line.
+- The machine's capabilities now also carry each project's `delivery` mode (`off`, `branch` or `draft-pr`) and the machine's `daily_budget_usd`, so ONOSOO can show them in its ready check. Never a path or a URL. ONOSOO versions that do not know the fields ignore them.
+- A run the daemon was cut off in is now ended in ONOSOO at the next start (an `error` and a failed `run-finished`), instead of showing as running until someone noticed.
 - The "config folder is inside the workspace" refusal now names the folder you ran MOAG from and says what to do (run it from another folder), instead of a bare statement.
 - Play and Execute are now **Run**: **Run Plan**, **Run Stage**, **Run Task**, and **Run** in the chat composer; a paused plan shows **Resume**. Command ids, keybindings (Ctrl+Alt+P) and settings are unchanged.
 - Playlist is now **Stage** wherever MOAG shows it: **Add Stage**, **Run Stage**, **Set Stage Status...**, the sidebar, Dashboard, notifications, Get Started walkthrough, command-line output, the hosted web UI and the docs. Command ids, settings (including `agentTaskPlayer.parallelPlaylists`) and plan files (the `playlists` key) are unchanged, so existing plans keep working.

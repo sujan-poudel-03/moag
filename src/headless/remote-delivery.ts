@@ -60,6 +60,77 @@ export interface DeliveryRequest {
   runId: string;
 }
 
+/** What went wrong with git, in words a person can act on. `kind` is stable (tests, logs); `text` is for people. */
+export interface GitProblem {
+  kind:
+    | 'network-blocked'
+    | 'ssh-key'
+    | 'https-login'
+    | 'host-key'
+    | 'repo-not-found'
+    | 'protected-branch'
+    | 'moved-branch'
+    | 'timeout'
+    | 'other';
+  text: string;
+}
+
+const SSH_443_HINT =
+  'Many networks block port 22. Point the remote at ssh.github.com on port 443 (in ~/.ssh/config: HostName ssh.github.com, Port 443), or switch the remote to its https address.';
+
+/**
+ * Turn git's own words into the real reason and what to do about it. The raw message is only ever shortened, never
+ * hidden: it follows the plain reason, so nothing is lost. The first rule that matches wins.
+ */
+export function classifyGitFailure(message: string): GitProblem {
+  const m = message.replace(/\s+/g, ' ').trim();
+  const lower = m.toLowerCase();
+  const raw = m.slice(0, 160);
+  if (/did not finish in time/.test(lower)) {
+    return { kind: 'timeout', text: `git took too long, so the connection is probably blocked or very slow. ${SSH_443_HINT}` };
+  }
+  if (/connection timed out|operation timed out|network is unreachable|no route to host|could not resolve host|connection refused|port 22/.test(lower)) {
+    return { kind: 'network-blocked', text: `git could not reach the remote. ${SSH_443_HINT} (git said: ${raw})` };
+  }
+  if (/host key verification failed|remote host identification has changed/.test(lower)) {
+    return {
+      kind: 'host-key',
+      text: `This machine does not trust the remote's SSH host key yet. Run "git ls-remote origin" once in the project and accept it. (git said: ${raw})`,
+    };
+  }
+  if (/permission denied \(publickey\)|no matching host key|publickey/.test(lower)) {
+    return {
+      kind: 'ssh-key',
+      text: `The remote refused this machine's SSH key. Check that the key in ~/.ssh is added to your GitHub account and that the project's remote uses the right host alias. (git said: ${raw})`,
+    };
+  }
+  if (/could not read username|terminal prompts disabled|authentication failed|invalid username or password|error: 40[13]|http 40[13]/.test(lower)) {
+    return {
+      kind: 'https-login',
+      text: `This machine is not signed in to GitHub over https. Run "gh auth login", or switch the remote to SSH. (git said: ${raw})`,
+    };
+  }
+  if (/repository not found|does not appear to be a git repository|not found/.test(lower)) {
+    return {
+      kind: 'repo-not-found',
+      text: `The remote does not exist, or the signed-in account cannot see it. Check the origin address and the account's access. (git said: ${raw})`,
+    };
+  }
+  if (/protected branch|gh006|gh013|push declined due to repository rule|rule violations/.test(lower)) {
+    return {
+      kind: 'protected-branch',
+      text: `GitHub refused the push because of a branch rule. Allow moag/* branches in the repository's rules. (git said: ${raw})`,
+    };
+  }
+  if (/non-fast-forward|fetch first|updates were rejected/.test(lower)) {
+    return {
+      kind: 'moved-branch',
+      text: `A branch with this name already exists on the remote and has moved on, so it was not overwritten. Delete or rename it there and run again. (git said: ${raw})`,
+    };
+  }
+  return { kind: 'other', text: `git said: ${raw}` };
+}
+
 /** What to tell ONOSOO (a run event, or nothing) and a line for the daemon's own log. */
 export interface DeliveryResult {
   event: { event: 'pr-created'; url: string } | { event: 'pr-skipped'; reason: string; message: string } | null;
@@ -118,7 +189,7 @@ export async function deliverBranch(req: DeliveryRequest, deps: DeliveryDeps): P
   // An explicit refspec and no force: a branch someone moved on the remote is refused, never overwritten.
   const pushed = await deps.git(['push', '--no-verify', 'origin', `${ref}:${ref}`], req.projectPath);
   if (!pushed.ok) {
-    return skipped('push-failed', `The branch could not be pushed: ${pushed.message.replace(/\s+/g, ' ').slice(0, 200)} Check the machine's GitHub login.`);
+    return skipped('push-failed', `The branch could not be pushed. ${classifyGitFailure(pushed.message).text}`);
   }
   if (req.mode === 'branch') { return { event: null, note: `pushed ${req.branch}` }; }
 

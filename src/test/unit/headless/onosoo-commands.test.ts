@@ -90,6 +90,8 @@ function harness(opts: {
   timers?: { setTimeout(fn: () => void, ms: number): unknown; clearTimeout(h: unknown): void }; stderr?: (s: string) => void;
   /** The project's tip of the parent branch (null = no branch); when set, the host uses it instead of branchExists. */
   projectTip?: string | null; drain?: () => Promise<void>;
+  /** Boot: end, in ONOSOO's eyes, the runs the last daemon was cut off in. */
+  closeInterrupted?: (runIds: readonly string[]) => void | Promise<void>;
   /** Project identities (protocol v1.2); absent by default. */
   identities?: CommandHostOptions['identities'];
   /** The capabilities key check; defaults to pass-all when identities are given; null leaves it out. */
@@ -118,6 +120,7 @@ function harness(opts: {
     branchExists: async () => opts.branchExists ?? true,
     ...(opts.projectTip !== undefined ? { projectBranchTip: async () => opts.projectTip as string | null } : {}),
     ...(opts.drain ? { drainLeftoverSpool: opts.drain } : {}),
+    ...(opts.closeInterrupted ? { closeInterruptedRuns: opts.closeInterrupted } : {}),
     ...(opts.lock ? { lock: opts.lock } : {}),
     ledger: new RemoteLedger(stateDir),
     audit: new RemoteAudit(stateDir),
@@ -177,12 +180,34 @@ describe('ONOSOO command host', () => {
     await h.host.tick();
     await h.host.tick();
     assert.equal(h.control.caps.length, 1);
-    assert.deepEqual(h.control.caps[0], { mode: 'isolated', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'] }], engines: ['claude', 'ollama'] });
+    assert.deepEqual(h.control.caps[0], { mode: 'isolated', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'], delivery: 'off' }], engines: ['claude', 'ollama'], daily_budget_usd: 20 });
     assert.ok(!JSON.stringify(h.control.caps).includes(PROJECT_PATH));
     h.setProjects(projects({ projects: [{ id: 'web', name: 'Web (renamed)', kinds: [], path: PROJECT_PATH }] }));
     await h.host.tick();
     assert.equal(h.control.caps.length, 2);
     assert.equal(h.control.caps[1].projects[0].name, 'Web (renamed)');
+  });
+
+  it('capabilities carry each project\'s delivery mode and the daily cap, and leave the cap out when there is none', async () => {
+    const withDelivery = harness();
+    withDelivery.setProjects(projects({
+      dailyBudgetUsd: 7.5,
+      projects: [
+        { id: 'web', name: 'Web app', kinds: ['node'], path: PROJECT_PATH, delivery: 'draft-pr' },
+        { id: 'api', name: 'API', kinds: ['node'], path: PROJECT_PATH, delivery: 'branch' },
+        { id: 'docs', name: 'Docs', kinds: [], path: PROJECT_PATH },
+      ],
+    }));
+    await withDelivery.host.tick();
+    const caps = withDelivery.control.caps[0];
+    assert.deepEqual(caps.projects.map((p) => [p.id, p.delivery]), [['web', 'draft-pr'], ['api', 'branch'], ['docs', 'off']]);
+    assert.equal(caps.daily_budget_usd, 7.5);
+    assert.ok(!JSON.stringify(caps).includes(PROJECT_PATH), 'still no path');
+
+    const noCap = harness();
+    noCap.setProjects(projects({ dailyBudgetUsd: null }));
+    await noCap.host.tick();
+    assert.equal('daily_budget_usd' in noCap.control.caps[0], false);
   });
 
   it('capabilities carry why an installed engine is not offered, and omit the key when there is nothing to say', async () => {
@@ -239,6 +264,46 @@ describe('ONOSOO command host', () => {
     await h.host.start();
     assert.equal(h.runs.get('run-old')!.outcome, 'interrupted');
     assert.equal(new RemoteLedger(stateDir).remaining(20), 14);
+  });
+
+  describe('a run cut short by a crash is closed in ONOSOO at the next start', () => {
+    function crashedState(): string {
+      const stateDir = tmp();
+      new RemoteLedger(stateDir, { pid: process.pid }).reserve('run-old', 6, 20);
+      new RemoteRuns(stateDir).save({
+        runId: 'run-old', projectId: 'web', commandId: 'c0', kind: 'start-run', branch: 'moag/x', startSha: 'a'.repeat(40), engine: 'claude',
+        allotment: 6, startedAt: '2026-10-11T00:00:00Z', exitCode: null, outcome: 'live', gateTaskId: null, snapshot: dehydratePlan(createEmptyPlan('x')),
+      });
+      return stateDir;
+    }
+
+    it('names the interrupted runs, before the spool is drained so the closing events go out with it', async () => {
+      const order: string[] = [];
+      const closed: string[][] = [];
+      const h = harness({
+        stateDir: crashedState(),
+        closeInterrupted: (ids) => { order.push('close'); closed.push([...ids]); },
+        drain: async () => { order.push('drain'); },
+      });
+      await h.host.start();
+      assert.deepEqual(closed, [['run-old']]);
+      assert.deepEqual(order, ['close', 'drain']);
+    });
+
+    it('is not called when nothing was live', async () => {
+      let called = false;
+      const h = harness({ closeInterrupted: () => { called = true; } });
+      await h.host.start();
+      assert.equal(called, false);
+    });
+
+    it('a failure there never stops the daemon from starting, and the run is still charged and marked', async () => {
+      const stateDir = crashedState();
+      const h = harness({ stateDir, closeInterrupted: () => { throw new Error('disk full'); } });
+      await h.host.start();
+      assert.equal(h.runs.get('run-old')!.outcome, 'interrupted');
+      assert.equal(new RemoteLedger(stateDir).remaining(20), 14);
+    });
   });
 
   it('a 409 result is not retried; a retry result stays in the outbox for the next cycle', async () => {
@@ -707,7 +772,7 @@ describe('ONOSOO command host — project identity', () => {
     f.known.set(PROJECT_PATH, ID_WEB);
     await h.host.tick();
     assert.equal(h.control.caps.length, 2);
-    assert.deepEqual(h.control.caps[1].projects, [{ id: 'web', name: 'Web app', kinds: ['node'], key: KEY_WEB }]);
+    assert.deepEqual(h.control.caps[1].projects, [{ id: 'web', name: 'Web app', kinds: ['node'], key: KEY_WEB, delivery: 'off' }]);
     await h.host.tick();
     await h.host.tick();
     assert.equal(h.control.caps.length, 2);
@@ -876,7 +941,7 @@ describe('ONOSOO command host — project identity', () => {
     h.control.polls.push([startRun('c1')]);
     await h.host.tick();
     await tick();
-    assert.deepEqual(h.control.caps[0].projects, [{ id: 'web', name: 'Web app', kinds: ['node'] }]);
+    assert.deepEqual(h.control.caps[0].projects, [{ id: 'web', name: 'Web app', kinds: ['node'], delivery: 'off' }]);
     assert.equal(h.sups.length, 1);
     assert.equal(h.sups[0].req.identity, null);
   });
@@ -889,7 +954,7 @@ describe('ONOSOO command host — local mode', () => {
     const h = harness({ platform: 'win32' });
     h.setProjects(local());
     await h.host.tick();
-    assert.deepEqual(h.control.caps[0], { mode: 'local', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'] }], engines: ['claude', 'ollama'] });
+    assert.deepEqual(h.control.caps[0], { mode: 'local', remote_start: true, projects: [{ id: 'web', name: 'Web app', kinds: ['node'], delivery: 'off' }], engines: ['claude', 'ollama'], daily_budget_usd: 20 });
     assert.ok(!JSON.stringify(h.control.caps).includes(PROJECT_PATH));
   });
 
