@@ -20,6 +20,20 @@ updates:
         update-types: ['version-update:semver-major', 'version-update:semver-minor']
       - dependency-name: '@types/node'
         update-types: ['version-update:semver-major']
+      # Majors that need a deliberate migration (config formats, compiler,
+      # packaging, SDK API). Upgrade these on purpose, not from a bot PR.
+      - dependency-name: 'typescript'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'eslint'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@typescript-eslint/*'
+        update-types: ['version-update:semver-major']
+      - dependency-name: 'mocha'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@vscode/vsce'
+        update-types: ['version-update:semver-major']
+      - dependency-name: '@anthropic-ai/sdk'
+        update-types: ['version-update:semver-major']
 
   - package-ecosystem: github-actions
     directory: /
@@ -30,3 +44,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # The image follows the Node LTS pinned in .nvmrc; digest and patch
+      # updates still arrive, a new major is moved by hand with .nvmrc.
+      - dependency-name: 'node'
+        update-types: ['version-update:semver-major']

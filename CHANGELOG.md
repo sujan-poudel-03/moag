@@ -551,18 +551,18 @@ _No separate commit: this work shipped in 66dd50c together with 0.5.0 and 0.6.0.
 - `.agent-plan.json` file format with auto-load on workspace open
 
 [Unreleased]: https://github.com/sujan-poudel-03/moag/compare/v0.11.0...HEAD
-[0.11.0]: https://github.com/sujan-poudel-03/moag/compare/v0.10.0...v0.11.0
-[0.10.0]: https://github.com/sujan-poudel-03/moag/compare/v0.9.15...v0.10.0
-[0.9.15]: https://github.com/sujan-poudel-03/moag/compare/v0.9.14...v0.9.15
-[0.9.14]: https://github.com/sujan-poudel-03/moag/compare/v0.9.13...v0.9.14
-[0.9.13]: https://github.com/sujan-poudel-03/moag/compare/v0.9.12...v0.9.13
-[0.9.12]: https://github.com/sujan-poudel-03/moag/compare/v0.9.10...v0.9.12
-[0.9.10]: https://github.com/sujan-poudel-03/moag/compare/v0.9.9...v0.9.10
-[0.9.9]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
-[0.9.8]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
-[0.9.7]: https://github.com/sujan-poudel-03/moag/compare/v0.9.6...v0.9.9
-[0.9.6]: https://github.com/sujan-poudel-03/moag/compare/v0.9.5...v0.9.6
-[0.9.5]: https://github.com/sujan-poudel-03/moag/compare/v0.9.4...v0.9.5
+[0.11.0]: https://github.com/sujan-poudel-03/moag/compare/234da82...v0.11.0
+[0.10.0]: https://github.com/sujan-poudel-03/moag/compare/2fec84a...234da82
+[0.9.15]: https://github.com/sujan-poudel-03/moag/compare/0abf8fd...2fec84a
+[0.9.14]: https://github.com/sujan-poudel-03/moag/compare/7ecf43b...0abf8fd
+[0.9.13]: https://github.com/sujan-poudel-03/moag/compare/84fcf76...7ecf43b
+[0.9.12]: https://github.com/sujan-poudel-03/moag/compare/64e503b...84fcf76
+[0.9.10]: https://github.com/sujan-poudel-03/moag/compare/4573414...64e503b
+[0.9.9]: https://github.com/sujan-poudel-03/moag/compare/6864628...4573414
+[0.9.8]: https://github.com/sujan-poudel-03/moag/compare/6864628...4573414
+[0.9.7]: https://github.com/sujan-poudel-03/moag/compare/6864628...4573414
+[0.9.6]: https://github.com/sujan-poudel-03/moag/compare/a83fde7...6864628
+[0.9.5]: https://github.com/sujan-poudel-03/moag/compare/v0.9.4...a83fde7
 [0.9.4]: https://github.com/sujan-poudel-03/moag/compare/a1f8e7e...v0.9.4
 [0.9.0]: https://github.com/sujan-poudel-03/moag/compare/f2654de...a1f8e7e
 [0.8.0]: https://github.com/sujan-poudel-03/moag/compare/v0.7.0...f2654de

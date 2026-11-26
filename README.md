@@ -1,8 +1,8 @@
 # MOAG — AI Agent Orchestrator
 
 [![CI](https://github.com/sujan-poudel-03/moag/actions/workflows/ci.yml/badge.svg)](https://github.com/sujan-poudel-03/moag/actions/workflows/ci.yml)
-[![Visual Studio Marketplace Version](https://img.shields.io/visual-studio-marketplace/v/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
-[![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/moag.agent-task-player)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
+[![Visual Studio Marketplace Version](https://vsmarketplacebadges.dev/version-short/moag.agent-task-player.svg)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
+[![Visual Studio Marketplace Installs](https://vsmarketplacebadges.dev/installs-short/moag.agent-task-player.svg)](https://marketplace.visualstudio.com/items?itemName=moag.agent-task-player)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 > **Run AI agents stage by stage.** Build a plan, pick your engines, hit Run — Claude Code, Codex, Gemini, Ollama, GitHub Copilot or the Anthropic API execute your tasks while you watch.
