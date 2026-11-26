@@ -1040,10 +1040,6 @@
           "when": "false"
         },
         {
-          "command": "agentTaskPlayer.setTestPhase",
-          "when": "false"
-        },
-        {
           "command": "agentTaskPlayer.saveTaskAsTemplate",
           "when": "false"
         },

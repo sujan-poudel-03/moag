@@ -7274,9 +7274,31 @@ async function cmdSetPlaylistStatus(item?: PlanTreeItem): Promise<void> {
 }
 
 async function cmdSetTestPhase(item?: PlanTreeItem): Promise<void> {
-  if (!currentPlan || !item || item.kind !== 'playlist') { return; }
+  if (!currentPlan) {
+    vscode.window.showWarningMessage('No plan loaded.');
+    return;
+  }
 
-  const playlist = currentPlan.playlists[item.playlistIndex];
+  // From the Command Palette there is no row: ask which stage. The sidebar's
+  // "No test stage" hint sends people here.
+  let playlistIndex: number;
+  if (item && item.kind === 'playlist') {
+    playlistIndex = item.playlistIndex;
+  } else if (currentPlan.playlists.length === 0) {
+    vscode.window.showWarningMessage('Add a stage first.');
+    return;
+  } else if (currentPlan.playlists.length === 1) {
+    playlistIndex = 0;
+  } else {
+    const items = currentPlan.playlists.map((pl, i) => ({
+      label: pl.name, description: pl.testPhase ? 'test phase' : undefined, index: i,
+    }));
+    const picked = await vscode.window.showQuickPick(items, { placeHolder: 'Select a stage' });
+    if (!picked) { return; }
+    playlistIndex = picked.index;
+  }
+
+  const playlist = currentPlan.playlists[playlistIndex];
   const current = playlist.testPhase ?? false;
   const picks = [
     { label: '$(beaker) Mark as Test Phase', value: true, description: 'Sandbox auto-launches and TTT check runs when this stage starts' },

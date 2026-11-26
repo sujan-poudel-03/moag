@@ -8,6 +8,10 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ## [Unreleased]
 
+### Fixed
+
+- **"No test stage" now points at a control that exists.** The sidebar hint said to right-click a stage, but no stage row has that menu. **MOAG: Toggle Test Phase** is now in the Command Palette, asks which stage when the plan has more than one, and the hint names it.
+
 ## [0.11.0] - 2026-11-26
 
 ### Added
