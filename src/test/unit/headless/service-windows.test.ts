@@ -27,7 +27,8 @@ function run(verb: string | undefined, over: Partial<ServiceDeps> = {}, results:
 describe('moag service', () => {
   it('keeps its files under LocalAppData, outside MOAG\'s config folder and the home folder', () => {
     const p = servicePaths(env);
-    assert.equal(p.workDir, 'C:\\Users\\me\\AppData\\Local\\moag\\daemon-home'.replaceAll('\\', require('path').sep));
+    // Windows paths whatever the host, so this holds on Linux and macOS CI too.
+    assert.equal(p.workDir, 'C:\\Users\\me\\AppData\\Local\\moag\\daemon-home');
     assert.ok(!p.workDir.toLowerCase().includes('roaming'));
   });
 
