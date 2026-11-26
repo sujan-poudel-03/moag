@@ -8,6 +8,8 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-26
+
 ### Added
 
 - **`moag init`.** In a git repository, one command pairs the machine (asking for the device key unless it is already paired), adds the repository to `projects.json` (creating the file in local mode with remote start on and a $10 daily budget if there is none), and says what to run next. It never changes an existing file's mode, budget or other projects, leaves an already-listed repository alone, and picks delivery from what the machine can do (`draft-pr` with `gh` signed in, `branch` with an origin only, else off). See "Local mode" in `docs/onosoo-remote.md`.
@@ -16,9 +18,7 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 - `docs/project-key-vectors.json`: example remotes and the id each one gives, checked by MOAG's tests and shared with ONOSOO.
 - Remote runs: an engine login check, the reason an installed engine is not offered, branch delivery, and each task's stage and kind in run-meta.
 - **Copy ONOSOO Project ID.** The command **MOAG: Copy ONOSOO Project ID** puts the ID runs from a folder report on the clipboard (with a folder picker in a multi-root workspace), and `moag project-id [--cwd <dir>] [--json]` prints it, exiting 1 with the reason when the folder has none. Both apply the same privacy filter as a run, so an ID a run would not send is never shown. While this machine is paired, the Dashboard status bar shows the ONOSOO project runs go to, with **Copy** and, for a repository with a link, **Open repository**.
-
 - **`moag service install | uninstall | status` (Windows).** Registers a per-user Task Scheduler task so the daemon starts when you sign in, hidden, as you, restarted a minute after a failure, with a log in `%LOCALAPPDATA%\moag\daemon.log`. No terminal window to keep open. See "Windows: start the daemon when you sign in" in `docs/onosoo-remote.md`.
-
 - **`moag delivery-check [<project id>]`.** Read-only check that a finished run can be pushed (and a draft pull request opened) from this machine: an `origin` exists, git can reach it, and `gh` is signed in where draft pull requests are on. Exit 0 when all is well, 1 on a problem. See "Local mode" in `docs/onosoo-remote.md`.
 
 ### Changed
@@ -550,7 +550,8 @@ _No separate commit: this work shipped in 66dd50c together with 0.5.0 and 0.6.0.
 - Configurable autoplay delay
 - `.agent-plan.json` file format with auto-load on workspace open
 
-[Unreleased]: https://github.com/sujan-poudel-03/moag/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/sujan-poudel-03/moag/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/sujan-poudel-03/moag/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/sujan-poudel-03/moag/compare/v0.9.15...v0.10.0
 [0.9.15]: https://github.com/sujan-poudel-03/moag/compare/v0.9.14...v0.9.15
 [0.9.14]: https://github.com/sujan-poudel-03/moag/compare/v0.9.13...v0.9.14
