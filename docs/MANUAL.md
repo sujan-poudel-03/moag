@@ -640,6 +640,7 @@ moag host [run | init | draft <project> | status | stop <env> | remove <env>]
 moag pair [<key>] [--url <base>]
 moag init [<folder>] [--url <base>] [--name <name>] [--id <id>] [--budget <usd>] [--delivery off|branch|draft-pr] [--pr-base <branch>]
 moag service <install | uninstall | status>
+moag delivery-check [<project id>]
 moag project-id [--cwd <dir>] [--json]
 moag --version | moag help
 ```
@@ -688,6 +689,10 @@ repository root works too). `moag pair` saves the ONOSOO device key; pass it on 
 `moag init`, run inside a git repository, pairs the machine if it is not paired and lists the
 repository in `projects.json` so ONOSOO can start runs in it (local mode; see "Local mode" in
 `docs/onosoo-remote.md`). On Windows, `moag service install` starts the daemon whenever you sign in.
+`moag delivery-check` checks, without changing anything, that a finished run can be pushed (and a draft pull
+request opened) from this machine: the project has an `origin`, git can reach it, and `gh` is signed in where
+draft pull requests are on. A failure says the real reason (a blocked port 22, a missing SSH key or login, a
+branch rule) and what to do.
 `moag project-id` prints the ONOSOO project ID runs from the folder report (with
 `--json`, one object); it exits 1, with the reason on stderr, when the folder has none.
 
