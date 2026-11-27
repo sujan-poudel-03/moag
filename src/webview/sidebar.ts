@@ -2473,7 +2473,7 @@ function renderTavPanel() {
   let hint = '';
   let hintClass = '';
   if (!hasTestPlaylist) {
-    hint = '⚠ No test stage — right-click a stage → Toggle Test Phase';
+    hint = '⚠ No test stage — run "MOAG: Toggle Test Phase" from the Command Palette';
     hintClass = 'warn';
   } else if (testTool === 'sandbox' && !sbActive && !testPlaylistRunning) {
     hint = 'Sandbox will auto-launch when the test stage starts';
@@ -2573,7 +2573,7 @@ function renderSandboxTttHint() {
       sbTttHintEl.textContent = '✓ Auto-launches when the test stage runs';
       sbTttHintEl.className = 'sb-ttt-hint ok';
     } else {
-      sbTttHintEl.textContent = '⚠ No test stage — right-click a stage → Toggle Test Phase';
+      sbTttHintEl.textContent = '⚠ No test stage — run "MOAG: Toggle Test Phase" from the Command Palette';
       sbTttHintEl.className = 'sb-ttt-hint warn';
     }
     sbTttHintRowEl.style.display = '';

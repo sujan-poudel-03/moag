@@ -56,6 +56,7 @@ import { PROJECT_STANDARDS_HEADER } from '../standards/profile';
 import { DESIGN_SYSTEM_HEADER } from '../standards/design';
 import { TaskQueue } from './task-queue';
 import { ghSync } from '../utils/gh';
+import { readParallelStages } from '../utils/parallel-stages';
 import { fileIncidentIssue } from '../github/issue-sync';
 // Type-only — zero runtime dependency, keeps the runner headless-safe.
 import type { EngineCallUsage } from '../utils/usage-log';
@@ -1020,8 +1021,7 @@ export class TaskRunner {
     }
 
     const failSafe = this.isFailSafeMode();
-    const concurrentPlaylists = getConfig('agentTaskPlayer')
-      .get<number>('parallelPlaylists', 1);
+    const concurrentPlaylists = readParallelStages(getConfig('agentTaskPlayer'));
     const requested = failSafe ? 1 : concurrentPlaylists;
     // Concurrency is only granted once each playlist has its own checkout.
     const effectiveConcurrentPlaylists = await this.armIsolation(plan, requested);

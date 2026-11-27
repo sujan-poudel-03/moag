@@ -1,6 +1,6 @@
 // ─── Worktree isolation — make concurrent playlists safe ─────────────────────
 //
-// `parallelPlaylists > 1` used to run N agents in ONE working directory. Two
+// `parallelStages > 1` used to run N agents in ONE working directory. Two
 // agents editing the same file at 3am produce a tree that compiles, passes
 // nothing, and cannot be attributed to either of them. This gives each
 // concurrent playlist its own git worktree and its own branch, so their edits

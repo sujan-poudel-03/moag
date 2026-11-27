@@ -42,7 +42,7 @@ MOAG has no tenants — its equivalent blast radius is that it runs autonomous a
 ### 4. Failure paths
 The happy path is not the review. Attack:
 
-- **Concurrent play.** `_playLock` guards `play()`/`playTask()`; `parallelPlaylists` (1–8) and `playlist.parallel` both create real concurrency. Is new shared mutable state safe from all three entry points? What happens on a double-click?
+- **Concurrent play.** `_playLock` guards `play()`/`playTask()`; `parallelStages` (1–8) and `playlist.parallel` both create real concurrency. Is new shared mutable state safe from all three entry points? What happens on a double-click?
 - **Abort and timeout.** Task timeout is `agentTaskPlayer.taskTimeoutMs` (**default `1800000` ms = 30 min** in `package.json` — `CLAUDE.md`'s "10 min" is stale); timed-out tasks get exit code 124. Git subprocesses hard-kill at 30 s. On abort: is the child process killed (`taskkill /pid <pid> /T /F` on Windows, `SIGTERM` elsewhere)? Is the abort listener removed on **both** `close` and `error`? Is `_abortController` nulled in `finally`? Leaked abort listeners are a bug this project has already shipped once.
 - **Partial failure.** Task fails → `failurePolicy` (`stop` / `continue` / `mark-blocked`) → dependents marked `Blocked` → auto-fix cycles (capped at 3) → engine fallback on rate limit. Is each of those transitions still correct, and does `saveAndRefresh()` persist status after task-completed *and* task-failed?
 - **Unhandled rejections.** Any new async call from `extension.ts` without a `.catch()` can kill the extension host. Grep for it.

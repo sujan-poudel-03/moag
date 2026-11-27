@@ -171,7 +171,7 @@ Every task produces an `EngineResult`: stdout, stderr, exit code, duration, toke
 | Save task as template | Right-click task → Save as Template |
 | Add from template | Right-click stage → Add from Template |
 | Set task status manually | Right-click task → Set Status |
-| Mark test phase stage | Right-click stage → Toggle Test Phase |
+| Mark test phase stage | Command Palette → MOAG: Toggle Test Phase |
 | Bulk delete tasks | Select + Delete |
 
 ### Execution

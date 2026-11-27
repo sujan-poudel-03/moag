@@ -261,7 +261,7 @@ export function buildExecConfig(engine: string, allotment: number, branchPrefix:
       ...base.agentTaskPlayer,
       'git.autoCommit': true,
       'git.branchPrefix': branchPrefix,
-      parallelPlaylists: 1,
+      parallelStages: 1,
       taskTimeoutMs: REMOTE_TASK_TIMEOUT_MS,
       'engines.claude.autoApprove': true,
       'engines.codex.autoApprove': true,

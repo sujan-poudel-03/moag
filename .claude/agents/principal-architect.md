@@ -85,7 +85,7 @@ CI (`.github/workflows/ci.yml`) runs lint, compile, `test:unit` on ubuntu/window
 
 Attack your own design and hand the reviewer the list. The ones that actually bite in this codebase:
 
-- **Concurrency.** `_playLock` is a boolean mutex guarding `play()`/`playTask()`; `parallelPlaylists` (1–8) runs playlists concurrently; `playlist.parallel` runs tasks within a playlist concurrently. Any shared mutable state you add is reachable from all three. Say what happens on the second concurrent entry.
+- **Concurrency.** `_playLock` is a boolean mutex guarding `play()`/`playTask()`; `parallelStages` (1–8) runs playlists concurrently; `playlist.parallel` runs tasks within a playlist concurrently. Any shared mutable state you add is reachable from all three. Say what happens on the second concurrent entry.
 - **Abort and cleanup.** Every long-running path takes an `AbortSignal`, and every listener added to one must be removed on both `close` and `error` — leaked abort listeners were a real bug (`base-cli.ts`). Timers, child processes, and `_abortController` all need a `finally`.
 - **Partial failure.** A task can fail, time out (exit 124), be rate-limited into an engine fallback, be auto-fixed, or block its dependents. Which of those paths does your change have to be correct on?
 - **Unhandled rejections.** An unhandled rejection from an async runner call crashes the extension host. Every `runner.play*()` call site in `extension.ts` has a `.catch()`. New async entry points need one.

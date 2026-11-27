@@ -60,7 +60,7 @@ export interface EngineAdapter {
  * Consulted before every engine call. Returning false blocks the call.
  *
  * MUST be synchronous and cheap — a plain latch read. Anything that awaits or
- * shows UI would fire once per concurrent call under parallelPlaylists.
+ * shows UI would fire once per concurrent call under parallelStages.
  */
 export type CeilingGuard = (ctx: { engineId: EngineId; label: string }) => boolean;
 

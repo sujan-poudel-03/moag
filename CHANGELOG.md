@@ -8,6 +8,14 @@ GitHub release notes (see docs/RELEASING.md). Compare links are at the end.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`agentTaskPlayer.parallelPlaylists` is now `agentTaskPlayer.parallelStages`**, so the Settings editor shows **Parallel Stages**. Nothing to do: a value set under the old name is still used while the new one is unset, and VS Code marks the old one as deprecated. The headless CLI's config file reads both names the same way.
+
+### Fixed
+
+- **"No test stage" now points at a control that exists.** The sidebar hint said to right-click a stage, but no stage row has that menu. **MOAG: Toggle Test Phase** is now in the Command Palette, asks which stage when the plan has more than one, and the hint names it.
+
 ## [0.11.0] - 2026-11-26
 
 ### Added
